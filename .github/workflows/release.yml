@@ -1,0 +1,73 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and update
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Select release tag
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          PUSH_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            tag="$INPUT_TAG"
+          else
+            tag="$PUSH_TAG"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Linux binary
+        run: cargo build --release --locked
+
+      - name: Smoke check
+        shell: bash
+        run: |
+          ./target/release/ryn --version
+          output="$(./target/release/ryn run examples/arguments.ryn -- "linux smoke")"
+          printf '%s\n' "$output"
+          grep -Fxq 'argument count: 1' <<< "$output"
+          grep -Fxq 'first argument: linux smoke' <<< "$output"
+
+      - name: Package and upload Linux binary
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          version="${TAG#v}"
+          stage="ryn-${version}-linux-x86_64"
+          mkdir "$stage"
+          cp target/release/ryn README.md "$stage/"
+          tar -czf "${stage}.tar.gz" "$stage"
+          sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+          gh release upload "$TAG" "${stage}.tar.gz" "${stage}.tar.gz.sha256" --repo "$GITHUB_REPOSITORY" --clobber
