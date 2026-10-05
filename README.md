@@ -107,6 +107,22 @@ cargo run --manifest-path ..\Cargo.toml -- run .
 
 When using an installed `ryn` executable, the commands from inside the project are simply `ryn check .`, `ryn build .`, and `ryn run .`. The project entry point is `src/main.ryn`; default native output goes to `build/<project-name>` (with `.exe` on Windows). `ryn new` refuses to overwrite an existing path. The generated project intentionally has no dependency manifest yet.
 
+## Install the latest release
+
+The installers download the latest stable GitHub release, verify its SHA-256 checksum, and install the CLI for the current user. Windows uses `install.ps1` and installs to `%LOCALAPPDATA%\Programs\Ryn`; Linux x86_64 uses `install.sh` and installs to `~/.local/bin`. The Bash installer adds that default directory to Bash startup files when needed.
+
+Run the script from a checkout of this repository:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+```bash
+bash ./install.sh
+```
+
+The repository is currently private. Sign in with `gh auth login` before running an installer, or provide a short-lived `GH_TOKEN`/`GITHUB_TOKEN` with read access to the repository. The scripts also work without a token if the repository is made public. Linux currently publishes x86_64 binaries; other Linux architectures need a matching release asset before they can be installed.
+
 Remove the project's default build artifacts with `ryn clean .`. This command leaves source files and executables written outside `build/` untouched.
 
 `build` and `run` accept `-o` or `--output` to choose the native executable path. `run` keeps the generated executable at that path after it finishes.
