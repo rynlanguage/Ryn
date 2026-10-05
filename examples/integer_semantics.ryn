@@ -1,0 +1,36 @@
+fn main() {
+    let max: i8 = 127
+    let min: i8 = -128
+    let half: i8 = 64
+    let neg_seven: i8 = -7
+    let min16: i16 = -32768
+    let min32: i32 = -2147483648
+    let min64: i64 = -9223372036854775808
+    let max_u8: u8 = 255
+    let max_u16: u16 = 65535
+    let max_u32: u32 = 4294967295
+    let max_u64: u64 = 18446744073709551615
+
+    print(max + 1)
+    print(min - 1)
+    print(half * 2)
+    print(-min)
+    print(neg_seven / 2)
+    print(neg_seven % 2)
+    print(min / -1)
+    print(min % -1)
+    print(min16 / -1)
+    print(min16 % -1)
+    print(min32 / -1)
+    print(min32 % -1)
+    print(min64 / -1)
+    print(min64 % -1)
+    print(max_u8 / 2)
+    print(max_u8 % 2)
+    print(max_u16 / 256)
+    print(max_u16 % 256)
+    print(max_u32 / 10)
+    print(max_u32 % 10)
+    print(max_u64 / 10)
+    print(max_u64 % 10)
+}

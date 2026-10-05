@@ -1,0 +1,11 @@
+fn main() {
+    let name: str = "Ryn"
+    let mut health: i64 = 100
+
+    health -= 20
+    let answer = 20 + 2 * 11
+
+    print(name)
+    print(health)
+    print(answer)
+}

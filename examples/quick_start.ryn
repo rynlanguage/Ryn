@@ -1,0 +1,19 @@
+fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+fn main() {
+    let name = "Ryn"
+    let mut health = 100
+
+    health -= 20
+
+    let status = if health > 0 { "alive" } else { "down" }
+    print(status)
+
+    if health > 0 {
+        print("Hello, {name}!")
+        print(add(20, 22))
+        print(health)
+    }
+}

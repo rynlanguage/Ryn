@@ -1,0 +1,52 @@
+fn small_count() -> i16 {
+    2
+}
+
+fn main() {
+    let signed: i8 = -1
+    print(signed as i16)
+    print(signed as u16)
+
+    let wide: u64 = 18446744073709551615
+    print(18446744073709551615 as u64)
+    print(wide as u8)
+    print(wide as i64)
+
+    let small: u8 = 255
+    print(small as i64)
+    let count = small_count() as u32
+    let one: u8 = 1
+    print(one << count)
+
+    let pattern: u16 = 0x1234
+    print(pattern as u8)
+
+    let rounded: u64 = 16777217
+    print(rounded as f32 == 16777216.0)
+    let fraction: f32 = 0.1
+    let promoted: f64 = fraction as f64
+    print(promoted == 0.10000000149011612)
+    let halfway_down: f64 = 1.000000059604644775390625
+    print(halfway_down as f32 == 1.0)
+    let halfway_up: f64 = 1.000000178813934326171875
+    print(halfway_up as f32 == 1.000000238418579)
+    let large_float: f64 = 1e300
+    print(large_float as f32)
+
+    let fractional: f64 = 12.9
+    print(fractional as i32)
+    let negative: f64 = -12.9
+    print(negative as i32)
+    print(large_float as u8)
+    let negative_large: f64 = -1e300
+    print(negative_large as i8)
+    let not_a_number: f64 = 0.0 / 0.0
+    print(not_a_number as i16)
+    print(not_a_number as u64)
+    print(negative as u16)
+    let positive_infinity: f64 = 1.0 / 0.0
+    print(positive_infinity as i64)
+    print(positive_infinity as u64)
+    let negative_infinity: f64 = -1.0 / 0.0
+    print(negative_infinity as u64)
+}

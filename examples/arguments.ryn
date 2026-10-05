@@ -1,0 +1,9 @@
+fn main() {
+    let count = arg_count()
+    print("argument count: {count}")
+
+    if count > 0 {
+        let first = arg(0)
+        print("first argument: {first}")
+    }
+}

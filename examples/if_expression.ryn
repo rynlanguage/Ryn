@@ -1,0 +1,30 @@
+fn choose(flag: bool) -> i32 {
+    if flag {
+        10
+    } else if true {
+        20
+    } else {
+        30
+    }
+}
+
+fn mark(value: i32) -> i32 {
+    print(value)
+    value
+}
+
+fn main() {
+    let message = if false { "wrong" } else { "selected" }
+    print(message)
+
+    let decimal: f32 = if true { 1.5 } else { 2.5 }
+    print(decimal)
+
+    print(if false { false } else { true })
+
+    let answer = if true { mark(1) } else { mark(2) }
+    print(answer)
+
+    print(choose(false) + if false { 1 } else { 2 })
+    print(if false { 1 } else if false { 2 } else { 3 } + 4)
+}

@@ -1,0 +1,22 @@
+[package]
+name = "ryn"
+version = "0.0.1"
+edition = "2024"
+description = "Ryn native programming language compiler"
+
+[dependencies]
+cranelift-codegen = "0.136.2"
+cranelift-frontend = "0.136.2"
+cranelift-module = "0.136.2"
+cranelift-native = "0.136.2"
+cranelift-object = "0.136.2"
+same-file = "1.0"
+unicode-width = "0.2"
+
+[[bench]]
+name = "compiler_pipeline"
+harness = false
+
+[workspace]
+members = ["."]
+resolver = "3"

@@ -1,0 +1,29 @@
+fn main() {
+    let mut score = 10
+
+    if score >= 10 && score < 20 {
+        score += 5
+        print("rank up")
+    } else {
+        print("no rank")
+    }
+
+    print(score)
+    print(score == 15)
+
+    let mut selected = 0
+    if score == 15 {
+        selected = 1
+    } else {
+        selected = 2
+    }
+    print(selected)
+
+    if !false {
+        if score > 0 {
+            print("boolean works")
+        } else {
+            print("unexpected")
+        }
+    }
+}

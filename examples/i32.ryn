@@ -1,0 +1,19 @@
+fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+fn negate(value: i32) -> i32 {
+    -value
+}
+
+fn main() {
+    let mut total: i32 = add(20, 22)
+    let minimum: i32 = -2147483648
+    let maximum: i32 = 2147483647
+    total = total + 1
+    print(total)
+    print(negate(5))
+    print(minimum)
+    print(maximum)
+    print(total > 40)
+}

@@ -1,0 +1,43 @@
+fn scale(value: f32, factor: f32) -> f32 {
+    value * factor - 0.0
+}
+
+fn identity(value: f64) -> f64 {
+    value
+}
+
+fn main() {
+    let mut precise: f64 = 1.25
+    precise = precise * 4.0 / 2.0 + 0.0 - 0.0
+    let small = scale(1.5, 2.0)
+    print(precise)
+    print(-precise)
+    print(small)
+    print(-small)
+    print(identity(0.125))
+    print(small > 2.5)
+    print(precise <= 2.5)
+    print(1.25)
+
+    let zero64: f64 = 0.0
+    let nan64 = zero64 / zero64
+    let zero32: f32 = 0.0
+    let nan32 = zero32 / zero32
+    print(1.0 / zero64)
+    print(-1.0 / zero64)
+    print(nan64)
+    print(-0.0)
+    print(nan64 == nan64)
+    print(nan64 != nan64)
+    print(nan64 < 1.0)
+    print(nan64 <= 1.0)
+    print(nan64 > 1.0)
+    print(nan64 >= 1.0)
+    print(-0.0 == 0.0)
+    print(1.0 / zero32)
+    print(-1.0 / zero32)
+    print(nan32)
+    print(nan32 == nan32)
+    print(nan32 != nan32)
+    print(nan32 < 1.0)
+}

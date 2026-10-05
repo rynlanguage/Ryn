@@ -1,0 +1,4 @@
+fn main() -> i32 {
+    print("Ryn exit status: 7")
+    7
+}

@@ -1,0 +1,36 @@
+struct Player {
+    name: str
+    vitals: Vitals
+}
+
+struct Vitals {
+    health: i32
+    alive: bool
+}
+
+fn damage(player: Player, amount: i32) -> Player {
+    let mut updated = Player {
+        name: player.name,
+        vitals: player.vitals,
+    }
+    updated.vitals.health -= amount
+    updated.vitals.alive = updated.vitals.health > 0
+    updated
+}
+
+fn main() {
+    let player = Player {
+        name: "Veni",
+        vitals: Vitals {
+            health: 100,
+            alive: true,
+        },
+    }
+    let damaged = if true { damage(player, 35) } else { player }
+    print(damaged.name)
+    print(damaged.vitals.health)
+    print(damaged.vitals.alive)
+    print(player.vitals.health)
+    print(player)
+    print("updated={damaged}")
+}

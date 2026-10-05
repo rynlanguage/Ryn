@@ -1,0 +1,5 @@
+fn main() {
+    print("first\0second")
+    print("quote: \" and slash: \\")
+    print("Unicode: \u{1F980}")
+}

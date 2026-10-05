@@ -1,0 +1,13 @@
+fn select(first: str, second: str) -> str {
+    second
+}
+
+fn relay(value: str) -> str {
+    select("", value)
+}
+
+fn main() {
+    print(relay("Łódź 🦀"))
+    print(select("ignored", "UTF-8 ✓"))
+    print(relay(""))
+}

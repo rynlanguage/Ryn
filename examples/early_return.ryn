@@ -1,0 +1,53 @@
+fn absolute(value: i32) -> i32 {
+    if value < 0 {
+        return -value
+    }
+    value
+}
+
+fn choose(value: i32) -> i32 {
+    if value == 0 {
+        return 10
+    } else {
+        return 20
+    }
+}
+
+fn label(enabled: bool) -> str {
+    if enabled {
+        return "enabled"
+    } else {
+        return "disabled"
+    }
+}
+
+fn find_three(limit: i32) -> i32 {
+    let mut value: i32 = 0
+    while value < limit {
+        if value == 3 {
+            return value
+        }
+        value += 1
+    }
+    -1
+}
+
+fn notify(enabled: bool) {
+    if !enabled {
+        return
+    }
+    print("notification")
+}
+
+fn main() {
+    print(absolute(-7))
+    print(absolute(4))
+    print(choose(0))
+    print(choose(1))
+    print(label(true))
+    print(label(false))
+    print(find_three(5))
+    print(find_three(2))
+    notify(false)
+    notify(true)
+}
