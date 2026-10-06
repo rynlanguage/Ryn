@@ -91,6 +91,16 @@ See [the shapes example](examples/shapes.ryn). Built-in types extend the same wa
 
 Arithmetic operators resolve through `extend` methods: defining `fun add(self, rhs: Vec3) -> Vec3` makes `a + b` work (`sub`, `mul`, `div`, `rem` map the same way), with the right operand's literal type taken from the method signature ([the operators example](examples/operators.ryn)). Associated types, `shape`-spelled operator contracts, and conditional extensions remain future work.
 
+## Self-hosting (0.0.4)
+
+`examples/self_hosted_project` is a Ryn-written frontend for Ryn: a source manager (UTF-8 line indexing, LF/CRLF/CR handling), a lexer (keywords, identifiers, decimal/binary/hex integers, floats, strings with escapes, characters, punctuation, operators), and a parser (functions with parameters and return types, declarations and assignments, `when`/`else`, `while`, `for`, `break`/`continue`/`return`, `echo`, expression statements, calls, field/method access, indexing, struct literals). The `main.ryn` CLI reads a file and reports the first lexical or parse diagnostic with line/column, or `ok`:
+
+```ryn
+ryn run examples/self_hosted_project -- examples/hello.ryn
+```
+
+Differential tests (`tests/self_hosted_frontend.rs`) check the frontend against samples the Rust compiler accepts and rejects. This is the first stage of the self-hosting path; the type checker, Ryn Guard, and native code generation remain future stages.
+
 ## Ryn example
 
 The runnable [quick start](examples/quick_start.ryn) demonstrates a function, inferred and mutable locals, compound assignment, a value-producing conditional, and string interpolation:

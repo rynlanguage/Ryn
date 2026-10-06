@@ -5415,11 +5415,15 @@ impl<'a> Analyzer<'a> {
                 .get(name)
                 .map(|binding| binding.ty)
                 .filter(|ty| is_numeric(*ty)),
-            Expression::Call { name, .. } => self
-                .signatures
-                .get(name)
-                .and_then(|signature| signature.return_type)
-                .filter(|ty| is_numeric(*ty)),
+            Expression::Call { name, .. } => {
+                if name == "arg_count" {
+                    return Some(Type::U32);
+                }
+                self.signatures
+                    .get(name)
+                    .and_then(|signature| signature.return_type)
+                    .filter(|ty| is_numeric(*ty))
+            }
             Expression::Field { value, name, .. } => {
                 let receiver_hint = self.value_type_hint(value)?;
                 let struct_id = match receiver_hint {

@@ -12,7 +12,7 @@ enum Kind {
     End
 }
 
-struct TokenSpan {
+pub struct TokenSpan {
     kind: u64,
     start: u64,
     end: u64,
@@ -23,10 +23,10 @@ struct TokenSpan {
     character_payload: char
 }
 
-struct LexError {
-    code: u64,
-    start: u64,
-    end: u64
+pub struct LexError {
+    pub code: u64,
+    pub start: u64,
+    pub end: u64
 }
 
 struct UnicodeEscape {
@@ -36,10 +36,10 @@ struct UnicodeEscape {
     valid: bool
 }
 
-struct Lexed {
-    tokens: Vec<TokenSpan>,
-    errors: Vec<LexError>,
-    string_values: Vec<String>
+pub struct Lexed {
+    pub tokens: Vec<TokenSpan>,
+    pub errors: Vec<LexError>,
+    pub string_values: Vec<String>
 }
 
 struct AstNode {
@@ -51,21 +51,21 @@ struct AstNode {
     payload: u64
 }
 
-struct ParseState {
-    source: String,
-    tokens: Vec<TokenSpan>,
-    index: u64,
-    nodes: Vec<AstNode>,
-    children: Vec<u64>,
-    failed: bool,
-    error_code: u64,
-    error_start: u64,
-    error_end: u64
+pub struct ParseState {
+    pub source: String,
+    pub tokens: Vec<TokenSpan>,
+    pub index: u64,
+    pub nodes: Vec<AstNode>,
+    pub children: Vec<u64>,
+    pub failed: bool,
+    pub error_code: u64,
+    pub error_start: u64,
+    pub error_end: u64
 }
 
-struct ParseValue {
-    state: ParseState,
-    node_id: u64
+pub struct ParseValue {
+    pub state: ParseState,
+    pub node_id: u64
 }
 
 struct AstArena {
@@ -324,7 +324,7 @@ fun encode_token(kind: Kind, start: u64, end: u64, scalar_start: u64, scalar_end
     }
 }
 
-fun lex(source: String) -> Lexed {
+pub fun lex(source: String) -> Lexed {
     text := source
     mut tokens: Vec<TokenSpan> = Vec()
     mut errors: Vec<LexError> = Vec()
@@ -649,7 +649,7 @@ fun file_error_lex() -> Lexed {
     return failed
 }
 
-fun lex_error_message(code: u64) -> str {
+pub fun lex_error_message(code: u64) -> str {
     when code == 1 { "unknown character" }
     else when code == 2 { "unterminated string literal" }
     else when code == 3 { "expected a digit after the radix prefix" }
@@ -663,7 +663,7 @@ fun lex_error_message(code: u64) -> str {
     else { "lexical error" }
 }
 
-fun format_lex_error(source: source_manager::SourceFile, error: LexError) -> String {
+pub fun format_lex_error(source: source_manager::SourceFile, error: LexError) -> String {
     location := source_manager::locate(source.text.clone(), source.line_starts.clone(), error.start)
     line := location.index(0)
     column := location.index(1)
@@ -794,8 +794,176 @@ fun parse_primary(state: ParseState) -> ParseValue {
     ParseValue { state: next, node_id: 0 }
 }
 
+fun parse_call_expression(state: ParseState, name_node_id: u64) -> ParseValue {
+    mut next := state
+    name_node := next.nodes.index(name_node_id)
+    next.index += 1
+    mut arguments := Vec<u64>()
+    while !next.failed && next.tokens.index(next.index).kind != 102 {
+        argument := parse_arithmetic_expression(next, 1)
+        when argument.state.failed { return argument }
+        next = argument.state
+        arguments.push(argument.node_id)
+        separator := next.tokens.index(next.index)
+        when separator.kind == 107 { next.index += 1 }
+        else { break }
+    }
+    closing := next.tokens.index(next.index)
+    when closing.kind != 102 {
+        next.failed = true
+        next.error_code = 2
+        next.error_start = closing.start
+        next.error_end = closing.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    argument_count := arguments.len()
+    mut children := Vec<u64>()
+    children.push(name_node_id)
+    for argument_id in arguments { children.push(argument_id) }
+    append_ast_node(next, 19, name_node.start, closing.end, argument_count, children)
+}
+
+fun clone_parse_state(state: ParseState) -> ParseState {
+    ParseState {
+        source: state.source.clone(),
+        tokens: state.tokens.clone(),
+        index: state.index,
+        nodes: state.nodes.clone(),
+        children: state.children.clone(),
+        failed: state.failed,
+        error_code: state.error_code,
+        error_start: state.error_start,
+        error_end: state.error_end
+    }
+}
+
+fun parse_postfix_expression(value: ParseValue) -> ParseValue {
+    mut current := value
+    while !current.state.failed {
+        token := current.state.tokens.index(current.state.index)
+        when token.kind == 105 {
+            mut next := current.state
+            next.index += 1
+            index_value := parse_arithmetic_expression(next, 1)
+            when index_value.state.failed { return index_value }
+            next = index_value.state
+            closing := next.tokens.index(next.index)
+            when closing.kind != 106 {
+                next.failed = true
+                next.error_code = 2
+                next.error_start = closing.start
+                next.error_end = closing.end
+                return ParseValue { state: next, node_id: 0 }
+            }
+            next.index += 1
+            base_node := next.nodes.index(current.node_id)
+            mut children := Vec<u64>()
+            children.push(current.node_id)
+            children.push(index_value.node_id)
+            current = append_ast_node(next, 34, base_node.start, closing.end, 0, children)
+        } else when token.kind == 103
+            && current.state.tokens.index(current.state.index + 1).kind == 300
+            && current.state.tokens.index(current.state.index + 2).kind == 109 {
+            // A struct literal follows an identifier: `Point { x: 1, y: 2 }`.
+            // The lookahead requires `{ name :` so `when flag {` blocks and
+            // other brace statements never parse as literals.
+            mut next := current.state
+            next.index += 1
+            mut fields := Vec<u64>()
+            mut literal_end := token.end
+            while !next.failed && next.tokens.index(next.index).kind != 104 {
+                field_name := next.tokens.index(next.index)
+                colon := next.tokens.index(next.index + 1)
+                when field_name.kind != 300 || colon.kind != 109 {
+                    next.failed = true
+                    next.error_code = 10
+                    next.error_start = field_name.start
+                    next.error_end = colon.end
+                    return ParseValue { state: next, node_id: 0 }
+                }
+                next.index += 2
+                field_value := parse_arithmetic_expression(next, 1)
+                when field_value.state.failed { return field_value }
+                value_node := field_value.state.nodes.index(field_value.node_id)
+                value_end := value_node.end
+                next = field_value.state
+                name_children := Vec<u64>()
+                field_node := append_ast_node(next, 3, field_name.start, field_name.end, field_name.start, name_children)
+                next = field_node.state
+                mut field_children := Vec<u64>()
+                field_children.push(field_node.node_id)
+                field_children.push(field_value.node_id)
+                field_pair := append_ast_node(next, 32, field_name.start, value_end, 0, field_children)
+                next = field_pair.state
+                fields.push(field_pair.node_id)
+                literal_end = value_end
+                separator := next.tokens.index(next.index)
+                when separator.kind == 107 {
+                    next.index += 1
+                    when next.tokens.index(next.index).kind == 104 {
+                        next.index += 1
+                        break
+                    }
+                } else {
+                    break
+                }
+            }
+            when next.failed { return ParseValue { state: next, node_id: 0 } }
+            closing := next.tokens.index(next.index)
+            when closing.kind != 104 {
+                next.failed = true
+                next.error_code = 6
+                next.error_start = closing.start
+                next.error_end = closing.end
+                return ParseValue { state: next, node_id: 0 }
+            }
+            next.index += 1
+            literal_end = closing.end
+            base_node := next.nodes.index(current.node_id)
+            mut children := Vec<u64>()
+            children.push(current.node_id)
+            field_count := fields.len()
+            for field in fields.clone() { children.push(field) }
+            current = append_ast_node(next, 36, base_node.start, literal_end, field_count, children)
+        } else when token.kind == 101 {
+            // A direct call: `add(20, 22)` after a name or field chain.
+            current = parse_call_expression(clone_parse_state(current.state), current.node_id)
+        } else when token.kind == 110 {
+            mut next := current.state
+            next.index += 1
+            member := next.tokens.index(next.index)
+            when member.kind != 300 && member.kind != 301 {
+                next.failed = true
+                next.error_code = 1
+                next.error_start = member.start
+                next.error_end = member.end
+                return ParseValue { state: next, node_id: 0 }
+            }
+            member_kind := when member.kind == 300 { 3 as u64 } else { 1 as u64 }
+            member_payload := when member.kind == 300 { member.start } else { member.payload }
+            member_node := append_ast_node(next, member_kind, member.start, member.end, member_payload, Vec<u64>())
+            next = member_node.state
+            next.index += 1
+            base_node := next.nodes.index(current.node_id)
+            mut children := Vec<u64>()
+            children.push(current.node_id)
+            children.push(member_node.node_id)
+            access := append_ast_node(next, 35, base_node.start, member.end, 0, children)
+            when access.state.tokens.index(access.state.index).kind == 101 {
+                current = parse_call_expression(clone_parse_state(access.state), access.node_id)
+            } else {
+                current = access
+            }
+        } else {
+            break
+        }
+    }
+    current
+}
+
 fun parse_arithmetic_expression(state: ParseState, minimum_precedence: u64) -> ParseValue {
-    mut left := parse_primary(state)
+    mut left := parse_postfix_expression(parse_primary(state))
     while !left.state.failed {
         operator := left.state.tokens.index(left.state.index)
         precedence := arithmetic_precedence(operator.kind)
@@ -854,9 +1022,564 @@ fun parse_arithmetic(source: String) -> ParseValue {
     result
 }
 
+fun parse_while_statement(state: ParseState) -> ParseValue {
+    mut next := state
+    keyword := next.tokens.index(next.index)
+    next.index += 1
+    condition := parse_arithmetic_expression(next, 1)
+    when condition.state.failed { return condition }
+    next = condition.state
+    opening := next.tokens.index(next.index)
+    when opening.kind != 103 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = opening.start
+        next.error_end = opening.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    mut body_children := Vec<u64>()
+    mut last_end := opening.end
+    while !next.failed && next.tokens.index(next.index).kind != 104 && next.tokens.index(next.index).kind != 0 {
+        before := next.index
+        statement := parse_simple_statement(next)
+        next = statement.state
+        when next.index == before && !next.failed {
+            next.failed = true
+            next.error_code = 5
+        }
+        when !next.failed {
+            body_node := next.nodes.index(statement.node_id)
+            last_end = body_node.end
+            body_children.push(statement.node_id)
+        }
+    }
+    when next.failed { return ParseValue { state: next, node_id: 0 } }
+    closing := next.tokens.index(next.index)
+    when closing.kind != 104 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = closing.start
+        next.error_end = closing.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    when body_children.len() == 0 { last_end = closing.start }
+    mut body_elements := Vec<u64>()
+    for child in body_children { body_elements.push(child) }
+    body := append_ast_node(next, 13, opening.start, closing.end, body_elements.len(), body_elements)
+    mut loop_children := Vec<u64>()
+    loop_children.push(condition.node_id)
+    loop_children.push(body.node_id)
+    append_ast_node(body.state, 14, keyword.start, closing.end, 0, loop_children)
+}
+
+fun parse_for_statement(state: ParseState) -> ParseValue {
+    mut next := state
+    keyword := next.tokens.index(next.index)
+    name_token := next.tokens.index(next.index + 1)
+    in_token := next.tokens.index(next.index + 2)
+    when name_token.kind != 300 || in_token.kind != 8 {
+        next.failed = true
+        next.error_code = 10
+        next.error_start = name_token.start
+        next.error_end = in_token.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 3
+    name_node := append_ast_node(next, 3, name_token.start, name_token.end, name_token.start, Vec<u64>())
+    start := parse_arithmetic_expression(name_node.state, 1)
+    when start.state.failed { return start }
+    next = start.state
+    range_token := next.tokens.index(next.index)
+    when range_token.kind != 203 {
+        next.failed = true
+        next.error_code = 10
+        next.error_start = range_token.start
+        next.error_end = range_token.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    end := parse_arithmetic_expression(next, 1)
+    when end.state.failed { return end }
+    next = end.state
+    opening := next.tokens.index(next.index)
+    when opening.kind != 103 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = opening.start
+        next.error_end = opening.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    mut body_children := Vec<u64>()
+    while !next.failed && next.tokens.index(next.index).kind != 104 && next.tokens.index(next.index).kind != 0 {
+        before := next.index
+        statement := parse_simple_statement(next)
+        next = statement.state
+        when next.index == before && !next.failed {
+            next.failed = true
+            next.error_code = 5
+        }
+        when !next.failed { body_children.push(statement.node_id) }
+    }
+    when next.failed { return ParseValue { state: next, node_id: 0 } }
+    closing := next.tokens.index(next.index)
+    when closing.kind != 104 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = closing.start
+        next.error_end = closing.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    body := append_ast_node(next, 13, opening.start, closing.end, body_children.len(), body_children)
+    mut loop_children := Vec<u64>()
+    loop_children.push(name_node.node_id)
+    loop_children.push(start.node_id)
+    loop_children.push(end.node_id)
+    loop_children.push(body.node_id)
+    append_ast_node(body.state, 17, keyword.start, closing.end, 0, loop_children)
+}
+
+fun parse_when_statement(state: ParseState) -> ParseValue {
+    mut next := state
+    keyword := next.tokens.index(next.index)
+    next.index += 1
+    condition := parse_arithmetic_expression(next, 1)
+    when condition.state.failed { return condition }
+    next = condition.state
+    opening := next.tokens.index(next.index)
+    when opening.kind != 103 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = opening.start
+        next.error_end = opening.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    mut then_children := Vec<u64>()
+    while !next.failed && next.tokens.index(next.index).kind != 104 && next.tokens.index(next.index).kind != 0 {
+        before := next.index
+        statement := parse_simple_statement(next)
+        next = statement.state
+        when next.index == before && !next.failed {
+            next.failed = true
+            next.error_code = 5
+        }
+        when !next.failed { then_children.push(statement.node_id) }
+    }
+    when next.failed { return ParseValue { state: next, node_id: 0 } }
+    then_close := next.tokens.index(next.index)
+    when then_close.kind != 104 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = then_close.start
+        next.error_end = then_close.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    then_block := append_ast_node(next, 13, opening.start, then_close.end, then_children.len(), then_children)
+    next = then_block.state
+    mut else_block_id := 0 as u64
+    mut statement_end := then_close.end
+    else_token := next.tokens.index(next.index)
+    when else_token.kind == 6 {
+        next.index += 1
+        else_open := next.tokens.index(next.index)
+        when else_open.kind != 103 {
+            next.failed = true
+            next.error_code = 6
+            next.error_start = else_open.start
+            next.error_end = else_open.end
+            return ParseValue { state: next, node_id: 0 }
+        }
+        next.index += 1
+        mut else_children := Vec<u64>()
+        while !next.failed && next.tokens.index(next.index).kind != 104 && next.tokens.index(next.index).kind != 0 {
+            before := next.index
+            statement := parse_simple_statement(next)
+            next = statement.state
+            when next.index == before && !next.failed {
+                next.failed = true
+                next.error_code = 5
+            }
+            when !next.failed { else_children.push(statement.node_id) }
+        }
+        when next.failed { return ParseValue { state: next, node_id: 0 } }
+        else_close := next.tokens.index(next.index)
+        when else_close.kind != 104 {
+            next.failed = true
+            next.error_code = 6
+            next.error_start = else_close.start
+            next.error_end = else_close.end
+            return ParseValue { state: next, node_id: 0 }
+        }
+        next.index += 1
+        else_block := append_ast_node(next, 13, else_open.start, else_close.end, else_children.len(), else_children)
+        next = else_block.state
+        else_block_id = else_block.node_id
+        statement_end = else_close.end
+    } else {
+        empty_children := Vec<u64>()
+        empty_block := append_ast_node(next, 13, then_close.end, then_close.end, 0, empty_children)
+        next = empty_block.state
+        else_block_id = empty_block.node_id
+    }
+    mut branch_children := Vec<u64>()
+    branch_children.push(condition.node_id)
+    branch_children.push(then_block.node_id)
+    branch_children.push(else_block_id)
+    append_ast_node(next, 18, keyword.start, statement_end, 0, branch_children)
+}
+
+fun parse_function_declaration(state: ParseState) -> ParseValue {
+    mut next := state
+    keyword := next.tokens.index(next.index)
+    name_token := next.tokens.index(next.index + 1)
+    mut opening_index := next.index + 2
+    mut opening := next.tokens.index(opening_index)
+    when name_token.kind != 300 {
+        next.failed = true
+        next.error_code = 10
+        next.error_start = name_token.start
+        next.error_end = opening.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    mut name_children := Vec<u64>()
+    name_node := append_ast_node(next, 3, name_token.start, name_token.end, name_token.start, name_children)
+    next = name_node.state
+    next.index += 2
+    mut generic_node_id := 0 as u64
+    generic_open := next.tokens.index(next.index)
+    when next.source.slice(generic_open.start, generic_open.end) == String("<") {
+        generic_start := generic_open.start
+        next.index += 1
+        mut generic_names := Vec<u64>()
+        mut closed_generics := false
+        while next.index < next.tokens.len() && !closed_generics {
+            generic_token := next.tokens.index(next.index)
+            generic_text := next.source.slice(generic_token.start, generic_token.end)
+            when generic_token.kind == 300 {
+                generic_name := append_ast_node(next, 3, generic_token.start, generic_token.end, generic_token.start, Vec<u64>())
+                next = generic_name.state
+                generic_names.push(generic_name.node_id)
+            } else when generic_text == String(">") {
+                closed_generics = true
+                generic_end := generic_token.end
+                next.index += 1
+                generic_list := append_ast_node(next, 33, generic_start, generic_end, generic_names.len(), generic_names)
+                next = generic_list.state
+                generic_node_id = generic_list.node_id
+                break
+            } else when generic_text != String(",") {
+                next.failed = true
+                next.error_code = 10
+                next.error_start = generic_token.start
+                next.error_end = generic_token.end
+                break
+            }
+            next.index += 1
+        }
+        when !closed_generics {
+            next.failed = true
+            next.error_code = 2
+            next.error_start = generic_open.start
+            next.error_end = next.tokens.index(next.index).end
+            return ParseValue { state: next, node_id: 0 }
+        }
+    }
+    opening_index = next.index
+    opening = next.tokens.index(opening_index)
+    when opening.kind != 101 {
+        next.failed = true
+        next.error_code = 10
+        next.error_start = opening.start
+        next.error_end = opening.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index = opening_index + 1
+    mut parameters := Vec<u64>()
+    while !next.failed && next.tokens.index(next.index).kind != 102 {
+        parameter_name := next.tokens.index(next.index)
+        colon := next.tokens.index(next.index + 1)
+        when parameter_name.kind != 300 || colon.kind != 109 {
+            next.failed = true
+            next.error_code = 10
+            next.error_start = parameter_name.start
+            next.error_end = colon.end
+            return ParseValue { state: next, node_id: 0 }
+        }
+        next.index += 2
+        type_token := next.tokens.index(next.index)
+        type_start := type_token.start
+        mut type_end := type_token.end
+        mut angle_depth := 0 as i64
+        mut square_depth := 0 as i64
+        mut tuple_depth := 0 as i64
+        while next.index < next.tokens.len() {
+            type_part := next.tokens.index(next.index)
+            type_text := next.source.slice(type_part.start, type_part.end)
+            at_type_end := angle_depth == 0 && square_depth == 0 && tuple_depth == 0 && (type_part.kind == 107 || type_part.kind == 102)
+            when at_type_end { break }
+            when type_text == String("<") { angle_depth += 1 }
+            else when type_text == String(">") { angle_depth -= 1 }
+            else when type_text == String("[") { square_depth += 1 }
+            else when type_text == String("]") { square_depth -= 1 }
+            else when type_text == String("(") { tuple_depth += 1 }
+            else when type_text == String(")") { tuple_depth -= 1 }
+            type_end = type_part.end
+            next.index += 1
+        }
+        when type_end == type_start {
+            next.failed = true
+            next.error_code = 10
+            next.error_start = type_start
+            next.error_end = type_token.end
+            return ParseValue { state: next, node_id: 0 }
+        }
+        empty_children := Vec<u64>()
+        parameter_name_node := append_ast_node(next, 3, parameter_name.start, parameter_name.end, parameter_name.start, empty_children)
+        next = parameter_name_node.state
+        type_children := Vec<u64>()
+        mut type_payload := 0 as u64
+        when type_token.kind == 300 && type_end == type_token.end { type_payload = type_token.start }
+        type_node := append_ast_node(next, 7, type_start, type_end, type_payload, type_children)
+        next = type_node.state
+        mut parameter_children := Vec<u64>()
+        parameter_children.push(parameter_name_node.node_id)
+        parameter_children.push(type_node.node_id)
+        parameter_node := append_ast_node(next, 32, parameter_name.start, type_end, 0, parameter_children)
+        next = parameter_node.state
+        parameters.push(parameter_node.node_id)
+        when next.tokens.index(next.index).kind == 107 { next.index += 1 }
+        else { break }
+    }
+    parameter_close := next.tokens.index(next.index)
+    when parameter_close.kind != 102 {
+        next.failed = true
+        next.error_code = 2
+        next.error_start = parameter_close.start
+        next.error_end = parameter_close.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    mut return_type_symbol := 0 as u64
+    mut return_type_start := parameter_close.end
+    mut return_type_end := parameter_close.end
+    arrow := next.tokens.index(next.index)
+    when next.source.slice(arrow.start, arrow.end) == String("->") {
+        next.index += 1
+        type_token := next.tokens.index(next.index)
+        when type_token.kind == 0 || type_token.kind == 103 {
+            next.failed = true
+            next.error_code = 10
+            next.error_start = type_token.start
+            next.error_end = type_token.end
+            return ParseValue { state: next, node_id: 0 }
+        }
+        return_type_start = type_token.start
+        mut return_angle_depth := 0 as i64
+        mut return_square_depth := 0 as i64
+        mut return_tuple_depth := 0 as i64
+        mut return_type_done := false
+        while next.index < next.tokens.len() && !return_type_done {
+            return_part := next.tokens.index(next.index)
+            return_text := next.source.slice(return_part.start, return_part.end)
+            at_body := return_angle_depth == 0 && return_square_depth == 0 && return_tuple_depth == 0 && return_part.kind == 103
+            when at_body { return_type_done = true }
+            else {
+                when return_text == String("<") { return_angle_depth += 1 }
+                else when return_text == String(">") { return_angle_depth -= 1 }
+                else when return_text == String("[") { return_square_depth += 1 }
+                else when return_text == String("]") { return_square_depth -= 1 }
+                else when return_text == String("(") { return_tuple_depth += 1 }
+                else when return_text == String(")") { return_tuple_depth -= 1 }
+                return_type_end = return_part.end
+                next.index += 1
+            }
+        }
+        when return_type_end == return_type_start {
+            next.failed = true
+            next.error_code = 10
+            next.error_start = return_type_start
+            next.error_end = type_token.end
+            return ParseValue { state: next, node_id: 0 }
+        }
+        when type_token.kind == 300 && return_type_end == type_token.end { return_type_symbol = type_token.start }
+    }
+    type_children := Vec<u64>()
+    return_type_node := append_ast_node(next, 7, return_type_start, return_type_end, return_type_symbol, type_children)
+    next = return_type_node.state
+    body_open := next.tokens.index(next.index)
+    when body_open.kind != 103 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = body_open.start
+        next.error_end = body_open.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    mut body_children := Vec<u64>()
+    while !next.failed && next.tokens.index(next.index).kind != 104 && next.tokens.index(next.index).kind != 0 {
+        before := next.index
+        statement := parse_simple_statement(next)
+        next = statement.state
+        when next.index == before && !next.failed {
+            next.failed = true
+            next.error_code = 5
+        }
+        when !next.failed { body_children.push(statement.node_id) }
+    }
+    when next.failed { return ParseValue { state: next, node_id: 0 } }
+    body_close := next.tokens.index(next.index)
+    when body_close.kind != 104 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = body_close.start
+        next.error_end = body_close.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    body := append_ast_node(next, 13, body_open.start, body_close.end, body_children.len(), body_children)
+    next = body.state
+    parameter_count := parameters.len()
+    parameter_list := append_ast_node(next, 31, opening.start, parameter_close.end, parameters.len(), parameters)
+    next = parameter_list.state
+    mut function_children := Vec<u64>()
+    function_children.push(name_node.node_id)
+    function_children.push(parameter_list.node_id)
+    function_children.push(return_type_node.node_id)
+    function_children.push(body.node_id)
+    when generic_node_id != 0 { function_children.push(generic_node_id) }
+    append_ast_node(next, 30, keyword.start, body_close.end, parameter_count, function_children)
+}
+
+fun parse_struct_declaration(state: ParseState) -> ParseValue {
+    mut next := state
+    keyword := next.tokens.index(next.index)
+    name_token := next.tokens.index(next.index + 1)
+    when name_token.kind != 300 {
+        next.failed = true
+        next.error_code = 10
+        next.error_start = name_token.start
+        next.error_end = name_token.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 2
+    name_children := Vec<u64>()
+    name_node := append_ast_node(next, 3, name_token.start, name_token.end, name_token.start, name_children)
+    next = name_node.state
+    opening := next.tokens.index(next.index)
+    when opening.kind != 103 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = opening.start
+        next.error_end = opening.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    mut fields := Vec<u64>()
+    while !next.failed && next.tokens.index(next.index).kind != 104 && next.tokens.index(next.index).kind != 0 {
+        field_name := next.tokens.index(next.index)
+        colon := next.tokens.index(next.index + 1)
+        when field_name.kind != 300 || colon.kind != 109 {
+            next.failed = true
+            next.error_code = 10
+            next.error_start = field_name.start
+            next.error_end = colon.end
+            return ParseValue { state: next, node_id: 0 }
+        }
+        next.index += 2
+        type_token := next.tokens.index(next.index)
+        type_start := type_token.start
+        mut type_end := type_token.end
+        mut angle_depth := 0 as i64
+        mut square_depth := 0 as i64
+        mut tuple_depth := 0 as i64
+        while next.index < next.tokens.len() {
+            type_part := next.tokens.index(next.index)
+            type_text := next.source.slice(type_part.start, type_part.end)
+            at_type_end := angle_depth == 0 && square_depth == 0 && tuple_depth == 0
+                && (type_part.kind == 107 || type_part.kind == 102 || type_part.kind == 104)
+            when at_type_end { break }
+            when type_text == String("<") { angle_depth += 1 }
+            else when type_text == String(">") { angle_depth -= 1 }
+            else when type_text == String("[") { square_depth += 1 }
+            else when type_text == String("]") { square_depth -= 1 }
+            else when type_text == String("(") { tuple_depth += 1 }
+            else when type_text == String(")") { tuple_depth -= 1 }
+            type_end = type_part.end
+            next.index += 1
+        }
+        when type_end == type_start {
+            next.failed = true
+            next.error_code = 10
+            next.error_start = type_start
+            next.error_end = type_token.end
+            return ParseValue { state: next, node_id: 0 }
+        }
+        field_name_children := Vec<u64>()
+        field_node := append_ast_node(next, 3, field_name.start, field_name.end, field_name.start, field_name_children)
+        next = field_node.state
+        type_children := Vec<u64>()
+        mut type_payload := 0 as u64
+        when type_token.kind == 300 && type_end == type_token.end { type_payload = type_token.start }
+        type_node := append_ast_node(next, 7, type_start, type_end, type_payload, type_children)
+        next = type_node.state
+        mut field_children := Vec<u64>()
+        field_children.push(field_node.node_id)
+        field_children.push(type_node.node_id)
+        field_pair := append_ast_node(next, 32, field_name.start, type_end, 0, field_children)
+        next = field_pair.state
+        fields.push(field_pair.node_id)
+        separator := next.tokens.index(next.index)
+        when separator.kind == 107 { next.index += 1 }
+    }
+    when next.failed { return ParseValue { state: next, node_id: 0 } }
+    closing := next.tokens.index(next.index)
+    when closing.kind != 104 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = closing.start
+        next.error_end = closing.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    mut children := Vec<u64>()
+    children.push(name_node.node_id)
+    for field in fields.clone() { children.push(field) }
+    append_ast_node(next, 37, keyword.start, closing.end, fields.len(), children)
+}
+
 fun parse_simple_statement(state: ParseState) -> ParseValue {
     mut next := state
     token := next.tokens.index(next.index)
+    when token.kind == 15 { return parse_struct_declaration(next) }
+    when token.kind == 12 { return parse_while_statement(next) }
+    when token.kind == 7 { return parse_for_statement(next) }
+    when token.kind == 5 { return parse_when_statement(next) }
+    when token.kind == 1 { return parse_function_declaration(next) }
+    when token.kind == 13 || token.kind == 14 {
+        next.index += 1
+        statement_kind := when token.kind == 13 { 15 as u64 } else { 16 as u64 }
+        mut statement := append_ast_node(next, statement_kind, token.start, token.end, 0, Vec<u64>())
+        when statement.state.tokens.index(statement.state.index).kind == 108 {
+            statement.state.index += 1
+        }
+        return statement
+    }
+    when token.kind == 9 {
+        following := next.tokens.index(next.index + 1)
+        when following.kind == 108 || following.kind == 104 || following.kind == 0 {
+            next.index += 1
+            mut statement := append_ast_node(next, 21, token.start, token.end, token.kind, Vec<u64>())
+            mut after := statement.state
+            when after.tokens.index(after.index).kind == 108 { after.index += 1 }
+            statement.state = after
+            return statement
+        }
+    }
     when token.kind == 10 || token.kind == 9 {
         next.index += 1
         statement_kind := when token.kind == 10 { 20 as u64 } else { 21 as u64 }
@@ -935,11 +1658,24 @@ fun parse_simple_statement(state: ParseState) -> ParseValue {
         when terminator.kind == 108 { statement.state.index += 1 }
         return statement
     }
-    next.failed = true
-    next.error_code = 4
-    next.error_start = token.start
-    next.error_end = token.end
-    ParseValue { state: next, node_id: 0 }
+    // Any other statement position falls back to an expression statement, so
+    // tail expressions such as `a + b` parse inside function bodies.
+    expression := parse_arithmetic_expression(next, 1)
+    when expression.state.failed { return expression }
+    expression_node := expression.state.nodes.index(expression.node_id)
+    mut children := Vec<u64>()
+    children.push(expression.node_id)
+    mut statement := append_ast_node(
+        expression.state,
+        27,
+        token.start,
+        expression_node.end,
+        0,
+        children
+    )
+    terminator := statement.state.tokens.index(statement.state.index)
+    when terminator.kind == 108 { statement.state.index += 1 }
+    statement
 }
 
 fun is_assignment_operator(kind: u64) -> bool {
@@ -959,6 +1695,10 @@ fun compound_operator(kind: u64) -> u64 {
     else when kind == 214 { 215 }
     else when kind == 216 { 217 }
     else { 0 }
+}
+
+pub fun parse_program(source: String) -> ParseValue {
+    parse_simple_program(source)
 }
 
 fun parse_simple_program(source: String) -> ParseValue {

@@ -1,7 +1,8 @@
+#[derive(Clone)]
 pub struct SourceFile {
-    name: String,
-    text: String,
-    line_starts: Vec<u64>
+    pub name: String,
+    pub text: String,
+    pub line_starts: Vec<u64>
 }
 
 pub fun utf8_width(value: char) -> u64 {
