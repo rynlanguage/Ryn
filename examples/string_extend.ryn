@@ -1,0 +1,19 @@
+extend String {
+    fun empty(self) -> bool {
+        return self.len() == 0
+    }
+
+    fun shout(mut self) {
+        self.append("!")
+    }
+}
+
+fun main() {
+    mut text := String("hey")
+    echo text.empty()
+    text.shout()
+    echo text
+    echo text.empty()
+    mut empty_text := String("")
+    echo empty_text.empty()
+}

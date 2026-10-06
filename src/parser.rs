@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     ast::{
         BinaryOp, ChooseArm, ConstantDef, EnumDef, Expression, ExtendDef, Function, Parameter,
-        PrintPart, Program, Statement, StructDef, StructField, TypeAliasDef, TypeName, UseDecl,
-        VariantDef,
+        PrintPart, Program, ShapeDef, ShapeMethod, Statement, StructDef, StructField, TypeAliasDef,
+        TypeName, UseDecl, VariantDef,
     },
     lexer::{Token, TokenKind, lex, lex_recovering},
     source::{Diagnostic, Span},
@@ -170,6 +170,7 @@ impl Parser<'_> {
         let mut enums = Vec::new();
         let mut type_aliases = Vec::new();
         let mut extends = Vec::new();
+        let mut shapes = Vec::new();
         let mut functions = Vec::new();
         while !matches!(self.peek().kind, TokenKind::Eof) {
             if matches!(self.peek().kind, TokenKind::Namespace) {
@@ -244,7 +245,10 @@ impl Parser<'_> {
                 extends.push(definition);
                 functions.extend(methods);
             } else if matches!(self.peek().kind, TokenKind::Shape) {
-                return Err(self.error("`shape` declarations are not supported yet"));
+                if repr_c {
+                    return Err(self.error("`#[repr(C)]` applies only to structs"));
+                }
+                shapes.push(self.shape_def()?);
             } else if matches!(&self.peek().kind, TokenKind::Ident(name) if name == "extern") {
                 if repr_c {
                     return Err(self.error("`#[repr(C)]` applies only to structs"));
@@ -271,6 +275,7 @@ impl Parser<'_> {
             enums,
             type_aliases,
             extends,
+            shapes,
             functions,
         })
     }
@@ -281,6 +286,7 @@ impl Parser<'_> {
         let mut enums = Vec::new();
         let mut type_aliases = Vec::new();
         let mut extends = Vec::new();
+        let mut shapes = Vec::new();
         let mut functions = Vec::new();
         let mut diagnostics = Vec::new();
 
@@ -348,7 +354,7 @@ impl Parser<'_> {
                         functions.extend(methods);
                     })
                 } else if matches!(self.peek().kind, TokenKind::Shape) {
-                    Err(self.error("`shape` declarations are not supported yet"))
+                    self.shape_def().map(|definition| shapes.push(definition))
                 } else if matches!(&self.peek().kind, TokenKind::Ident(name) if name == "extern") {
                     self.next();
                     match self.next().kind {
@@ -387,6 +393,7 @@ impl Parser<'_> {
                 enums,
                 type_aliases,
                 extends,
+                shapes,
                 functions,
             })
         } else {
@@ -433,6 +440,146 @@ impl Parser<'_> {
         Ok(())
     }
 
+    fn shape_def(&mut self) -> Result<ShapeDef, Diagnostic> {
+        let start = self
+            .expect(|k| matches!(k, TokenKind::Shape), "expected `shape`")?
+            .span
+            .start;
+        let (name, _) = self.ident("expected shape name")?;
+        let name = self.qualified_declaration_name(name);
+        self.expect(
+            |k| matches!(k, TokenKind::LBrace),
+            "expected `{` after shape name",
+        )?;
+        let mut methods = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+            let fun_start = self
+                .expect(|k| matches!(k, TokenKind::Fn), "expected `fun` in shape")?
+                .span
+                .start;
+            let (method_name, _) = self.ident("expected method name")?;
+            self.expect(
+                |k| matches!(k, TokenKind::LParen),
+                "expected `(` after method name",
+            )?;
+            let mut parameters = Vec::new();
+            if !matches!(self.peek().kind, TokenKind::RParen) {
+                loop {
+                    let parameter_start = self.at;
+                    let parameter = (|| {
+                        let mutable = if matches!(self.peek().kind, TokenKind::Mut) {
+                            self.next();
+                            true
+                        } else {
+                            false
+                        };
+                        let (param_name, param_span) = self.ident("expected parameter name")?;
+                        if param_name == "self" && !matches!(self.peek().kind, TokenKind::Colon) {
+                            // The concrete receiver type is only known at
+                            // conformance time; `Self` stands in here.
+                            return Ok(Parameter {
+                                name: param_name,
+                                ty: TypeName::Reference(
+                                    Box::new(TypeName::Named("Self".into(), param_span)),
+                                    mutable,
+                                    param_span,
+                                ),
+                                span: param_span,
+                            });
+                        }
+                        let _ = mutable;
+                        self.expect(
+                            |kind| matches!(kind, TokenKind::Colon),
+                            "expected `:` after parameter name",
+                        )?;
+                        let ty = self.type_name()?;
+                        Ok(Parameter {
+                            name: param_name,
+                            ty,
+                            span: param_span,
+                        })
+                    })();
+                    match parameter {
+                        Ok(parameter) => parameters.push(parameter),
+                        Err(diagnostic) if self.recovering => {
+                            self.recovery_diagnostics.push(diagnostic);
+                            self.synchronize_parameter(parameter_start);
+                        }
+                        Err(diagnostic) => return Err(diagnostic),
+                    }
+                    if matches!(self.peek().kind, TokenKind::Comma) {
+                        self.next();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect(
+                |k| matches!(k, TokenKind::RParen),
+                "expected `)` after shape method parameters",
+            )?;
+            let return_type = if matches!(self.peek().kind, TokenKind::Arrow) {
+                self.next();
+                Some(self.type_name()?)
+            } else {
+                None
+            };
+            let (default_body, default_value) = if matches!(self.peek().kind, TokenKind::FatArrow) {
+                self.next();
+                let value = self.expression(0)?;
+                (None, Some(value))
+            } else if matches!(self.peek().kind, TokenKind::LBrace) {
+                self.next();
+                let mut body = Vec::new();
+                while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+                    let statement_start = self.at;
+                    match self.statement() {
+                        Ok(statement) => body.push(statement),
+                        Err(diagnostic) if self.recovering => {
+                            self.recovery_diagnostics.push(diagnostic);
+                            self.synchronize_statement(statement_start, true);
+                        }
+                        Err(diagnostic) => return Err(diagnostic),
+                    }
+                }
+                self.expect(
+                    |k| matches!(k, TokenKind::RBrace),
+                    "expected `}` after the default method body",
+                )?;
+                (Some(body), None)
+            } else {
+                if matches!(self.peek().kind, TokenKind::Semicolon) {
+                    self.next();
+                }
+                (None, None)
+            };
+            methods.push(ShapeMethod {
+                name: method_name,
+                parameters,
+                return_type,
+                default_body,
+                default_value,
+                span: Span {
+                    start: fun_start,
+                    end: self.peek().span.start,
+                },
+            });
+        }
+        let end = self
+            .expect(
+                |k| matches!(k, TokenKind::RBrace),
+                "expected `}` after shape methods",
+            )?
+            .span
+            .end;
+        Ok(ShapeDef {
+            name,
+            methods,
+            module_path: String::new(),
+            span: Span { start, end },
+        })
+    }
+
     fn extend_def(&mut self) -> Result<(ExtendDef, Vec<Function>), Diagnostic> {
         let start = self
             .expect(|k| matches!(k, TokenKind::Extend), "expected `extend`")?
@@ -444,10 +591,18 @@ impl Parser<'_> {
         let receiver_type = self.type_name()?;
         let type_name = match &receiver_type {
             TypeName::Named(name, _) => name.clone(),
-            _ => return Err(self.error("`extend` currently supports named structure types only")),
+            // Built-in spellings resolve to their own variants; `String` is the
+            // supported extension target for now.
+            TypeName::OwnedString => "String".to_string(),
+            _ => {
+                return Err(self.error("`extend` currently supports named structures and `String`"));
+            }
         };
+        let mut as_shape = None;
         if matches!(self.peek().kind, TokenKind::As) {
-            return Err(self.error("`extend ... as Shape` is not supported yet"));
+            self.next();
+            let (shape_name, _) = self.ident("expected shape name after `as`")?;
+            as_shape = Some(self.qualified_declaration_name(shape_name));
         }
         self.expect(
             |k| matches!(k, TokenKind::LBrace),
@@ -494,6 +649,7 @@ impl Parser<'_> {
                 extern_c: false,
                 external_symbol: None,
                 type_parameters: Vec::new(),
+                type_parameter_bounds: Vec::new(),
                 public: constant.public,
                 module_path: String::new(),
                 parameters: Vec::new(),
@@ -506,6 +662,7 @@ impl Parser<'_> {
         Ok((
             ExtendDef {
                 type_name: receiver_type,
+                as_shape,
                 functions: Vec::new(),
                 constants: Vec::new(),
                 module_path: String::new(),
@@ -1067,6 +1224,7 @@ impl Parser<'_> {
         let external_symbol = extern_c.then(|| name.clone());
         let name = self.qualified_declaration_name(name);
         let mut type_parameters = Vec::new();
+        let mut type_parameter_bounds = Vec::new();
         if matches!(self.peek().kind, TokenKind::Less) {
             self.next();
             loop {
@@ -1083,7 +1241,21 @@ impl Parser<'_> {
                     });
                 }
                 self.generic_type_parameters.insert(parameter.clone());
-                type_parameters.push(parameter);
+                type_parameters.push(parameter.clone());
+                let mut bounds = Vec::new();
+                if matches!(self.peek().kind, TokenKind::Colon) {
+                    self.next();
+                    loop {
+                        let (bound, _) = self.ident("expected a shape name after `:`")?;
+                        bounds.push(self.qualified_declaration_name(bound));
+                        if matches!(self.peek().kind, TokenKind::Plus) {
+                            self.next();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                type_parameter_bounds.push((parameter, bounds));
                 if matches!(self.peek().kind, TokenKind::Comma) {
                     self.next();
                     continue;
@@ -1183,6 +1355,7 @@ impl Parser<'_> {
                 extern_c,
                 external_symbol: None,
                 type_parameters,
+                type_parameter_bounds,
                 public,
                 module_path: String::new(),
                 parameters,
@@ -1211,6 +1384,7 @@ impl Parser<'_> {
                 extern_c,
                 external_symbol,
                 type_parameters,
+                type_parameter_bounds,
                 public,
                 module_path: String::new(),
                 parameters,
@@ -1278,6 +1452,7 @@ impl Parser<'_> {
             extern_c,
             external_symbol,
             type_parameters,
+            type_parameter_bounds,
             public,
             module_path: String::new(),
             parameters,

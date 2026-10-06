@@ -204,6 +204,8 @@ impl Guard<'_> {
                 ..
             }
             | IrExpression::SliceElementAddress { .. }
+            | IrExpression::Dereference { .. }
+            | IrExpression::ReferenceField { .. }
             | IrExpression::StringAsStr(_) => true,
             IrExpression::Local {
                 ty: Type::Reference(_, _) | Type::Slice(_),
@@ -661,6 +663,24 @@ impl Guard<'_> {
                 break;
             }
             match &mut statement {
+                IrStatement::Let { ty, value, .. } | IrStatement::Assign { ty, value, .. }
+                    if matches!(
+                        &*value,
+                        IrExpression::Dereference { ty: pointee, .. }
+                            if matches!(
+                                pointee,
+                                Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Enum(_)
+                            )
+                    ) =>
+                {
+                    let _ = ty;
+                    return Err(Diagnostic {
+                        code: "R0240",
+                        message: "cannot move a borrowed view out of a reference".into(),
+                        span: self.expression_span(value),
+                        help: Some("clone the value explicitly with `.clone()`".into()),
+                    });
+                }
                 IrStatement::Block(statements) => {
                     let (output, falls) = self.block(std::mem::take(statements), true)?;
                     *statements = output;

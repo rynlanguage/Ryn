@@ -68,7 +68,24 @@ extend Player {
 }
 ```
 
-Fields are private to their module unless marked `pub`; methods are private unless marked `pub`. See [the objects example](examples/objects.ryn). `shape` contracts, generic constraints, and `#[derive]` are planned for this milestone but not implemented yet.
+Fields are private to their module unless marked `pub`; methods are private unless marked `pub`. Void `mut self` methods chain in place on the receiver (`player.damage(10).heal(5)`), and only the last link of a chain may return a value. See [the objects example](examples/objects.ryn).
+
+`shape` declares a structural contract: any type whose methods satisfy the required signatures conforms automatically — no implementation declaration needed. Methods with bodies provide default implementations that are materialized per conforming type. Shapes constrain generics (`fun tick<T: Entity>(entity: T)`, combined bounds with `+`), checked at the call site during monomorphization (`R0450`), and `extend Player as Entity` validates an explicit conformance:
+
+```ryn
+shape Entity {
+    fun update(mut self, delta: f32)
+
+    fun enabled(self) -> bool => true
+}
+
+fun tick<T: Entity>(entity: T) -> T {
+    entity.update(0.016)
+    entity
+}
+```
+
+See [the shapes example](examples/shapes.ryn). Built-in types extend the same way — `extend String { fun empty(self) -> bool { ... } }` ([the String extension example](examples/string_extend.ryn)). Associated types, operator contracts, `#[derive]`, and conditional extensions remain future work.
 
 ## Ryn example
 

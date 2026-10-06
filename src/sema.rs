@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     ast::{
-        BinaryOp, EnumDef, Expression, Function, PrintPart, Program, Statement, StructDef,
-        TypeName, VariantDef,
+        BinaryOp, EnumDef, Expression, Function, PrintPart, Program, ShapeDef, Statement,
+        StructDef, TypeName, VariantDef,
     },
     filesystem_ops::FilesystemOp,
     map_ops::MapOp,
@@ -764,12 +764,34 @@ struct Binding {
     mutable: bool,
 }
 
+type LoweredMethod = Result<Option<(IrCallTarget, Vec<IrExpression>, Option<Type>)>, Diagnostic>;
+
 #[derive(Clone)]
 struct FunctionSignature {
     target: IrCallTarget,
     parameters: Vec<Type>,
     return_type: Option<Type>,
     is_destructor: bool,
+}
+
+#[derive(Clone)]
+struct ShapeRequirement {
+    self_mutable: bool,
+    parameters: Vec<Type>,
+    return_type: Option<Type>,
+    has_default: bool,
+}
+
+#[derive(Clone, Default)]
+struct ShapeTable {
+    shapes: HashMap<String, HashMap<String, ShapeRequirement>>,
+    order: Vec<String>,
+}
+
+impl ShapeTable {
+    fn get(&self, name: &str) -> Option<&HashMap<String, ShapeRequirement>> {
+        self.shapes.get(name)
+    }
 }
 
 pub fn analyze(program: Program) -> Result<RynIr, Diagnostic> {
@@ -1112,12 +1134,12 @@ fn analyze_with_recovery(
     }
     let mut signatures = HashMap::new();
     let mut main_index = None;
-    let function_module_paths = program
+    let mut function_module_paths = program
         .functions
         .iter()
         .map(|function| function.module_path.clone())
         .collect::<Vec<_>>();
-    let function_visibility = program
+    let mut function_visibility = program
         .functions
         .iter()
         .map(|function| function.public)
@@ -1425,6 +1447,41 @@ fn analyze_with_recovery(
                 .with_help("add a top-level `fun main() { ... }` function"),
         ]);
     };
+    let shape_table = build_shape_table(&program.shapes, &struct_ids, &enum_ids);
+    for extend in &program.extends {
+        let Some(shape_name) = &extend.as_shape else {
+            continue;
+        };
+        let TypeName::Named(type_name, type_span) = &extend.type_name else {
+            continue;
+        };
+        let Some(struct_id) = struct_ids.get(type_name).copied() else {
+            return Err(vec![diag(
+                "R0230",
+                format!("`extend as` names an unknown structure `{type_name}`"),
+                *type_span,
+            )]);
+        };
+        if let Err(message) = struct_conforms_to_shape(
+            &structs[struct_id],
+            shape_name,
+            &shape_table,
+            &signatures,
+            &structs,
+        ) {
+            return Err(vec![diag("R0450", message, extend.span)]);
+        }
+    }
+    materialize_shape_defaults(
+        &mut program.functions,
+        &mut signatures,
+        &mut function_module_paths,
+        &mut function_visibility,
+        &shape_table,
+        &program.shapes,
+        &structs,
+        &struct_ids,
+    );
     let mut functions = Vec::with_capacity(program.functions.len());
     let mut diagnostics = Vec::new();
     for function in program.functions {
@@ -1443,6 +1500,7 @@ fn analyze_with_recovery(
             &enum_ids,
             &function_module_paths,
             &function_visibility,
+            &shape_table,
         );
         if recover_errors {
             match analyzer.function_recovering(function) {
@@ -1468,6 +1526,253 @@ fn analyze_with_recovery(
     };
     crate::guard::check(&mut ir).map_err(|error| vec![error])?;
     Ok(ir)
+}
+
+fn build_shape_table(
+    shapes: &[ShapeDef],
+    struct_ids: &HashMap<String, usize>,
+    enum_ids: &HashMap<String, usize>,
+) -> ShapeTable {
+    let mut table = ShapeTable::default();
+    for shape in shapes {
+        if table.shapes.contains_key(&shape.name) {
+            continue;
+        }
+        let namespace = shape
+            .module_path
+            .rsplit_once("::")
+            .map(|(parent, _)| parent)
+            .or(Some(shape.module_path.as_str()))
+            .filter(|_| !shape.module_path.is_empty());
+        let namespace = namespace.map(|namespace| namespace.to_string());
+        let namespace = namespace.as_deref();
+        let mut requirements = HashMap::new();
+        for method in &shape.methods {
+            let mut parameter_types = Vec::new();
+            let mut self_mutable = false;
+            for (index, parameter) in method.parameters.iter().enumerate() {
+                let resolved =
+                    resolve_type_name_scoped(&parameter.ty, struct_ids, enum_ids, namespace);
+                let Ok(resolved) = resolved else {
+                    continue;
+                };
+                if index == 0 && parameter.name == "self" {
+                    if let Type::Reference(_, mutable) = resolved {
+                        self_mutable = mutable;
+                    }
+                    continue;
+                }
+                parameter_types.push(resolved);
+            }
+            let return_type = method.return_type.as_ref().and_then(|name| {
+                resolve_type_name_scoped(name, struct_ids, enum_ids, namespace).ok()
+            });
+            let has_default = method.default_body.is_some() || method.default_value.is_some();
+            requirements.insert(
+                method.name.clone(),
+                ShapeRequirement {
+                    self_mutable,
+                    parameters: parameter_types,
+                    return_type,
+                    has_default,
+                },
+            );
+        }
+        table.order.push(shape.name.clone());
+        table.shapes.insert(shape.name.clone(), requirements);
+    }
+    table
+}
+
+fn method_signature_candidates(definition: &RynStruct, method: &str) -> Vec<String> {
+    let mut candidates = vec![format!("{}::{method}", definition.name)];
+    if !definition.module_path.is_empty() {
+        candidates.push(format!(
+            "{}::{}::{method}",
+            definition.module_path, definition.name
+        ));
+    }
+    candidates
+}
+
+fn struct_conforms_to_shape(
+    definition: &RynStruct,
+    shape_name: &str,
+    table: &ShapeTable,
+    signatures: &HashMap<String, FunctionSignature>,
+    structs: &[RynStruct],
+) -> Result<(), String> {
+    let Some(requirements) = table.get(shape_name) else {
+        return Err(format!("unknown shape `{shape_name}`"));
+    };
+    for (method_name, requirement) in requirements {
+        if requirement.has_default {
+            continue;
+        }
+        let mut found = None;
+        for candidate in method_signature_candidates(definition, method_name) {
+            if let Some(signature) = signatures.get(&candidate) {
+                found = Some(signature.clone());
+                break;
+            }
+        }
+        let Some(signature) = found else {
+            return Err(format!(
+                "`{}` does not satisfy shape `{shape_name}`: missing method `{method_name}`",
+                definition.name
+            ));
+        };
+        let Some(self_parameter) = signature.parameters.first() else {
+            return Err(format!(
+                "`{}` method `{method_name}` must take a receiver",
+                definition.name
+            ));
+        };
+        let Type::Reference(target, actual_mutable) = self_parameter else {
+            return Err(format!(
+                "`{}` method `{method_name}` must take `self`",
+                definition.name
+            ));
+        };
+        if !matches!(pointer_target(*target), Type::Struct(id) if structs[id].name == definition.name)
+        {
+            return Err(format!(
+                "`{}` method `{method_name}` must take a `{}` receiver",
+                definition.name, definition.name
+            ));
+        }
+        if requirement.self_mutable && !actual_mutable {
+            return Err(format!(
+                "`{}` method `{method_name}` must take `mut self` to satisfy `{shape_name}`",
+                definition.name
+            ));
+        }
+        if signature.parameters.len() - 1 != requirement.parameters.len() {
+            return Err(format!(
+                "`{}` method `{method_name}` has {} parameter(s) but `{shape_name}` requires {}",
+                definition.name,
+                signature.parameters.len() - 1,
+                requirement.parameters.len()
+            ));
+        }
+        for (index, expected) in requirement.parameters.iter().enumerate() {
+            if signature.parameters[index + 1] != *expected {
+                return Err(format!(
+                    "`{}` method `{method_name}` parameter {} has type `{}` but `{shape_name}` requires `{}`",
+                    definition.name,
+                    index + 1,
+                    type_name(signature.parameters[index + 1]),
+                    type_name(*expected)
+                ));
+            }
+        }
+        if signature.return_type != requirement.return_type {
+            return Err(format!(
+                "`{}` method `{method_name}` return type does not match `{shape_name}`",
+                definition.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn struct_has_method(
+    definition: &RynStruct,
+    method: &str,
+    signatures: &HashMap<String, FunctionSignature>,
+) -> bool {
+    method_signature_candidates(definition, method)
+        .iter()
+        .any(|candidate| signatures.contains_key(candidate))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_shape_defaults(
+    functions: &mut Vec<crate::ast::Function>,
+    signatures: &mut HashMap<String, FunctionSignature>,
+    function_module_paths: &mut Vec<String>,
+    function_visibility: &mut Vec<bool>,
+    table: &ShapeTable,
+    shapes: &[ShapeDef],
+    structs: &[RynStruct],
+    struct_ids: &HashMap<String, usize>,
+) {
+    let _ = struct_ids;
+    for shape in shapes {
+        let Some(requirements) = table.get(&shape.name) else {
+            continue;
+        };
+        // Only types that satisfy the required methods receive the defaults.
+        for (struct_index, definition) in structs.iter().enumerate() {
+            if definition.name.starts_with('$') {
+                continue;
+            }
+            if struct_conforms_to_shape(definition, &shape.name, table, signatures, structs)
+                .is_err()
+            {
+                continue;
+            }
+            for (method_name, requirement) in requirements {
+                if struct_has_method(definition, method_name, signatures) {
+                    continue;
+                }
+                let Some(method) = shape
+                    .methods
+                    .iter()
+                    .find(|method| &method.name == method_name)
+                else {
+                    continue;
+                };
+                let (default_body, default_value) =
+                    match (&method.default_body, &method.default_value) {
+                        (Some(body), _) => (body.clone(), None),
+                        (None, Some(value)) => (Vec::new(), Some(value.clone())),
+                        (None, None) => continue,
+                    };
+                let qualified = format!("{}::{}", definition.name, method_name);
+                let struct_type = Type::Struct(struct_index);
+                let self_type =
+                    Type::Reference(intern_pointer_target(struct_type), requirement.self_mutable);
+                let index = functions.len();
+                functions.push(crate::ast::Function {
+                    name: qualified.clone(),
+                    extern_c: false,
+                    external_symbol: None,
+                    type_parameters: Vec::new(),
+                    type_parameter_bounds: Vec::new(),
+                    public: true,
+                    module_path: definition.module_path.clone(),
+                    parameters: vec![crate::ast::Parameter {
+                        name: "self".into(),
+                        ty: crate::ast::TypeName::Reference(
+                            Box::new(crate::ast::TypeName::Named(
+                                definition.name.clone(),
+                                method.span,
+                            )),
+                            requirement.self_mutable,
+                            method.span,
+                        ),
+                        span: method.span,
+                    }],
+                    return_type: method.return_type.clone(),
+                    body: default_body,
+                    return_value: default_value,
+                    span: method.span,
+                });
+                signatures.insert(
+                    qualified,
+                    FunctionSignature {
+                        target: IrCallTarget::Function(index),
+                        parameters: vec![self_type],
+                        return_type: requirement.return_type,
+                        is_destructor: false,
+                    },
+                );
+                function_module_paths.push(definition.module_path.clone());
+                function_visibility.push(true);
+            }
+        }
+    }
 }
 
 fn is_option_u64_ast(definition: &EnumDef) -> bool {
@@ -1537,6 +1842,7 @@ struct Analyzer<'a> {
     enum_ids: &'a HashMap<String, usize>,
     function_module_paths: &'a [String],
     function_visibility: &'a [bool],
+    shapes: &'a ShapeTable,
     loop_depth: usize,
     function_name: String,
     module_path: String,
@@ -1546,6 +1852,7 @@ struct Analyzer<'a> {
 }
 
 impl<'a> Analyzer<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         signatures: &'a HashMap<String, FunctionSignature>,
         structs: &'a mut Vec<RynStruct>,
@@ -1554,6 +1861,7 @@ impl<'a> Analyzer<'a> {
         enum_ids: &'a HashMap<String, usize>,
         function_module_paths: &'a [String],
         function_visibility: &'a [bool],
+        shapes: &'a ShapeTable,
     ) -> Self {
         Self {
             names: HashMap::new(),
@@ -1568,6 +1876,7 @@ impl<'a> Analyzer<'a> {
             enum_ids,
             function_module_paths,
             function_visibility,
+            shapes,
             loop_depth: 0,
             function_name: String::new(),
             module_path: String::new(),
@@ -1743,6 +2052,27 @@ impl<'a> Analyzer<'a> {
                 },
             );
             parameters.push(LocalBinding { slot, ty });
+        }
+        for (type_name, bounds) in &function.type_parameter_bounds {
+            if bounds.is_empty() {
+                continue;
+            }
+            let Some(struct_id) = self.scoped_struct_id(type_name) else {
+                continue;
+            };
+            for shape_name in bounds {
+                if let Err(message) = struct_conforms_to_shape(
+                    &self.structs[struct_id],
+                    shape_name,
+                    self.shapes,
+                    self.signatures,
+                    self.structs,
+                ) {
+                    return Err(diag("R0450", message, function.span).with_help(format!(
+                        "structural conformance checks `{type_name}` against `{shape_name}` at the call site"
+                    )));
+                }
+            }
         }
         Ok((parameters, body_always_returns))
     }
@@ -2626,8 +2956,87 @@ impl<'a> Analyzer<'a> {
                 arguments,
                 span,
             } => {
-                let (target, arguments, _) = self.lower_method(*value, name, arguments, span)?;
-                Ok(IrStatement::Call { target, arguments })
+                // Flatten `root.m1().m2()` into sequential calls that borrow the
+                // same root local, so in-place chains mutate the receiver.
+                let mut links = vec![(name, arguments, span)];
+                let mut root_expression = *value;
+                while let Expression::MethodCall {
+                    value,
+                    name,
+                    arguments,
+                    span,
+                } = root_expression
+                {
+                    links.push((name, arguments, span));
+                    root_expression = *value;
+                }
+                links.reverse();
+                let root_is_local = matches!(root_expression, Expression::Name(_, _))
+                    || matches!(root_expression, Expression::Field { .. });
+                if links.len() > 1 && !root_is_local {
+                    return Err(diag(
+                        "R0235",
+                        "chained method receivers must be a local variable for now",
+                        span,
+                    ));
+                }
+                let root_name_for_mutable = match &root_expression {
+                    Expression::Name(name, _) => Some(name.clone()),
+                    Expression::Field { value, .. } => {
+                        let mut current = &**value;
+                        while let Expression::Field { value, .. } = current {
+                            current = value;
+                        }
+                        match current {
+                            Expression::Name(name, _) => Some(name.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let (root_ir, mut current_ty) = self.expression(root_expression, None)?;
+                let mut statements = Vec::with_capacity(links.len());
+                let link_count = links.len();
+                for (link_index, (link_name, link_arguments, link_span)) in
+                    links.into_iter().enumerate()
+                {
+                    let mutable = root_name_for_mutable
+                        .clone()
+                        .and_then(|name| self.names.get(&name).copied())
+                        .is_none_or(|binding| {
+                            binding.mutable || self.parameter_slots.contains(&binding.slot)
+                        });
+                    let lowered = self.lower_method_for_chain(
+                        root_ir.clone(),
+                        current_ty,
+                        link_name,
+                        link_arguments,
+                        link_span,
+                        mutable,
+                    )?;
+                    let (target, arguments, result) = lowered;
+                    statements.push(IrStatement::Call { target, arguments });
+                    if let Some(ty) = result {
+                        current_ty = ty;
+                        if link_index + 1 != link_count {
+                            return Err(diag(
+                                "R0235",
+                                "only the last method in a chain may return a value for now",
+                                link_span,
+                            )
+                            .with_help("void `mut self` methods keep chaining on the receiver"));
+                        }
+                    }
+                }
+                if statements.len() == 1 {
+                    let Some(IrStatement::Call { target, arguments }) =
+                        statements.into_iter().next()
+                    else {
+                        unreachable!("single statement is a call");
+                    };
+                    return Ok(IrStatement::Call { target, arguments });
+                }
+                Ok(IrStatement::Block(statements))
             }
             Statement::If {
                 condition,
@@ -4866,8 +5275,14 @@ impl<'a> Analyzer<'a> {
                 .and_then(|signature| signature.return_type)
                 .filter(|ty| is_numeric(*ty)),
             Expression::Field { value, name, .. } => {
-                let Type::Struct(struct_id) = self.value_type_hint(value)? else {
-                    return None;
+                let receiver_hint = self.value_type_hint(value)?;
+                let struct_id = match receiver_hint {
+                    Type::Struct(id) => id,
+                    Type::Reference(target, _) => match pointer_target(target) {
+                        Type::Struct(id) => id,
+                        _ => return None,
+                    },
+                    _ => return None,
                 };
                 self.structs[struct_id]
                     .fields
@@ -4918,37 +5333,43 @@ impl<'a> Analyzer<'a> {
             Expression::Character(_, _) => Some(Type::Char),
             Expression::String(_, _) => Some(Type::Str),
             Expression::Call { name, .. } if name == "String" => Some(Type::OwnedString),
-            Expression::MethodCall { value, name, .. } => match self.value_type_hint(value) {
-                Some(Type::OwnedString) => match name.as_str() {
-                    "clone" | "concat" | "slice" | "slice_chars" | "trim" => {
-                        Some(Type::OwnedString)
-                    }
-                    "to_i8" => Some(Type::I8),
-                    "to_i16" => Some(Type::I16),
-                    "to_i32" => Some(Type::I32),
-                    "to_i64" => Some(Type::I64),
-                    "to_u8" => Some(Type::U8),
-                    "to_u16" => Some(Type::U16),
-                    "to_u32" => Some(Type::U32),
-                    "to_u64" => Some(Type::U64),
-                    "to_f32" => Some(Type::F32),
-                    "to_f64" => Some(Type::F64),
-                    "len" | "char_count" => Some(Type::U64),
-                    "find" => Some(Type::I64),
-                    "split" => Some(Type::Vec(intern_vec_elem(Type::OwnedString))),
-                    "char_at" => Some(Type::Char),
-                    "byte_at" => Some(Type::U8),
-                    "starts_with" | "ends_with" | "contains" => Some(Type::Bool),
+            Expression::MethodCall { value, name, .. } => {
+                let receiver_hint = match self.value_type_hint(value) {
+                    Some(Type::Reference(target, _)) => Some(pointer_target(target)),
+                    other => other,
+                };
+                match receiver_hint {
+                    Some(Type::OwnedString) => match name.as_str() {
+                        "clone" | "concat" | "slice" | "slice_chars" | "trim" => {
+                            Some(Type::OwnedString)
+                        }
+                        "to_i8" => Some(Type::I8),
+                        "to_i16" => Some(Type::I16),
+                        "to_i32" => Some(Type::I32),
+                        "to_i64" => Some(Type::I64),
+                        "to_u8" => Some(Type::U8),
+                        "to_u16" => Some(Type::U16),
+                        "to_u32" => Some(Type::U32),
+                        "to_u64" => Some(Type::U64),
+                        "to_f32" => Some(Type::F32),
+                        "to_f64" => Some(Type::F64),
+                        "len" | "char_count" => Some(Type::U64),
+                        "find" => Some(Type::I64),
+                        "split" => Some(Type::Vec(intern_vec_elem(Type::OwnedString))),
+                        "char_at" => Some(Type::Char),
+                        "byte_at" => Some(Type::U8),
+                        "starts_with" | "ends_with" | "contains" => Some(Type::Bool),
+                        _ => None,
+                    },
+                    Some(Type::Vec(id)) => match name.as_str() {
+                        "clone" => Some(Type::Vec(id)),
+                        "len" | "capacity" => Some(Type::U64),
+                        "take" | "extract" | "index" => Some(vec_elem(id)),
+                        _ => None,
+                    },
                     _ => None,
-                },
-                Some(Type::Vec(id)) => match name.as_str() {
-                    "clone" => Some(Type::Vec(id)),
-                    "len" | "capacity" => Some(Type::U64),
-                    "take" | "extract" | "index" => Some(vec_elem(id)),
-                    _ => None,
-                },
-                _ => None,
-            },
+                }
+            }
             Expression::Name(name, _) => self.names.get(name).map(|binding| binding.ty),
             Expression::StructLiteral { name, .. } => self.scoped_struct_id(name).map(Type::Struct),
             Expression::Call { name, .. } => self
@@ -4957,8 +5378,14 @@ impl<'a> Analyzer<'a> {
                 .and_then(|signature| signature.return_type),
             Expression::Cast(_, target, _) => self.resolve_type_name(target).ok(),
             Expression::Field { value, name, .. } => {
-                let Type::Struct(struct_id) = self.value_type_hint(value)? else {
-                    return None;
+                let receiver_ty = self.value_type_hint(value)?;
+                let struct_id = match receiver_ty {
+                    Type::Struct(id) => id,
+                    Type::Reference(target, _) => match pointer_target(target) {
+                        Type::Struct(id) => id,
+                        _ => return None,
+                    },
+                    _ => return None,
                 };
                 self.structs[struct_id]
                     .fields
@@ -5176,8 +5603,8 @@ impl<'a> Analyzer<'a> {
         }
         let mutable = root(&value)
             .and_then(|name| self.names.get(name))
-            .is_none_or(|binding| binding.mutable);
-        let (receiver, receiver_ty) = self.expression(value, None)?;
+            .is_none_or(|binding| binding.mutable || self.parameter_slots.contains(&binding.slot));
+        let (mut receiver, receiver_ty) = self.expression(value, None)?;
         if let Type::Vec(elem_id) = receiver_ty {
             if matches!(name.as_str(), "as_slice" | "slice") {
                 if custom_drop_vec_only(Type::Vec(elem_id), self.structs, self.enums) {
@@ -5266,18 +5693,41 @@ impl<'a> Analyzer<'a> {
                 mutable,
             );
         }
-        if let Type::Reference(target, reference_mutable) = receiver_ty
-            && let Type::Struct(struct_id) = pointer_target(target)
-        {
-            return self.lower_struct_method_borrowed(
-                receiver,
-                receiver_ty,
-                reference_mutable,
-                struct_id,
-                name,
-                arguments,
+        if let Type::Reference(target, reference_mutable) = receiver_ty {
+            let pointee = pointer_target(target);
+            if let Type::Struct(struct_id) = pointee {
+                return self.lower_struct_method_borrowed(
+                    receiver,
+                    receiver_ty,
+                    reference_mutable,
+                    struct_id,
+                    name,
+                    arguments,
+                    span,
+                );
+            }
+            if pointee == Type::OwnedString {
+                // A built-in receiver borrowed through `extend String { ... }`:
+                // load the handle from the reference's stack home as a borrowed
+                // view; the reference's home keeps ownership.
+                let dereferenced = IrExpression::Dereference {
+                    pointer: Box::new(receiver),
+                    ty: pointee,
+                };
+                receiver = dereferenced;
+                return self.lower_string_method_receiver(
+                    receiver,
+                    name,
+                    arguments,
+                    span,
+                    reference_mutable,
+                );
+            }
+            return Err(diag(
+                "R0234",
+                format!("`extend` for `{}` is not supported yet", type_name(pointee)),
                 span,
-            );
+            ));
         }
         if receiver_ty != Type::OwnedString {
             return Err(diag(
@@ -5286,6 +5736,17 @@ impl<'a> Analyzer<'a> {
                 span,
             ));
         }
+        self.lower_string_method_receiver(receiver, name, arguments, span, mutable)
+    }
+
+    fn lower_string_method_receiver(
+        &mut self,
+        receiver: IrExpression,
+        name: String,
+        arguments: Vec<Expression>,
+        span: Span,
+        mutable: bool,
+    ) -> Result<(IrCallTarget, Vec<IrExpression>, Option<Type>), Diagnostic> {
         let owned_argument = arguments
             .first()
             .and_then(|argument| self.value_type_hint(argument))
@@ -5343,6 +5804,17 @@ impl<'a> Analyzer<'a> {
             "split" if owned_argument => StringOp::SplitString,
             "split" => StringOp::SplitStr,
             _ => {
+                let extension = self.lookup_extension_method(
+                    &receiver,
+                    &name,
+                    arguments,
+                    Type::OwnedString,
+                    span,
+                    mutable,
+                )?;
+                if let Some(result) = extension {
+                    return Ok(result);
+                }
                 return Err(diag(
                     "R0234",
                     format!("String has no method `{name}`"),
@@ -5389,6 +5861,192 @@ impl<'a> Analyzer<'a> {
         )?;
         arguments.insert(0, receiver);
         Ok((target, arguments, result))
+    }
+
+    /// Lowers one chain link against the current receiver value.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_method_for_chain(
+        &mut self,
+        receiver: IrExpression,
+        receiver_ty: Type,
+        name: String,
+        arguments: Vec<Expression>,
+        span: Span,
+        mutable: bool,
+    ) -> Result<(IrCallTarget, Vec<IrExpression>, Option<Type>), Diagnostic> {
+        match receiver_ty {
+            Type::Struct(struct_id) => self.lower_struct_method(
+                receiver,
+                receiver_ty,
+                struct_id,
+                name,
+                arguments,
+                span,
+                mutable,
+            ),
+            Type::Vec(elem_id) => {
+                self.lower_vec_method(receiver, elem_id, name, arguments, span, mutable)
+            }
+            Type::Map(map_id) => {
+                self.lower_map_method(receiver, map_id, name, arguments, span, mutable)
+            }
+            Type::Reference(target, reference_mutable) => {
+                if let Type::Struct(struct_id) = pointer_target(target) {
+                    return self.lower_struct_method_borrowed(
+                        receiver,
+                        receiver_ty,
+                        reference_mutable,
+                        struct_id,
+                        name,
+                        arguments,
+                        span,
+                    );
+                }
+                if pointer_target(target) == Type::OwnedString {
+                    return self.lower_string_method_receiver(
+                        receiver,
+                        name,
+                        arguments,
+                        span,
+                        reference_mutable,
+                    );
+                }
+                Err(diag(
+                    "R0234",
+                    format!("type `{}` has no method `{name}`", type_name(receiver_ty)),
+                    span,
+                ))
+            }
+            Type::OwnedString => {
+                self.lower_string_method_receiver(receiver, name, arguments, span, mutable)
+            }
+            other => Err(diag(
+                "R0234",
+                format!("type `{}` has no method `{name}`", type_name(other)),
+                span,
+            )),
+        }
+    }
+
+    /// Resolves an `extend`-defined method on a built-in receiver type.
+    #[allow(clippy::too_many_arguments)]
+    fn lookup_extension_method(
+        &mut self,
+        receiver: &IrExpression,
+        name: &str,
+        arguments: Vec<Expression>,
+        receiver_ty: Type,
+        span: Span,
+        receiver_mutable: bool,
+    ) -> LoweredMethod {
+        let display_name = match receiver_ty {
+            Type::OwnedString => "String".to_string(),
+            other => type_name(other),
+        };
+        let mut candidates = vec![format!("{display_name}::{name}")];
+        let suffix = format!("::{display_name}::{name}");
+        for signature_name in self.signatures.keys() {
+            if signature_name.ends_with(&suffix) {
+                candidates.push(signature_name.clone());
+            }
+        }
+        for candidate in candidates {
+            let Some(signature) = self.signatures.get(&candidate).cloned() else {
+                continue;
+            };
+            let Some(self_parameter) = signature.parameters.first().copied() else {
+                continue;
+            };
+            let Type::Reference(target, self_mutable) = self_parameter else {
+                continue;
+            };
+            if pointer_target(target) != receiver_ty {
+                continue;
+            }
+            if self_mutable && !receiver_mutable {
+                return Err(diag(
+                    "R0204",
+                    format!("method `{name}` requires a mutable receiver"),
+                    span,
+                )
+                .with_help("declare the receiver's root binding with `mut`"));
+            }
+            let function_index = match signature.target {
+                IrCallTarget::Function(index) => index,
+                _ => continue,
+            };
+            if !self
+                .function_visibility
+                .get(function_index)
+                .copied()
+                .unwrap_or(false)
+                && self
+                    .function_module_paths
+                    .get(function_index)
+                    .map(String::as_str)
+                    != Some(self.module_path.as_str())
+            {
+                return Err(diag("R0425", format!("method `{name}` is private"), span)
+                    .with_help("mark the method `pub` inside its `extend` block"));
+            }
+            // Borrow the receiver local; a reference receiver passes through.
+            let receiver_argument = match &receiver {
+                IrExpression::Local {
+                    slot,
+                    ty,
+                    span: local_span,
+                } => {
+                    if matches!(ty, Type::Reference(_, _)) {
+                        (*receiver).clone()
+                    } else {
+                        self.addressed_slot_types[*slot] = Some(*ty);
+                        IrExpression::AddressOf {
+                            slot: *slot,
+                            ty: *ty,
+                            pointer_type: Type::Reference(
+                                intern_pointer_target(receiver_ty),
+                                self_mutable,
+                            ),
+                            span: *local_span,
+                        }
+                    }
+                }
+                _ => {
+                    return Err(diag(
+                        "R0235",
+                        "method receivers must be a local variable for now",
+                        span,
+                    )
+                    .with_help(
+                        "assign the value to a local first; expression receivers are not supported yet",
+                    ));
+                }
+            };
+            let mut lowered = vec![receiver_argument];
+            for argument in arguments {
+                let argument_span = argument.span();
+                let parameter_type = signature
+                    .parameters
+                    .get(lowered.len())
+                    .copied()
+                    .unwrap_or(Type::Bool);
+                let (value, actual) = self.expression(argument, Some(parameter_type))?;
+                if actual != parameter_type {
+                    return Err(diag(
+                        "R0212",
+                        format!(
+                            "method argument has type `{}` but `{}` is required",
+                            type_name(actual),
+                            type_name(parameter_type)
+                        ),
+                        argument_span,
+                    ));
+                }
+                lowered.push(value);
+            }
+            return Ok(Some((signature.target, lowered, signature.return_type)));
+        }
+        Ok(None)
     }
 
     fn lower_vec_method(
@@ -7589,7 +8247,11 @@ fn reference_pointee_supported_in(ty: Type, structs: &[RynStruct]) -> bool {
             .get(id)
             .is_none_or(|definition| definition.drop_function.is_none());
     }
-    false
+    // Owning handles live behind their stack home; dereference reads clone.
+    matches!(
+        ty,
+        Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Enum(_)
+    )
 }
 
 fn is_integer(ty: Type) -> bool {

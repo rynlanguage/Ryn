@@ -198,6 +198,15 @@ pub(crate) fn check_project(project: &Path) -> Result<(RynIr, Vec<PathBuf>), Str
                 .clone_from(&segment.source.module_path);
         }
     }
+    for definition in &mut program.shapes {
+        if let Some(segment) = segments.iter().find(|segment| {
+            segment.start <= definition.span.start && definition.span.start < segment.end
+        }) {
+            definition
+                .module_path
+                .clone_from(&segment.source.module_path);
+        }
+    }
     for definition in &mut program.type_aliases {
         if let Some(segment) = segments.iter().find(|segment| {
             segment.start <= definition.span.start && definition.span.start < segment.end

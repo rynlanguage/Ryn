@@ -1182,6 +1182,6 @@ fn extend_methods_borrow_receivers_and_associated_items_resolve() {
     );
     assert_eq!(
         String::from_utf8_lossy(&result.stdout),
-        "100\n70\n75\n100\nv3nn7\n"
+        "100\n75\n100\nv3nn7\n"
     );
 }

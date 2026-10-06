@@ -1692,6 +1692,8 @@ fn reference_storage_layout(ty: Type, structs: &[RynStruct]) -> (u32, u32) {
                 .unwrap_or(1);
             ((slot_count * 8) as u32, 8)
         }
+        // Owning handles are pointer-sized stack homes.
+        Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Enum(_) => (8, 8),
         _ => unreachable!("reference target was validated as scalar or structure"),
     }
 }
@@ -3667,6 +3669,37 @@ fn emit_expr(
             let CompiledValue::Integer(pointer, _) = pointer else {
                 return Err("internal error: dereference operand is not a pointer".into());
             };
+            // Owning handles load as borrowed views; the reference's home keeps
+            // ownership, so the view must never be stored or consumed.
+            if matches!(
+                ty,
+                Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Enum(_)
+            ) {
+                let handle = b.ins().load(
+                    module.target_config().pointer_type(),
+                    MemFlagsData::new(),
+                    pointer,
+                    0,
+                );
+                return Ok(match ty {
+                    Type::OwnedString => CompiledValue::OwnedString {
+                        ptr: handle,
+                        temporary: false,
+                    },
+                    Type::Vec(_) => CompiledValue::Vec {
+                        ptr: handle,
+                        temporary: false,
+                    },
+                    Type::Map(_) => CompiledValue::Map {
+                        ptr: handle,
+                        temporary: false,
+                    },
+                    _ => CompiledValue::Enum {
+                        ptr: handle,
+                        temporary: false,
+                    },
+                });
+            }
             let value = b.ins().load(
                 clif_scalar_type(*ty, module.target_config().pointer_type())?,
                 MemFlagsData::new(),

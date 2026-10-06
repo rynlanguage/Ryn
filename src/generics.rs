@@ -239,6 +239,14 @@ fn specialize_call(
             });
         }
     }
+    let concrete_bounds = template
+        .type_parameter_bounds
+        .iter()
+        .filter_map(|(parameter, bounds)| {
+            let concrete = substitutions.get(parameter)?;
+            Some((type_key(concrete), bounds.clone()))
+        })
+        .collect::<Vec<_>>();
     let type_key = template
         .type_parameters
         .iter()
@@ -271,6 +279,9 @@ fn specialize_call(
         let mut function = template.clone();
         function.name.clone_from(&specialized_name);
         function.type_parameters.clear();
+        // Bounds follow the substitution: the key becomes the concrete type name
+        // so semantic analysis can check conformance on the specialization.
+        function.type_parameter_bounds = concrete_bounds.clone();
         for parameter in &mut function.parameters {
             substitute_type(&mut parameter.ty, &substitutions);
         }

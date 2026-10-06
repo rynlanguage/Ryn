@@ -7,7 +7,26 @@ pub struct Program {
     pub enums: Vec<EnumDef>,
     pub type_aliases: Vec<TypeAliasDef>,
     pub extends: Vec<ExtendDef>,
+    pub shapes: Vec<ShapeDef>,
     pub functions: Vec<Function>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShapeDef {
+    pub name: String,
+    pub methods: Vec<ShapeMethod>,
+    pub module_path: String,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShapeMethod {
+    pub name: String,
+    pub parameters: Vec<Parameter>,
+    pub return_type: Option<TypeName>,
+    pub default_body: Option<Vec<Statement>>,
+    pub default_value: Option<Expression>,
+    pub span: Span,
 }
 #[derive(Debug)]
 pub struct UseDecl {
@@ -59,6 +78,7 @@ pub struct StructField {
 #[derive(Clone, Debug)]
 pub struct ExtendDef {
     pub type_name: TypeName,
+    pub as_shape: Option<String>,
     pub functions: Vec<Function>,
     pub constants: Vec<ConstantDef>,
     pub module_path: String,
@@ -78,6 +98,7 @@ pub struct Function {
     pub extern_c: bool,
     pub external_symbol: Option<String>,
     pub type_parameters: Vec<String>,
+    pub type_parameter_bounds: Vec<(String, Vec<String>)>,
     pub public: bool,
     pub module_path: String,
     pub parameters: Vec<Parameter>,

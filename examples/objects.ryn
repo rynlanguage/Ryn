@@ -24,9 +24,7 @@ extend Player {
 fun main() {
     mut player := Player::new("v3nn7")
     echo player.health()
-    player.damage(30)
-    echo player.health()
-    player.heal(5)
+    player.damage(30).heal(5)
     echo player.health()
     echo Player::MAX_HEALTH
     echo player.name
