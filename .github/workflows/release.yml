@@ -71,3 +71,68 @@ jobs:
           tar -czf "${stage}.tar.gz" "$stage"
           sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
           gh release upload "$TAG" "${stage}.tar.gz" "${stage}.tar.gz.sha256" --repo "$GITHUB_REPOSITORY" --clobber
+
+  windows-x86_64:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - name: Select release tag
+        id: release
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          PUSH_TAG: ${{ github.ref_name }}
+        run: |
+          if ($env:EVENT_NAME -eq 'workflow_dispatch') {
+            $tag = $env:INPUT_TAG
+          } else {
+            $tag = $env:PUSH_TAG
+          }
+          if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Invalid release tag: $tag"
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Windows binary
+        run: cargo build --release --locked
+
+      - name: Smoke check
+        shell: pwsh
+        run: |
+          $version = & target/release/ryn.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "ryn --version failed with exit code $LASTEXITCODE" }
+          Write-Output $version
+          $expectedVersion = "ryn $($env:TAG.Substring(1))"
+          if ($version.Trim() -ne $expectedVersion) { throw "Unexpected version: $version" }
+          $output = & target/release/ryn.exe run examples/arguments.ryn -- "windows smoke"
+          if ($LASTEXITCODE -ne 0) { throw "Ryn smoke program failed with exit code $LASTEXITCODE" }
+          $output | ForEach-Object { Write-Output $_ }
+          if ($output -notcontains 'argument count: 1') { throw 'Argument count smoke check failed' }
+          if ($output -notcontains 'first argument: windows smoke') { throw 'Argument value smoke check failed' }
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+
+      - name: Package and upload Windows binary
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          $version = $env:TAG.Substring(1)
+          $stage = "ryn-$version-windows-x86_64"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item target/release/ryn.exe, README.md, install.ps1 -Destination $stage
+          $archive = "$stage.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $archive -Force
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archive" | Set-Content -LiteralPath "$archive.sha256" -NoNewline
+          gh release upload $env:TAG $archive "$archive.sha256" --repo $env:GITHUB_REPOSITORY --clobber
