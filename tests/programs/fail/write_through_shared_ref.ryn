@@ -1,0 +1,5 @@
+fun main() {
+    mut value := 5
+    borrowed := &value
+    *borrowed = 7
+}

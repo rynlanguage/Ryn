@@ -1,0 +1,4 @@
+fun main() {
+    owner := String("released before assertion exit")
+    assert_message(false, "assertion cleanup example")
+}

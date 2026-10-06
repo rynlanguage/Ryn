@@ -1,0 +1,27 @@
+#[drop(release)]
+struct Resource { handle: *i32, marker: i32 }
+type ResourceHandle = Resource
+
+fun release(resource: Resource) {
+    echo *resource.handle
+    echo resource.marker
+}
+
+fun forward(resources: Map<i32, ResourceHandle>) -> Map<i32, ResourceHandle> {
+    resources
+}
+
+fun main() {
+    mut first: i32 = 10
+    mut second: i32 = 20
+    mut third: i32 = 30
+    mut resources := forward(Map<i32, ResourceHandle>())
+    resources.insert(1, Resource { handle: &raw mut first, marker: 101 })
+    resources.insert(2, Resource { handle: &raw mut second, marker: 202 })
+    resources.insert(1, Resource { handle: &raw mut third, marker: 303 })
+    echo resources.contains_key(2)
+    echo resources.remove(2)
+    resources.clear()
+    mut remaining := Map<i32, ResourceHandle>()
+    remaining.insert(4, Resource { handle: &raw mut first, marker: 404 })
+}

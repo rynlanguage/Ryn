@@ -2,31 +2,73 @@ use crate::source::Span;
 
 #[derive(Debug)]
 pub struct Program {
+    pub uses: Vec<UseDecl>,
     pub structs: Vec<StructDef>,
+    pub enums: Vec<EnumDef>,
+    pub type_aliases: Vec<TypeAliasDef>,
     pub functions: Vec<Function>,
 }
 #[derive(Debug)]
-pub struct StructDef {
-    pub name: String,
-    pub fields: Vec<StructField>,
+pub struct UseDecl {
+    pub path: Vec<String>,
     pub span: Span,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
+pub struct TypeAliasDef {
+    pub name: String,
+    pub type_parameters: Vec<String>,
+    pub ty: TypeName,
+    pub public: bool,
+    pub module_path: String,
+    pub span: Span,
+}
+#[derive(Clone, Debug)]
+pub struct EnumDef {
+    pub name: String,
+    pub type_parameters: Vec<String>,
+    pub variants: Vec<VariantDef>,
+    pub public: bool,
+    pub module_path: String,
+    pub span: Span,
+}
+#[derive(Clone, Debug)]
+pub struct VariantDef {
+    pub name: String,
+    pub fields: Vec<TypeName>,
+    pub span: Span,
+}
+#[derive(Clone, Debug)]
+pub struct StructDef {
+    pub name: String,
+    pub type_parameters: Vec<String>,
+    pub fields: Vec<StructField>,
+    pub public: bool,
+    pub repr_c: bool,
+    pub drop_function: Option<String>,
+    pub module_path: String,
+    pub span: Span,
+}
+#[derive(Clone, Debug)]
 pub struct StructField {
     pub name: String,
     pub ty: TypeName,
     pub span: Span,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Function {
     pub name: String,
+    pub extern_c: bool,
+    pub external_symbol: Option<String>,
+    pub type_parameters: Vec<String>,
+    pub public: bool,
+    pub module_path: String,
     pub parameters: Vec<Parameter>,
     pub return_type: Option<TypeName>,
     pub body: Vec<Statement>,
     pub return_value: Option<Expression>,
     pub span: Span,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Parameter {
     pub name: String,
     pub ty: TypeName,
@@ -45,8 +87,18 @@ pub enum TypeName {
     F32,
     F64,
     Str,
+    OwnedString,
+    Char,
     Bool,
     Named(String, Span),
+    Parameter(String, Span),
+    Vec(Box<TypeName>, Span),
+    Map(Box<TypeName>, Box<TypeName>, Span),
+    Array(Box<TypeName>, usize, Span),
+    Slice(Box<TypeName>, Span),
+    Reference(Box<TypeName>, bool, Span),
+    RawPointer(Box<TypeName>, Span),
+    FunctionPointer(Vec<TypeName>, Option<Box<TypeName>>, bool, Span),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,14 +123,22 @@ pub enum BinaryOp {
     Or,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Expression {
     Integer(u64, Span),
     Float(f64, Span),
     String(String, Span),
+    Character(char, Span),
     Boolean(bool, Span),
     Name(String, Span),
     Call {
+        name: String,
+        type_arguments: Vec<TypeName>,
+        arguments: Vec<Expression>,
+        span: Span,
+    },
+    MethodCall {
+        value: Box<Expression>,
         name: String,
         arguments: Vec<Expression>,
         span: Span,
@@ -109,7 +169,56 @@ pub enum Expression {
     Negate(Box<Expression>, Span),
     Not(Box<Expression>, Span),
     BitNot(Box<Expression>, Span),
+    AddressOf {
+        mutable: bool,
+        raw: bool,
+        value: Box<Expression>,
+        span: Span,
+    },
+    Dereference(Box<Expression>, Span),
     Cast(Box<Expression>, TypeName, Span),
+    LayoutOf {
+        ty: TypeName,
+        alignment: bool,
+        span: Span,
+    },
+    VecConstructor {
+        element: TypeName,
+        span: Span,
+    },
+    MapConstructor {
+        key: TypeName,
+        value: TypeName,
+        span: Span,
+    },
+    Tuple(Vec<Expression>, Span),
+    ArrayLiteral(Vec<Expression>, Span),
+    Index {
+        value: Box<Expression>,
+        index: Box<Expression>,
+        span: Span,
+    },
+    Propagate(Box<Expression>, Span),
+    EnumConstruct {
+        enum_name: String,
+        variant: String,
+        arguments: Vec<Expression>,
+        span: Span,
+    },
+    Choose {
+        value: Box<Expression>,
+        arms: Vec<ChooseArm>,
+        span: Span,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct ChooseArm {
+    pub enum_name: Option<String>,
+    pub variant: Option<String>,
+    pub bindings: Vec<String>,
+    pub body: Expression,
+    pub span: Span,
 }
 
 impl Expression {
@@ -118,25 +227,39 @@ impl Expression {
             Self::Integer(_, span)
             | Self::Float(_, span)
             | Self::String(_, span)
+            | Self::Character(_, span)
             | Self::Boolean(_, span)
             | Self::Name(_, span)
             | Self::Negate(_, span) => *span,
-            Self::Not(_, span) | Self::BitNot(_, span) | Self::Cast(_, _, span) => *span,
+            Self::Not(_, span)
+            | Self::BitNot(_, span)
+            | Self::Dereference(_, span)
+            | Self::Cast(_, _, span) => *span,
+            Self::AddressOf { span, .. } => *span,
+            Self::LayoutOf { span, .. } => *span,
             Self::Binary { span, .. } => *span,
             Self::Call { span, .. } => *span,
+            Self::MethodCall { span, .. } => *span,
             Self::If { span, .. } => *span,
             Self::StructLiteral { span, .. } | Self::Field { span, .. } => *span,
+            Self::VecConstructor { span, .. } => *span,
+            Self::MapConstructor { span, .. } => *span,
+            Self::Tuple(_, span) => *span,
+            Self::ArrayLiteral(_, span) => *span,
+            Self::Index { span, .. } => *span,
+            Self::Propagate(_, span) => *span,
+            Self::EnumConstruct { span, .. } | Self::Choose { span, .. } => *span,
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum PrintPart {
     Text(String),
     Value(Expression),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Statement {
     Let {
         name: String,
@@ -147,6 +270,17 @@ pub enum Statement {
     },
     Assign {
         name: String,
+        value: Expression,
+        span: Span,
+    },
+    IndexAssign {
+        name: String,
+        index: Expression,
+        value: Expression,
+        span: Span,
+    },
+    DereferenceAssign {
+        pointer: Expression,
         value: Expression,
         span: Span,
     },
@@ -167,6 +301,13 @@ pub enum Statement {
     PrintTemplate(Vec<PrintPart>, Span),
     Call {
         name: String,
+        type_arguments: Vec<TypeName>,
+        arguments: Vec<Expression>,
+        span: Span,
+    },
+    MethodCall {
+        value: Box<Expression>,
+        name: String,
         arguments: Vec<Expression>,
         span: Span,
     },
@@ -186,6 +327,13 @@ pub enum Statement {
         name_span: Span,
         start: Expression,
         end: Expression,
+        body: Vec<Statement>,
+        span: Span,
+    },
+    ForEach {
+        name: String,
+        name_span: Span,
+        collection: Expression,
         body: Vec<Statement>,
         span: Span,
     },

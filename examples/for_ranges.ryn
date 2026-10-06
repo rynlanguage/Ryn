@@ -1,34 +1,34 @@
-fn lower_bound() -> i32 {
-    print("lower")
+fun lower_bound() -> i32 {
+    echo "lower"
     1
 }
 
-fn upper_bound() -> i32 {
-    print("upper")
+fun upper_bound() -> i32 {
+    echo "upper"
     4
 }
 
-fn main() {
-    let mut total = 0
+fun main() {
+    mut total := 0
     for index in 0..6 {
-        if index == 2 {
+        when index == 2 {
             continue
         }
-        if index == 5 {
+        when index == 5 {
             break
         }
-        print(index)
+        echo index
         total += index
     }
-    print(total)
+    echo total
 
     for index in lower_bound()..upper_bound() {
-        print(index)
+        echo index
     }
 
-    let byte_start: u8 = 254
-    let byte_end: u8 = 255
+    byte_start: u8 = 254
+    byte_end: u8 = 255
     for byte in byte_start..byte_end {
-        print(byte)
+        echo byte
     }
 }

@@ -1,0 +1,5 @@
+use coremath::base
+
+pub fun add(left: i32, right: i32) -> i32 {
+    return base::sum(left, right)
+}

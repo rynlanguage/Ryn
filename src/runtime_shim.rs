@@ -1,8 +1,140 @@
-use std::{
-    io::Write,
-    slice,
-    sync::OnceLock,
-};
+use std::{io::Write, slice, sync::OnceLock};
+
+#[path = "runtime/string.rs"]
+pub mod strings;
+
+#[path = "runtime/filesystem.rs"]
+pub mod filesystem;
+
+#[path = "runtime/system.rs"]
+pub mod system;
+
+#[path = "runtime/vector.rs"]
+pub mod vectors;
+
+#[path = "runtime/map.rs"]
+pub mod maps;
+
+#[path = "runtime/enum.rs"]
+pub mod enums;
+
+#[repr(C)]
+pub struct RynFfiRecordI32 {
+    pub value: i32,
+}
+
+#[repr(C)]
+pub struct RynFfiPairI32 {
+    pub first: i32,
+    pub second: i32,
+}
+
+#[repr(C)]
+pub struct RynFfiPairI16 {
+    pub first: i16,
+    pub second: i16,
+}
+
+#[repr(C)]
+pub struct RynFfiBytePair {
+    pub first: u8,
+    pub second: u8,
+}
+
+#[repr(C)]
+pub struct RynFfiMixedPair {
+    pub first: u8,
+    pub second: u16,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[repr(C)]
+pub struct RynFfiFloatPair {
+    pub first: f32,
+    pub second: f32,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[repr(C)]
+pub struct RynFfiDoubleValue {
+    pub value: f64,
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_ffi_float_pair_sum(pair: RynFfiFloatPair) -> f32 {
+    pair.first + pair.second
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_ffi_make_float_pair(first: f32, second: f32) -> RynFfiFloatPair {
+    RynFfiFloatPair { first, second }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_ffi_double_value(value: RynFfiDoubleValue) -> RynFfiDoubleValue {
+    value
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_ffi_record_i32(record: RynFfiRecordI32) -> i32 {
+    record.value + 1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_ffi_make_record_i32(value: i32) -> RynFfiRecordI32 {
+    RynFfiRecordI32 { value }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_ffi_pair_i32(pair: RynFfiPairI32) -> i32 {
+    pair.first + pair.second
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_ffi_make_pair_i32(first: i32, second: i32) -> RynFfiPairI32 {
+    RynFfiPairI32 { first, second }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_ffi_pair_i16(pair: RynFfiPairI16) -> i16 {
+    pair.first + pair.second
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_ffi_make_pair_i16(first: i16, second: i16) -> RynFfiPairI16 {
+    RynFfiPairI16 { first, second }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_ffi_byte_pair(pair: RynFfiBytePair) -> u8 {
+    pair.first + pair.second
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_ffi_make_byte_pair(first: u8, second: u8) -> RynFfiBytePair {
+    RynFfiBytePair { first, second }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_ffi_mixed_pair(pair: RynFfiMixedPair) -> u16 {
+    pair.first as u16 + pair.second
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_ffi_make_mixed_pair(first: u8, second: u16) -> RynFfiMixedPair {
+    RynFfiMixedPair { first, second }
+}
+
+#[cfg(ryn_runtime_debug)]
+pub fn debug_live_vectors() -> usize { vectors::live_vectors() }
+
+#[cfg(ryn_runtime_debug)]
+pub fn debug_live_strings() -> usize {
+    strings::live_strings()
+}
 
 static RYN_ARGUMENTS: OnceLock<Vec<String>> = OnceLock::new();
 
@@ -146,6 +278,15 @@ pub extern "C" fn ryn_integer_division_by_zero() {
     let _ = writeln!(
         std::io::stderr().lock(),
         "Ryn runtime error: integer division or remainder by zero"
+    );
+    std::process::exit(1);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_array_index_out_of_bounds() {
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "Ryn runtime error: array index is out of bounds"
     );
     std::process::exit(1);
 }

@@ -1,4 +1,4 @@
-fn main() -> i32 {
-    print("Ryn exit status: 7")
+fun main() -> i32 {
+    echo "Ryn exit status: 7"
     7
 }

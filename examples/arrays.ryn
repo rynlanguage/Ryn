@@ -1,0 +1,45 @@
+fun rotate(values: [i32; 4]) -> [i32; 4] {
+    [values[1], values[2], values[3], values[0]]
+}
+
+fun at(values: [i32; 4], index: u64) -> i32 {
+    values[index]
+}
+
+fun first_label(values: [String; 2]) -> String {
+    values[0]
+}
+
+fun main() {
+    mut values: [i32; 4] = [10, 20, 30, 40]
+    values[1] = 25
+    rotated := rotate(values)
+    echo values[0]
+    echo values[1]
+    echo at(rotated, 2)
+    fractions := [1.5, 2.5]
+    echo fractions[1]
+    flags := [true, false]
+    echo flags[1]
+
+    mut labels: [String; 2] = [String("Ryn"), String("language")]
+    echo labels[0]
+    echo labels[0]
+    labels[1] = String("compiler")
+    echo labels[1]
+
+    buckets: [Vec<i32>; 1] = [Vec<i32>()]
+    echo buckets[0].len()
+
+    nested: [[i32; 2]; 2] = [[1, 2], [3, 4]]
+    echo nested[1][0]
+    words: [str; 2] = ["fixed", "views"]
+    echo words[1]
+
+    echo first_label(labels)
+
+    mut names := Vec<String>()
+    names.push(String("nested owner"))
+    groups: [Vec<String>; 1] = [names]
+    echo groups[0].len()
+}

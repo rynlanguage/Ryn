@@ -1,0 +1,71 @@
+#[repr(C)]
+struct Record {
+    value: i32
+}
+
+#[repr(C)]
+struct Pair {
+    first: i32,
+    second: i32
+}
+
+#[repr(C)]
+struct SmallPair {
+    first: i16,
+    second: i16
+}
+
+#[repr(C)]
+struct BytePair {
+    first: u8,
+    second: u8
+}
+
+#[repr(C)]
+struct MixedPair {
+    first: u8,
+    second: u16
+}
+
+extern "C" fun ryn_ffi_record_i32(record: Record) -> i32;
+extern "C" fun ryn_ffi_make_record_i32(value: i32) -> Record;
+extern "C" fun ryn_ffi_pair_i32(pair: Pair) -> i32;
+extern "C" fun ryn_ffi_make_pair_i32(first: i32, second: i32) -> Pair;
+extern "C" fun ryn_ffi_pair_i16(pair: SmallPair) -> i16;
+extern "C" fun ryn_ffi_make_pair_i16(first: i16, second: i16) -> SmallPair;
+extern "C" fun ryn_ffi_byte_pair(pair: BytePair) -> u8;
+extern "C" fun ryn_ffi_make_byte_pair(first: u8, second: u8) -> BytePair;
+extern "C" fun ryn_ffi_mixed_pair(pair: MixedPair) -> u16;
+extern "C" fun ryn_ffi_make_mixed_pair(first: u8, second: u16) -> MixedPair;
+
+fun main() {
+    record := Record { value: 41 }
+    echo ryn_ffi_record_i32(record)
+    echo ryn_ffi_make_record_i32(42).value
+    echo sizeof(Record)
+    echo alignof(Record)
+    pair := Pair { first: 19, second: 23 }
+    echo ryn_ffi_pair_i32(pair)
+    returned_pair := ryn_ffi_make_pair_i32(20, 22)
+    echo returned_pair.first
+    echo returned_pair.second
+    echo ryn_ffi_pair_i32(returned_pair)
+    small := SmallPair { first: 1234, second: 2345 }
+    echo ryn_ffi_pair_i16(small)
+    returned_small := ryn_ffi_make_pair_i16(1000, 2345)
+    echo returned_small.first
+    echo returned_small.second
+    echo ryn_ffi_pair_i16(returned_small)
+    bytes := BytePair { first: 11, second: 31 }
+    echo ryn_ffi_byte_pair(bytes)
+    returned_bytes := ryn_ffi_make_byte_pair(12, 30)
+    echo returned_bytes.first
+    echo returned_bytes.second
+    echo ryn_ffi_byte_pair(returned_bytes)
+    mixed := MixedPair { first: 10, second: 32 }
+    echo ryn_ffi_mixed_pair(mixed)
+    returned_mixed := ryn_ffi_make_mixed_pair(20, 22)
+    echo returned_mixed.first
+    echo returned_mixed.second
+    echo ryn_ffi_mixed_pair(returned_mixed)
+}

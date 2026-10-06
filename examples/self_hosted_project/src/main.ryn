@@ -1,0 +1,5 @@
+use compiler::lexer
+
+fun main() {
+    echo lexer::formatted_sample()
+}

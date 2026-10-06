@@ -1,0 +1,19 @@
+struct TokenSpan {
+    kind: u64,
+    start: u64,
+    end: u64
+}
+
+fun main() {
+    mut tokens: Vec<TokenSpan> = Vec()
+    tokens.push(TokenSpan { kind: 4, start: 10, end: 12 })
+    tokens.push(TokenSpan { kind: 8, start: 12, end: 15 })
+
+    first := tokens.index(0)
+    echo first.kind
+    echo first.start
+    echo first.end
+    removed := tokens.take(1)
+    echo removed.kind
+    echo tokens.len()
+}

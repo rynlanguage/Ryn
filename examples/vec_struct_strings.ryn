@@ -1,0 +1,26 @@
+struct Label {
+    id: i32,
+    name: String
+}
+
+fun main() {
+    mut labels: Vec<Label> = Vec<Label>()
+    labels.push(Label { id: 1, name: String("first") })
+    labels.push(Label { id: 2, name: String("second") })
+
+    mut copied: Vec<Label> = labels.clone()
+    mut first := copied.index(0)
+    first.name.append(" copy")
+    echo first.name
+    echo labels.index(0).name
+
+    labels.set(1, Label { id: 3, name: String("replacement") })
+    echo labels.index(1).name
+
+    taken := copied.take(1)
+    echo taken.name
+    echo labels.len()
+    for label in labels {
+        echo label.name
+    }
+}

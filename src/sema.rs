@@ -1,8 +1,16 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    ast::{BinaryOp, Expression, Function, PrintPart, Program, Statement, StructDef, TypeName},
+    ast::{
+        BinaryOp, EnumDef, Expression, Function, PrintPart, Program, Statement, StructDef,
+        TypeName, VariantDef,
+    },
+    filesystem_ops::FilesystemOp,
+    map_ops::MapOp,
     source::{Diagnostic, Span},
+    string_ops::StringOp,
+    system_ops::SystemOp,
+    vector_ops::VecOp,
 };
 
 const MAX_STRUCT_NESTING: usize = 64;
@@ -20,8 +28,445 @@ pub enum Type {
     F32,
     F64,
     Str,
+    OwnedString,
+    Char,
     Bool,
     Struct(usize),
+    Vec(usize),
+    Map(usize),
+    Enum(usize),
+    Array(usize),
+    Slice(usize),
+    Reference(usize, bool),
+    RawPointer(usize),
+    FunctionPointer(usize),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionPointerSignature {
+    pub parameters: Vec<Type>,
+    pub result: Option<Type>,
+    pub extern_c: bool,
+}
+
+static FUNCTION_POINTER_TYPES: Mutex<Vec<FunctionPointerSignature>> = Mutex::new(Vec::new());
+
+pub fn intern_function_pointer(signature: FunctionPointerSignature) -> usize {
+    let mut signatures = FUNCTION_POINTER_TYPES
+        .lock()
+        .expect("function pointer type registry");
+    if let Some(index) = signatures.iter().position(|known| *known == signature) {
+        index
+    } else {
+        signatures.push(signature);
+        signatures.len() - 1
+    }
+}
+
+pub fn function_pointer_info(id: usize) -> FunctionPointerSignature {
+    FUNCTION_POINTER_TYPES
+        .lock()
+        .expect("function pointer type registry")[id]
+        .clone()
+}
+
+fn is_c_abi_scalar(ty: Type) -> bool {
+    matches!(
+        ty,
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::F32
+            | Type::F64
+            | Type::Bool
+    )
+}
+
+fn is_c_abi_parameter(ty: Type, structs: &[RynStruct]) -> bool {
+    is_c_abi_scalar(ty)
+        || matches!(ty, Type::Char | Type::RawPointer(_))
+        || is_c_abi_record(ty, structs)
+}
+
+fn signature_has_record(signature: &FunctionPointerSignature) -> bool {
+    signature
+        .parameters
+        .iter()
+        .chain(signature.result.iter())
+        .any(|ty| matches!(ty, Type::Struct(_)))
+}
+
+fn is_c_abi_record(ty: Type, structs: &[RynStruct]) -> bool {
+    matches!(ty, Type::Struct(id)
+        if structs[id].repr_c
+            && (structs[id].fields.len() == 1
+                && is_c_abi_record_member(structs[id].fields[0].ty)
+                || c_abi_packed_record_layout(id, structs).is_some()))
+}
+
+fn c_abi_packed_record_layout(
+    id: usize,
+    structs: &[RynStruct],
+) -> Option<(usize, Vec<(usize, Type)>)> {
+    let fields = &structs[id].fields;
+    if fields.is_empty() {
+        return None;
+    }
+    let mut offset = 0_usize;
+    let mut aggregate_align = 1_usize;
+    let mut layout = Vec::with_capacity(fields.len());
+    for field in fields {
+        let (size, align) = c_abi_scalar_field_layout(field.ty)?;
+        offset = align_up(offset, align);
+        layout.push((offset, field.ty));
+        offset = offset.checked_add(size)?;
+        aggregate_align = aggregate_align.max(align);
+    }
+    let size = align_up(offset, aggregate_align);
+    matches!(size, 1 | 2 | 4 | 8).then_some((size, layout))
+}
+
+fn c_abi_scalar_field_layout(ty: Type) -> Option<(usize, usize)> {
+    match ty {
+        Type::I8 | Type::U8 | Type::Bool => Some((1, 1)),
+        Type::I16 | Type::U16 => Some((2, 2)),
+        Type::I32 | Type::U32 | Type::Char => Some((4, 4)),
+        Type::F32 => Some((4, 4)),
+        Type::I64 | Type::U64 | Type::F64 => Some((8, 8)),
+        _ => None,
+    }
+}
+
+fn align_up(value: usize, alignment: usize) -> usize {
+    value.saturating_add(alignment - 1) / alignment * alignment
+}
+
+fn is_c_abi_record_member(ty: Type) -> bool {
+    matches!(
+        ty,
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::F32
+            | Type::F64
+            | Type::Bool
+            | Type::Char
+    )
+}
+
+use std::sync::Mutex;
+
+static VEC_ELEMS: Mutex<Vec<Type>> = Mutex::new(Vec::new());
+
+pub fn intern_vec_elem(elem: Type) -> usize {
+    let mut elems = VEC_ELEMS.lock().expect("vec element registry");
+    if let Some(index) = elems.iter().position(|known| *known == elem) {
+        index
+    } else {
+        elems.push(elem);
+        elems.len() - 1
+    }
+}
+
+pub fn vec_elem(id: usize) -> Type {
+    VEC_ELEMS
+        .lock()
+        .expect("vec element registry")
+        .get(id)
+        .copied()
+        .expect("vec element id")
+}
+
+static ARRAYS: Mutex<Vec<(Type, usize)>> = Mutex::new(Vec::new());
+
+pub fn intern_array(element: Type, length: usize) -> usize {
+    let mut arrays = ARRAYS.lock().expect("array type registry");
+    if let Some(index) = arrays.iter().position(|known| *known == (element, length)) {
+        index
+    } else {
+        arrays.push((element, length));
+        arrays.len() - 1
+    }
+}
+
+pub fn array_info(id: usize) -> (Type, usize) {
+    ARRAYS.lock().expect("array type registry")[id]
+}
+
+static MAP_TYPES: Mutex<Vec<(Type, Type)>> = Mutex::new(Vec::new());
+
+static POINTER_TYPES: Mutex<Vec<Type>> = Mutex::new(Vec::new());
+
+pub fn intern_pointer_target(target: Type) -> usize {
+    let mut targets = POINTER_TYPES.lock().expect("pointer type registry");
+    if let Some(index) = targets.iter().position(|known| *known == target) {
+        index
+    } else {
+        targets.push(target);
+        targets.len() - 1
+    }
+}
+
+pub fn pointer_target(id: usize) -> Type {
+    POINTER_TYPES.lock().expect("pointer type registry")[id]
+}
+
+pub fn intern_map(key: Type, value: Type) -> usize {
+    let mut maps = MAP_TYPES.lock().expect("Map type registry");
+    if let Some(index) = maps.iter().position(|known| *known == (key, value)) {
+        index
+    } else {
+        maps.push((key, value));
+        maps.len() - 1
+    }
+}
+
+pub fn map_info(id: usize) -> (Type, Type) {
+    MAP_TYPES.lock().expect("Map type registry")[id]
+}
+
+fn contains_custom_drop(
+    ty: Type,
+    structs: &[RynStruct],
+    enums: &[RynEnum],
+    seen_structs: &mut HashSet<usize>,
+    seen_enums: &mut HashSet<usize>,
+    depth: usize,
+) -> bool {
+    if depth > MAX_STRUCT_NESTING {
+        return false;
+    }
+    match ty {
+        Type::Struct(id) => {
+            if structs[id].drop_function.is_some() {
+                return true;
+            }
+            seen_structs.insert(id)
+                && structs[id].fields.iter().any(|field| {
+                    contains_custom_drop(
+                        field.ty,
+                        structs,
+                        enums,
+                        seen_structs,
+                        seen_enums,
+                        depth + 1,
+                    )
+                })
+        }
+        Type::Array(id) => contains_custom_drop(
+            array_info(id).0,
+            structs,
+            enums,
+            seen_structs,
+            seen_enums,
+            depth + 1,
+        ),
+        Type::Vec(id) => contains_custom_drop(
+            vec_elem(id),
+            structs,
+            enums,
+            seen_structs,
+            seen_enums,
+            depth + 1,
+        ),
+        Type::Map(id) => {
+            let (key, value) = map_info(id);
+            contains_custom_drop(key, structs, enums, seen_structs, seen_enums, depth + 1)
+                || contains_custom_drop(value, structs, enums, seen_structs, seen_enums, depth + 1)
+        }
+        Type::Enum(id) => {
+            seen_enums.insert(id)
+                && enums[id].variants.iter().any(|variant| {
+                    variant.fields.iter().any(|field| {
+                        contains_custom_drop(
+                            *field,
+                            structs,
+                            enums,
+                            seen_structs,
+                            seen_enums,
+                            depth + 1,
+                        )
+                    })
+                })
+        }
+        _ => false,
+    }
+}
+
+fn custom_drop_struct_fields_only(
+    ty: Type,
+    structs: &[RynStruct],
+    enums: &[RynEnum],
+    depth: usize,
+) -> bool {
+    if depth > MAX_STRUCT_NESTING {
+        return false;
+    }
+    let Type::Struct(id) = ty else {
+        return false;
+    };
+    if structs[id].drop_function.is_some() {
+        return true;
+    }
+    structs[id].fields.iter().all(|field| {
+        let nested_custom_drop = contains_custom_drop(
+            field.ty,
+            structs,
+            enums,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            depth + 1,
+        );
+        if !nested_custom_drop {
+            return true;
+        }
+        match field.ty {
+            Type::Struct(_) => custom_drop_struct_fields_only(field.ty, structs, enums, depth + 1),
+            Type::Vec(_) => custom_drop_vec_only(field.ty, structs, enums),
+            Type::Map(_) => custom_drop_map_only(field.ty, structs, enums),
+            _ => false,
+        }
+    })
+}
+
+fn custom_drop_array_only(ty: Type, structs: &[RynStruct], enums: &[RynEnum]) -> bool {
+    match ty {
+        Type::Array(id) => {
+            let element = array_info(id).0;
+            custom_drop_array_only(element, structs, enums)
+                || custom_drop_struct_fields_only(element, structs, enums, 0)
+        }
+        _ => false,
+    }
+}
+
+fn custom_drop_vec_only(ty: Type, structs: &[RynStruct], enums: &[RynEnum]) -> bool {
+    let Type::Vec(id) = ty else {
+        return false;
+    };
+    let element = vec_elem(id);
+    contains_custom_drop(
+        element,
+        structs,
+        enums,
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+        0,
+    ) && custom_drop_struct_fields_only(element, structs, enums, 0)
+}
+
+fn custom_drop_map_only(ty: Type, structs: &[RynStruct], enums: &[RynEnum]) -> bool {
+    let Type::Map(id) = ty else {
+        return false;
+    };
+    let value = map_info(id).1;
+    contains_custom_drop(
+        value,
+        structs,
+        enums,
+        &mut HashSet::new(),
+        &mut HashSet::new(),
+        0,
+    ) && custom_drop_struct_fields_only(value, structs, enums, 0)
+}
+
+fn map_value_struct(ty: Type) -> Option<usize> {
+    let Type::Map(id) = ty else {
+        return None;
+    };
+    match map_info(id).1 {
+        Type::Struct(struct_id) => Some(struct_id),
+        _ => None,
+    }
+}
+
+fn map_payload_type_supported(ty: Type, structs: &[RynStruct], depth: usize) -> bool {
+    if depth > MAX_STRUCT_NESTING {
+        return false;
+    }
+    match ty {
+        Type::Str | Type::Slice(_) => false,
+        Type::Struct(id) => {
+            structs[id].drop_function.is_none()
+                && structs[id]
+                    .fields
+                    .iter()
+                    .all(|field| map_payload_type_supported(field.ty, structs, depth + 1))
+        }
+        Type::Array(id) => map_payload_type_supported(array_info(id).0, structs, depth + 1),
+        Type::Vec(id) => map_payload_type_supported(vec_elem(id), structs, depth + 1),
+        Type::Map(id) => {
+            let (key, value) = map_info(id);
+            map_payload_type_supported(key, structs, depth + 1)
+                && map_payload_type_supported(value, structs, depth + 1)
+        }
+        _ => true,
+    }
+}
+
+fn enum_payload_struct_supported(ty: Type, structs: &[RynStruct], depth: usize) -> bool {
+    if depth > MAX_STRUCT_NESTING {
+        return false;
+    }
+    match ty {
+        Type::Str | Type::Slice(_) => false,
+        Type::Struct(id) => {
+            structs[id].drop_function.is_none()
+                && structs[id]
+                    .fields
+                    .iter()
+                    .all(|field| enum_payload_struct_supported(field.ty, structs, depth + 1))
+        }
+        Type::Array(id) => enum_payload_struct_supported(array_info(id).0, structs, depth + 1),
+        Type::Vec(id) => enum_payload_struct_supported(vec_elem(id), structs, depth + 1),
+        Type::Map(id) => {
+            let (key, value) = map_info(id);
+            enum_payload_struct_supported(key, structs, depth + 1)
+                && enum_payload_struct_supported(value, structs, depth + 1)
+        }
+        _ => true,
+    }
+}
+
+fn map_struct_value_supported(ty: Type, structs: &[RynStruct], enums: &[RynEnum]) -> bool {
+    map_value_struct(ty).is_none_or(|struct_id| {
+        let value_type = Type::Struct(struct_id);
+        let has_custom_drop = contains_custom_drop(
+            value_type,
+            structs,
+            enums,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            0,
+        );
+        structs[struct_id].drop_function.is_some()
+            || (has_custom_drop && custom_drop_struct_fields_only(value_type, structs, enums, 0))
+            || map_payload_type_supported(value_type, structs, 0)
+    })
+}
+
+#[derive(Clone, Debug)]
+pub struct RynArmBinding {
+    pub slot: usize,
+    pub ty: Type,
+    pub field_index: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct RynMatchArm {
+    pub variant: Option<usize>,
+    pub bindings: Vec<RynArmBinding>,
+    pub body: IrExpression,
 }
 
 #[derive(Clone, Debug)]
@@ -29,8 +474,14 @@ pub enum IrExpression {
     Integer(i128, Type),
     Float(f64, Type),
     String(String),
+    Character(char),
     Boolean(bool),
     Local {
+        slot: usize,
+        ty: Type,
+        span: Span,
+    },
+    Move {
         slot: usize,
         ty: Type,
     },
@@ -43,6 +494,7 @@ pub enum IrExpression {
         struct_id: usize,
         field_index: usize,
         ty: Type,
+        span: Span,
     },
     Call {
         target: IrCallTarget,
@@ -55,6 +507,60 @@ pub enum IrExpression {
         else_value: Box<IrExpression>,
         ty: Type,
     },
+    EnumMatch {
+        value: Box<IrExpression>,
+        enum_id: usize,
+        arms: Vec<RynMatchArm>,
+        ty: Type,
+    },
+    Propagate {
+        value: Box<IrExpression>,
+        input_enum: usize,
+        output_enum: usize,
+        success_type: Type,
+        failure_type: Option<Type>,
+        success_variant: usize,
+        failure_variant: usize,
+        output_failure_variant: usize,
+    },
+    ArrayValue(Vec<IrExpression>),
+    ArrayAsSlice {
+        array: Box<IrExpression>,
+        slice_id: usize,
+        length: usize,
+    },
+    ArrayIndex {
+        array: Box<IrExpression>,
+        index: Box<IrExpression>,
+        ty: Type,
+        length: usize,
+    },
+    SliceIndex {
+        slice: Box<IrExpression>,
+        index: Box<IrExpression>,
+        ty: Type,
+    },
+    SliceElementAddress {
+        slice: Box<IrExpression>,
+        index: Box<IrExpression>,
+        ty: Type,
+        span: Span,
+    },
+    AddressOf {
+        slot: usize,
+        ty: Type,
+        pointer_type: Type,
+        span: Span,
+    },
+    Dereference {
+        pointer: Box<IrExpression>,
+        ty: Type,
+    },
+    StringFindOption {
+        value: Box<IrExpression>,
+        enum_id: usize,
+    },
+    StringAsStr(Box<IrExpression>),
     Binary {
         op: BinaryOp,
         left: Box<IrExpression>,
@@ -64,6 +570,10 @@ pub enum IrExpression {
     Negate(Box<IrExpression>, Type),
     Not(Box<IrExpression>),
     BitNot(Box<IrExpression>, Type),
+    FunctionAddress {
+        function: usize,
+        ty: Type,
+    },
     Cast {
         value: Box<IrExpression>,
         source: Type,
@@ -73,13 +583,32 @@ pub enum IrExpression {
 
 #[derive(Clone, Debug)]
 pub enum IrStatement {
+    Block(Vec<IrStatement>),
+    Drop {
+        slots: Vec<(usize, Type)>,
+    },
     Let {
         slot: usize,
         ty: Type,
         value: IrExpression,
+        span: Span,
     },
     Assign {
         slot: usize,
+        ty: Type,
+        value: IrExpression,
+        span: Span,
+    },
+    ArrayAssign {
+        slot: usize,
+        element: Type,
+        length: usize,
+        index: IrExpression,
+        value: IrExpression,
+        span: Span,
+    },
+    DereferenceAssign {
+        pointer: IrExpression,
         ty: Type,
         value: IrExpression,
     },
@@ -126,6 +655,17 @@ pub enum IrCallTarget {
     Function(usize),
     ArgumentCount,
     Argument,
+    String(StringOp),
+    Filesystem(FilesystemOp),
+    TryReadFile(usize),
+    ReadFileResult(usize),
+    System(SystemOp),
+    IndirectFunctionPointer(usize),
+    Vec(VecOp, usize),
+    VecSlice(usize),
+    SliceLen,
+    Map(MapOp, usize),
+    EnumNew { enum_id: usize, tag: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +683,7 @@ pub enum LocalType {
     F32,
     F64,
     Ptr,
+    OwnedPtr,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -154,10 +695,14 @@ pub struct LocalBinding {
 #[derive(Debug)]
 pub struct RynFunction {
     pub parameters: Vec<LocalBinding>,
+    pub external_symbol: Option<String>,
     pub return_type: Option<Type>,
+    pub reference_return_parameter: Option<usize>,
     pub return_value: Option<IrExpression>,
     pub statements: Vec<IrStatement>,
     pub local_types: Vec<LocalType>,
+    pub owned_slot_types: Vec<Option<Type>>,
+    pub addressed_slot_types: Vec<Option<Type>>,
 }
 
 #[derive(Debug)]
@@ -165,6 +710,19 @@ pub struct RynIr {
     pub functions: Vec<RynFunction>,
     pub main_index: usize,
     pub structs: Vec<RynStruct>,
+    pub enums: Vec<RynEnum>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RynEnum {
+    pub name: String,
+    pub variants: Vec<RynEnumVariant>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RynEnumVariant {
+    pub name: String,
+    pub fields: Vec<Type>,
 }
 
 #[derive(Clone, Debug)]
@@ -172,6 +730,8 @@ pub struct RynStruct {
     pub name: String,
     pub fields: Vec<RynStructField>,
     pub slot_count: usize,
+    pub repr_c: bool,
+    pub drop_function: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -193,6 +753,7 @@ struct FunctionSignature {
     target: IrCallTarget,
     parameters: Vec<Type>,
     return_type: Option<Type>,
+    is_destructor: bool,
 }
 
 pub fn analyze(program: Program) -> Result<RynIr, Diagnostic> {
@@ -208,9 +769,95 @@ pub fn analyze_recovering(program: Program) -> Result<RynIr, Vec<Diagnostic>> {
     analyze_with_recovery(program, true)
 }
 
-fn analyze_with_recovery(program: Program, recover_errors: bool) -> Result<RynIr, Vec<Diagnostic>> {
+fn analyze_with_recovery(
+    mut program: Program,
+    recover_errors: bool,
+) -> Result<RynIr, Vec<Diagnostic>> {
+    program = crate::generics::monomorphize(program).map_err(|diagnostic| vec![diagnostic])?;
+    if !program.enums.iter().any(is_option_u64_ast) {
+        program.enums.push(EnumDef {
+            name: "$RynOption#FindU64".into(),
+            type_parameters: Vec::new(),
+            variants: vec![
+                VariantDef {
+                    name: "Some".into(),
+                    fields: vec![TypeName::U64],
+                    span: Span::default(),
+                },
+                VariantDef {
+                    name: "None".into(),
+                    fields: Vec::new(),
+                    span: Span::default(),
+                },
+            ],
+            public: false,
+            module_path: String::new(),
+            span: Span::default(),
+        });
+    }
+    if !program.enums.iter().any(is_option_string_ast) {
+        program.enums.push(EnumDef {
+            name: "$RynOption#FileString".into(),
+            type_parameters: Vec::new(),
+            variants: vec![
+                VariantDef {
+                    name: "Some".into(),
+                    fields: vec![TypeName::OwnedString],
+                    span: Span::default(),
+                },
+                VariantDef {
+                    name: "None".into(),
+                    fields: Vec::new(),
+                    span: Span::default(),
+                },
+            ],
+            public: false,
+            module_path: String::new(),
+            span: Span::default(),
+        });
+    }
+    for (option_name, payload) in [
+        ("I8", TypeName::I8),
+        ("I16", TypeName::I16),
+        ("I32", TypeName::I32),
+        ("I64", TypeName::I64),
+        ("U8", TypeName::U8),
+        ("U16", TypeName::U16),
+        ("U32", TypeName::U32),
+        ("U64", TypeName::U64),
+        ("F32", TypeName::F32),
+        ("F64", TypeName::F64),
+    ] {
+        if !program
+            .enums
+            .iter()
+            .any(|definition| is_option_ast_payload(definition, &payload))
+        {
+            program.enums.push(EnumDef {
+                name: format!("$RynOption#TryParse{option_name}"),
+                type_parameters: Vec::new(),
+                variants: vec![
+                    VariantDef {
+                        name: "Some".into(),
+                        fields: vec![payload],
+                        span: Span::default(),
+                    },
+                    VariantDef {
+                        name: "None".into(),
+                        fields: Vec::new(),
+                        span: Span::default(),
+                    },
+                ],
+                public: false,
+                module_path: String::new(),
+                span: Span::default(),
+            });
+        }
+    }
     let mut struct_ids = HashMap::new();
+    let mut enum_ids = HashMap::new();
     let mut declaration_errors = Vec::new();
+    let mut struct_name_concepts = HashSet::<&str>::new();
     for (index, definition) in program.structs.iter().enumerate() {
         if struct_ids.insert(definition.name.clone(), index).is_some() {
             let diagnostic = diag(
@@ -223,6 +870,155 @@ fn analyze_with_recovery(program: Program, recover_errors: bool) -> Result<RynIr
                 declaration_errors.push(diagnostic);
             } else {
                 return Err(vec![diagnostic]);
+            }
+        } else {
+            struct_name_concepts.insert(definition.name.as_str());
+        }
+    }
+    for (index, definition) in program.enums.iter().enumerate() {
+        if enum_ids.insert(definition.name.clone(), index).is_some() {
+            let diagnostic = diag(
+                "R0238",
+                format!("duplicate enum `{}`", definition.name),
+                definition.span,
+            )
+            .with_help("give each enum a unique name");
+            if recover_errors {
+                declaration_errors.push(diagnostic);
+            } else {
+                return Err(vec![diagnostic]);
+            }
+        } else if struct_name_concepts.contains(definition.name.as_str()) {
+            let diagnostic = diag(
+                "R0238",
+                format!(
+                    "enum `{}` has the same name as a structure",
+                    definition.name
+                ),
+                definition.span,
+            )
+            .with_help("give each type a unique name");
+            if recover_errors {
+                declaration_errors.push(diagnostic);
+            } else {
+                return Err(vec![diagnostic]);
+            }
+        }
+    }
+    // Also reject a struct declared after a same-named enum.
+    for definition in &program.structs {
+        if enum_ids.contains_key(&definition.name) {
+            let diagnostic = diag(
+                "R0238",
+                format!(
+                    "structure `{}` has the same name as an enum",
+                    definition.name
+                ),
+                definition.span,
+            )
+            .with_help("give each type a unique name");
+            if recover_errors {
+                declaration_errors.push(diagnostic);
+            } else {
+                return Err(vec![diagnostic]);
+            }
+        }
+    }
+    for import in &program.uses {
+        let module_path = import.path.join("::");
+        let Some(alias) = import.path.last() else {
+            continue;
+        };
+        for (index, definition) in program
+            .structs
+            .iter()
+            .enumerate()
+            .filter(|(_, definition)| definition.public && definition.module_path == module_path)
+        {
+            let alias_name = format!("{alias}::{}", definition.name);
+            if struct_ids
+                .insert(alias_name.clone(), index)
+                .is_some_and(|existing| existing != index)
+            {
+                return Err(vec![diag(
+                    "R0424",
+                    format!("module alias `{alias_name}` refers to multiple types"),
+                    import.span,
+                )]);
+            }
+        }
+        for (index, definition) in
+            program.enums.iter().enumerate().filter(|(_, definition)| {
+                definition.public && definition.module_path == module_path
+            })
+        {
+            let alias_name = format!("{alias}::{}", definition.name);
+            if enum_ids
+                .insert(alias_name.clone(), index)
+                .is_some_and(|existing| existing != index)
+            {
+                return Err(vec![diag(
+                    "R0424",
+                    format!("module alias `{alias_name}` refers to multiple types"),
+                    import.span,
+                )]);
+            }
+        }
+    }
+    let mut type_names = struct_ids
+        .keys()
+        .chain(enum_ids.keys())
+        .cloned()
+        .collect::<HashSet<_>>();
+    for alias in &program.type_aliases {
+        let builtin = matches!(
+            alias.name.as_str(),
+            "i8" | "i16"
+                | "i32"
+                | "i64"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "f32"
+                | "f64"
+                | "str"
+                | "String"
+                | "char"
+                | "bool"
+                | "Vec"
+                | "Map"
+                | "HashMap"
+                | "Set"
+                | "Option"
+                | "Result"
+        );
+        if builtin || !type_names.insert(alias.name.clone()) {
+            let diagnostic = diag(
+                "R0241",
+                format!(
+                    "type alias `{}` conflicts with an existing type",
+                    alias.name
+                ),
+                alias.span,
+            )
+            .with_help("give each declared type and alias a unique name");
+            if recover_errors {
+                declaration_errors.push(diagnostic);
+            } else {
+                return Err(vec![diagnostic]);
+            }
+        }
+    }
+    for alias in &program.type_aliases {
+        if !alias.type_parameters.is_empty() {
+            continue;
+        }
+        if let Err(error) = resolve_type_name(&alias.ty, &struct_ids, &enum_ids) {
+            if recover_errors {
+                declaration_errors.push(error);
+            } else {
+                return Err(vec![error]);
             }
         }
     }
@@ -247,14 +1043,15 @@ fn analyze_with_recovery(program: Program, recover_errors: bool) -> Result<RynIr
             return Err(declaration_errors);
         }
 
-        let mut struct_errors = collect_struct_declaration_errors(&program.structs, &struct_ids);
+        let mut struct_errors =
+            collect_struct_declaration_errors(&program.structs, &struct_ids, &enum_ids);
         if !struct_errors.is_empty() {
             struct_errors.sort_by_key(|diagnostic| diagnostic.span.start);
             return Err(struct_errors);
         }
 
         let mut signature_errors =
-            collect_function_signature_errors(&program.functions, &struct_ids);
+            collect_function_signature_errors(&program.functions, &struct_ids, &enum_ids);
         if !signature_errors.is_empty() {
             signature_errors.sort_by_key(|diagnostic| diagnostic.span.start);
             return Err(signature_errors);
@@ -267,10 +1064,48 @@ fn analyze_with_recovery(program: Program, recover_errors: bool) -> Result<RynIr
             return Err(layout_cycle_errors);
         }
     }
-    let structs =
-        resolve_struct_layouts(&program.structs, &struct_ids).map_err(|error| vec![error])?;
+    let mut structs = resolve_struct_layouts(&program.structs, &struct_ids, &enum_ids)
+        .map_err(|error| vec![error])?;
+    let enums = resolve_enum_layouts(&program.enums, &structs, &struct_ids, &enum_ids)
+        .map_err(|error| vec![error])?;
+    for definition in &structs {
+        for field in &definition.fields {
+            validate_array_supported(field.ty, &structs, Span::default())
+                .map_err(|error| vec![error])?;
+            validate_vec_struct_elements(
+                field.ty,
+                &structs,
+                program
+                    .structs
+                    .iter()
+                    .find(|source| source.name == definition.name)
+                    .map_or(Span::default(), |source| source.span),
+            )
+            .map_err(|error| vec![error])?;
+        }
+    }
+    for definition in &enums {
+        for variant in &definition.variants {
+            for field in &variant.fields {
+                validate_array_supported(*field, &structs, Span::default())
+                    .map_err(|error| vec![error])?;
+                validate_vec_struct_elements(*field, &structs, Span::default())
+                    .map_err(|error| vec![error])?;
+            }
+        }
+    }
     let mut signatures = HashMap::new();
     let mut main_index = None;
+    let function_module_paths = program
+        .functions
+        .iter()
+        .map(|function| function.module_path.clone())
+        .collect::<Vec<_>>();
+    let function_visibility = program
+        .functions
+        .iter()
+        .map(|function| function.public)
+        .collect::<Vec<_>>();
     for (index, function) in program.functions.iter().enumerate() {
         if signatures.contains_key(&function.name) {
             return Err(vec![
@@ -285,15 +1120,56 @@ fn analyze_with_recovery(program: Program, recover_errors: bool) -> Result<RynIr
             ]);
         }
         let signature_result = (|| {
+            let namespace = declaration_namespace(&function.name, &function.module_path);
             let mut parameters = Vec::with_capacity(function.parameters.len());
             for parameter in &function.parameters {
-                parameters.push(resolve_type_name(&parameter.ty, &struct_ids)?);
+                let ty = resolve_type_name_scoped(
+                    &parameter.ty,
+                    &struct_ids,
+                    &enum_ids,
+                    namespace.as_deref(),
+                )?;
+                validate_array_supported(ty, &structs, parameter.span)?;
+                parameters.push(ty);
             }
             let return_type = function
                 .return_type
                 .as_ref()
-                .map(|name| resolve_type_name(name, &struct_ids))
+                .map(|name| {
+                    let ty = resolve_type_name_scoped(
+                        name,
+                        &struct_ids,
+                        &enum_ids,
+                        namespace.as_deref(),
+                    )?;
+                    validate_array_supported(ty, &structs, function.span)?;
+                    Ok(ty)
+                })
                 .transpose()?;
+            if function.extern_c
+                && (parameters
+                    .iter()
+                    .any(|ty| !is_c_abi_parameter(*ty, &structs))
+                    || return_type.is_some_and(|ty| {
+                        !is_c_abi_scalar(ty)
+                            && !matches!(ty, Type::RawPointer(_))
+                            && !is_c_abi_record(ty, &structs)
+                    }))
+            {
+                return Err(diag(
+                    "R0247",
+                    "`extern \"C\"` supports scalar values, one-field scalar records, and packed integer/float `#[repr(C)]` records of 1, 2, 4, or 8 bytes",
+                    function.span,
+                )
+                .with_help("use scalar values, a one-field scalar record, or an integer record whose C layout is 1, 2, 4, or 8 bytes"));
+            }
+            if function.extern_c && function.name == "main" {
+                return Err(diag(
+                    "R0247",
+                    "`main` must be defined by the Ryn program, not imported from C",
+                    function.span,
+                ));
+            }
             if function.name == "main"
                 && (!function.parameters.is_empty()
                     || return_type.is_some_and(|return_type| return_type != Type::I32))
@@ -303,12 +1179,13 @@ fn analyze_with_recovery(program: Program, recover_errors: bool) -> Result<RynIr
                     "`main` must take no parameters and return either no value or `i32`",
                     function.span,
                 )
-                .with_help("use `fn main() { ... }` or `fn main() -> i32 { ... }`; move reusable work into another function"));
+                .with_help("use `fun main() { ... }` or `fun main() -> i32 { ... }`; move reusable work into another function"));
             }
             Ok(FunctionSignature {
                 target: IrCallTarget::Function(index),
                 parameters,
                 return_type,
+                is_destructor: false,
             })
         })();
         let signature = signature_result.map_err(|diagnostic| vec![diagnostic])?;
@@ -317,10 +1194,219 @@ fn analyze_with_recovery(program: Program, recover_errors: bool) -> Result<RynIr
         }
         signatures.insert(function.name.clone(), signature);
     }
+    for import in &program.uses {
+        let module_path = import.path.join("::");
+        let Some(alias) = import.path.last() else {
+            continue;
+        };
+        let prefix = format!("{module_path}::");
+        for function in program
+            .functions
+            .iter()
+            .filter(|function| function.public && function.module_path == module_path)
+        {
+            let Some(suffix) = function.name.strip_prefix(&prefix) else {
+                continue;
+            };
+            let alias_name = format!("{alias}::{suffix}");
+            let signature = signatures[&function.name].clone();
+            if let Some(existing) = signatures.get(&alias_name) {
+                if !matches!(
+                    (existing.target, signature.target),
+                    (IrCallTarget::Function(left), IrCallTarget::Function(right)) if left == right
+                ) {
+                    return Err(vec![diag(
+                        "R0424",
+                        format!("module alias `{alias_name}` refers to multiple symbols"),
+                        import.span,
+                    )]);
+                }
+            } else {
+                signatures.insert(alias_name, signature);
+            }
+        }
+    }
+    let mut destructor_owners = HashSet::new();
+    for (struct_id, definition) in program.structs.iter().enumerate() {
+        let Some(drop_name) = &definition.drop_function else {
+            continue;
+        };
+        let Some(signature) = signatures.get(drop_name) else {
+            return Err(vec![diag(
+                "R0255",
+                format!("destructor function `{drop_name}` was not found"),
+                definition.span,
+            )]);
+        };
+        let IrCallTarget::Function(function_id) = signature.target else {
+            return Err(vec![diag(
+                "R0255",
+                "a destructor must name a Ryn function",
+                definition.span,
+            )]);
+        };
+        let function = &program.functions[function_id];
+        if function.public
+            || function.extern_c
+            || !function.type_parameters.is_empty()
+            || signature.parameters != [Type::Struct(struct_id)]
+            || signature.return_type.is_some()
+            || !destructor_owners.insert(function_id)
+        {
+            return Err(vec![diag(
+                "R0255",
+                "a destructor must be a private, non-generic `fun drop(value: ThisStruct)` with no return value, and can belong to only one struct",
+                definition.span,
+            )]);
+        }
+        if definition.repr_c
+            || structs[struct_id]
+                .fields
+                .first()
+                .is_none_or(|field| !matches!(field.ty, Type::RawPointer(_)))
+            || structs[struct_id].fields.iter().any(|field| {
+                !matches!(
+                    field.ty,
+                    Type::I8
+                        | Type::I16
+                        | Type::I32
+                        | Type::I64
+                        | Type::U8
+                        | Type::U16
+                        | Type::U32
+                        | Type::U64
+                        | Type::F32
+                        | Type::F64
+                        | Type::Bool
+                        | Type::Char
+                        | Type::RawPointer(_)
+                )
+            })
+        {
+            return Err(vec![diag(
+                "R0255",
+                "custom destructors currently require non-`repr(C)` structs with scalar or raw-pointer fields",
+                definition.span,
+            )]);
+        }
+        structs[struct_id].drop_function = Some(function_id);
+        signatures.get_mut(drop_name).unwrap().is_destructor = true;
+    }
+    for definition in &structs {
+        for field in &definition.fields {
+            if !map_struct_value_supported(field.ty, &structs, &enums) {
+                return Err(vec![diag(
+                    "R0244",
+                    "Map struct values must support a generated clone/drop plan; this value type has no supported Map layout",
+                    program
+                        .structs
+                        .iter()
+                        .find(|source| source.name == definition.name)
+                        .map_or(Span::default(), |source| source.span),
+                )]);
+            }
+            let mut seen_structs = HashSet::new();
+            let mut seen_enums = HashSet::new();
+            if contains_custom_drop(
+                field.ty,
+                &structs,
+                &enums,
+                &mut seen_structs,
+                &mut seen_enums,
+                0,
+            ) && !custom_drop_struct_fields_only(field.ty, &structs, &enums, 0)
+                && !custom_drop_vec_only(field.ty, &structs, &enums)
+                && !custom_drop_map_only(field.ty, &structs, &enums)
+            {
+                return Err(vec![diag(
+                    "R0255",
+                    "custom-destructor values may be nested through ordinary struct fields, move-only Vec elements, and move-only Map values; arrays and enum payloads remain restricted",
+                    program
+                        .structs
+                        .iter()
+                        .find(|source| source.name == definition.name)
+                        .map_or(Span::default(), |source| source.span),
+                )]);
+            }
+        }
+    }
+    for definition in &enums {
+        if !definition.name.starts_with("$RynOption#")
+            && definition
+                .variants
+                .iter()
+                .flat_map(|variant| &variant.fields)
+                .any(|ty| !map_struct_value_supported(*ty, &structs, &enums))
+        {
+            return Err(vec![diag(
+                "R0244",
+                "Map struct values must support a generated clone/drop plan; this value type has no supported Map layout",
+                Span::default(),
+            )]);
+        }
+        if !definition.name.starts_with("$RynOption#")
+            && definition
+                .variants
+                .iter()
+                .flat_map(|variant| &variant.fields)
+                .any(|ty| {
+                    let mut seen_structs = HashSet::new();
+                    let mut seen_enums = HashSet::new();
+                    contains_custom_drop(
+                        *ty,
+                        &structs,
+                        &enums,
+                        &mut seen_structs,
+                        &mut seen_enums,
+                        0,
+                    )
+                })
+        {
+            return Err(vec![diag(
+                "R0255",
+                "custom-destructor values cannot be stored in enum payloads yet",
+                Span::default(),
+            )]);
+        }
+    }
+    for function in &program.functions {
+        let Some(signature) = signatures.get(&function.name) else {
+            continue;
+        };
+        for ty in signature
+            .parameters
+            .iter()
+            .copied()
+            .chain(signature.return_type)
+        {
+            let mut seen_structs = HashSet::new();
+            let mut seen_enums = HashSet::new();
+            if contains_custom_drop(ty, &structs, &enums, &mut seen_structs, &mut seen_enums, 0)
+                && !matches!(ty, Type::Struct(id) if structs[id].drop_function.is_some())
+                && !custom_drop_array_only(ty, &structs, &enums)
+                && !custom_drop_vec_only(ty, &structs, &enums)
+                && !custom_drop_map_only(ty, &structs, &enums)
+                && !custom_drop_struct_fields_only(ty, &structs, &enums, 0)
+            {
+                return Err(vec![diag(
+                    "R0255",
+                    "custom-destructor values may only be nested through ordinary struct fields; collections, arrays, and enum payloads remain unsupported",
+                    function.span,
+                )]);
+            }
+            if !map_struct_value_supported(ty, &structs, &enums) {
+                return Err(vec![diag(
+                    "R0244",
+                    "Map struct values must support a generated clone/drop plan; this value type has no supported Map layout",
+                    function.span,
+                )]);
+            }
+        }
+    }
     let Some(main_index) = main_index else {
         return Err(vec![
-            diag("R0200", "program must define `fn main()`", Span::default())
-                .with_help("add a top-level `fn main() { ... }` function"),
+            diag("R0200", "program must define `fun main()`", Span::default())
+                .with_help("add a top-level `fun main() { ... }` function"),
         ]);
     };
     let mut functions = Vec::with_capacity(program.functions.len());
@@ -333,7 +1419,15 @@ fn analyze_with_recovery(program: Program, recover_errors: bool) -> Result<RynIr
                 continue;
             }
         }
-        let analyzer = Analyzer::new(&signatures, &structs, &struct_ids);
+        let analyzer = Analyzer::new(
+            &signatures,
+            &mut structs,
+            &struct_ids,
+            &enums,
+            &enum_ids,
+            &function_module_paths,
+            &function_visibility,
+        );
         if recover_errors {
             match analyzer.function_recovering(function) {
                 Ok(function) => functions.push(function),
@@ -350,21 +1444,86 @@ fn analyze_with_recovery(program: Program, recover_errors: bool) -> Result<RynIr
         diagnostics.sort_by_key(|diagnostic| diagnostic.span.start);
         return Err(diagnostics);
     }
-    Ok(RynIr {
+    let mut ir = RynIr {
         functions,
         main_index,
         structs,
-    })
+        enums,
+    };
+    crate::guard::check(&mut ir).map_err(|error| vec![error])?;
+    Ok(ir)
+}
+
+fn is_option_u64_ast(definition: &EnumDef) -> bool {
+    definition.name.starts_with("$RynOption")
+        && definition.variants.len() == 2
+        && definition.variants[0].name == "Some"
+        && definition.variants[0].fields == [TypeName::U64]
+        && definition.variants[1].name == "None"
+        && definition.variants[1].fields.is_empty()
+}
+
+fn is_option_string_ast(definition: &EnumDef) -> bool {
+    definition.name.starts_with("$RynOption")
+        && definition.variants.len() == 2
+        && definition.variants[0].name == "Some"
+        && definition.variants[0].fields == [TypeName::OwnedString]
+        && definition.variants[1].name == "None"
+        && definition.variants[1].fields.is_empty()
+}
+
+fn is_option_ast_payload(definition: &EnumDef, payload: &TypeName) -> bool {
+    definition.name.starts_with("$RynOption")
+        && definition.variants.len() == 2
+        && definition.variants[0].name == "Some"
+        && definition.variants[0].fields == [payload.clone()]
+        && definition.variants[1].name == "None"
+        && definition.variants[1].fields.is_empty()
+}
+
+fn is_option_u64(definition: &RynEnum) -> bool {
+    definition.name.starts_with("$RynOption")
+        && definition.variants.len() == 2
+        && definition.variants[0].name == "Some"
+        && definition.variants[0].fields == [Type::U64]
+        && definition.variants[1].name == "None"
+        && definition.variants[1].fields.is_empty()
+}
+
+fn is_option_of(definition: &RynEnum, value: Type) -> bool {
+    definition.name.starts_with("$RynOption#")
+        && definition.variants.len() == 2
+        && definition.variants[0].name == "Some"
+        && definition.variants[0].fields == [value]
+        && definition.variants[1].name == "None"
+        && definition.variants[1].fields.is_empty()
+}
+
+fn is_result_of(definition: &RynEnum, value: Type, error: Type) -> bool {
+    definition.name.starts_with("$RynResult#")
+        && definition.variants.len() == 2
+        && definition.variants[0].name == "Ok"
+        && definition.variants[0].fields == [value]
+        && definition.variants[1].name == "Err"
+        && definition.variants[1].fields == [error]
 }
 
 struct Analyzer<'a> {
     names: HashMap<String, Binding>,
     local_types: Vec<LocalType>,
+    owned_slot_types: Vec<Option<Type>>,
+    addressed_slot_types: Vec<Option<Type>>,
+    parameter_slots: HashSet<usize>,
     signatures: &'a HashMap<String, FunctionSignature>,
-    structs: &'a [RynStruct],
+    structs: &'a mut Vec<RynStruct>,
     struct_ids: &'a HashMap<String, usize>,
+    enums: &'a [RynEnum],
+    enum_ids: &'a HashMap<String, usize>,
+    function_module_paths: &'a [String],
+    function_visibility: &'a [bool],
     loop_depth: usize,
     function_name: String,
+    module_path: String,
     return_type: Option<Type>,
     recover_block_errors: bool,
     recovery_diagnostics: Vec<Diagnostic>,
@@ -373,24 +1532,120 @@ struct Analyzer<'a> {
 impl<'a> Analyzer<'a> {
     fn new(
         signatures: &'a HashMap<String, FunctionSignature>,
-        structs: &'a [RynStruct],
+        structs: &'a mut Vec<RynStruct>,
         struct_ids: &'a HashMap<String, usize>,
+        enums: &'a [RynEnum],
+        enum_ids: &'a HashMap<String, usize>,
+        function_module_paths: &'a [String],
+        function_visibility: &'a [bool],
     ) -> Self {
         Self {
             names: HashMap::new(),
             local_types: Vec::new(),
+            owned_slot_types: Vec::new(),
+            addressed_slot_types: Vec::new(),
+            parameter_slots: HashSet::new(),
             signatures,
             structs,
             struct_ids,
+            enums,
+            enum_ids,
+            function_module_paths,
+            function_visibility,
             loop_depth: 0,
             function_name: String::new(),
+            module_path: String::new(),
             return_type: None,
             recover_block_errors: false,
             recovery_diagnostics: Vec::new(),
         }
     }
 
+    fn namespace_prefix(&self) -> Option<String> {
+        let local_name = if self.module_path.is_empty() {
+            self.function_name.as_str()
+        } else {
+            self.function_name
+                .strip_prefix(&format!("{}::", self.module_path))?
+        };
+        local_name
+            .rsplit_once("::")
+            .map(|(namespace, _)| namespace.to_string())
+    }
+
+    fn scoped_struct_id(&self, name: &str) -> Option<usize> {
+        self.struct_ids.get(name).copied().or_else(|| {
+            self.namespace_prefix()
+                .map(|namespace| format!("{namespace}::{name}"))
+                .and_then(|qualified| self.struct_ids.get(&qualified).copied())
+        })
+    }
+
+    fn scoped_enum_id(&self, name: &str) -> Option<usize> {
+        self.enum_ids.get(name).copied().or_else(|| {
+            self.namespace_prefix()
+                .map(|namespace| format!("{namespace}::{name}"))
+                .and_then(|qualified| self.enum_ids.get(&qualified).copied())
+        })
+    }
+
+    fn resolve_type_name(&self, name: &TypeName) -> Result<Type, Diagnostic> {
+        let namespace = self.namespace_prefix();
+        let ty =
+            resolve_type_name_scoped(name, self.struct_ids, self.enum_ids, namespace.as_deref())?;
+        let mut seen_structs = HashSet::new();
+        let mut seen_enums = HashSet::new();
+        if contains_custom_drop(
+            ty,
+            self.structs,
+            self.enums,
+            &mut seen_structs,
+            &mut seen_enums,
+            0,
+        ) && !matches!(ty, Type::Struct(id) if self.structs[id].drop_function.is_some())
+            && !custom_drop_array_only(ty, self.structs, self.enums)
+            && !custom_drop_vec_only(ty, self.structs, self.enums)
+            && !custom_drop_map_only(ty, self.structs, self.enums)
+            && !custom_drop_struct_fields_only(ty, self.structs, self.enums, 0)
+        {
+            return Err(diag(
+                "R0255",
+                "custom-destructor values may only be nested through ordinary struct fields; collections, arrays, and enum payloads remain unsupported",
+                name_span(name),
+            ));
+        }
+        if !map_struct_value_supported(ty, self.structs, self.enums) {
+            return Err(diag(
+                "R0244",
+                "Map struct values must support a generated clone/drop plan; this value type has no supported Map layout",
+                name_span(name),
+            ));
+        }
+        validate_array_supported(ty, self.structs, name_span(name))?;
+        validate_vec_struct_elements(ty, self.structs, name_span(name))?;
+        Ok(ty)
+    }
+
     fn function(mut self, mut function: Function) -> Result<RynFunction, Diagnostic> {
+        if function.extern_c {
+            let signature = &self.signatures[&function.name];
+            return Ok(RynFunction {
+                parameters: signature
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, ty)| LocalBinding { slot, ty: *ty })
+                    .collect(),
+                external_symbol: function.external_symbol,
+                return_type: signature.return_type,
+                reference_return_parameter: None,
+                return_value: None,
+                statements: Vec::new(),
+                local_types: Vec::new(),
+                owned_slot_types: Vec::new(),
+                addressed_slot_types: Vec::new(),
+            });
+        }
         let (parameters, body_always_returns) = self.prepare_function(&function)?;
         let statements = self.block(std::mem::take(&mut function.body))?;
         self.finish_function(function, parameters, body_always_returns, statements)
@@ -400,6 +1655,9 @@ impl<'a> Analyzer<'a> {
         mut self,
         mut function: Function,
     ) -> Result<RynFunction, Vec<Diagnostic>> {
+        if function.extern_c {
+            return self.function(function).map_err(|error| vec![error]);
+        }
         let (parameters, body_always_returns) = self
             .prepare_function(&function)
             .map_err(|error| vec![error])?;
@@ -432,7 +1690,16 @@ impl<'a> Analyzer<'a> {
         function: &Function,
     ) -> Result<(Vec<LocalBinding>, bool), Diagnostic> {
         self.function_name.clone_from(&function.name);
+        self.module_path.clone_from(&function.module_path);
         self.return_type = self.signatures[&function.name].return_type;
+        if matches!(self.return_type, Some(Type::Slice(_))) {
+            return Err(diag(
+                "R0240",
+                "a borrowed slice cannot be returned from a function",
+                function.span,
+            )
+            .with_help("return an owning `Vec<T>` or consume the slice inside the function"));
+        }
         let body_always_returns = block_always_returns(&function.body);
         let mut parameters = Vec::with_capacity(function.parameters.len());
         for (parameter, ty) in function
@@ -450,6 +1717,7 @@ impl<'a> Analyzer<'a> {
             }
             let ty = *ty;
             let slot = self.allocate(ty);
+            self.parameter_slots.insert(slot);
             self.names.insert(
                 parameter.name.clone(),
                 Binding {
@@ -475,6 +1743,7 @@ impl<'a> Analyzer<'a> {
             (Some(expected), Some(value)) => {
                 let span = value.span();
                 let (value, actual) = self.expression(value, Some(expected))?;
+                self.validate_reference_return(&value, function.span)?;
                 if expected != actual {
                     return Err(diag(
                         "R0205",
@@ -527,12 +1796,30 @@ impl<'a> Analyzer<'a> {
             }
             (None, None) => None,
         };
+        let mut returned_reference_parameters = Vec::new();
+        collect_reference_returns(&statements, &parameters, &mut returned_reference_parameters);
+        if let Some(value) = &return_value {
+            returned_reference_parameters.push(reference_parameter_index(value, &parameters));
+        }
+        let reference_return_parameter = returned_reference_parameters
+            .first()
+            .copied()
+            .flatten()
+            .filter(|parameter| {
+                returned_reference_parameters
+                    .iter()
+                    .all(|returned| *returned == Some(*parameter))
+            });
         Ok(RynFunction {
             parameters,
+            external_symbol: None,
             return_type,
+            reference_return_parameter,
             return_value,
             statements,
             local_types: std::mem::take(&mut self.local_types),
+            owned_slot_types: std::mem::take(&mut self.owned_slot_types),
+            addressed_slot_types: std::mem::take(&mut self.addressed_slot_types),
         })
     }
 
@@ -543,36 +1830,100 @@ impl<'a> Analyzer<'a> {
     }
 
     fn allocate_storage(&mut self, ty: Type) {
-        if let Type::Struct(struct_id) = ty {
-            let field_types = self.structs[struct_id]
-                .fields
-                .iter()
-                .map(|field| field.ty)
-                .collect::<Vec<_>>();
-            for field_ty in field_types {
-                self.allocate_storage(field_ty);
+        match ty {
+            Type::Struct(struct_id) => {
+                let field_types = self.structs[struct_id]
+                    .fields
+                    .iter()
+                    .map(|field| field.ty)
+                    .collect::<Vec<_>>();
+                for field_ty in field_types {
+                    self.allocate_storage(field_ty);
+                }
             }
-        } else {
-            self.allocate_scalar(ty);
+            Type::Array(id) => {
+                let (element, length) = array_info(id);
+                for _ in 0..length {
+                    self.allocate_storage(element);
+                }
+            }
+            _ => self.allocate_scalar(ty),
         }
     }
 
     fn allocate_scalar(&mut self, ty: Type) {
+        self.addressed_slot_types.push(None);
         match ty {
-            Type::I8 | Type::U8 => self.local_types.push(LocalType::I8),
-            Type::I16 | Type::U16 => self.local_types.push(LocalType::I16),
-            Type::I32 => self.local_types.push(LocalType::I32),
-            Type::I64 => self.local_types.push(LocalType::I64),
-            Type::U32 => self.local_types.push(LocalType::I32),
-            Type::U64 => self.local_types.push(LocalType::I64),
-            Type::F32 => self.local_types.push(LocalType::F32),
-            Type::F64 => self.local_types.push(LocalType::F64),
+            Type::I8 | Type::U8 => {
+                self.local_types.push(LocalType::I8);
+                self.owned_slot_types.push(None);
+            }
+            Type::I16 | Type::U16 => {
+                self.local_types.push(LocalType::I16);
+                self.owned_slot_types.push(None);
+            }
+            Type::I32 => {
+                self.local_types.push(LocalType::I32);
+                self.owned_slot_types.push(None);
+            }
+            Type::I64 => {
+                self.local_types.push(LocalType::I64);
+                self.owned_slot_types.push(None);
+            }
+            Type::U32 => {
+                self.local_types.push(LocalType::I32);
+                self.owned_slot_types.push(None);
+            }
+            Type::U64 => {
+                self.local_types.push(LocalType::I64);
+                self.owned_slot_types.push(None);
+            }
+            Type::F32 => {
+                self.local_types.push(LocalType::F32);
+                self.owned_slot_types.push(None);
+            }
+            Type::F64 => {
+                self.local_types.push(LocalType::F64);
+                self.owned_slot_types.push(None);
+            }
             Type::Str => {
                 self.local_types.push(LocalType::Ptr);
+                self.owned_slot_types.push(None);
                 self.local_types.push(LocalType::I64);
+                self.owned_slot_types.push(None);
             }
-            Type::Bool => self.local_types.push(LocalType::I8),
+            Type::Slice(_) => {
+                self.local_types.push(LocalType::Ptr);
+                self.owned_slot_types.push(None);
+                self.local_types.push(LocalType::I64);
+                self.owned_slot_types.push(None);
+            }
+            Type::Reference(_, _) | Type::RawPointer(_) | Type::FunctionPointer(_) => {
+                self.local_types.push(LocalType::Ptr);
+                self.owned_slot_types.push(None);
+            }
+            Type::OwnedString => {
+                self.local_types.push(LocalType::OwnedPtr);
+                self.owned_slot_types.push(Some(Type::OwnedString));
+            }
+            Type::Vec(_) | Type::Map(_) => {
+                self.local_types.push(LocalType::OwnedPtr);
+                self.owned_slot_types.push(Some(ty));
+            }
+            Type::Enum(_) => {
+                self.local_types.push(LocalType::OwnedPtr);
+                self.owned_slot_types.push(Some(ty));
+            }
+            Type::Char => {
+                self.local_types.push(LocalType::I32);
+                self.owned_slot_types.push(None);
+            }
+            Type::Bool => {
+                self.local_types.push(LocalType::I8);
+                self.owned_slot_types.push(None);
+            }
             Type::Struct(_) => unreachable!("structure storage is allocated field by field"),
+            Type::Array(_) => unreachable!("array storage is allocated element by element"),
         }
     }
 
@@ -604,6 +1955,7 @@ impl<'a> Analyzer<'a> {
                 Err(diagnostic) => {
                     self.names = names_before;
                     self.local_types.truncate(local_type_count);
+                    self.owned_slot_types.truncate(local_type_count);
                     self.loop_depth = loop_depth;
                     self.recovery_diagnostics.push(diagnostic);
                     if failed_declaration_blocks_recovery {
@@ -732,7 +2084,7 @@ impl<'a> Analyzer<'a> {
         value_span: Span,
     ) {
         let expected = match annotation
-            .map(|name| resolve_type_name(name, self.struct_ids))
+            .map(|name| self.resolve_type_name(name))
             .transpose()
         {
             Ok(expected) => expected,
@@ -796,7 +2148,7 @@ impl<'a> Analyzer<'a> {
                 let value_span = value.span();
                 let annotation = match annotation
                     .as_ref()
-                    .map(|name| resolve_type_name(name, self.struct_ids))
+                    .map(|name| self.resolve_type_name(name))
                     .transpose()
                 {
                     Ok(annotation) => annotation,
@@ -808,6 +2160,14 @@ impl<'a> Analyzer<'a> {
                 };
                 let (value, inferred) = self.expression(value, annotation)?;
                 let ty = annotation.unwrap_or(inferred);
+                if matches!(ty, Type::Slice(_)) {
+                    return Err(diag(
+                        "R0240",
+                        "a borrowed slice cannot be stored in a local binding",
+                        value_span,
+                    )
+                    .with_help("use the slice immediately or pass it to a function"));
+                }
                 if ty != inferred {
                     return Err(diag(
                         "R0205",
@@ -825,7 +2185,12 @@ impl<'a> Analyzer<'a> {
                 }
                 let slot = self.allocate(ty);
                 self.names.insert(name, Binding { slot, ty, mutable });
-                Ok(IrStatement::Let { slot, ty, value })
+                Ok(IrStatement::Let {
+                    slot,
+                    ty,
+                    value,
+                    span,
+                })
             }
             Statement::Assign { name, value, span } => {
                 let Some(binding) = self.names.get(&name).copied() else {
@@ -834,10 +2199,9 @@ impl<'a> Analyzer<'a> {
                     return Err(error);
                 };
                 if !binding.mutable {
-                    let error =
-                        diag("R0204", format!("`{name}` is immutable"), span).with_help(format!(
-                            "declare `{name}` with `let mut` if you intend to assign a new value"
-                        ));
+                    let error = diag("R0204", format!("`{name}` is immutable"), span).with_help(
+                        format!("declare `mut {name} := ...` if this binding must be mutable"),
+                    );
                     self.check_discarded_expression(value);
                     return Err(error);
                 }
@@ -862,6 +2226,123 @@ impl<'a> Analyzer<'a> {
                     slot: binding.slot,
                     ty: binding.ty,
                     value,
+                    span,
+                })
+            }
+            Statement::DereferenceAssign {
+                pointer,
+                value,
+                span,
+            } => {
+                let (pointer, pointer_type) = self.expression(pointer, None)?;
+                let (ty, mutable) = match pointer_type {
+                    Type::Reference(id, mutable) => (pointer_target(id), mutable),
+                    Type::RawPointer(id) => (pointer_target(id), true),
+                    _ => {
+                        return Err(diag(
+                            "R0206",
+                            "dereference assignment requires a mutable reference or raw pointer",
+                            span,
+                        ));
+                    }
+                };
+                if !mutable {
+                    return Err(
+                        diag("R0206", "cannot assign through a shared reference", span)
+                            .with_help("create the reference with `&mut value`"),
+                    );
+                }
+                if !reference_pointee_supported(ty) {
+                    return Err(diag(
+                        "R0206",
+                        "assignment through this pointer type is not supported yet",
+                        span,
+                    ));
+                }
+                let value_span = value.span();
+                let (value, actual) = self.expression(value, Some(ty))?;
+                if actual != ty {
+                    return Err(diag(
+                        "R0205",
+                        format!(
+                            "cannot assign `{}` through a pointer to `{}`",
+                            type_name(actual),
+                            type_name(ty)
+                        ),
+                        value_span,
+                    ));
+                }
+                Ok(IrStatement::DereferenceAssign { pointer, ty, value })
+            }
+            Statement::IndexAssign {
+                name,
+                index,
+                value,
+                span,
+            } => {
+                let Some(binding) = self.names.get(&name).copied() else {
+                    let error = self.unknown_variable(&name, span);
+                    self.check_discarded_expression(index);
+                    self.check_discarded_expression(value);
+                    return Err(error);
+                };
+                if !binding.mutable {
+                    let error = diag("R0204", format!("`{name}` is immutable"), span).with_help(
+                        format!("declare `mut {name} := ...` to assign an array element"),
+                    );
+                    self.check_discarded_expression(index);
+                    self.check_discarded_expression(value);
+                    return Err(error);
+                }
+                let Type::Array(array_id) = binding.ty else {
+                    let error = diag("R0241", "indexed assignment requires a fixed array", span);
+                    self.check_discarded_expression(index);
+                    self.check_discarded_expression(value);
+                    return Err(error);
+                };
+                let (element, length) = array_info(array_id);
+                let mut seen_structs = HashSet::new();
+                let mut seen_enums = HashSet::new();
+                if contains_custom_drop(
+                    element,
+                    self.structs,
+                    self.enums,
+                    &mut seen_structs,
+                    &mut seen_enums,
+                    0,
+                ) {
+                    return Err(diag(
+                        "R0255",
+                        "custom-destructor array elements cannot be replaced by index yet",
+                        span,
+                    )
+                    .with_help(
+                        "replace or move the whole array so every owner is cleaned up correctly",
+                    ));
+                }
+                let (index, index_ty) = self.expression(index, None)?;
+                if !is_integer(index_ty) {
+                    return Err(diag("R0242", "array index must be an integer", span));
+                }
+                let (value, value_ty) = self.expression(value, Some(element))?;
+                if value_ty != element {
+                    return Err(diag(
+                        "R0205",
+                        format!(
+                            "array element requires `{}` but has type `{}`",
+                            type_name(element),
+                            type_name(value_ty)
+                        ),
+                        span,
+                    ));
+                }
+                Ok(IrStatement::ArrayAssign {
+                    slot: binding.slot,
+                    element,
+                    length,
+                    index,
+                    value,
+                    span,
                 })
             }
             Statement::FieldAssign {
@@ -882,7 +2363,9 @@ impl<'a> Analyzer<'a> {
                 };
                 if !binding.mutable {
                     let error = diag("R0204", format!("`{object}` is immutable"), object_span)
-                        .with_help(format!("declare `{object}` with `let mut` if you intend to change one of its fields"));
+                        .with_help(format!(
+                            "declare `mut {object} := ...` if you intend to change its fields"
+                        ));
                     self.check_discarded_expression(value);
                     return Err(error);
                 }
@@ -935,6 +2418,7 @@ impl<'a> Analyzer<'a> {
                     .fields
                     .iter()
                     .find(|candidate| candidate.name == *final_field)
+                    .cloned()
                 else {
                     let error =
                         self.unknown_struct_field(struct_id, final_field, *final_field_span);
@@ -1010,7 +2494,7 @@ impl<'a> Analyzer<'a> {
                 if !binding.mutable {
                     let error = diag("R0204", format!("`{name}` is immutable"), name_span)
                         .with_help(format!(
-                            "declare `{name}` with `let mut` if you intend to assign a new value"
+                            "declare `mut {name} := ...` if this binding must be mutable"
                         ));
                     self.check_discarded_expression(value);
                     return Err(error);
@@ -1041,6 +2525,7 @@ impl<'a> Analyzer<'a> {
                     slot: binding.slot,
                     ty: binding.ty,
                     value,
+                    span,
                 })
             }
             Statement::Print(expr, span) => {
@@ -1050,6 +2535,10 @@ impl<'a> Analyzer<'a> {
                     }
                     e
                 })?;
+                if type_contains_vec(ty, self.structs) {
+                    return Err(diag("R0234", "`echo` cannot print `Vec` values yet", span)
+                        .with_help("iterate the values manually and print each element"));
+                }
                 Ok(IrStatement::Print { value, ty })
             }
             Statement::PrintTemplate(parts, span) => {
@@ -1059,6 +2548,16 @@ impl<'a> Analyzer<'a> {
                         PrintPart::Text(value) => lowered.push(IrPrintPart::Text(value)),
                         PrintPart::Value(expression) => match self.expression(expression, None) {
                             Ok((value, ty)) => {
+                                if type_contains_vec(ty, self.structs) {
+                                    return Err(diag(
+                                        "R0234",
+                                        "`echo` cannot print `Vec` values yet",
+                                        span,
+                                    )
+                                    .with_help(
+                                        "iterate the values manually and print each element",
+                                    ));
+                                }
                                 lowered.push(IrPrintPart::Value { value, ty });
                             }
                             Err(mut diagnostic) if self.recover_block_errors => {
@@ -1082,8 +2581,18 @@ impl<'a> Analyzer<'a> {
                 name,
                 arguments,
                 span,
+                ..
             } => {
                 let (target, arguments, _) = self.lower_call(name, arguments, span)?;
+                Ok(IrStatement::Call { target, arguments })
+            }
+            Statement::MethodCall {
+                value,
+                name,
+                arguments,
+                span,
+            } => {
+                let (target, arguments, _) = self.lower_method(*value, name, arguments, span)?;
                 Ok(IrStatement::Call { target, arguments })
             }
             Statement::If {
@@ -1113,7 +2622,7 @@ impl<'a> Analyzer<'a> {
                 if ty != Type::Bool {
                     let error = diag(
                         "R0207",
-                        "`if` condition must have type `bool`",
+                        "`when` condition must have type `bool`",
                         condition_span,
                     )
                     .with_help("use a boolean expression, such as a comparison, for the condition");
@@ -1205,7 +2714,8 @@ impl<'a> Analyzer<'a> {
                     return Err(error);
                 }
 
-                let (start, ty) = match self.expression(start, None) {
+                let start_hint = self.integer_type_hint(&end);
+                let (start, ty) = match self.expression(start, start_hint) {
                     Ok(value) => value,
                     Err(error) if self.recover_block_errors => {
                         self.recover_for_after_invalid_start(&name, name_span, end, body);
@@ -1279,6 +2789,173 @@ impl<'a> Analyzer<'a> {
                     body,
                 })
             }
+            Statement::ForEach {
+                name,
+                name_span,
+                collection,
+                body,
+                ..
+            } => {
+                if self.names.contains_key(&name) {
+                    let error = diag(
+                        "R0202",
+                        format!("`{name}` is already declared in this scope"),
+                        name_span,
+                    )
+                    .with_help("choose a unique name for the collection loop variable");
+                    if self.recover_block_errors {
+                        if let Err(error) = self.expression(collection, None) {
+                            self.recovery_diagnostics.push(error);
+                        }
+                        let outer = self.names.clone();
+                        self.loop_depth += 1;
+                        let _ = self.block(body);
+                        self.loop_depth -= 1;
+                        self.names = outer;
+                    }
+                    return Err(error);
+                }
+                let collection_span = collection.span();
+                let (collection, collection_type) = self.expression(collection, None)?;
+                let elem = match collection_type {
+                    Type::Vec(elem_id) => vec_elem(elem_id),
+                    Type::Slice(elem_id) => vec_elem(elem_id),
+                    Type::OwnedString => Type::Char,
+                    Type::Str => Type::Char,
+                    _ => {
+                        return Err(diag(
+                            "R0206",
+                            format!(
+                                "`for element in ...` requires a Vec, String, or str, found `{}`",
+                                type_name(collection_type)
+                            ),
+                            collection_span,
+                        )
+                        .with_help("iterate a `Vec<T>`, `String`, or `str` directly, or use a numeric range with `..`"));
+                    }
+                };
+                let vector_slot = self.allocate(collection_type);
+                let index_slot = self.allocate(Type::U64);
+                let end_slot = self.allocate(Type::U64);
+                let item_slot = self.allocate(elem);
+                let outer_names = self.names.clone();
+                self.names.insert(
+                    name,
+                    Binding {
+                        slot: item_slot,
+                        ty: elem,
+                        mutable: false,
+                    },
+                );
+                self.loop_depth += 1;
+                let body = self.block(body);
+                self.loop_depth -= 1;
+                self.names = outer_names;
+                let body = body?;
+
+                let vector_value = IrExpression::Local {
+                    slot: vector_slot,
+                    ty: collection_type,
+                    span: collection_span,
+                };
+                let (length, item_value) = match collection_type {
+                    Type::Vec(elem_id) => (
+                        IrExpression::Call {
+                            target: IrCallTarget::Vec(VecOp::Len, elem_id),
+                            arguments: vec![vector_value.clone()],
+                            return_type: Type::U64,
+                        },
+                        IrExpression::Call {
+                            target: IrCallTarget::Vec(VecOp::Take, elem_id),
+                            arguments: vec![
+                                vector_value.clone(),
+                                IrExpression::Integer(0, Type::U64),
+                            ],
+                            return_type: elem,
+                        },
+                    ),
+                    Type::OwnedString => (
+                        IrExpression::Call {
+                            target: IrCallTarget::String(StringOp::CharCount),
+                            arguments: vec![vector_value.clone()],
+                            return_type: Type::U64,
+                        },
+                        IrExpression::Call {
+                            target: IrCallTarget::String(StringOp::CharAt),
+                            arguments: vec![
+                                vector_value.clone(),
+                                IrExpression::Local {
+                                    slot: index_slot,
+                                    ty: Type::U64,
+                                    span: collection_span,
+                                },
+                            ],
+                            return_type: Type::Char,
+                        },
+                    ),
+                    Type::Str => (
+                        IrExpression::Call {
+                            target: IrCallTarget::String(StringOp::StrCharCount),
+                            arguments: vec![vector_value.clone()],
+                            return_type: Type::U64,
+                        },
+                        IrExpression::Call {
+                            target: IrCallTarget::String(StringOp::StrCharAt),
+                            arguments: vec![
+                                vector_value.clone(),
+                                IrExpression::Local {
+                                    slot: index_slot,
+                                    ty: Type::U64,
+                                    span: collection_span,
+                                },
+                            ],
+                            return_type: Type::Char,
+                        },
+                    ),
+                    Type::Slice(elem_id) => (
+                        IrExpression::Call {
+                            target: IrCallTarget::SliceLen,
+                            arguments: vec![vector_value.clone()],
+                            return_type: Type::U64,
+                        },
+                        IrExpression::SliceIndex {
+                            slice: Box::new(vector_value.clone()),
+                            index: Box::new(IrExpression::Local {
+                                slot: index_slot,
+                                ty: Type::U64,
+                                span: collection_span,
+                            }),
+                            ty: vec_elem(elem_id),
+                        },
+                    ),
+                    _ => unreachable!("iterable type checked above"),
+                };
+                let item = IrStatement::Let {
+                    slot: item_slot,
+                    ty: elem,
+                    value: item_value,
+                    span: name_span,
+                };
+                let mut loop_body = Vec::with_capacity(body.len() + 1);
+                loop_body.push(item);
+                loop_body.extend(body);
+                Ok(IrStatement::Block(vec![
+                    IrStatement::Let {
+                        slot: vector_slot,
+                        ty: collection_type,
+                        value: collection,
+                        span: collection_span,
+                    },
+                    IrStatement::For {
+                        slot: index_slot,
+                        end_slot,
+                        ty: Type::U64,
+                        start: IrExpression::Integer(0, Type::U64),
+                        end: length,
+                        body: loop_body,
+                    },
+                ]))
+            }
             Statement::Break(span) => {
                 if self.loop_depth == 0 {
                     return Err(
@@ -1327,6 +3004,7 @@ impl<'a> Analyzer<'a> {
                     (Some(expected), Some(value)) => {
                         let value_span = value.span();
                         let (value, actual) = self.expression(value, Some(expected))?;
+                        self.validate_reference_return(&value, value_span)?;
                         if actual != expected {
                             return Err(diag(
                                 "R0205",
@@ -1348,6 +3026,54 @@ impl<'a> Analyzer<'a> {
                 };
                 Ok(IrStatement::Return { value })
             }
+        }
+    }
+
+    fn validate_reference_return(
+        &self,
+        value: &IrExpression,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        if !matches!(self.return_type, Some(Type::Reference(_, _))) {
+            return Ok(());
+        }
+        let parameter_origin = match value {
+            IrExpression::Local {
+                slot,
+                ty: Type::Reference(_, _),
+                ..
+            } => self.parameter_slots.contains(slot),
+            IrExpression::SliceElementAddress { slice, .. } => matches!(
+                &**slice,
+                IrExpression::Local {
+                    slot,
+                    ty: Type::Slice(_),
+                    ..
+                } if self.parameter_slots.contains(slot)
+            ),
+            // A call's result provenance is not yet tracked. Treat it as
+            // unknown so a callee cannot smuggle a reference to this
+            // function's local stack frame through a reference return.
+            IrExpression::Call { .. } => false,
+            IrExpression::If {
+                then_value,
+                else_value,
+                ..
+            } => {
+                self.validate_reference_return(then_value, span).is_ok()
+                    && self.validate_reference_return(else_value, span).is_ok()
+            }
+            _ => false,
+        };
+        if parameter_origin {
+            Ok(())
+        } else {
+            Err(diag(
+                "R0248",
+                "a reference to a local value cannot escape its stack frame",
+                span,
+            )
+            .with_help("return a reference derived directly from a reference parameter"))
         }
     }
 
@@ -1393,26 +3119,394 @@ impl<'a> Analyzer<'a> {
                 }
                 Ok((IrExpression::Float(n, ty), ty))
             }
+            Expression::LayoutOf {
+                ty,
+                alignment,
+                span: _,
+            } => {
+                let ty = self.resolve_type_name(&ty)?;
+                let (size, align) = type_layout(ty, self.structs);
+                let value = if alignment { align } else { size };
+                Ok((IrExpression::Integer(value as i128, Type::U64), Type::U64))
+            }
             Expression::String(s, _) => Ok((IrExpression::String(s), Type::Str)),
+            Expression::Character(value, _) => Ok((IrExpression::Character(value), Type::Char)),
             Expression::Boolean(value, _) => Ok((IrExpression::Boolean(value), Type::Bool)),
             Expression::Name(name, span) => {
-                let binding = self
-                    .names
-                    .get(&name)
-                    .ok_or_else(|| self.unknown_variable(&name, span))?;
+                let binding = self.names.get(&name).copied();
+                let Some(binding) = binding else {
+                    if let Some(expected_type) = expected
+                        && matches!(expected_type, Type::FunctionPointer(_))
+                        && let Some(coerced) =
+                            self.coerce_function_pointer(&name, &expected_type, span)?
+                    {
+                        return Ok((coerced, expected_type));
+                    }
+                    return Err(self.unknown_variable(&name, span));
+                };
                 Ok((
                     IrExpression::Local {
                         slot: binding.slot,
                         ty: binding.ty,
+                        span,
                     },
                     binding.ty,
+                ))
+            }
+            Expression::AddressOf {
+                mutable,
+                raw,
+                value,
+                span,
+            } => {
+                let (name, name_span) = match *value {
+                    Expression::Index {
+                        value: slice,
+                        index,
+                        span: index_span,
+                    } => {
+                        if mutable || raw {
+                            return Err(diag(
+                                "R0206",
+                                "slice elements can only be borrowed through immutable references",
+                                span,
+                            ));
+                        }
+                        let (slice, slice_ty) = self.expression(*slice, None)?;
+                        let Type::Slice(slice_id) = slice_ty else {
+                            return Err(diag(
+                                "R0206",
+                                "address-of indexing currently requires a borrowed slice",
+                                index_span,
+                            ));
+                        };
+                        let element = vec_elem(slice_id);
+                        if !reference_pointee_supported(element) {
+                            return Err(diag(
+                                "R0206",
+                                format!(
+                                    "references to `{}` are not supported yet",
+                                    type_name(element)
+                                ),
+                                index_span,
+                            )
+                            .with_help(
+                                "borrowed slice references currently support scalar elements",
+                            ));
+                        }
+                        let (index, index_ty) = self.expression(*index, None)?;
+                        if !is_integer(index_ty) {
+                            return Err(diag(
+                                "R0242",
+                                "slice index must be an integer",
+                                index_span,
+                            ));
+                        }
+                        let pointer_type = Type::Reference(intern_pointer_target(element), false);
+                        return Ok((
+                            IrExpression::SliceElementAddress {
+                                slice: Box::new(slice),
+                                index: Box::new(index),
+                                ty: element,
+                                span,
+                            },
+                            pointer_type,
+                        ));
+                    }
+                    Expression::Name(name, name_span) => (name, name_span),
+                    _ => {
+                        return Err(diag(
+                            "R0206",
+                            "address-of currently requires a local variable or a borrowed slice element",
+                            span,
+                        ));
+                    }
+                };
+                let binding = *self
+                    .names
+                    .get(&name)
+                    .ok_or_else(|| self.unknown_variable(&name, name_span))?;
+                if mutable && !raw && !binding.mutable {
+                    return Err(diag(
+                        "R0206",
+                        "cannot create a mutable reference to an immutable binding",
+                        name_span,
+                    )
+                    .with_help("declare the value with `mut` before borrowing it mutably"));
+                }
+                if !reference_pointee_supported(binding.ty) {
+                    return Err(diag(
+                        "R0206",
+                        format!(
+                            "references to `{}` are not supported yet",
+                            type_name(binding.ty)
+                        ),
+                        name_span,
+                    )
+                    .with_help("the current backend supports references to scalar values"));
+                }
+                self.addressed_slot_types[binding.slot] = Some(binding.ty);
+                let target = intern_pointer_target(binding.ty);
+                let pointer_type = if raw {
+                    Type::RawPointer(target)
+                } else {
+                    Type::Reference(target, mutable)
+                };
+                Ok((
+                    IrExpression::AddressOf {
+                        slot: binding.slot,
+                        ty: binding.ty,
+                        pointer_type,
+                        span,
+                    },
+                    pointer_type,
+                ))
+            }
+            Expression::Dereference(pointer, span) => {
+                let (pointer, pointer_type) = self.expression(*pointer, None)?;
+                let pointee = match pointer_type {
+                    Type::Reference(id, _) | Type::RawPointer(id) => pointer_target(id),
+                    _ => {
+                        return Err(diag(
+                            "R0206",
+                            "dereference requires a reference or raw pointer",
+                            span,
+                        ));
+                    }
+                };
+                if !reference_pointee_supported(pointee) {
+                    return Err(diag(
+                        "R0206",
+                        format!(
+                            "dereferencing `{}` is not supported yet",
+                            type_name(pointee)
+                        ),
+                        span,
+                    ));
+                }
+                Ok((
+                    IrExpression::Dereference {
+                        pointer: Box::new(pointer),
+                        ty: pointee,
+                    },
+                    pointee,
+                ))
+            }
+            Expression::Tuple(elements, span) => {
+                let expected_fields = match expected {
+                    Some(Type::Struct(struct_id))
+                        if self.structs[struct_id].name.starts_with("$RynTuple#") =>
+                    {
+                        let fields = self.structs[struct_id].fields.clone();
+                        if fields.len() != elements.len() {
+                            return Err(diag(
+                                "R0205",
+                                format!(
+                                    "tuple has {} elements but the expected tuple has {}",
+                                    elements.len(),
+                                    fields.len()
+                                ),
+                                span,
+                            ));
+                        }
+                        Some((struct_id, fields))
+                    }
+                    Some(other) => {
+                        return Err(diag(
+                            "R0205",
+                            format!(
+                                "tuple literal does not match expected type `{}`",
+                                type_name(other)
+                            ),
+                            span,
+                        ));
+                    }
+                    None => None,
+                };
+                let mut values = Vec::with_capacity(elements.len());
+                let mut field_types = Vec::with_capacity(elements.len());
+                for (index, element) in elements.into_iter().enumerate() {
+                    let expected_type =
+                        expected_fields.as_ref().map(|(_, fields)| fields[index].ty);
+                    let (value, value_type) = self.expression(element, expected_type)?;
+                    values.push(value);
+                    field_types.push(value_type);
+                }
+                let struct_id = if let Some((struct_id, _)) = expected_fields {
+                    struct_id
+                } else if let Some(struct_id) = self.structs.iter().position(|definition| {
+                    definition.name.starts_with("$RynTuple#")
+                        && definition.fields.len() == field_types.len()
+                        && definition
+                            .fields
+                            .iter()
+                            .zip(&field_types)
+                            .all(|(field, ty)| field.ty == *ty)
+                }) {
+                    struct_id
+                } else {
+                    let mut slot_offset = 0;
+                    let fields = field_types
+                        .iter()
+                        .enumerate()
+                        .map(|(index, ty)| {
+                            let field = RynStructField {
+                                name: format!("_{index}"),
+                                ty: *ty,
+                                slot_offset,
+                            };
+                            slot_offset += storage_slot_width(*ty, self.structs);
+                            field
+                        })
+                        .collect();
+                    let struct_id = self.structs.len();
+                    self.structs.push(RynStruct {
+                        name: format!("$RynTuple#inferred{struct_id}"),
+                        fields,
+                        slot_count: slot_offset,
+                        repr_c: false,
+                        drop_function: None,
+                    });
+                    struct_id
+                };
+                let fields = self.structs[struct_id]
+                    .fields
+                    .iter()
+                    .zip(values)
+                    .enumerate()
+                    .map(|(field_index, (_, value))| (field_index, value))
+                    .collect();
+                Ok((
+                    IrExpression::StructValue { struct_id, fields },
+                    Type::Struct(struct_id),
+                ))
+            }
+            Expression::ArrayLiteral(elements, span) => {
+                let mut elements = elements.into_iter();
+                let (element_ty, length, first_value) = match expected {
+                    Some(Type::Array(id)) => {
+                        let (element, length) = array_info(id);
+                        if elements.len() != length {
+                            return Err(diag(
+                                "R0240",
+                                format!(
+                                    "array literal has {} elements but the expected array needs {length}",
+                                    elements.len()
+                                ),
+                                span,
+                            ));
+                        }
+                        (element, length, None)
+                    }
+                    Some(other) => {
+                        return Err(diag(
+                            "R0205",
+                            format!(
+                                "array literal does not match expected type `{}`",
+                                type_name(other)
+                            ),
+                            span,
+                        ));
+                    }
+                    None => {
+                        let length = elements.len();
+                        let Some(first) = elements.next() else {
+                            return Err(diag(
+                                "R0240",
+                                "cannot infer the type and length of an empty array literal",
+                                span,
+                            )
+                            .with_help(
+                                "provide an explicit type such as `values: [i32; 0] = []`",
+                            ));
+                        };
+                        let (first_value, element) = self.expression(first, None)?;
+                        (element, length, Some(first_value))
+                    }
+                };
+                validate_array_literal_elem(element_ty, self.structs, span)?;
+                let mut values = Vec::with_capacity(length);
+                if let Some(first_value) = first_value {
+                    values.push(first_value);
+                }
+                for value in elements {
+                    let value_span = value.span();
+                    let (value, actual) = self.expression(value, Some(element_ty))?;
+                    if actual != element_ty {
+                        return Err(diag(
+                            "R0205",
+                            format!(
+                                "array element requires `{}` but has type `{}`",
+                                type_name(element_ty),
+                                type_name(actual)
+                            ),
+                            value_span,
+                        ));
+                    }
+                    values.push(value);
+                }
+                let ty = Type::Array(intern_array(element_ty, length));
+                Ok((IrExpression::ArrayValue(values), ty))
+            }
+            Expression::Index { value, index, span } => {
+                let (array, array_ty) = self.expression(*value, None)?;
+                if let Type::Slice(slice_id) = array_ty {
+                    let (index, index_ty) = self.expression(*index, None)?;
+                    if !is_integer(index_ty) {
+                        return Err(diag("R0242", "slice index must be an integer", span));
+                    }
+                    let element = vec_elem(slice_id);
+                    return Ok((
+                        IrExpression::SliceIndex {
+                            slice: Box::new(array),
+                            index: Box::new(index),
+                            ty: element,
+                        },
+                        element,
+                    ));
+                }
+                let Type::Array(array_id) = array_ty else {
+                    return Err(diag("R0241", "indexing requires a fixed array", span));
+                };
+                let (element, length) = array_info(array_id);
+                let mut seen_structs = HashSet::new();
+                let mut seen_enums = HashSet::new();
+                if contains_custom_drop(
+                    element,
+                    self.structs,
+                    self.enums,
+                    &mut seen_structs,
+                    &mut seen_enums,
+                    0,
+                ) {
+                    return Err(diag(
+                        "R0255",
+                        "custom-destructor array elements cannot be read by index yet",
+                        span,
+                    )
+                    .with_help(
+                        "move or pass the whole array; indexed reads would duplicate an owner",
+                    ));
+                }
+                let (index, index_ty) = self.expression(*index, None)?;
+                if !is_integer(index_ty) {
+                    return Err(diag("R0242", "array index must be an integer", span));
+                }
+                Ok((
+                    IrExpression::ArrayIndex {
+                        array: Box::new(array),
+                        index: Box::new(index),
+                        ty: element,
+                        length,
+                    },
+                    element,
                 ))
             }
             Expression::StructLiteral { name, fields, span } => {
                 if self.recover_block_errors {
                     return self.struct_literal_recovering(name, fields, span, expected);
                 }
-                let struct_id = *self.struct_ids.get(&name).ok_or_else(|| {
+                let struct_id = self.scoped_struct_id(&name).ok_or_else(|| {
                     diag("R0227", format!("unknown structure `{name}`"), span)
                         .with_help("declare the structure before constructing it")
                 })?;
@@ -1422,12 +3516,14 @@ impl<'a> Analyzer<'a> {
                         "R0205",
                         format!(
                             "structure literal `{name}` does not match the expected type `{}`",
-                            expected.map(type_name).unwrap_or("unknown")
+                            expected
+                                .map(type_name)
+                                .unwrap_or_else(|| "unknown".to_owned())
                         ),
                         span,
                     ));
                 }
-                let definition = &self.structs[struct_id];
+                let definition = self.structs[struct_id].clone();
                 let mut initialized = vec![false; definition.fields.len()];
                 let mut values = Vec::with_capacity(definition.fields.len());
                 for (field_name, value, field_span) in fields {
@@ -1510,15 +3606,123 @@ impl<'a> Analyzer<'a> {
                         struct_id,
                         field_index,
                         ty: field_info.ty,
+                        span,
                     },
                     field_info.ty,
+                ))
+            }
+            Expression::VecConstructor { element, span } => {
+                let elem = self.resolve_type_name(&element).map_err(|mut error| {
+                    error.span = span;
+                    error
+                })?;
+                validate_vec_elem(&elem, span)?;
+                let vec_id = intern_vec_elem(elem);
+                let ty = Type::Vec(vec_id);
+                let mut seen_structs = HashSet::new();
+                let mut seen_enums = HashSet::new();
+                if contains_custom_drop(
+                    elem,
+                    self.structs,
+                    self.enums,
+                    &mut seen_structs,
+                    &mut seen_enums,
+                    0,
+                ) && !custom_drop_vec_only(ty, self.structs, self.enums)
+                {
+                    return Err(diag(
+                        "R0255",
+                        "Vec elements cannot contain nested custom-destructor values yet",
+                        span,
+                    )
+                    .with_help("use custom-drop resources directly as Vec elements, or keep nested resources in a regular struct value"));
+                }
+                Ok((
+                    IrExpression::Call {
+                        target: IrCallTarget::Vec(VecOp::New, vec_id),
+                        arguments: Vec::new(),
+                        return_type: ty,
+                    },
+                    ty,
+                ))
+            }
+            Expression::MapConstructor { key, value, span } => {
+                let key = self.resolve_type_name(&key).map_err(|mut error| {
+                    error.span = span;
+                    error
+                })?;
+                let value = self.resolve_type_name(&value).map_err(|mut error| {
+                    error.span = span;
+                    error
+                })?;
+                validate_map_types(key, value, span)?;
+                if !map_struct_value_supported(
+                    Type::Map(intern_map(key, value)),
+                    self.structs,
+                    self.enums,
+                ) {
+                    return Err(diag(
+                        "R0244",
+                        "Map struct values must support a generated clone/drop plan; this value type has no supported Map layout",
+                        span,
+                    ));
+                }
+                let map_id = intern_map(key, value);
+                let ty = Type::Map(map_id);
+                Ok((
+                    IrExpression::Call {
+                        target: IrCallTarget::Map(MapOp::New, map_id),
+                        arguments: Vec::new(),
+                        return_type: ty,
+                    },
+                    ty,
                 ))
             }
             Expression::Call {
                 name,
                 arguments,
                 span,
+                ..
             } => {
+                if let Some((enum_name, variant)) = name.rsplit_once("::")
+                    && (self.scoped_enum_id(enum_name).is_some()
+                        || matches!(enum_name, "Option" | "Result")
+                        || expected.is_some_and(|expected| {
+                            matches!(expected, Type::Enum(id)
+                                if is_generic_enum_name(&self.enums[id].name, enum_name))
+                        }))
+                {
+                    return self.expression(
+                        Expression::EnumConstruct {
+                            enum_name: enum_name.to_owned(),
+                            variant: variant.to_owned(),
+                            arguments,
+                            span,
+                        },
+                        expected,
+                    );
+                }
+                if name == "Vec" && arguments.is_empty() {
+                    return match expected.filter(|ty| matches!(ty, Type::Vec(_))) {
+                        Some(ty @ Type::Vec(_)) => Ok((
+                            IrExpression::Call {
+                                target: match ty {
+                                    Type::Vec(id) => IrCallTarget::Vec(VecOp::New, id),
+                                    _ => unreachable!(),
+                                },
+                                arguments: Vec::new(),
+                                return_type: ty,
+                            },
+                            ty,
+                        )),
+                        _ => Err(diag(
+                            "R0234",
+                            "cannot infer the element type of an empty `Vec()`",
+                            span,
+                        )
+                        .with_help("use `Vec<T>()` or annotate the variable, e.g. `mut values: Vec<i32> = Vec()`")),
+                    };
+                }
                 let (target, lowered, return_type) =
                     self.lower_call(name.clone(), arguments, span)?;
                 let return_type = return_type.ok_or_else(|| {
@@ -1535,6 +3739,453 @@ impl<'a> Analyzer<'a> {
                     IrExpression::Call {
                         target,
                         arguments: lowered,
+                        return_type,
+                    },
+                    return_type,
+                ))
+            }
+            Expression::EnumConstruct {
+                enum_name,
+                variant,
+                arguments,
+                span,
+            } => {
+                let expected_generic_id = expected.and_then(|expected| match expected {
+                    Type::Enum(id) if is_generic_enum_name(&self.enums[id].name, &enum_name) => {
+                        Some(id)
+                    }
+                    _ => None,
+                });
+                let enum_id = self.scoped_enum_id(&enum_name).or(expected_generic_id);
+                let Some(enum_id) = enum_id else {
+                    return Err(diag("R0230", format!("unknown enum `{enum_name}`"), span)
+                        .with_help(if matches!(enum_name.as_str(), "Option" | "Result") {
+                            "give this generic variant an expected `Option<T>` or `Result<T, E>` type"
+                        } else {
+                            "declare the enum before constructing it"
+                        }));
+                };
+                let definition = &self.enums[enum_id];
+                let Some(variant_index) = definition
+                    .variants
+                    .iter()
+                    .position(|candidate| candidate.name == *variant)
+                else {
+                    return Err(diag(
+                        "R0233",
+                        format!("enum `{enum_name}` has no variant `{variant}`"),
+                        span,
+                    ));
+                };
+                let variant_definition = &definition.variants[variant_index];
+                if variant_definition.fields.iter().any(|field| {
+                    contains_custom_drop(
+                        *field,
+                        self.structs,
+                        self.enums,
+                        &mut HashSet::new(),
+                        &mut HashSet::new(),
+                        0,
+                    )
+                }) {
+                    return Err(diag(
+                        "R0255",
+                        "custom-destructor resources cannot be constructed inside enum payloads",
+                        span,
+                    ));
+                }
+                if arguments.len() != variant_definition.fields.len() {
+                    return Err(diag(
+                        "R0233",
+                        format!(
+                            "enum variant `{enum_name}::{variant}` expects {} field value(s), got {}",
+                            variant_definition.fields.len(),
+                            arguments.len()
+                        ),
+                        span,
+                    ));
+                }
+                let mut lowered = Vec::new();
+                for (index, argument) in arguments.into_iter().enumerate() {
+                    let field_ty = variant_definition.fields[index];
+                    let (value, actual) = self.expression(argument, Some(field_ty))?;
+                    if actual != field_ty {
+                        return Err(diag(
+                            "R0205",
+                            format!(
+                                "variant `{enum_name}::{variant}` field {index} requires `{}` but the value has type `{}`",
+                                type_name(field_ty),
+                                type_name(actual)
+                            ),
+                            span,
+                        ));
+                    }
+                    lowered.push(value);
+                }
+                Ok((
+                    IrExpression::Call {
+                        target: IrCallTarget::EnumNew {
+                            enum_id,
+                            tag: variant_index,
+                        },
+                        arguments: lowered,
+                        return_type: Type::Enum(enum_id),
+                    },
+                    Type::Enum(enum_id),
+                ))
+            }
+            Expression::Propagate(value, span) => {
+                let (value, input_type) = self.expression(*value, None)?;
+                let Type::Enum(input_enum) = input_type else {
+                    return Err(diag(
+                        "R0234",
+                        "the `?` operator requires an `Option<T>` or `Result<T, E>` value",
+                        span,
+                    ));
+                };
+                let input_name = &self.enums[input_enum].name;
+                let is_option = input_name.starts_with("$RynOption#");
+                let is_result = input_name.starts_with("$RynResult#");
+                if !is_option && !is_result {
+                    return Err(diag(
+                        "R0234",
+                        "the `?` operator requires an `Option<T>` or `Result<T, E>` value",
+                        span,
+                    ));
+                }
+                let Some(Type::Enum(output_enum)) = self.return_type else {
+                    return Err(diag(
+                        "R0234",
+                        "`?` can only be used in a function returning the matching `Option` or `Result` type",
+                        span,
+                    ));
+                };
+                if (is_option && !self.enums[output_enum].name.starts_with("$RynOption#"))
+                    || (is_result && !self.enums[output_enum].name.starts_with("$RynResult#"))
+                {
+                    return Err(diag(
+                        "R0234",
+                        "the enclosing function must return the same generic type used with `?`",
+                        span,
+                    ));
+                }
+                let input = &self.enums[input_enum];
+                let output = &self.enums[output_enum];
+                let (success_name, failure_name) = if is_option {
+                    ("Some", "None")
+                } else {
+                    ("Ok", "Err")
+                };
+                let Some(input_success) = input
+                    .variants
+                    .iter()
+                    .find(|variant| variant.name == success_name)
+                else {
+                    return Err(diag(
+                        "R0234",
+                        "malformed generic specialization: missing success variant",
+                        span,
+                    ));
+                };
+                let Some(input_failure) = input
+                    .variants
+                    .iter()
+                    .find(|variant| variant.name == failure_name)
+                else {
+                    return Err(diag(
+                        "R0234",
+                        "malformed generic specialization: missing failure variant",
+                        span,
+                    ));
+                };
+                let Some(output_failure) = output
+                    .variants
+                    .iter()
+                    .find(|variant| variant.name == failure_name)
+                else {
+                    return Err(diag(
+                        "R0234",
+                        "malformed generic return type: missing failure variant",
+                        span,
+                    ));
+                };
+                if input_success.fields.len() != 1 {
+                    return Err(diag("R0234", "malformed generic success variant", span));
+                }
+                let failure_type = if is_option {
+                    if !input_failure.fields.is_empty() || !output_failure.fields.is_empty() {
+                        return Err(diag("R0234", "malformed Option specialization", span));
+                    }
+                    None
+                } else {
+                    if input_failure.fields.len() != 1 || output_failure.fields.len() != 1 {
+                        return Err(diag("R0234", "malformed Result specialization", span));
+                    }
+                    let error_type = input_failure.fields[0];
+                    if output_failure.fields[0] != error_type {
+                        return Err(diag(
+                            "R0205",
+                            "the `?` error type must match the enclosing function's `Result` error type",
+                            span,
+                        ));
+                    }
+                    Some(error_type)
+                };
+                let success_type = input_success.fields[0];
+                let success_variant = input
+                    .variants
+                    .iter()
+                    .position(|variant| variant.name == success_name)
+                    .unwrap();
+                let failure_variant = input
+                    .variants
+                    .iter()
+                    .position(|variant| variant.name == failure_name)
+                    .unwrap();
+                let output_failure_variant = output
+                    .variants
+                    .iter()
+                    .position(|variant| variant.name == failure_name)
+                    .unwrap();
+                Ok((
+                    IrExpression::Propagate {
+                        value: Box::new(value),
+                        input_enum,
+                        output_enum,
+                        success_type,
+                        failure_type,
+                        success_variant,
+                        failure_variant,
+                        output_failure_variant,
+                    },
+                    success_type,
+                ))
+            }
+            Expression::Choose { value, arms, span } => {
+                if arms
+                    .iter()
+                    .position(|arm| arm.variant.is_none())
+                    .is_some_and(|index| index + 1 != arms.len())
+                {
+                    return Err(diag("R0235", "the `_` arm in `choose` must be last", span));
+                }
+                let (scrutinee, scrut_ty) = self.expression(*value, None)?;
+                let Type::Enum(enum_id) = scrut_ty else {
+                    return Err(diag("R0234", "`choose` requires an enum value", span)
+                        .with_help("match one of this enum's variants over a value of enum type"));
+                };
+                let definition = &self.enums[enum_id];
+                let mut covered = vec![false; definition.variants.len()];
+                let mut has_wildcard = false;
+                for arm in &arms {
+                    match (arm.enum_name.as_deref(), arm.variant.as_deref()) {
+                        (None, None) => {
+                            if has_wildcard {
+                                return Err(diag(
+                                    "R0235",
+                                    "`choose` has more than one `_` arm",
+                                    arm.span,
+                                ));
+                            }
+                            has_wildcard = true;
+                        }
+                        (Some(name), Some(variant_name)) => {
+                            if (*name != definition.name
+                                && self.scoped_enum_id(name) != Some(enum_id))
+                                && !is_generic_enum_name(&definition.name, name)
+                            {
+                                return Err(diag(
+                                    "R0233",
+                                    format!(
+                                        "pattern names enum `{name}` but the value has type enum `{}`",
+                                        definition.name
+                                    ),
+                                    arm.span,
+                                ));
+                            }
+                            let Some(index) = definition
+                                .variants
+                                .iter()
+                                .position(|candidate| candidate.name == variant_name)
+                            else {
+                                return Err(diag(
+                                    "R0233",
+                                    format!("enum `{name}` has no variant `{variant_name}`"),
+                                    arm.span,
+                                ));
+                            };
+                            if covered[index] {
+                                return Err(diag(
+                                    "R0235",
+                                    format!(
+                                        "`choose` handles variant `{name}::{variant_name}` more than once"
+                                    ),
+                                    arm.span,
+                                ));
+                            }
+                            covered[index] = true;
+                            if arm.bindings.len() != definition.variants[index].fields.len() {
+                                return Err(diag(
+                                    "R0233",
+                                    format!(
+                                        "enum variant `{name}::{variant_name}` expects {} binding(s), got {}",
+                                        definition.variants[index].fields.len(),
+                                        arm.bindings.len()
+                                    ),
+                                    arm.span,
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(diag(
+                                "R0233",
+                                "`choose` pattern must be any specific variant or `_`",
+                                arm.span,
+                            ));
+                        }
+                    }
+                }
+                if !has_wildcard {
+                    let missing = definition
+                        .variants
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| !covered[*index])
+                        .map(|(_, variant)| variant.name.as_str())
+                        .collect::<Vec<_>>();
+                    if !missing.is_empty() {
+                        return Err(diag(
+                            "R0235",
+                            format!(
+                                "`choose` is not exhaustive; missing variant(s): {}",
+                                missing.join(", ")
+                            ),
+                            span,
+                        )
+                        .with_help("add the missing variant arm(s) or a `_` fallback"));
+                    }
+                }
+                let mut common: Option<Type> = None;
+                let mut arms_ir = Vec::new();
+                for arm in arms {
+                    let saved_names = self.names.clone();
+                    let mut bindings_ir = Vec::new();
+                    if let (Some(_name), Some(variant_name)) =
+                        (arm.enum_name.as_deref(), arm.variant.as_deref())
+                    {
+                        let index = definition
+                            .variants
+                            .iter()
+                            .position(|candidate| candidate.name == variant_name)
+                            .unwrap();
+                        for (binding_index, binding_name) in arm.bindings.iter().enumerate() {
+                            let field_ty = definition.variants[index].fields[binding_index];
+                            let slot = self.allocate(field_ty);
+                            self.names.insert(
+                                binding_name.clone(),
+                                Binding {
+                                    slot,
+                                    ty: field_ty,
+                                    mutable: false,
+                                },
+                            );
+                            bindings_ir.push(RynArmBinding {
+                                slot,
+                                ty: field_ty,
+                                field_index: binding_index,
+                            });
+                        }
+                    }
+                    let arm_result = self.expression(arm.body, common);
+                    let (body_ir, body_ty) = arm_result?;
+                    match common {
+                        Some(expected) if expected != body_ty => {
+                            return Err(diag(
+                                "R0205",
+                                format!(
+                                    "`choose` arm has type `{}` but earlier arms have type `{}`",
+                                    type_name(body_ty),
+                                    type_name(expected)
+                                ),
+                                arm.span,
+                            ));
+                        }
+                        None => common = Some(body_ty),
+                        _ => {}
+                    }
+                    let variant_index = match (arm.enum_name.as_deref(), arm.variant.as_deref()) {
+                        (Some(_), Some(variant_name)) => Some(
+                            definition
+                                .variants
+                                .iter()
+                                .position(|candidate| candidate.name == variant_name)
+                                .unwrap(),
+                        ),
+                        _ => None,
+                    };
+                    self.names = saved_names;
+                    // Pattern bindings need distinct native slots for every arm.
+                    // Keep the allocated slots in the function frame; only their
+                    // lexical names leave scope here.
+                    arms_ir.push(RynMatchArm {
+                        variant: variant_index,
+                        bindings: bindings_ir,
+                        body: body_ir,
+                    });
+                }
+                let common = common
+                    .ok_or_else(|| diag("R0235", "`choose` must have at least one arm", span))?;
+                Ok((
+                    IrExpression::EnumMatch {
+                        value: Box::new(scrutinee),
+                        enum_id,
+                        arms: arms_ir,
+                        ty: common,
+                    },
+                    common,
+                ))
+            }
+            Expression::MethodCall {
+                value,
+                name,
+                arguments,
+                span,
+            } => {
+                let (target, arguments, result) =
+                    self.lower_method(*value, name.clone(), arguments, span)?;
+                if matches!(
+                    target,
+                    IrCallTarget::String(StringOp::FindStr | StringOp::FindString)
+                ) {
+                    let raw = IrExpression::Call {
+                        target,
+                        arguments,
+                        return_type: Type::I64,
+                    };
+                    let enum_id = self.enums.iter().position(is_option_u64).ok_or_else(|| {
+                        diag("R0900", "internal Option<u64> type is missing", span)
+                    })?;
+                    let ty = Type::Enum(enum_id);
+                    return Ok((
+                        IrExpression::StringFindOption {
+                            value: Box::new(raw),
+                            enum_id,
+                        },
+                        ty,
+                    ));
+                }
+                let return_type = result.ok_or_else(|| {
+                    diag(
+                        "R0215",
+                        format!("method `{name}` does not return a value"),
+                        span,
+                    )
+                    .with_help("call this method as a statement")
+                })?;
+                Ok((
+                    IrExpression::Call {
+                        target,
+                        arguments,
                         return_type,
                     },
                     return_type,
@@ -1569,7 +4220,7 @@ impl<'a> Analyzer<'a> {
                 if condition_ty != Type::Bool {
                     let error = diag(
                         "R0207",
-                        "`if` expression condition must have type `bool`",
+                        "`when` expression condition must have type `bool`",
                         condition_span,
                     )
                     .with_help("use a boolean expression, such as a comparison, for the condition");
@@ -1599,7 +4250,7 @@ impl<'a> Analyzer<'a> {
                     return Err(diag(
                         "R0205",
                         format!(
-                            "if-expression branches must have the same type, found `{}` and `{}`",
+                            "when-expression branches must have the same type, found `{}` and `{}`",
                             type_name(then_ty),
                             type_name(else_ty)
                         ),
@@ -1675,7 +4326,57 @@ impl<'a> Analyzer<'a> {
                 Ok((IrExpression::BitNot(Box::new(inner), ty), ty))
             }
             Expression::Cast(inner, target, span) => {
-                let target = resolve_type_name(&target, self.struct_ids)?;
+                let target = self.resolve_type_name(&target)?;
+                if matches!(target, Type::FunctionPointer(_)) {
+                    let inner_span = inner.span();
+                    if let Expression::Name(name, name_span) = inner.as_ref()
+                        && let Some(coerced) =
+                            self.coerce_function_pointer(name, &target, *name_span)?
+                    {
+                        return Ok((coerced, target));
+                    }
+                    let (value, source) = self.expression(*inner, None)?;
+                    if !matches!(source, Type::RawPointer(_) | Type::FunctionPointer(_)) {
+                        return Err(diag(
+                            "R0206",
+                            format!(
+                                "function pointer cast requires a raw pointer, found `{}`",
+                                type_name(source)
+                            ),
+                            inner_span,
+                        ));
+                    }
+                    return Ok((
+                        IrExpression::Cast {
+                            value: Box::new(value),
+                            source,
+                            target,
+                        },
+                        target,
+                    ));
+                }
+                if matches!(target, Type::RawPointer(_)) {
+                    let inner_span = inner.span();
+                    let (value, source) = self.expression(*inner, None)?;
+                    if matches!(source, Type::FunctionPointer(_)) {
+                        return Ok((
+                            IrExpression::Cast {
+                                value: Box::new(value),
+                                source,
+                                target,
+                            },
+                            target,
+                        ));
+                    }
+                    return Err(diag(
+                        "R0206",
+                        format!(
+                            "raw pointer cast requires a function pointer, found `{}`",
+                            type_name(source)
+                        ),
+                        inner_span,
+                    ));
+                }
                 if !is_numeric(target) {
                     return Err(diag(
                         "R0206",
@@ -1864,7 +4565,7 @@ impl<'a> Analyzer<'a> {
                         let valid = if equality {
                             left_ty == right_ty && is_equality_type(left_ty)
                         } else {
-                            is_numeric(left_ty) && left_ty == right_ty
+                            (is_numeric(left_ty) || left_ty == Type::Char) && left_ty == right_ty
                         };
                         if !valid {
                             let bad_operand_span = if equality {
@@ -1873,7 +4574,7 @@ impl<'a> Analyzer<'a> {
                                 } else {
                                     right_span
                                 }
-                            } else if !is_numeric(left_ty) {
+                            } else if !is_numeric(left_ty) && left_ty != Type::Char {
                                 left_span
                             } else {
                                 right_span
@@ -1951,7 +4652,7 @@ impl<'a> Analyzer<'a> {
         span: Span,
         expected: Option<Type>,
     ) -> Result<(IrExpression, Type), Diagnostic> {
-        let Some(struct_id) = self.struct_ids.get(&name).copied() else {
+        let Some(struct_id) = self.scoped_struct_id(&name) else {
             let mut diagnostics = vec![
                 diag("R0227", format!("unknown structure `{name}`"), span)
                     .with_help("declare the structure before constructing it"),
@@ -1965,14 +4666,16 @@ impl<'a> Analyzer<'a> {
         };
 
         let ty = Type::Struct(struct_id);
-        let definition = &self.structs[struct_id];
+        let definition = self.structs[struct_id].clone();
         let mut diagnostics = Vec::new();
         if expected.is_some_and(|expected| expected != ty) {
             diagnostics.push(diag(
                 "R0205",
                 format!(
                     "structure literal `{name}` does not match the expected type `{}`",
-                    expected.map(type_name).unwrap_or("unknown")
+                    expected
+                        .map(type_name)
+                        .unwrap_or_else(|| "unknown".to_owned())
                 ),
                 span,
             ));
@@ -2068,6 +4771,9 @@ impl<'a> Analyzer<'a> {
 
     fn numeric_type_hint(&self, expression: &Expression) -> Option<Type> {
         match expression {
+            Expression::MethodCall { .. } => self
+                .value_type_hint(expression)
+                .filter(|ty| is_numeric(*ty)),
             Expression::Name(name, _) => self
                 .names
                 .get(name)
@@ -2092,7 +4798,8 @@ impl<'a> Analyzer<'a> {
             Expression::Negate(inner, _) | Expression::BitNot(inner, _) => {
                 self.numeric_type_hint(inner)
             }
-            Expression::Cast(_, target, _) => resolve_type_name(target, self.struct_ids)
+            Expression::Cast(_, target, _) => self
+                .resolve_type_name(target)
                 .ok()
                 .filter(|ty| is_numeric(*ty)),
             Expression::Binary {
@@ -2127,15 +4834,47 @@ impl<'a> Analyzer<'a> {
 
     fn value_type_hint(&self, expression: &Expression) -> Option<Type> {
         match expression {
+            Expression::Character(_, _) => Some(Type::Char),
+            Expression::String(_, _) => Some(Type::Str),
+            Expression::Call { name, .. } if name == "String" => Some(Type::OwnedString),
+            Expression::MethodCall { value, name, .. } => match self.value_type_hint(value) {
+                Some(Type::OwnedString) => match name.as_str() {
+                    "clone" | "concat" | "slice" | "slice_chars" | "trim" => {
+                        Some(Type::OwnedString)
+                    }
+                    "to_i8" => Some(Type::I8),
+                    "to_i16" => Some(Type::I16),
+                    "to_i32" => Some(Type::I32),
+                    "to_i64" => Some(Type::I64),
+                    "to_u8" => Some(Type::U8),
+                    "to_u16" => Some(Type::U16),
+                    "to_u32" => Some(Type::U32),
+                    "to_u64" => Some(Type::U64),
+                    "to_f32" => Some(Type::F32),
+                    "to_f64" => Some(Type::F64),
+                    "len" | "char_count" => Some(Type::U64),
+                    "find" => Some(Type::I64),
+                    "split" => Some(Type::Vec(intern_vec_elem(Type::OwnedString))),
+                    "char_at" => Some(Type::Char),
+                    "byte_at" => Some(Type::U8),
+                    "starts_with" | "ends_with" | "contains" => Some(Type::Bool),
+                    _ => None,
+                },
+                Some(Type::Vec(id)) => match name.as_str() {
+                    "clone" => Some(Type::Vec(id)),
+                    "len" | "capacity" => Some(Type::U64),
+                    "take" | "extract" | "index" => Some(vec_elem(id)),
+                    _ => None,
+                },
+                _ => None,
+            },
             Expression::Name(name, _) => self.names.get(name).map(|binding| binding.ty),
-            Expression::StructLiteral { name, .. } => {
-                self.struct_ids.get(name).copied().map(Type::Struct)
-            }
+            Expression::StructLiteral { name, .. } => self.scoped_struct_id(name).map(Type::Struct),
             Expression::Call { name, .. } => self
                 .signatures
                 .get(name)
                 .and_then(|signature| signature.return_type),
-            Expression::Cast(_, target, _) => resolve_type_name(target, self.struct_ids).ok(),
+            Expression::Cast(_, target, _) => self.resolve_type_name(target).ok(),
             Expression::Field { value, name, .. } => {
                 let Type::Struct(struct_id) = self.value_type_hint(value)? else {
                     return None;
@@ -2174,18 +4913,812 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn lower_call(
+    fn lower_method(
         &mut self,
+        value: Expression,
         name: String,
         arguments: Vec<Expression>,
         span: Span,
     ) -> Result<(IrCallTarget, Vec<IrExpression>, Option<Type>), Diagnostic> {
-        let builtin = match name.as_str() {
-            "arg_count" => Some((IrCallTarget::ArgumentCount, Vec::new(), Some(Type::U32))),
-            "arg" => Some((IrCallTarget::Argument, vec![Type::U32], Some(Type::Str))),
+        fn root(value: &Expression) -> Option<&str> {
+            match value {
+                Expression::Name(name, _) => Some(name),
+                Expression::Field { value, .. } => root(value),
+                _ => None,
+            }
+        }
+        let mutable = root(&value)
+            .and_then(|name| self.names.get(name))
+            .is_none_or(|binding| binding.mutable);
+        let (receiver, receiver_ty) = self.expression(value, None)?;
+        if let Type::Vec(elem_id) = receiver_ty {
+            if matches!(name.as_str(), "as_slice" | "slice") {
+                if custom_drop_vec_only(Type::Vec(elem_id), self.structs, self.enums) {
+                    return Err(diag(
+                        "R0234",
+                        "slices of custom-destructor values are not supported because slice reads clone elements",
+                        span,
+                    ));
+                }
+                let (start, end) = if name == "slice" {
+                    if arguments.len() != 2 {
+                        return Err(diag(
+                            "R0211",
+                            format!(
+                                "method `slice` expects 2 arguments but got {}",
+                                arguments.len()
+                            ),
+                            span,
+                        ));
+                    }
+                    let mut arguments = arguments.into_iter();
+                    let start_expr = arguments.next().expect("slice arity checked");
+                    let end_expr = arguments.next().expect("slice arity checked");
+                    let (start, start_ty) = self.expression(start_expr, Some(Type::U64))?;
+                    let (end, end_ty) = self.expression(end_expr, Some(Type::U64))?;
+                    if start_ty != Type::U64 || end_ty != Type::U64 {
+                        return Err(diag("R0205", "Vec slice bounds must be u64", span));
+                    }
+                    (start, end)
+                } else {
+                    if !arguments.is_empty() {
+                        return Err(diag(
+                            "R0211",
+                            format!(
+                                "method `as_slice` expects no arguments but got {}",
+                                arguments.len()
+                            ),
+                            span,
+                        ));
+                    }
+                    (
+                        IrExpression::Integer(0, Type::U64),
+                        IrExpression::Call {
+                            target: IrCallTarget::Vec(VecOp::Len, elem_id),
+                            arguments: vec![receiver.clone()],
+                            return_type: Type::U64,
+                        },
+                    )
+                };
+                return Ok((
+                    IrCallTarget::VecSlice(elem_id),
+                    vec![receiver, start, end],
+                    Some(Type::Slice(elem_id)),
+                ));
+            }
+            return self.lower_vec_method(
+                receiver,
+                elem_id,
+                name.clone(),
+                arguments,
+                span,
+                mutable,
+            );
+        }
+        if let Type::Slice(_) = receiver_ty {
+            if name == "len" && arguments.is_empty() {
+                return Ok((IrCallTarget::SliceLen, vec![receiver], Some(Type::U64)));
+            }
+            return Err(diag(
+                "R0234",
+                format!("type `{}` has no method `{name}`", type_name(receiver_ty)),
+                span,
+            ));
+        }
+        if let Type::Map(map_id) = receiver_ty {
+            return self.lower_map_method(receiver, map_id, name.clone(), arguments, span, mutable);
+        }
+        if receiver_ty != Type::OwnedString {
+            return Err(diag(
+                "R0234",
+                format!("type `{}` has no method `{name}`", type_name(receiver_ty)),
+                span,
+            ));
+        }
+        let owned_argument = arguments
+            .first()
+            .and_then(|argument| self.value_type_hint(argument))
+            == Some(Type::OwnedString);
+        let try_parse = match name.as_str() {
+            "try_to_i8" => Some((Type::I8, 0)),
+            "try_to_i16" => Some((Type::I16, 1)),
+            "try_to_i32" => Some((Type::I32, 2)),
+            "try_to_i64" => Some((Type::I64, 3)),
+            "try_to_u8" => Some((Type::U8, 4)),
+            "try_to_u16" => Some((Type::U16, 5)),
+            "try_to_u32" => Some((Type::U32, 6)),
+            "try_to_u64" => Some((Type::U64, 7)),
+            "try_to_f32" => Some((Type::F32, 8)),
+            "try_to_f64" => Some((Type::F64, 9)),
             _ => None,
         };
-        let Some(sig) = self.signatures.get(&name).cloned() else {
+        let op = match name.as_str() {
+            "try_to_i8" | "try_to_i16" | "try_to_i32" | "try_to_i64" | "try_to_u8"
+            | "try_to_u16" | "try_to_u32" | "try_to_u64" | "try_to_f32" | "try_to_f64" => {
+                StringOp::TryParse
+            }
+            "clone" => StringOp::Clone,
+            "to_i8" => StringOp::ToI8,
+            "to_i16" => StringOp::ToI16,
+            "to_i32" => StringOp::ToI32,
+            "to_i64" => StringOp::ToI64,
+            "to_u8" => StringOp::ToU8,
+            "to_u16" => StringOp::ToU16,
+            "to_u32" => StringOp::ToU32,
+            "to_u64" => StringOp::ToU64,
+            "to_f32" => StringOp::ToF32,
+            "to_f64" => StringOp::ToF64,
+            "len" => StringOp::Len,
+            "char_count" => StringOp::CharCount,
+            "byte_at" => StringOp::ByteAt,
+            "char_at" => StringOp::CharAt,
+            "slice" => StringOp::Slice,
+            "slice_chars" => StringOp::SliceChars,
+            "trim" => StringOp::Trim,
+            "clear" => StringOp::Clear,
+            "push" => StringOp::Push,
+            "append" if owned_argument => StringOp::AppendString,
+            "append" => StringOp::AppendStr,
+            "concat" if owned_argument => StringOp::ConcatString,
+            "concat" => StringOp::ConcatStr,
+            "starts_with" if owned_argument => StringOp::StartsWithString,
+            "starts_with" => StringOp::StartsWithStr,
+            "ends_with" if owned_argument => StringOp::EndsWithString,
+            "ends_with" => StringOp::EndsWithStr,
+            "contains" if owned_argument => StringOp::ContainsString,
+            "contains" => StringOp::ContainsStr,
+            "find" if owned_argument => StringOp::FindString,
+            "find" => StringOp::FindStr,
+            "split" if owned_argument => StringOp::SplitString,
+            "split" => StringOp::SplitStr,
+            _ => {
+                return Err(diag(
+                    "R0234",
+                    format!("String has no method `{name}`"),
+                    span,
+                ));
+            }
+        };
+        if op.mutates() && !mutable {
+            return Err(diag(
+                "R0204",
+                format!("method `{name}` requires a mutable String"),
+                span,
+            )
+            .with_help("declare the receiver's root binding with `mut`"));
+        }
+        let mut arguments = arguments;
+        if let Some((_, tag)) = try_parse {
+            arguments.push(Expression::Integer(tag, span));
+        }
+        let parameters = op.parameters().into_iter().skip(1).collect();
+        let result_type = if let Some((parsed_type, _)) = try_parse {
+            let option_id = self
+                .enums
+                .iter()
+                .position(|definition| is_option_of(definition, parsed_type))
+                .ok_or_else(|| {
+                    diag(
+                        "R0900",
+                        "internal Option type for String parse is missing",
+                        span,
+                    )
+                })?;
+            Some(Type::Enum(option_id))
+        } else {
+            op.result()
+        };
+        let (target, mut arguments, result) = self.lower_builtin_call(
+            name,
+            IrCallTarget::String(op),
+            parameters,
+            result_type,
+            arguments,
+            span,
+        )?;
+        arguments.insert(0, receiver);
+        Ok((target, arguments, result))
+    }
+
+    fn lower_vec_method(
+        &mut self,
+        receiver: IrExpression,
+        elem_id: usize,
+        name: String,
+        arguments: Vec<Expression>,
+        span: Span,
+        mutable: bool,
+    ) -> Result<(IrCallTarget, Vec<IrExpression>, Option<Type>), Diagnostic> {
+        let elem = vec_elem(elem_id);
+        let elem_copyable = match elem {
+            Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::F32
+            | Type::F64
+            | Type::Bool
+            | Type::Char => true,
+            Type::OwnedString | Type::Vec(_) | Type::Map(_) => true,
+            Type::Struct(id) => {
+                self.structs[id].drop_function.is_none()
+                    && !contains_custom_drop(
+                        elem,
+                        self.structs,
+                        self.enums,
+                        &mut HashSet::new(),
+                        &mut HashSet::new(),
+                        0,
+                    )
+                    && vec_struct_fields_supported(&self.structs[id], self.structs)
+            }
+            _ => false,
+        };
+        let op = match name.as_str() {
+            "clone" if elem_copyable => VecOp::Clone,
+            "clone" => {
+                return Err(diag(
+                    "R0234",
+                    format!(
+                        "`Vec<{}>` contains move-only elements and cannot be cloned",
+                        type_name(elem)
+                    ),
+                    span,
+                ));
+            }
+            "len" => VecOp::Len,
+            "capacity" => VecOp::Capacity,
+            "reserve" => VecOp::Reserve,
+            "clear" => VecOp::Clear,
+            "push" => VecOp::Push,
+            "set" => VecOp::Set,
+            "take" => VecOp::Take,
+            "extract" if elem_copyable => VecOp::Extract,
+            "extract" => {
+                return Err(diag(
+                    "R0234",
+                    format!(
+                        "`Vec<{}>` elements must be copyable to read with `extract`",
+                        type_name(elem)
+                    ),
+                    span,
+                ));
+            }
+            "index" if elem_copyable => VecOp::Index,
+            "index" => {
+                return Err(diag(
+                    "R0234",
+                    format!(
+                        "`Vec<{}>` elements must be copyable to read with `index`",
+                        type_name(elem)
+                    ),
+                    span,
+                ));
+            }
+            _ => {
+                return Err(diag("R0234", format!("`Vec` has no method `{name}`"), span));
+            }
+        };
+        if op.mutates() && !mutable {
+            return Err(diag(
+                "R0204",
+                format!("method `{name}` requires a mutable Vec"),
+                span,
+            )
+            .with_help("declare the receiver's root binding with `mut`"));
+        }
+        let parameters = op.parameters(elem).into_iter().skip(1).collect();
+        let (target, mut arguments, result) = self.lower_builtin_call(
+            name,
+            IrCallTarget::Vec(op, elem_id),
+            parameters,
+            op.result(elem),
+            arguments,
+            span,
+        )?;
+        arguments.insert(0, receiver);
+        Ok((target, arguments, result))
+    }
+
+    fn lower_map_method(
+        &mut self,
+        receiver: IrExpression,
+        map_id: usize,
+        name: String,
+        arguments: Vec<Expression>,
+        span: Span,
+        mutable: bool,
+    ) -> Result<(IrCallTarget, Vec<IrExpression>, Option<Type>), Diagnostic> {
+        let (key, value) = map_info(map_id);
+        let op = match name.as_str() {
+            "len" => MapOp::Len,
+            "clone" => MapOp::Clone,
+            "clear" => MapOp::Clear,
+            "contains_key" | "contains" => MapOp::ContainsKey,
+            "insert" | "add" => MapOp::Insert,
+            "get" => MapOp::Get,
+            "remove" => MapOp::Remove,
+            "keys" => MapOp::Keys,
+            "values" => MapOp::Values,
+            _ => return Err(diag("R0234", format!("Map has no method `{name}`"), span)),
+        };
+        if op == MapOp::Get && !map_payload_type_supported(value, self.structs, 0) {
+            return Err(diag(
+                "R0234",
+                "Map.get cannot clone this move-only or unsupported value type",
+                span,
+            ));
+        }
+        if op == MapOp::Values && !map_payload_type_supported(value, self.structs, 0) {
+            return Err(diag(
+                "R0234",
+                "Map.values cannot clone this move-only or unsupported value type",
+                span,
+            ));
+        }
+        if op == MapOp::Clone && custom_drop_map_only(Type::Map(map_id), self.structs, self.enums) {
+            return Err(diag(
+                "R0234",
+                "Map.clone cannot duplicate move-only custom-destructor values",
+                span,
+            ));
+        }
+        if op.mutates() && !mutable {
+            return Err(diag(
+                "R0204",
+                format!("method `{name}` requires a mutable Map"),
+                span,
+            )
+            .with_help("declare the receiver's root binding with `mut`"));
+        }
+        let mut arguments = arguments;
+        if op == MapOp::Insert && value == Type::Bool && arguments.len() == 1 {
+            arguments.push(Expression::Boolean(true, span));
+        }
+        let parameters = op.parameters(key, value).into_iter().skip(1).collect();
+        let result_type = if op == MapOp::Get {
+            self.enums
+                .iter()
+                .position(|definition| is_option_of(definition, value))
+                .map(Type::Enum)
+        } else {
+            op.result(key, value)
+        };
+        let (target, mut arguments, result) = self.lower_builtin_call(
+            name,
+            IrCallTarget::Map(op, map_id),
+            parameters,
+            result_type,
+            arguments,
+            span,
+        )?;
+        arguments.insert(0, receiver);
+        Ok((target, arguments, result))
+    }
+
+    fn coerce_function_pointer(
+        &self,
+        name: &str,
+        target: &Type,
+        span: Span,
+    ) -> Result<Option<IrExpression>, Diagnostic> {
+        let Type::FunctionPointer(signature_id) = target else {
+            return Ok(None);
+        };
+        let pointer_signature = function_pointer_info(*signature_id);
+        let resolved = if self.signatures.contains_key(name) {
+            Some(name.to_string())
+        } else {
+            let namespace_name = self
+                .function_name
+                .rsplit_once("::")
+                .map(|(namespace, _)| format!("{namespace}::{name}"));
+            namespace_name
+                .filter(|candidate| self.signatures.contains_key(candidate))
+                .or_else(|| {
+                    let local_name = if self.module_path.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{}::{name}", self.module_path)
+                    };
+                    self.signatures
+                        .contains_key(&local_name)
+                        .then_some(local_name)
+                })
+        };
+        let Some(resolved) = resolved else {
+            return Ok(None);
+        };
+        let Some(function_signature) = self.signatures.get(&resolved) else {
+            return Ok(None);
+        };
+        if function_signature.is_destructor {
+            return Err(diag(
+                "R0255",
+                "destructor functions are called automatically by Ryn Guard",
+                span,
+            ));
+        }
+        let IrCallTarget::Function(function_index) = function_signature.target else {
+            return Ok(None);
+        };
+        if !self
+            .function_visibility
+            .get(function_index)
+            .copied()
+            .unwrap_or(false)
+            && self
+                .function_module_paths
+                .get(function_index)
+                .map(String::as_str)
+                != Some(self.module_path.as_str())
+        {
+            return Err(diag(
+                "R0425",
+                format!("function `{resolved}` is private in its module"),
+                span,
+            )
+            .with_help("mark the function `pub` to use it through a module alias"));
+        }
+        if signature_has_record(&pointer_signature) {
+            return Err(diag(
+                "R0247",
+                "function pointer coercion does not support C-ABI record parameters or results yet",
+                span,
+            )
+            .with_help("use scalar, pointer, or function-pointer parameter types"));
+        }
+        if function_signature.parameters != pointer_signature.parameters
+            || function_signature.return_type != pointer_signature.result
+        {
+            return Err(diag(
+                "R0206",
+                format!(
+                    "function `{resolved}` does not match the function pointer type `{}`",
+                    type_name(*target)
+                ),
+                span,
+            )
+            .with_help("the parameter and result types must match exactly"));
+        }
+        Ok(Some(IrExpression::FunctionAddress {
+            function: function_index,
+            ty: *target,
+        }))
+    }
+
+    fn lower_call(
+        &mut self,
+        name: String,
+        mut arguments: Vec<Expression>,
+        span: Span,
+    ) -> Result<(IrCallTarget, Vec<IrExpression>, Option<Type>), Diagnostic> {
+        if self
+            .signatures
+            .get(&name)
+            .is_some_and(|signature| signature.is_destructor)
+        {
+            return Err(diag(
+                "R0255",
+                "destructor functions are called automatically by Ryn Guard",
+                span,
+            ));
+        }
+        if let Some(binding) = self.names.get(&name).copied()
+            && let Type::FunctionPointer(signature_id) = binding.ty
+        {
+            let signature = function_pointer_info(signature_id);
+            if signature.extern_c
+                && signature
+                    .parameters
+                    .iter()
+                    .copied()
+                    .chain(signature.result)
+                    .any(|ty| {
+                        matches!(ty, Type::Struct(id)
+                            if c_abi_packed_record_layout(id, self.structs).is_none())
+                    })
+            {
+                return Err(diag(
+                    "R0247",
+                    "C-ABI function pointer records must use the supported packed 1, 2, 4, or 8 byte layout",
+                    span,
+                ));
+            }
+            if arguments.len() != signature.parameters.len() {
+                return Err(diag(
+                    "R0211",
+                    format!(
+                        "function pointer expects {} arguments but got {}",
+                        signature.parameters.len(),
+                        arguments.len()
+                    ),
+                    span,
+                ));
+            }
+            let mut lowered = vec![IrExpression::Local {
+                slot: binding.slot,
+                ty: binding.ty,
+                span,
+            }];
+            for (argument, expected) in arguments.drain(..).zip(&signature.parameters) {
+                let argument_span = argument.span();
+                let (value, actual) = self.expression(argument, Some(*expected))?;
+                if actual != *expected {
+                    return Err(diag(
+                        "R0212",
+                        format!(
+                            "function pointer argument has type `{}` but `{}` is required",
+                            type_name(actual),
+                            type_name(*expected)
+                        ),
+                        argument_span,
+                    ));
+                }
+                lowered.push(value);
+            }
+            return Ok((
+                IrCallTarget::IndirectFunctionPointer(signature_id),
+                lowered,
+                signature.result,
+            ));
+        }
+        if name == "String" && arguments.len() == 1 {
+            let argument = arguments.pop().unwrap();
+            let argument_span = argument.span();
+            let (value, ty) = self.expression(argument, None)?;
+            let operation = match ty {
+                Type::Str => StringOp::New,
+                Type::OwnedString => StringOp::Clone,
+                _ => StringOp::from_numeric_type(ty).ok_or_else(|| {
+                    diag(
+                        "R0205",
+                        format!("String construction does not support `{}`", type_name(ty)),
+                        argument_span,
+                    )
+                    .with_help("construct a String from `str` or a numeric value")
+                })?,
+            };
+            return Ok((
+                IrCallTarget::String(operation),
+                vec![value],
+                Some(Type::OwnedString),
+            ));
+        }
+        if name == "String" && arguments.is_empty() {
+            arguments.push(Expression::String(String::new(), span));
+        }
+        let raw_pointer = Type::RawPointer(intern_pointer_target(Type::U8));
+        let builtin = match name.as_str() {
+            "String" => Some((
+                IrCallTarget::String(StringOp::New),
+                vec![Type::Str],
+                Some(Type::OwnedString),
+            )),
+            "char_from_u32" => Some((
+                IrCallTarget::String(StringOp::CharFromU32),
+                vec![Type::U32],
+                Some(Type::Char),
+            )),
+            "arg_count" => Some((IrCallTarget::ArgumentCount, Vec::new(), Some(Type::U32))),
+            "arg" => Some((IrCallTarget::Argument, vec![Type::U32], Some(Type::Str))),
+            "read_file" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::ReadFile),
+                vec![Type::Str],
+                Some(Type::OwnedString),
+            )),
+            "try_read_file" => {
+                let option_id = self
+                    .enums
+                    .iter()
+                    .position(|definition| is_option_of(definition, Type::OwnedString))
+                    .ok_or_else(|| {
+                        diag("R0999", "internal error: Option<String> type missing", span)
+                    })?;
+                Some((
+                    IrCallTarget::TryReadFile(option_id),
+                    vec![Type::Str],
+                    Some(Type::Enum(option_id)),
+                ))
+            }
+            "read_file_result" => {
+                let result_id = self
+                    .enums
+                    .iter()
+                    .position(|definition| is_result_of(definition, Type::OwnedString, Type::I32))
+                    .ok_or_else(|| {
+                        diag(
+                            "R0999",
+                            "internal error: Result<String, i32> type missing",
+                            span,
+                        )
+                    })?;
+                Some((
+                    IrCallTarget::ReadFileResult(result_id),
+                    vec![Type::Str],
+                    Some(Type::Enum(result_id)),
+                ))
+            }
+            "write_file" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::WriteFile),
+                vec![Type::Str, Type::Str],
+                Some(Type::Bool),
+            )),
+            "create_dir" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::CreateDir),
+                vec![Type::Str],
+                Some(Type::Bool),
+            )),
+            "delete_file" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::DeleteFile),
+                vec![Type::Str],
+                Some(Type::Bool),
+            )),
+            "delete_dir" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::DeleteDir),
+                vec![Type::Str],
+                Some(Type::Bool),
+            )),
+            "file_exists" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::Exists),
+                vec![Type::Str],
+                Some(Type::Bool),
+            )),
+            "is_file" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::IsFile),
+                vec![Type::Str],
+                Some(Type::Bool),
+            )),
+            "is_directory" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::IsDirectory),
+                vec![Type::Str],
+                Some(Type::Bool),
+            )),
+            "delete_dir_all" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::DeleteDirAll),
+                vec![Type::Str],
+                Some(Type::Bool),
+            )),
+            "read_dir" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::ReadDir),
+                vec![Type::Str],
+                Some(Type::Vec(intern_vec_elem(Type::OwnedString))),
+            )),
+            "path_join" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::PathJoin),
+                vec![Type::Str, Type::Str],
+                Some(Type::OwnedString),
+            )),
+            "path_parent" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::PathParent),
+                vec![Type::Str],
+                Some(Type::OwnedString),
+            )),
+            "path_file_name" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::PathFileName),
+                vec![Type::Str],
+                Some(Type::OwnedString),
+            )),
+            "path_extension" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::PathExtension),
+                vec![Type::Str],
+                Some(Type::OwnedString),
+            )),
+            "path_is_absolute" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::PathIsAbsolute),
+                vec![Type::Str],
+                Some(Type::Bool),
+            )),
+            "env_exists" => Some((
+                IrCallTarget::System(SystemOp::EnvExists),
+                vec![Type::Str],
+                Some(Type::Bool),
+            )),
+            "env_or" => Some((
+                IrCallTarget::System(SystemOp::EnvOr),
+                vec![Type::Str, Type::Str],
+                Some(Type::OwnedString),
+            )),
+            "set_env" => Some((
+                IrCallTarget::System(SystemOp::SetEnv),
+                vec![Type::Str, Type::Str],
+                Some(Type::Bool),
+            )),
+            "remove_env" => Some((
+                IrCallTarget::System(SystemOp::RemoveEnv),
+                vec![Type::Str],
+                Some(Type::Bool),
+            )),
+            "stdin_read" => Some((
+                IrCallTarget::System(SystemOp::ReadStdin),
+                vec![],
+                Some(Type::OwnedString),
+            )),
+            "stdout_write" => Some((
+                IrCallTarget::System(SystemOp::WriteStdout),
+                vec![Type::Str],
+                None,
+            )),
+            "stderr_write" => Some((
+                IrCallTarget::System(SystemOp::WriteStderr),
+                vec![Type::Str],
+                None,
+            )),
+            "run_process" => Some((
+                IrCallTarget::System(SystemOp::RunProcess),
+                vec![Type::Str],
+                Some(Type::I32),
+            )),
+            "run_process_args" => Some((
+                IrCallTarget::System(SystemOp::RunProcessArgs),
+                vec![Type::Str, Type::Vec(intern_vec_elem(Type::OwnedString))],
+                Some(Type::I32),
+            )),
+            "panic" => Some((IrCallTarget::System(SystemOp::Panic), vec![Type::Str], None)),
+            "exit" => Some((IrCallTarget::System(SystemOp::Exit), vec![Type::I32], None)),
+            "assert" => Some((
+                IrCallTarget::System(SystemOp::Assert),
+                vec![Type::Bool],
+                None,
+            )),
+            "assert_message" => Some((
+                IrCallTarget::System(SystemOp::AssertMessage),
+                vec![Type::Bool, Type::Str],
+                None,
+            )),
+            "load_library" => Some((
+                IrCallTarget::System(SystemOp::LoadLibrary),
+                vec![Type::Str],
+                Some(raw_pointer),
+            )),
+            "load_symbol" => Some((
+                IrCallTarget::System(SystemOp::LoadSymbol),
+                vec![raw_pointer, Type::Str],
+                Some(raw_pointer),
+            )),
+            "unload_library" => Some((
+                IrCallTarget::System(SystemOp::UnloadLibrary),
+                vec![raw_pointer],
+                Some(Type::Bool),
+            )),
+            "pointer_is_null" => Some((
+                IrCallTarget::System(SystemOp::PointerIsNull),
+                vec![raw_pointer],
+                Some(Type::Bool),
+            )),
+            "call_c_i32_1" => Some((
+                IrCallTarget::System(SystemOp::CallCI32One),
+                vec![raw_pointer, Type::I32],
+                Some(Type::I32),
+            )),
+            _ => None,
+        };
+        let resolved_name = if self.signatures.contains_key(&name) {
+            name.clone()
+        } else {
+            let namespace_name = self
+                .function_name
+                .rsplit_once("::")
+                .map(|(namespace, _)| format!("{namespace}::{name}"));
+            namespace_name
+                .filter(|candidate| self.signatures.contains_key(candidate))
+                .or_else(|| {
+                    let local_name = if self.module_path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}::{name}", self.module_path)
+                    };
+                    self.signatures
+                        .contains_key(&local_name)
+                        .then_some(local_name)
+                })
+                .unwrap_or_else(|| name.clone())
+        };
+        let Some(sig) = self.signatures.get(&resolved_name).cloned() else {
             if let Some((target, parameters, return_type)) = builtin {
                 return self.lower_builtin_call(
                     name,
@@ -2214,6 +5747,21 @@ impl<'a> Analyzer<'a> {
                 None => diagnostic,
             });
         };
+        if let IrCallTarget::Function(index) = sig.target
+            && !self
+                .function_visibility
+                .get(index)
+                .copied()
+                .unwrap_or(false)
+            && self.function_module_paths.get(index).map(String::as_str)
+                != Some(self.module_path.as_str())
+        {
+            return Err(diag(
+                "R0425",
+                format!("function `{name}` is private to its module"),
+                span,
+            ));
+        }
         let make_arity_error = || {
             diag(
                 "R0211",
@@ -2244,7 +5792,7 @@ impl<'a> Analyzer<'a> {
                 }
                 continue;
             };
-            match self.expression(argument, Some(*expected)) {
+            match self.expression_for_parameter(argument, *expected) {
                 Ok((argument, actual)) if actual == *expected => lowered.push(argument),
                 Ok((argument, actual)) => {
                     let diagnostic = diag(
@@ -2277,6 +5825,44 @@ impl<'a> Analyzer<'a> {
             return Err(error);
         }
         Ok((sig.target, lowered, sig.return_type))
+    }
+
+    fn expression_for_parameter(
+        &mut self,
+        argument: Expression,
+        expected: Type,
+    ) -> Result<(IrExpression, Type), Diagnostic> {
+        let Type::Slice(slice_id) = expected else {
+            return self.expression(argument, Some(expected));
+        };
+        let hinted_array = self
+            .value_type_hint(&argument)
+            .filter(|ty| matches!(ty, Type::Array(_)));
+        let literal_array = match &argument {
+            Expression::ArrayLiteral(values, _) => {
+                Some(Type::Array(intern_array(vec_elem(slice_id), values.len())))
+            }
+            _ => None,
+        };
+        let array_context = hinted_array.or(literal_array);
+        if array_context.is_none() {
+            return self.expression(argument, Some(expected));
+        }
+        let (value, actual) = self.expression(argument, array_context)?;
+        if let Type::Array(array_id) = actual {
+            let (element, length) = array_info(array_id);
+            if element == vec_elem(slice_id) {
+                return Ok((
+                    IrExpression::ArrayAsSlice {
+                        array: Box::new(value),
+                        slice_id,
+                        length,
+                    },
+                    expected,
+                ));
+            }
+        }
+        Ok((value, actual))
     }
 
     fn lower_builtin_call(
@@ -2318,8 +5904,18 @@ impl<'a> Analyzer<'a> {
                 }
                 continue;
             };
-            match self.expression(argument, Some(expected)) {
+            let accepts_owned_path =
+                matches!(target, IrCallTarget::Filesystem(_)) && expected == Type::Str;
+            let analyzed = if accepts_owned_path {
+                self.expression(argument, None)
+            } else {
+                self.expression(argument, Some(expected))
+            };
+            match analyzed {
                 Ok((value, actual)) if actual == expected => lowered.push(value),
+                Ok((value, Type::OwnedString)) if accepts_owned_path => {
+                    lowered.push(IrExpression::StringAsStr(Box::new(value)));
+                }
                 Ok((value, actual)) => {
                     let error = diag(
                         "R0212",
@@ -2352,6 +5948,67 @@ impl<'a> Analyzer<'a> {
     }
 }
 
+fn reference_parameter_index(value: &IrExpression, parameters: &[LocalBinding]) -> Option<usize> {
+    match value {
+        IrExpression::Local {
+            slot,
+            ty: Type::Reference(_, _),
+            ..
+        } => parameters
+            .iter()
+            .position(|parameter| parameter.slot == *slot),
+        IrExpression::SliceElementAddress { slice, .. } => match &**slice {
+            IrExpression::Local {
+                slot,
+                ty: Type::Slice(_),
+                ..
+            } => parameters
+                .iter()
+                .position(|parameter| parameter.slot == *slot),
+            _ => None,
+        },
+        IrExpression::If {
+            then_value,
+            else_value,
+            ..
+        } => {
+            let then_index = reference_parameter_index(then_value, parameters)?;
+            (reference_parameter_index(else_value, parameters) == Some(then_index))
+                .then_some(then_index)
+        }
+        _ => None,
+    }
+}
+
+fn collect_reference_returns(
+    statements: &[IrStatement],
+    parameters: &[LocalBinding],
+    output: &mut Vec<Option<usize>>,
+) {
+    for statement in statements {
+        match statement {
+            IrStatement::Return {
+                value: Some(value), ..
+            } => {
+                output.push(reference_parameter_index(value, parameters));
+            }
+            IrStatement::Block(body) => collect_reference_returns(body, parameters, output),
+            IrStatement::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_reference_returns(then_body, parameters, output);
+                collect_reference_returns(else_body, parameters, output);
+            }
+            IrStatement::While { body, .. } | IrStatement::For { body, .. } => {
+                collect_reference_returns(body, parameters, output);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn block_always_returns(statements: &[Statement]) -> bool {
     statements.iter().any(|statement| match statement {
         Statement::Return { .. } => true,
@@ -2371,6 +6028,27 @@ fn block_always_returns(statements: &[Statement]) -> bool {
 fn resolve_type_name(
     name: &TypeName,
     structs: &HashMap<String, usize>,
+    enums: &HashMap<String, usize>,
+) -> Result<Type, Diagnostic> {
+    resolve_type_name_scoped(name, structs, enums, None)
+}
+
+fn declaration_namespace(name: &str, module_path: &str) -> Option<String> {
+    let local_name = if module_path.is_empty() {
+        name
+    } else {
+        name.strip_prefix(&format!("{module_path}::"))?
+    };
+    local_name
+        .rsplit_once("::")
+        .map(|(namespace, _)| namespace.to_string())
+}
+
+fn resolve_type_name_scoped(
+    name: &TypeName,
+    structs: &HashMap<String, usize>,
+    enums: &HashMap<String, usize>,
+    namespace: Option<&str>,
 ) -> Result<Type, Diagnostic> {
     Ok(match name {
         TypeName::I8 => Type::I8,
@@ -2384,17 +6062,369 @@ fn resolve_type_name(
         TypeName::F32 => Type::F32,
         TypeName::F64 => Type::F64,
         TypeName::Str => Type::Str,
+        TypeName::OwnedString => Type::OwnedString,
+        TypeName::Char => Type::Char,
         TypeName::Bool => Type::Bool,
-        TypeName::Named(name, span) => Type::Struct(*structs.get(name).ok_or_else(|| {
-            diag("R0230", format!("unknown type `{name}`"), *span)
-                .with_help("use a built-in type or declare this structure")
-        })?),
+        TypeName::Parameter(name, span) => {
+            return Err(diag(
+                "R0260",
+                format!("unresolved generic type parameter `{name}`"),
+                *span,
+            ));
+        }
+        TypeName::Named(name, span) => {
+            let qualified = namespace
+                .filter(|_| !name.contains("::"))
+                .map(|namespace| format!("{namespace}::{name}"));
+            if let Some(id) = qualified.as_ref().and_then(|name| structs.get(name)) {
+                Type::Struct(*id)
+            } else if let Some(id) = qualified.as_ref().and_then(|name| enums.get(name)) {
+                Type::Enum(*id)
+            } else {
+                match structs.get(name) {
+                    Some(id) => Type::Struct(*id),
+                    None => match enums.get(name) {
+                        Some(id) => Type::Enum(*id),
+                        None => {
+                            return Err(diag("R0230", format!("unknown type `{name}`"), *span)
+                                .with_help(
+                                    "use a built-in type or declare this structure or enum",
+                                ));
+                        }
+                    },
+                }
+            }
+        }
+        TypeName::Vec(element, span) => {
+            let elem = resolve_type_name_scoped(element, structs, enums, namespace)?;
+            validate_vec_elem(&elem, *span)?;
+            Type::Vec(intern_vec_elem(elem))
+        }
+        TypeName::Map(key, value, span) => {
+            let key = resolve_type_name_scoped(key, structs, enums, namespace)?;
+            let value = resolve_type_name_scoped(value, structs, enums, namespace)?;
+            validate_map_types(key, value, *span)?;
+            Type::Map(intern_map(key, value))
+        }
+        TypeName::Array(element, length, span) => {
+            let element = resolve_type_name_scoped(element, structs, enums, namespace)?;
+            validate_array_elem(element, *span)?;
+            if *length > i32::MAX as usize / 8 {
+                return Err(diag(
+                    "R0240",
+                    "fixed array is too large for the native backend",
+                    *span,
+                ));
+            }
+            Type::Array(intern_array(element, *length))
+        }
+        TypeName::Slice(element, span) => {
+            let element = resolve_type_name_scoped(element, structs, enums, namespace)?;
+            validate_slice_elem(element, *span)?;
+            Type::Slice(intern_vec_elem(element))
+        }
+        TypeName::Reference(element, mutable, _span) => {
+            let element = resolve_type_name_scoped(element, structs, enums, namespace)?;
+            Type::Reference(intern_pointer_target(element), *mutable)
+        }
+        TypeName::RawPointer(element, _) => {
+            let element = resolve_type_name_scoped(element, structs, enums, namespace)?;
+            Type::RawPointer(intern_pointer_target(element))
+        }
+        TypeName::FunctionPointer(parameters, result, extern_c, span) => {
+            let parameters = parameters
+                .iter()
+                .map(|parameter| resolve_type_name_scoped(parameter, structs, enums, namespace))
+                .collect::<Result<Vec<_>, _>>()?;
+            let result = result
+                .as_ref()
+                .map(|result| resolve_type_name_scoped(result, structs, enums, namespace))
+                .transpose()?;
+            let supported = |ty: Type| {
+                is_c_abi_scalar(ty)
+                    || matches!(
+                        ty,
+                        Type::Char | Type::RawPointer(_) | Type::FunctionPointer(_)
+                    )
+                    || (*extern_c && matches!(ty, Type::Struct(_)))
+            };
+            if parameters.iter().any(|ty| !supported(*ty))
+                || result.is_some_and(|ty| !supported(ty))
+            {
+                return Err(diag(
+                    "R0247",
+                    "function pointer types support scalar and pointer values; C-ABI records must fit the supported packed 1, 2, 4, or 8 byte layout",
+                    *span,
+                ));
+            }
+            let _ = extern_c;
+            Type::FunctionPointer(intern_function_pointer(FunctionPointerSignature {
+                parameters,
+                result,
+                extern_c: *extern_c,
+            }))
+        }
     })
+}
+
+fn validate_slice_elem(elem: Type, span: Span) -> Result<(), Diagnostic> {
+    if !matches!(elem, Type::Slice(_)) {
+        Ok(())
+    } else {
+        Err(diag(
+            "R0240",
+            format!(
+                "borrowed slices of `{}` are not supported yet",
+                type_name(elem)
+            ),
+            span,
+        )
+        .with_help("slice elements must be values with generated clone/drop support"))
+    }
+}
+
+fn validate_array_elem(elem: Type, span: Span) -> Result<(), Diagnostic> {
+    if matches!(elem, Type::Struct(_)) {
+        return Ok(());
+    }
+    if matches!(
+        elem,
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::F32
+            | Type::F64
+            | Type::Bool
+            | Type::Char
+            | Type::OwnedString
+            | Type::Vec(_)
+            | Type::Map(_)
+            | Type::Struct(_)
+            | Type::Enum(_)
+            | Type::Str
+            | Type::Array(_)
+    ) {
+        return Ok(());
+    }
+    Err(diag(
+        "R0240",
+        format!(
+            "fixed arrays do not support `{}` elements yet",
+            type_name(elem)
+        ),
+        span,
+    ))
+}
+
+fn validate_array_literal_elem(
+    elem: Type,
+    structs: &[RynStruct],
+    span: Span,
+) -> Result<(), Diagnostic> {
+    if array_element_clone_supported(elem, structs) {
+        Ok(())
+    } else if matches!(elem, Type::Struct(_)) {
+        Err(diag(
+            "R0240",
+            format!(
+                "fixed arrays cannot clone every field of `{}` elements yet",
+                type_name(elem)
+            ),
+            span,
+        )
+        .with_help("array elements support recursively nested structures and arrays containing scalar, str, String, Vec, Map, or enum fields; borrowed slices cannot be stored in array elements"))
+    } else {
+        validate_array_elem(elem, span)
+    }
+}
+
+fn array_element_clone_supported(ty: Type, structs: &[RynStruct]) -> bool {
+    match ty {
+        Type::I8
+        | Type::I16
+        | Type::I32
+        | Type::I64
+        | Type::U8
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::F32
+        | Type::F64
+        | Type::Bool
+        | Type::Char
+        | Type::Str
+        | Type::OwnedString
+        | Type::Map(_)
+        | Type::Enum(_)
+        | Type::Reference(_, _)
+        | Type::RawPointer(_)
+        | Type::FunctionPointer(_) => true,
+        Type::Vec(id) => array_element_clone_supported(vec_elem(id), structs),
+        Type::Array(id) => array_element_clone_supported(array_info(id).0, structs),
+        Type::Struct(id) => structs[id]
+            .fields
+            .iter()
+            .all(|field| array_element_clone_supported(field.ty, structs)),
+        Type::Slice(_) => false,
+    }
+}
+
+fn validate_array_supported(ty: Type, structs: &[RynStruct], span: Span) -> Result<(), Diagnostic> {
+    if let Type::Array(id) = ty {
+        let (element, _) = array_info(id);
+        validate_array_literal_elem(element, structs, span)?;
+        validate_array_supported(element, structs, span)?;
+    }
+    Ok(())
+}
+
+fn validate_vec_elem(elem: &Type, span: Span) -> Result<(), Diagnostic> {
+    match elem {
+        Type::I8
+        | Type::I16
+        | Type::I32
+        | Type::I64
+        | Type::U8
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::F32
+        | Type::F64
+        | Type::Bool
+        | Type::Char
+        | Type::OwnedString
+        | Type::Map(_)
+        | Type::Struct(_) => Ok(()),
+        other => Err(diag(
+            "R0234",
+            format!("`Vec<{}>` is not supported yet", type_name(*other)),
+            span,
+        )
+        .with_help(
+            "supported element types are integers, floats, `bool`, `char`, and `String` for now",
+        )),
+    }
+}
+
+fn validate_vec_struct_elements(
+    ty: Type,
+    structs: &[RynStruct],
+    span: Span,
+) -> Result<(), Diagnostic> {
+    match ty {
+        Type::Vec(id) => {
+            let element = vec_elem(id);
+            if let Type::Struct(struct_id) = element
+                && structs[struct_id].drop_function.is_none()
+                && !vec_struct_fields_supported(&structs[struct_id], structs)
+            {
+                return Err(diag(
+                    "R0234",
+                    format!("`Vec<{}>` contains a field without generated clone/drop support", structs[struct_id].name),
+                    span,
+                )
+                .with_help("use scalar, String, collection, enum, array, or nested-structure fields whose element types support cloning"));
+            }
+        }
+        Type::Array(id) => validate_vec_struct_elements(array_info(id).0, structs, span)?,
+        Type::Struct(id) => {
+            for field in &structs[id].fields {
+                validate_vec_struct_elements(field.ty, structs, span)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn vec_struct_fields_supported(structure: &RynStruct, structs: &[RynStruct]) -> bool {
+    structure.drop_function.is_none()
+        && structure
+            .fields
+            .iter()
+            .all(|field| array_element_clone_supported(field.ty, structs))
+}
+
+fn name_span(name: &TypeName) -> Span {
+    match name {
+        TypeName::Named(_, span)
+        | TypeName::Parameter(_, span)
+        | TypeName::Vec(_, span)
+        | TypeName::Map(_, _, span)
+        | TypeName::Array(_, _, span)
+        | TypeName::Slice(_, span)
+        | TypeName::Reference(_, _, span)
+        | TypeName::RawPointer(_, span)
+        | TypeName::FunctionPointer(_, _, _, span) => *span,
+        _ => Span::default(),
+    }
+}
+
+fn validate_map_types(key: Type, value: Type, span: Span) -> Result<(), Diagnostic> {
+    let key_supported = matches!(
+        key,
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Bool
+            | Type::Char
+            | Type::OwnedString
+    );
+    if !key_supported {
+        return Err(diag(
+            "R0244",
+            format!(
+                "Map key type `{}` does not implement Hash and Eq",
+                type_name(key)
+            ),
+            span,
+        )
+        .with_help("Map keys currently support integer types, bool, char, and String"));
+    }
+    let value_supported = matches!(
+        value,
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::F32
+            | Type::F64
+            | Type::Bool
+            | Type::Char
+            | Type::OwnedString
+            | Type::Vec(_)
+            | Type::Map(_)
+            | Type::Struct(_)
+    );
+    if !value_supported {
+        return Err(diag(
+            "R0244",
+            format!("Map value type `{}` is not supported", type_name(value)),
+            span,
+        )
+        .with_help("Map values currently support scalar types, String, and Vec<T>"));
+    }
+    Ok(())
 }
 
 fn collect_struct_declaration_errors(
     definitions: &[StructDef],
     struct_ids: &HashMap<String, usize>,
+    enum_ids: &HashMap<String, usize>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     for definition in definitions {
@@ -2410,6 +6440,7 @@ fn collect_struct_declaration_errors(
             continue;
         }
         let mut names = HashSet::new();
+        let namespace = definition.name.rsplit_once("::").map(|(path, _)| path);
         for field in &definition.fields {
             if !names.insert(field.name.as_str()) {
                 diagnostics.push(
@@ -2421,8 +6452,17 @@ fn collect_struct_declaration_errors(
                     .with_help("give each field in a structure a unique name"),
                 );
             }
-            if let Err(diagnostic) = resolve_type_name(&field.ty, struct_ids) {
-                diagnostics.push(diagnostic);
+            match resolve_type_name_scoped(&field.ty, struct_ids, enum_ids, namespace) {
+                Ok(Type::Slice(_)) => diagnostics.push(
+                    diag(
+                        "R0240",
+                        "a borrowed slice cannot be stored in a structure field",
+                        field.span,
+                    )
+                    .with_help("use the slice in a function parameter or store an owning `Vec<T>`"),
+                ),
+                Ok(_) => {}
+                Err(diagnostic) => diagnostics.push(diagnostic),
             }
         }
     }
@@ -2432,16 +6472,21 @@ fn collect_struct_declaration_errors(
 fn collect_function_signature_errors(
     functions: &[Function],
     struct_ids: &HashMap<String, usize>,
+    enum_ids: &HashMap<String, usize>,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     for function in functions {
+        let namespace = declaration_namespace(&function.name, &function.module_path);
         for parameter in &function.parameters {
-            if let Err(diagnostic) = resolve_type_name(&parameter.ty, struct_ids) {
+            if let Err(diagnostic) =
+                resolve_type_name_scoped(&parameter.ty, struct_ids, enum_ids, namespace.as_deref())
+            {
                 diagnostics.push(diagnostic);
             }
         }
         if let Some(return_type) = &function.return_type
-            && let Err(diagnostic) = resolve_type_name(return_type, struct_ids)
+            && let Err(diagnostic) =
+                resolve_type_name_scoped(return_type, struct_ids, enum_ids, namespace.as_deref())
         {
             diagnostics.push(diagnostic);
         }
@@ -2450,7 +6495,10 @@ fn collect_function_signature_errors(
                 || function
                     .return_type
                     .as_ref()
-                    .and_then(|name| resolve_type_name(name, struct_ids).ok())
+                    .and_then(|name| {
+                        resolve_type_name_scoped(name, struct_ids, enum_ids, namespace.as_deref())
+                            .ok()
+                    })
                     .is_some_and(|return_type| return_type != Type::I32))
         {
             diagnostics.push(
@@ -2459,7 +6507,7 @@ fn collect_function_signature_errors(
                     "`main` must take no parameters and return either no value or `i32`",
                     function.span,
                 )
-                .with_help("use `fn main() { ... }` or `fn main() -> i32 { ... }`; move reusable work into another function"),
+                .with_help("use `fun main() { ... }` or `fun main() -> i32 { ... }`; move reusable work into another function"),
             );
         }
     }
@@ -2484,9 +6532,120 @@ fn collect_duplicate_parameter_errors(function: &Function) -> Vec<Diagnostic> {
     diagnostics
 }
 
+fn resolve_enum_layouts(
+    definitions: &[EnumDef],
+    structs: &[RynStruct],
+    struct_ids: &HashMap<String, usize>,
+    enum_ids: &HashMap<String, usize>,
+) -> Result<Vec<RynEnum>, Diagnostic> {
+    let mut enums = Vec::new();
+    for definition in definitions {
+        let namespace = definition.name.rsplit_once("::").map(|(path, _)| path);
+        if definition.variants.is_empty() {
+            return Err(diag(
+                "R0233",
+                format!("enum `{}` must have at least one variant", definition.name),
+                definition.span,
+            )
+            .with_help("add a variant declaration inside the enum"));
+        }
+        let mut variants = Vec::new();
+        let mut variant_names = HashSet::new();
+        for variant in &definition.variants {
+            if !variant_names.insert(variant.name.as_str()) {
+                return Err(diag(
+                    "R0233",
+                    format!(
+                        "duplicate variant `{}` in enum `{}`",
+                        variant.name, definition.name
+                    ),
+                    variant.span,
+                )
+                .with_help("give each variant in the enum a unique name"));
+            }
+            let mut fields = Vec::new();
+            for field in &variant.fields {
+                let ty = resolve_type_name_scoped(field, struct_ids, enum_ids, namespace)?;
+                match ty {
+                    Type::I8
+                    | Type::I16
+                    | Type::I32
+                    | Type::I64
+                    | Type::U8
+                    | Type::U16
+                    | Type::U32
+                    | Type::U64
+                    | Type::F32
+                    | Type::F64
+                    | Type::Bool
+                    | Type::Char
+                    | Type::OwnedString => {}
+                    Type::Enum(_) | Type::Map(_) => {}
+                    Type::Struct(struct_id)
+                        if definition.name.starts_with("$RynOption#")
+                            && enum_payload_struct_supported(
+                                Type::Struct(struct_id),
+                                structs,
+                                0,
+                            ) => {}
+                    Type::Vec(id) => match vec_elem(id) {
+                        Type::I8
+                        | Type::I16
+                        | Type::I32
+                        | Type::I64
+                        | Type::U8
+                        | Type::U16
+                        | Type::U32
+                        | Type::U64
+                        | Type::F32
+                        | Type::F64
+                        | Type::Bool
+                        | Type::Char
+                        | Type::OwnedString => {}
+                        _ => {
+                            return Err(diag(
+                                "R0234",
+                                format!(
+                                    "variant `{}::{}` uses a nested `Vec` element type that is not supported yet",
+                                    definition.name, variant.name
+                                ),
+                                variant.span,
+                            ));
+                        }
+                    },
+                    _ => {
+                        return Err(diag(
+                            "R0234",
+                            format!(
+                                "variant `{}::{}` uses a field type that is not supported yet",
+                                definition.name, variant.name
+                            ),
+                            variant.span,
+                        )
+                        .with_help(
+                            "currently allowed field types are integers, floats, `bool`, `char`, `String`, `Vec`, and enums",
+                        ));
+                    }
+                }
+                fields.push(ty);
+            }
+            variants.push(RynEnumVariant {
+                name: variant.name.clone(),
+                fields,
+            });
+        }
+        enums.push(RynEnum {
+            name: definition.name.clone(),
+            variants,
+        });
+    }
+    Ok(enums)
+}
+
 fn resolve_struct_layouts(
     definitions: &[StructDef],
     struct_ids: &HashMap<String, usize>,
+    enum_ids: &HashMap<String, usize>,
 ) -> Result<Vec<RynStruct>, Diagnostic> {
     let mut states = vec![0; definitions.len()];
     let mut layouts = vec![None; definitions.len()];
@@ -2497,6 +6656,7 @@ fn resolve_struct_layouts(
             0,
             definitions,
             struct_ids,
+            enum_ids,
             &mut states,
             &mut layouts,
         )?;
@@ -2540,7 +6700,16 @@ fn collect_struct_layout_cycle_errors(
             let TypeName::Named(name, _) = &field.ty else {
                 continue;
             };
-            let Some(&child_id) = struct_ids.get(name) else {
+            let definition = &definitions[*struct_id];
+            let namespace = definition.name.rsplit_once("::").map(|(path, _)| path);
+            let qualified_name = namespace
+                .filter(|_| !name.contains("::"))
+                .map(|namespace| format!("{namespace}::{name}"));
+            let Some(&child_id) = qualified_name
+                .as_ref()
+                .and_then(|name| struct_ids.get(name))
+                .or_else(|| struct_ids.get(name))
+            else {
                 continue;
             };
             match states[child_id] {
@@ -2568,12 +6737,14 @@ fn collect_struct_layout_cycle_errors(
     diagnostics
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_struct_layout(
     struct_id: usize,
     via_field: Option<Span>,
     depth: usize,
     definitions: &[StructDef],
     struct_ids: &HashMap<String, usize>,
+    enum_ids: &HashMap<String, usize>,
     states: &mut [u8],
     layouts: &mut [Option<RynStruct>],
 ) -> Result<(), Diagnostic> {
@@ -2623,30 +6794,21 @@ fn resolve_struct_layout(
             )
             .with_help("give each field in a structure a unique name"));
         }
-        let ty = resolve_type_name(&field.ty, struct_ids)?;
-        let width = if let Type::Struct(child_id) = ty {
-            resolve_struct_layout(
-                child_id,
-                Some(field.span),
-                depth + 1,
-                definitions,
-                struct_ids,
-                states,
-                layouts,
-            )?;
-            layouts[child_id]
-                .as_ref()
-                .map(|layout| layout.slot_count)
-                .ok_or_else(|| {
-                    diag(
-                        "R0900",
-                        "internal error: child structure layout is missing",
-                        field.span,
-                    )
-                })?
-        } else {
-            slot_width(ty)
-        };
+        let namespace = definitions[struct_id]
+            .name
+            .rsplit_once("::")
+            .map(|(path, _)| path);
+        let ty = resolve_type_name_scoped(&field.ty, struct_ids, enum_ids, namespace)?;
+        let width = resolve_storage_width(
+            ty,
+            field.span,
+            depth + 1,
+            definitions,
+            struct_ids,
+            enum_ids,
+            states,
+            layouts,
+        )?;
         fields.push(RynStructField {
             name: field.name.clone(),
             ty,
@@ -2668,31 +6830,237 @@ fn resolve_struct_layout(
         name: definition.name.clone(),
         fields,
         slot_count,
+        repr_c: definition.repr_c,
+        drop_function: None,
     });
     states[struct_id] = 2;
     Ok(())
 }
 
-fn slot_width(ty: Type) -> usize {
-    if ty == Type::Str { 2 } else { 1 }
-}
-fn type_name(ty: Type) -> &'static str {
+#[allow(clippy::too_many_arguments)]
+fn resolve_storage_width(
+    ty: Type,
+    span: Span,
+    depth: usize,
+    definitions: &[StructDef],
+    struct_ids: &HashMap<String, usize>,
+    enum_ids: &HashMap<String, usize>,
+    states: &mut [u8],
+    layouts: &mut [Option<RynStruct>],
+) -> Result<usize, Diagnostic> {
     match ty {
-        Type::I8 => "i8",
-        Type::I16 => "i16",
-        Type::I32 => "i32",
-        Type::I64 => "i64",
-        Type::U8 => "u8",
-        Type::U16 => "u16",
-        Type::U32 => "u32",
-        Type::U64 => "u64",
-        Type::F32 => "f32",
-        Type::F64 => "f64",
-        Type::Str => "str",
-        Type::Bool => "bool",
-        Type::Struct(_) => "structure",
+        Type::Struct(child_id) => {
+            resolve_struct_layout(
+                child_id,
+                Some(span),
+                depth,
+                definitions,
+                struct_ids,
+                enum_ids,
+                states,
+                layouts,
+            )?;
+            layouts[child_id]
+                .as_ref()
+                .map(|layout| layout.slot_count)
+                .ok_or_else(|| {
+                    diag(
+                        "R0900",
+                        "internal error: child structure layout is missing",
+                        span,
+                    )
+                })
+        }
+        Type::Array(id) => {
+            let (element, length) = array_info(id);
+            resolve_storage_width(
+                element,
+                span,
+                depth + 1,
+                definitions,
+                struct_ids,
+                enum_ids,
+                states,
+                layouts,
+            )?
+            .checked_mul(length)
+            .ok_or_else(|| {
+                diag(
+                    "R0231",
+                    "structure layout is too large for the native backend",
+                    span,
+                )
+            })
+        }
+        _ => Ok(slot_width(ty)),
     }
 }
+
+pub fn slot_width(ty: Type) -> usize {
+    match ty {
+        Type::Str => 2,
+        Type::Slice(_) => 2,
+        Type::Array(id) => {
+            let (element, length) = array_info(id);
+            length.saturating_mul(slot_width(element))
+        }
+        _ => 1,
+    }
+}
+
+pub(crate) fn storage_slot_width(ty: Type, structs: &[RynStruct]) -> usize {
+    match ty {
+        Type::Struct(id) => structs[id].slot_count,
+        Type::Array(id) => {
+            let (element, length) = array_info(id);
+            length.saturating_mul(storage_slot_width(element, structs))
+        }
+        Type::Str | Type::Slice(_) => 2,
+        _ => 1,
+    }
+}
+
+fn type_layout(ty: Type, structs: &[RynStruct]) -> (usize, usize) {
+    fn align_up(size: usize, align: usize) -> usize {
+        size.saturating_add(align - 1) / align * align
+    }
+
+    match ty {
+        Type::I8 | Type::U8 | Type::Bool => (1, 1),
+        Type::I16 | Type::U16 => (2, 2),
+        Type::I32 | Type::U32 | Type::F32 | Type::Char => (4, 4),
+        Type::I64
+        | Type::U64
+        | Type::F64
+        | Type::OwnedString
+        | Type::Vec(_)
+        | Type::Map(_)
+        | Type::Enum(_)
+        | Type::Reference(_, _)
+        | Type::RawPointer(_)
+        | Type::FunctionPointer(_) => (8, 8),
+        Type::Str | Type::Slice(_) => (16, 8),
+        Type::Array(id) => {
+            let (element, length) = array_info(id);
+            let (element_size, element_align) = type_layout(element, structs);
+            (
+                align_up(element_size, element_align).saturating_mul(length),
+                element_align,
+            )
+        }
+        Type::Struct(id) => {
+            let mut size = 0usize;
+            let mut align = 1usize;
+            for field in &structs[id].fields {
+                let (field_size, field_align) = type_layout(field.ty, structs);
+                size = align_up(size, field_align).saturating_add(field_size);
+                align = align.max(field_align);
+            }
+            (align_up(size, align), align)
+        }
+    }
+}
+
+fn type_contains_vec(ty: Type, structs: &[RynStruct]) -> bool {
+    match ty {
+        Type::Vec(_) => true,
+        Type::Array(id) => type_contains_vec(array_info(id).0, structs),
+        Type::Struct(id) => structs[id]
+            .fields
+            .iter()
+            .any(|field| type_contains_vec(field.ty, structs)),
+        _ => false,
+    }
+}
+
+fn is_generic_enum_name(internal: &str, requested: &str) -> bool {
+    match requested {
+        "Option" => internal.starts_with("$RynOption#"),
+        "Result" => internal.starts_with("$RynResult#"),
+        _ => internal
+            .strip_prefix("$RynEnum#")
+            .and_then(|name| name.rsplit_once('#').map(|(template, _)| template))
+            .is_some_and(|template| {
+                template == requested
+                    || template
+                        .rsplit_once("::")
+                        .is_some_and(|(_, final_name)| final_name == requested)
+            }),
+    }
+}
+
+fn type_name(ty: Type) -> String {
+    match ty {
+        Type::I8 => "i8".into(),
+        Type::I16 => "i16".into(),
+        Type::I32 => "i32".into(),
+        Type::I64 => "i64".into(),
+        Type::U8 => "u8".into(),
+        Type::U16 => "u16".into(),
+        Type::U32 => "u32".into(),
+        Type::U64 => "u64".into(),
+        Type::F32 => "f32".into(),
+        Type::F64 => "f64".into(),
+        Type::Str => "str".into(),
+        Type::OwnedString => "String".into(),
+        Type::Char => "char".into(),
+        Type::Bool => "bool".into(),
+        Type::Struct(_) => "structure".into(),
+        Type::Vec(id) => format!("Vec<{}>", type_name(vec_elem(id))),
+        Type::Map(id) => {
+            let (key, value) = map_info(id);
+            format!("Map<{}, {}>", type_name(key), type_name(value))
+        }
+        Type::Enum(_) => "enum".into(),
+        Type::Array(id) => {
+            let (element, length) = array_info(id);
+            format!("[{}; {length}]", type_name(element))
+        }
+        Type::Slice(id) => format!("&[{}]", type_name(vec_elem(id))),
+        Type::Reference(id, mutable) => format!(
+            "&{}{}",
+            if mutable { "mut " } else { "" },
+            type_name(pointer_target(id))
+        ),
+        Type::RawPointer(id) => format!("*{}", type_name(pointer_target(id))),
+        Type::FunctionPointer(id) => {
+            let signature = function_pointer_info(id);
+            let parameters = signature
+                .parameters
+                .iter()
+                .map(|parameter| type_name(*parameter))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let prefix = if signature.extern_c {
+                "extern \"C\" "
+            } else {
+                ""
+            };
+            match signature.result {
+                Some(result) => format!("{prefix}fun({parameters}) -> {}", type_name(result)),
+                None => format!("{prefix}fun({parameters})"),
+            }
+        }
+    }
+}
+fn reference_pointee_supported(ty: Type) -> bool {
+    matches!(
+        ty,
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::F32
+            | Type::F64
+            | Type::Char
+            | Type::Bool
+    )
+}
+
 fn is_integer(ty: Type) -> bool {
     matches!(
         ty,
@@ -2784,7 +7152,11 @@ fn is_numeric(ty: Type) -> bool {
     is_integer(ty) || matches!(ty, Type::F32 | Type::F64)
 }
 fn is_equality_type(ty: Type) -> bool {
-    is_numeric(ty) || matches!(ty, Type::Str | Type::Bool | Type::Struct(_))
+    is_numeric(ty)
+        || matches!(
+            ty,
+            Type::Str | Type::OwnedString | Type::Char | Type::Bool | Type::Struct(_)
+        )
 }
 fn integer_bounds(ty: Type) -> (i128, i128) {
     match ty {
@@ -2820,15 +7192,30 @@ mod tests {
     use crate::source::Diagnostic;
 
     #[test]
+    fn enum_choose_requires_exhaustive_variants_and_a_final_wildcard() {
+        let missing = error(
+            "enum Flag { On, Off } fun main() { flag := Flag::On result := choose flag { Flag::On => 1 } }",
+        );
+        assert_eq!(missing.code, "R0235");
+        assert!(missing.message.contains("not exhaustive"));
+
+        let misplaced = error(
+            "enum Flag { On, Off } fun main() { flag := Flag::On result := choose flag { _ => 1, Flag::On => 2 } }",
+        );
+        assert_eq!(misplaced.code, "R0235");
+        assert!(misplaced.message.contains("must be last"));
+    }
+
+    #[test]
     fn process_argument_builtins_have_checked_signatures_and_can_be_shadowed() {
-        let wrong_count = error("fn main() { arg_count(0) }");
+        let wrong_count = error("fun main() { arg_count(0) }");
         assert_eq!(wrong_count.code, "R0211");
 
-        let wrong_index_type = error("fn main() { arg(\"0\") }");
+        let wrong_index_type = error("fun main() { arg(\"0\") }");
         assert_eq!(wrong_index_type.code, "R0212");
 
         analyze(
-            parse("fn arg_count() -> i32 { 9 } fn main() { print(arg_count()) }")
+            parse("fun arg_count() -> i32 { 9 } fun main() { echo(arg_count()) }")
                 .expect("shadowing source parses"),
         )
         .expect("a user function may shadow the builtin name");
@@ -2836,112 +7223,108 @@ mod tests {
 
     #[test]
     fn rejects_assignment_to_immutable_local() {
-        let diagnostic = error("fn main() { let value = 1 value = 2 }");
+        let diagnostic = error("fun main() { value := 1 value = 2 }");
         assert_eq!(diagnostic.code, "R0204");
         assert_eq!(
             diagnostic.help.as_deref(),
-            Some("declare `value` with `let mut` if you intend to assign a new value")
+            Some("declare `mut value := ...` if this binding must be mutable")
         );
 
-        let compound = error("fn main() { let value = 1 value += 2 }");
+        let compound = error("fun main() { value := 1 value += 2 }");
         assert_eq!(compound.code, "R0204");
         assert_eq!(compound.message, "`value` is immutable");
     }
 
     #[test]
     fn structural_diagnostics_suggest_direct_repairs() {
-        let missing_main = analyze(parse("fn helper() {}").expect("source parses"))
+        let missing_main = analyze(parse("fun helper() {}").expect("source parses"))
             .expect_err("program without main should fail");
         assert_eq!(missing_main.code, "R0200");
         assert_eq!(
             missing_main.help.as_deref(),
-            Some("add a top-level `fn main() { ... }` function")
+            Some("add a top-level `fun main() { ... }` function")
         );
 
-        let duplicate_function = error("fn main() {} fn main() {}");
+        let duplicate_function = error("fun main() {} fun main() {}");
         assert_eq!(duplicate_function.code, "R0201");
         assert_eq!(
             duplicate_function.help.as_deref(),
             Some("give each function a unique name; function overloading is not supported")
         );
 
-        let duplicate_parameter = error("fn take(value: i32, value: i32) {} fn main() {}");
+        let duplicate_parameter = error("fun take(value: i32, value: i32) {} fun main() {}");
         assert_eq!(duplicate_parameter.code, "R0202");
         assert_eq!(
             duplicate_parameter.help.as_deref(),
             Some("choose a unique name for each parameter in the function")
         );
 
-        let duplicate_local = error("fn main() { let value = 1 let value = 2 }");
+        let duplicate_local = error("fun main() { value := 1 value := 2 }");
         assert_eq!(duplicate_local.code, "R0202");
         assert_eq!(
             duplicate_local.help.as_deref(),
             Some("choose a different name or remove the second declaration of `value`")
         );
 
-        let invalid_main = error("fn main(value: i32) {}");
+        let invalid_main = error("fun main(value: i32) {}");
         assert_eq!(invalid_main.code, "R0208");
         assert_eq!(
             invalid_main.help.as_deref(),
             Some(
-                "use `fn main() { ... }` or `fn main() -> i32 { ... }`; move reusable work into another function"
+                "use `fun main() { ... }` or `fun main() -> i32 { ... }`; move reusable work into another function"
             )
         );
 
-        let unsupported_main_result = error("fn main() -> i64 { 0 }");
+        let unsupported_main_result = error("fun main() -> i64 { 0 }");
         assert_eq!(unsupported_main_result.code, "R0208");
     }
     #[test]
     fn rejects_arithmetic_on_strings() {
-        assert_eq!(
-            error("fn main() { let value = \"x\" + \"y\" }").code,
-            "R0206"
-        );
+        assert_eq!(error("fun main() { value := \"x\" + \"y\" }").code, "R0206");
     }
 
     #[test]
     fn bitwise_operators_require_matching_integer_types() {
         analyze(
             parse(
-                "fn main() { let left: u8 = 0b1010 let right: u8 = 0b1100 let both = left & right let either = left | right let different = left ^ right let inverted = ~left print(both) print(either) print(different) print(inverted) }",
+                "fun main() { left: u8 = 0b1010 right: u8 = 0b1100 both := left & right either := left | right different := left ^ right inverted := ~left echo(both) echo(either) echo(different) echo(inverted) }",
             )
             .expect("integer bitwise source parses"),
         )
         .expect("matching integer bitwise operands type-check");
 
-        let mismatched =
-            error("fn main() { let left: i32 = 1 let right: u32 = 2 let value = left & right }");
+        let mismatched = error("fun main() { left: i32 = 1 right: u32 = 2 value := left & right }");
         assert_eq!(mismatched.code, "R0206");
         assert_eq!(
             mismatched.message,
             "bitwise operands must have matching integer types, found `i32` and `u32`"
         );
         assert_eq!(
-            &"fn main() { let left: i32 = 1 let right: u32 = 2 let value = left & right }"
+            &"fun main() { left: i32 = 1 right: u32 = 2 value := left & right }"
                 [mismatched.span.start..mismatched.span.end],
             "right"
         );
 
-        assert_eq!(error("fn main() { let value = 1.0 & 2.0 }").code, "R0206");
-        assert_eq!(error("fn main() { let value = ~true }").code, "R0206");
+        assert_eq!(error("fun main() { value := 1.0 & 2.0 }").code, "R0206");
+        assert_eq!(error("fun main() { value := ~true }").code, "R0206");
     }
 
     #[test]
     fn if_expression_requires_a_boolean_condition_and_matching_branch_types() {
         analyze(
-            parse("fn main() { let result: i32 = if true { 1 } else { 2 } }")
+            parse("fun main() { result: i32 = when true { 1 } else { 2 } }")
                 .expect("source parses"),
         )
-        .expect("matching if-expression branches type-check");
+        .expect("matching when-expression branches type-check");
 
-        let condition = error("fn main() { let result = if 1 { 1 } else { 2 } }");
+        let condition = error("fun main() { result := when 1 { 1 } else { 2 } }");
         assert_eq!(condition.code, "R0207");
         assert_eq!(
             condition.message,
-            "`if` expression condition must have type `bool`"
+            "`when` expression condition must have type `bool`"
         );
 
-        let source = "fn main() { let result = if true { 1 } else { 2.0 } }";
+        let source = "fun main() { result := when true { 1 } else { 2.0 } }";
         let branches = error(source);
         let else_value = source.rfind("2.0").expect("else value is present");
         assert_eq!(branches.code, "R0205");
@@ -2949,13 +7332,13 @@ mod tests {
         assert_eq!(branches.span.end, else_value + "2.0".len());
         assert_eq!(
             branches.message,
-            "if-expression branches must have the same type, found `i64` and `f64`"
+            "when-expression branches must have the same type, found `i64` and `f64`"
         );
     }
 
     #[test]
     fn if_statements_with_void_calls_remain_statements_before_a_tail_value() {
-        let source = "fn notify() { print(1) } fn answer(flag: bool) -> i32 { if flag { notify() } else { notify() } 42 } fn main() { print(answer(false)) }";
+        let source = "fun notify() { echo(1) } fun answer(flag: bool) -> i32 { when flag { notify() } else { notify() } 42 } fun main() { echo(answer(false)) }";
         analyze(parse(source).expect("source parses"))
             .expect("statement branches do not become void-valued if expressions");
     }
@@ -2963,19 +7346,18 @@ mod tests {
     #[test]
     fn checks_i32_literal_range_and_mixed_integer_types() {
         assert_eq!(
-            error("fn main() { let value: i32 = 2147483648 }").code,
+            error("fun main() { value: i32 = 2147483648 }").code,
             "R0206"
         );
         assert_eq!(
-            error("fn main() { let value: i32 = 1 let wide: i64 = 2 print(value + wide) }").code,
+            error("fun main() { value: i32 = 1 wide: i64 = 2 echo(value + wide) }").code,
             "R0206"
         );
     }
 
     #[test]
     fn compound_assignment_requires_compatible_numeric_types() {
-        let diagnostic =
-            error("fn main() { let mut narrow: i32 = 1 let wide: i64 = 2 narrow += wide }");
+        let diagnostic = error("fun main() { mut narrow: i32 = 1 wide: i64 = 2 narrow += wide }");
         assert_eq!(diagnostic.code, "R0206");
         assert_eq!(
             diagnostic.message,
@@ -2983,7 +7365,7 @@ mod tests {
         );
         assert_eq!(
             diagnostic.span.start,
-            "fn main() { let mut narrow: i32 = 1 let wide: i64 = 2 narrow += wide }"
+            "fun main() { mut narrow: i32 = 1 wide: i64 = 2 narrow += wide }"
                 .rfind("wide")
                 .expect("right operand is present")
         );
@@ -2991,11 +7373,11 @@ mod tests {
 
     #[test]
     fn bitwise_compound_assignment_requires_matching_integer_types() {
-        let float = error("fn main() { let mut value: f32 = 1.0 value &= 1.0 }");
+        let float = error("fun main() { mut value: f32 = 1.0 value &= 1.0 }");
         assert_eq!(float.code, "R0206");
         assert!(float.message.contains("bitwise operands"));
 
-        let mixed = error("fn main() { let mut narrow: i32 = 1 let wide: i64 = 2 narrow |= wide }");
+        let mixed = error("fun main() { mut narrow: i32 = 1 wide: i64 = 2 narrow |= wide }");
         assert_eq!(mixed.code, "R0206");
         assert!(
             mixed
@@ -3006,12 +7388,12 @@ mod tests {
 
     #[test]
     fn shifts_require_an_integer_value_and_u32_count() {
-        let mixed_count = error("fn main() { let amount: i32 = 2 print(1 << amount) }");
+        let mixed_count = error("fun main() { amount: i32 = 2 echo(1 << amount) }");
         assert_eq!(mixed_count.code, "R0206");
         assert!(mixed_count.message.contains("`u32` count"));
 
         analyze(
-            parse("fn main() { let amount: u32 = 2 let value: i8 = 1 << amount print(value) }")
+            parse("fun main() { amount: u32 = 2 value: i8 = 1 << amount echo(value) }")
                 .expect("typed shift source parses"),
         )
         .expect("the left value keeps its type and the shift count is u32");
@@ -3020,12 +7402,12 @@ mod tests {
     #[test]
     fn numeric_casts_accept_numeric_sources_and_targets() {
         analyze(
-            parse("fn main() { let signed: i8 = -1 let widened: u16 = signed as u16 let narrowed: i8 = widened as i8 let maximum: u64 = 18446744073709551615 let reinterpret: i64 = maximum as i64 let small: i32 = 16777217 let rounded: f32 = small as f32 let promoted: f64 = rounded as f64 let fractional: f64 = 12.9 let integer: i32 = fractional as i32 }")
+            parse("fun main() { signed: i8 = -1 widened: u16 = signed as u16 narrowed: i8 = widened as i8 maximum: u64 = 18446744073709551615 reinterpret: i64 = maximum as i64 small: i32 = 16777217 rounded: f32 = small as f32 promoted: f64 = rounded as f64 fractional: f64 = 12.9 integer: i32 = fractional as i32 }")
                 .expect("numeric cast source parses"),
         )
         .expect("numeric casts support integer and floating-point conversions");
 
-        let non_numeric_source = error("fn main() { let value = true as i32 }");
+        let non_numeric_source = error("fun main() { value := true as i32 }");
         assert_eq!(non_numeric_source.code, "R0206");
         assert!(
             non_numeric_source
@@ -3033,7 +7415,7 @@ mod tests {
                 .contains("numeric cast requires a numeric value")
         );
 
-        let non_numeric_target = error("fn main() { let value = 1 as bool }");
+        let non_numeric_target = error("fun main() { value := 1 as bool }");
         assert_eq!(non_numeric_target.code, "R0206");
         assert!(
             non_numeric_target
@@ -3044,8 +7426,7 @@ mod tests {
 
     #[test]
     fn operator_type_diagnostics_highlight_the_incompatible_operand() {
-        let arithmetic_source =
-            "fn main() { let left: i32 = 1 let right: i64 = 2 print(left + right) }";
+        let arithmetic_source = "fun main() { left: i32 = 1 right: i64 = 2 echo(left + right) }";
         let arithmetic = error(arithmetic_source);
         let right_start = arithmetic_source
             .rfind("right")
@@ -3062,8 +7443,7 @@ mod tests {
             Some("use matching numeric types; Ryn does not implicitly convert numeric values")
         );
 
-        let comparison_source =
-            "fn main() { let left: i32 = 1 let right: i64 = 2 print(left < right) }";
+        let comparison_source = "fun main() { left: i32 = 1 right: i64 = 2 echo(left < right) }";
         let comparison = error(comparison_source);
         let right_start = comparison_source
             .rfind("right")
@@ -3080,8 +7460,7 @@ mod tests {
             Some("use numeric values with ordering operators such as `<` and `>=`")
         );
 
-        let logical_source =
-            "fn main() { let left: bool = true let right: i32 = 1 print(left && right) }";
+        let logical_source = "fun main() { left: bool = true right: i32 = 1 echo(left && right) }";
         let logical = error(logical_source);
         let right_start = logical_source
             .rfind("right")
@@ -3099,7 +7478,7 @@ mod tests {
         );
 
         let bad_left_source =
-            "fn main() { let text: str = \"x\" let number: i32 = 1 print(text + number) }";
+            "fun main() { text: str = \"x\" number: i32 = 1 echo(text + number) }";
         let bad_left = error(bad_left_source);
         let text_start = bad_left_source
             .rfind("text")
@@ -3120,12 +7499,12 @@ mod tests {
     #[test]
     fn equality_accepts_matching_bool_and_str_but_ordering_stays_numeric() {
         analyze(
-            parse("fn main() { print(true == false) print(\"a\" != \"b\") }")
+            parse("fun main() { echo(true == false) echo(\"a\" != \"b\") }")
                 .expect("source parses"),
         )
         .expect("bool and string equality are supported");
 
-        let mixed = error("fn main() { print(true == 1) }");
+        let mixed = error("fun main() { echo(true == 1) }");
         assert_eq!(mixed.code, "R0206");
         assert_eq!(
             mixed.message,
@@ -3136,7 +7515,7 @@ mod tests {
             Some("compare values with the same type")
         );
 
-        let ordered = error("fn main() { print(true < false) }");
+        let ordered = error("fun main() { echo(true < false) }");
         assert_eq!(ordered.code, "R0206");
         assert_eq!(
             ordered.message,
@@ -3151,22 +7530,24 @@ mod tests {
     #[test]
     fn validates_small_and_unsigned_integer_ranges() {
         analyze(
-            parse("fn main() { let min: i8 = -128 let max: u64 = 18446744073709551615 print(min) print(max) }")
-                .expect("source parses"),
+            parse(
+                "fun main() { min: i8 = -128 max: u64 = 18446744073709551615 echo(min) echo(max) }",
+            )
+            .expect("source parses"),
         )
         .expect("representable boundary values are accepted");
-        let too_large_i8 = error("fn main() { let value: i8 = 128 }");
+        let too_large_i8 = error("fun main() { value: i8 = 128 }");
         assert_eq!(too_large_i8.code, "R0206");
         assert_eq!(
             too_large_i8.help.as_deref(),
             Some("use a value from `-128` to `127`, or choose a wider integer type")
         );
-        assert_eq!(error("fn main() { let value: u8 = 256 }").code, "R0206");
+        assert_eq!(error("fun main() { value: u8 = 256 }").code, "R0206");
         assert_eq!(
-            error("fn main() { let value: i64 = 9223372036854775808 }").code,
+            error("fun main() { value: i64 = 9223372036854775808 }").code,
             "R0206"
         );
-        let unsigned_negation = error("fn main() { let value: u8 = 1 print(-value) }");
+        let unsigned_negation = error("fun main() { value: u8 = 1 echo(-value) }");
         assert_eq!(unsigned_negation.code, "R0206");
         assert_eq!(
             unsigned_negation.help.as_deref(),
@@ -3174,7 +7555,7 @@ mod tests {
                 "declare the value with a signed integer or floating-point type before negating it"
             )
         );
-        let invalid_not = error("fn main() { print(!1) }");
+        let invalid_not = error("fun main() { echo(!1) }");
         assert_eq!(invalid_not.code, "R0206");
         assert_eq!(
             invalid_not.help.as_deref(),
@@ -3184,31 +7565,28 @@ mod tests {
 
     #[test]
     fn accepts_i32_minimum_literal() {
-        analyze(parse("fn main() { let value: i32 = -2147483648 print(value) }").expect("parses"))
+        analyze(parse("fun main() { value: i32 = -2147483648 echo(value) }").expect("parses"))
             .expect("i32 minimum is representable");
     }
 
     #[test]
     fn rejects_out_of_range_f32_and_mixed_float_types() {
-        let out_of_range = error("fn main() { let value: f32 = 3.5e38 }");
+        let out_of_range = error("fun main() { value: f32 = 3.5e38 }");
         assert_eq!(out_of_range.code, "R0206");
         assert_eq!(
             out_of_range.help.as_deref(),
             Some("use a smaller finite value or declare it as `f64`")
         );
         assert_eq!(
-            error("fn main() { let narrow: f32 = 1.0 let wide: f64 = 2.0 print(narrow + wide) }")
-                .code,
+            error("fun main() { narrow: f32 = 1.0 wide: f64 = 2.0 echo(narrow + wide) }").code,
             "R0206"
         );
         assert_eq!(
-            error(
-                "fn main() { let integer: i32 = 1 let decimal: f32 = 2.0 print(integer + decimal) }"
-            )
-            .code,
+            error("fun main() { integer: i32 = 1 decimal: f32 = 2.0 echo(integer + decimal) }")
+                .code,
             "R0206"
         );
-        let modulo_source = "fn main() { print(1.0 % 0.5) }";
+        let modulo_source = "fun main() { echo(1.0 % 0.5) }";
         let modulo = error(modulo_source);
         let expression_start = modulo_source.find("1.0 % 0.5").expect("modulo expression");
         assert_eq!(modulo.code, "R0206");
@@ -3225,24 +7603,24 @@ mod tests {
     }
     #[test]
     fn rejects_use_before_declaration() {
-        assert_eq!(error("fn main() { print(missing) }").code, "R0203");
+        assert_eq!(error("fun main() { echo(missing) }").code, "R0203");
     }
 
     #[test]
     fn suggests_a_close_variable_name_only_when_the_match_is_unambiguous() {
-        let diagnostic = error("fn main() { let count = 1 print(cout) }");
+        let diagnostic = error("fun main() { count := 1 echo(cout) }");
         assert_eq!(diagnostic.code, "R0203");
         assert_eq!(diagnostic.help.as_deref(), Some("did you mean `count`?"));
 
-        let ambiguous = error("fn main() { let count = 1 let coat = 2 print(cout) }");
+        let ambiguous = error("fun main() { count := 1 coat := 2 echo(cout) }");
         assert_eq!(ambiguous.code, "R0203");
         assert!(ambiguous.help.is_none());
 
-        let assignment = error("fn main() { let mut count = 1 cout = 2 }");
+        let assignment = error("fun main() { mut count := 1 cout = 2 }");
         assert_eq!(assignment.code, "R0203");
         assert_eq!(assignment.help.as_deref(), Some("did you mean `count`?"));
 
-        let compound_assignment = error("fn main() { let mut count = 1 cout += 2 }");
+        let compound_assignment = error("fun main() { mut count := 1 cout += 2 }");
         assert_eq!(compound_assignment.code, "R0203");
         assert_eq!(
             compound_assignment.help.as_deref(),
@@ -3253,18 +7631,18 @@ mod tests {
     #[test]
     fn suggests_a_close_function_name() {
         let diagnostic =
-            error("fn calculate(value: i64) -> i64 { value } fn main() { print(calculat(1)) }");
+            error("fun calculate(value: i64) -> i64 { value } fun main() { echo(calculat(1)) }");
         assert_eq!(diagnostic.code, "R0210");
         assert_eq!(
             diagnostic.help.as_deref(),
             Some("did you mean `calculate`?")
         );
 
-        let builtin = error("fn main() { argg(0) }");
+        let builtin = error("fun main() { argg(0) }");
         assert_eq!(builtin.code, "R0210");
         assert_eq!(builtin.help.as_deref(), Some("did you mean `arg`?"));
 
-        let builtin_with_underscore = error("fn main() { arg_coun(0) }");
+        let builtin_with_underscore = error("fun main() { arg_coun(0) }");
         assert_eq!(
             builtin_with_underscore.help.as_deref(),
             Some("did you mean `arg_count`?")
@@ -3284,7 +7662,7 @@ mod tests {
     }
     #[test]
     fn checks_explicit_local_types() {
-        let diagnostic = error("fn main() { let value: i64 = \"wrong\" }");
+        let diagnostic = error("fun main() { value: i64 = \"wrong\" }");
         assert_eq!(diagnostic.code, "R0205");
         assert_eq!(
             diagnostic.help.as_deref(),
@@ -3294,7 +7672,7 @@ mod tests {
 
     #[test]
     fn type_mismatch_diagnostics_highlight_the_offending_value() {
-        let initializer_source = "fn main() { let value: i32 = \"wrong\" }";
+        let initializer_source = "fun main() { value: i32 = \"wrong\" }";
         let initializer = error(initializer_source);
         let initializer_start = initializer_source
             .find("\"wrong\"")
@@ -3303,7 +7681,7 @@ mod tests {
         assert_eq!(initializer.span.start, initializer_start);
         assert_eq!(initializer.span.end, initializer_start + "\"wrong\"".len());
 
-        let assignment_source = "fn main() { let mut value: i32 = 1 value = \"wrong\" }";
+        let assignment_source = "fun main() { mut value: i32 = 1 value = \"wrong\" }";
         let assignment = error(assignment_source);
         let assignment_start = assignment_source
             .find("\"wrong\"")
@@ -3312,7 +7690,7 @@ mod tests {
         assert_eq!(assignment.span.start, assignment_start);
         assert_eq!(assignment.span.end, assignment_start + "\"wrong\"".len());
 
-        let argument_source = "fn take(value: i32) {} fn main() { take(\"wrong\") }";
+        let argument_source = "fun take(value: i32) {} fun main() { take(\"wrong\") }";
         let argument = error(argument_source);
         let argument_start = argument_source
             .find("\"wrong\"")
@@ -3324,7 +7702,7 @@ mod tests {
 
     #[test]
     fn unknown_interpolation_variable_highlights_its_source_name() {
-        let source = r#"fn main() { print("λ\n{missing}") }"#;
+        let source = r#"fun main() { echo("λ\n{missing}") }"#;
         let diagnostic = error(source);
         let name_start = source
             .find("missing")
@@ -3335,10 +7713,10 @@ mod tests {
     }
     #[test]
     fn requires_boolean_conditions() {
-        let source = "fn main() { if 1 { print(1) } }";
+        let source = "fun main() { when 1 { echo(1) } }";
         let diagnostic = error(source);
         assert_eq!(diagnostic.code, "R0207");
-        let condition_start = source.find("if 1").expect("if condition is present") + 3;
+        let condition_start = source.find("when 1").expect("when condition is present") + 5;
         assert_eq!(diagnostic.span.start, condition_start);
         assert_eq!(diagnostic.span.end, condition_start + 1);
         assert_eq!(
@@ -3349,13 +7727,13 @@ mod tests {
     #[test]
     fn branch_local_does_not_escape_its_scope() {
         assert_eq!(
-            error("fn main() { if true { let hidden = 1 } print(hidden) }").code,
+            error("fun main() { when true { hidden := 1 } echo(hidden) }").code,
             "R0203"
         );
     }
     #[test]
     fn requires_boolean_loop_conditions() {
-        let source = "fn main() { while 1 { print(1) } }";
+        let source = "fun main() { while 1 { echo(1) } }";
         let diagnostic = error(source);
         assert_eq!(diagnostic.code, "R0207");
         let condition_start = source.find("while 1").expect("while condition is present") + 6;
@@ -3369,14 +7747,14 @@ mod tests {
 
     #[test]
     fn rejects_loop_control_outside_a_while_loop() {
-        let break_diagnostic = error("fn main() { break }");
+        let break_diagnostic = error("fun main() { break }");
         assert_eq!(break_diagnostic.code, "R0016");
         assert_eq!(
             break_diagnostic.message,
             "`break` can only be used inside a loop"
         );
 
-        let continue_diagnostic = error("fn main() { continue }");
+        let continue_diagnostic = error("fun main() { continue }");
         assert_eq!(continue_diagnostic.code, "R0017");
         assert_eq!(
             continue_diagnostic.message,
@@ -3386,7 +7764,7 @@ mod tests {
     #[test]
     fn validates_function_call_arguments() {
         let diagnostic =
-            error("fn add(value: i64) -> i64 { value } fn main() { print(add(\"wrong\")) }");
+            error("fun add(value: i64) -> i64 { value } fun main() { echo(add(\"wrong\")) }");
         assert_eq!(diagnostic.code, "R0212");
         assert_eq!(
             diagnostic.help.as_deref(),
@@ -3396,7 +7774,7 @@ mod tests {
     #[test]
     fn checks_function_arity() {
         let diagnostic =
-            error("fn add(a: i64, b: i64) -> i64 { a + b } fn main() { print(add(1)) }");
+            error("fun add(a: i64, b: i64) -> i64 { a + b } fun main() { echo(add(1)) }");
         assert_eq!(diagnostic.code, "R0211");
         assert_eq!(
             diagnostic.help.as_deref(),
@@ -3405,11 +7783,11 @@ mod tests {
     }
     #[test]
     fn rejects_unknown_function_calls() {
-        assert_eq!(error("fn main() { print(missing()) }").code, "R0210");
+        assert_eq!(error("fun main() { echo(missing()) }").code, "R0210");
     }
     #[test]
     fn checks_function_return_type() {
-        let diagnostic = error("fn answer() -> i64 { \"wrong\" } fn main() { print(1) }");
+        let diagnostic = error("fun answer() -> i64 { \"wrong\" } fun main() { echo(1) }");
         assert_eq!(diagnostic.code, "R0205");
         assert_eq!(
             diagnostic.help.as_deref(),
@@ -3419,7 +7797,7 @@ mod tests {
 
     #[test]
     fn checks_explicit_return_statement_types() {
-        let diagnostic = error("fn answer() -> i32 { return \"wrong\" } fn main() {}");
+        let diagnostic = error("fun answer() -> i32 { return \"wrong\" } fun main() {}");
         assert_eq!(diagnostic.code, "R0205");
         assert_eq!(
             diagnostic.help.as_deref(),
@@ -3429,37 +7807,37 @@ mod tests {
 
     #[test]
     fn requires_a_result_type_for_explicit_return_statements() {
-        let diagnostic = error("fn answer() { return 42 } fn main() {}");
+        let diagnostic = error("fun answer() { return 42 } fun main() {}");
         assert_eq!(diagnostic.code, "R0013");
         assert!(diagnostic.message.contains("must declare its type"));
     }
 
     #[test]
     fn accepts_bare_return_in_void_functions() {
-        let source = "fn notify(enabled: bool) { if !enabled { return } print(1) } fn main() { notify(false) }";
+        let source = "fun notify(enabled: bool) { when !enabled { return } echo(1) } fun main() { notify(false) }";
         assert!(analyze(parse(source).expect("source parses")).is_ok());
     }
 
     #[test]
     fn requires_a_value_when_returning_from_a_value_function() {
-        let diagnostic = error("fn answer() -> i32 { return } fn main() {}");
+        let diagnostic = error("fun answer() -> i32 { return } fun main() {}");
         assert_eq!(diagnostic.code, "R0216");
         assert_eq!(diagnostic.help.as_deref(), Some("return a `i32` value"));
     }
 
     #[test]
     fn accepts_functions_that_return_from_every_if_else_branch() {
-        let source =
-            "fn answer(flag: bool) -> i32 { if flag { return 1 } else { return 2 } } fn main() {}";
+        let source = "fun answer(flag: bool) -> i32 { when flag { return 1 } else { return 2 } } fun main() {}";
         assert!(analyze(parse(source).expect("source parses")).is_ok());
 
-        let partial = error("fn answer(flag: bool) -> i32 { if flag { return 1 } } fn main() {}");
+        let partial =
+            error("fun answer(flag: bool) -> i32 { when flag { return 1 } } fun main() {}");
         assert_eq!(partial.code, "R0213");
     }
 
     #[test]
     fn suggests_returning_a_value_from_non_void_functions() {
-        let diagnostic = error("fn answer() -> i64 {} fn main() {}");
+        let diagnostic = error("fun answer() -> i64 {} fun main() {}");
         assert_eq!(diagnostic.code, "R0213");
         assert_eq!(
             diagnostic.help.as_deref(),
@@ -3469,7 +7847,7 @@ mod tests {
 
     #[test]
     fn suggests_a_result_type_for_tail_expressions() {
-        let diagnostic = error("fn answer() { 42 } fn main() {}");
+        let diagnostic = error("fun answer() { 42 } fun main() {}");
         assert_eq!(diagnostic.code, "R0214");
         assert_eq!(
             diagnostic.help.as_deref(),
@@ -3479,9 +7857,9 @@ mod tests {
 
     #[test]
     fn permits_void_calls_as_statements_but_not_values() {
-        let source = "fn notify() { print(\"hi\") } fn main() { notify() }";
+        let source = "fun notify() { echo(\"hi\") } fun main() { notify() }";
         assert!(analyze(parse(source).expect("parses")).is_ok());
-        let diagnostic = error("fn notify() { print(\"hi\") } fn main() { print(notify()) }");
+        let diagnostic = error("fun notify() { echo(\"hi\") } fun main() { echo(notify()) }");
         assert_eq!(diagnostic.code, "R0215");
         assert_eq!(
             diagnostic.help.as_deref(),
@@ -3491,19 +7869,19 @@ mod tests {
 
     #[test]
     fn structures_validate_declarations_literals_and_field_mutability() {
-        let valid = "struct Pair { left: i32, right: str } struct Boxed { pair: Pair, enabled: bool } fn identity(value: Boxed) -> Boxed { return value } fn main() { let mut boxed = Boxed { enabled: true, pair: Pair { right: \"r\", left: 3 } } boxed.pair.left = 4 print(identity(boxed).pair.left) }";
+        let valid = "struct Pair { left: i32, right: str } struct Boxed { pair: Pair, enabled: bool } fun identity(value: Boxed) -> Boxed { return value } fun main() { mut boxed := Boxed { enabled: true, pair: Pair { right: \"r\", left: 3 } } boxed.pair.left = 4 echo(identity(boxed).pair.left) }";
         analyze(parse(valid).expect("valid structure program parses"))
             .expect("nested fields and by-value function signatures type-check");
 
-        assert_eq!(error("struct Empty {} fn main() {}").code, "R0221");
+        assert_eq!(error("struct Empty {} fun main() {}").code, "R0221");
         assert_eq!(
-            error("struct A { x: i32, x: bool } fn main() {}").code,
+            error("struct A { x: i32, x: bool } fun main() {}").code,
             "R0222"
         );
-        assert_eq!(error("struct A { x: Missing } fn main() {}").code, "R0230");
-        assert_eq!(error("struct A { a: A } fn main() {}").code, "R0232");
+        assert_eq!(error("struct A { x: Missing } fun main() {}").code, "R0230");
+        assert_eq!(error("struct A { a: A } fun main() {}").code, "R0232");
         assert_eq!(
-            error("struct A { b: B } struct B { a: A } fn main() {}").code,
+            error("struct A { b: B } struct B { a: A } fun main() {}").code,
             "R0232"
         );
         let mut deeply_nested = (0..=MAX_STRUCT_NESTING + 1)
@@ -3516,82 +7894,80 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join(" ");
-        deeply_nested.push_str(" fn main() {}");
+        deeply_nested.push_str(" fun main() {}");
         assert_eq!(error(&deeply_nested).code, "R0233");
         assert_eq!(
-            error("struct A { x: i32, y: i32 } fn main() { let a = A { x: 1 } }").code,
+            error("struct A { x: i32, y: i32 } fun main() { a := A { x: 1 } }").code,
             "R0229"
         );
         assert_eq!(
-            error("struct A { x: i32 } fn main() { let a = A { x: 1, x: 2 } }").code,
+            error("struct A { x: i32 } fun main() { a := A { x: 1, x: 2 } }").code,
             "R0228"
         );
         assert_eq!(
-            error("struct A { x: i32 } fn main() { let a = A { y: 1 } }").code,
+            error("struct A { x: i32 } fun main() { a := A { y: 1 } }").code,
             "R0225"
         );
-        let literal_field_typo =
-            error("struct A { width: i32 } fn main() { let a = A { widt: 1 } }");
+        let literal_field_typo = error("struct A { width: i32 } fun main() { a := A { widt: 1 } }");
         assert_eq!(literal_field_typo.code, "R0225");
         assert_eq!(
             literal_field_typo.help.as_deref(),
             Some("did you mean `width`?")
         );
         let access_field_typo =
-            error("struct A { width: i32 } fn main() { let a = A { width: 1 } print(a.widt) }");
+            error("struct A { width: i32 } fun main() { a := A { width: 1 } echo(a.widt) }");
         assert_eq!(access_field_typo.code, "R0225");
         assert_eq!(
             access_field_typo.help.as_deref(),
             Some("did you mean `width`?")
         );
         assert_eq!(
-            error("struct A { x: i32 } fn main() { let a = A { x: true } }").code,
+            error("struct A { x: i32 } fun main() { a := A { x: true } }").code,
             "R0205"
         );
         assert_eq!(
-            error("struct A { x: i32 } fn main() { let a = A { x: 1 } a.x = 2 }").code,
+            error("struct A { x: i32 } fun main() { a := A { x: 1 } a.x = 2 }").code,
             "R0204"
         );
         analyze(
-            parse("struct A { x: i32 } fn main() { let a = A { x: 1 } print(a) print(\"a={a}\") }")
+            parse("struct A { x: i32 } fun main() { a := A { x: 1 } echo(a) echo(\"a={a}\") }")
                 .expect("structure printing source parses"),
         )
         .expect("structures may be printed directly or interpolated");
         assert_eq!(
-            error("struct A { x: i32 } fn main() { let a = A { x: 1 } print(a.missing) }").code,
+            error("struct A { x: i32 } fun main() { a := A { x: 1 } echo(a.missing) }").code,
             "R0225"
         );
         assert_eq!(
-            error("fn main() { let value = 1 print(value.field) }").code,
+            error("fun main() { value := 1 echo(value.field) }").code,
             "R0224"
         );
         assert_eq!(
-            error("struct A { x: i32 } fn main() { let mut a = A { x: 1 } a.x.y = 2 }").code,
+            error("struct A { x: i32 } fun main() { mut a := A { x: 1 } a.x.y = 2 }").code,
             "R0224"
         );
         assert_eq!(
             error(
-                "struct A { text: str } fn main() { let mut a = A { text: \"x\" } a.text += \"y\" }"
+                "struct A { text: str } fun main() { mut a := A { text: \"x\" } a.text += \"y\" }"
             )
             .code,
             "R0206"
         );
         assert_eq!(
-            error(
-                "struct A { count: i32 } fn main() { let mut a = A { count: 1 } a.count += 0.5 }"
-            )
-            .code,
+            error("struct A { count: i32 } fun main() { mut a := A { count: 1 } a.count += 0.5 }")
+                .code,
             "R0206"
         );
-        let structure_equality = "struct A { x: i32 } fn main() { let a = A { x: 1 } let b = A { x: 1 } print(a == b) print(a != b) }";
+        let structure_equality = "struct A { x: i32 } fun main() { a := A { x: 1 } b := A { x: 1 } echo(a == b) echo(a != b) }";
         analyze(parse(structure_equality).expect("structure equality source parses"))
             .expect("matching structure values support equality");
         assert_eq!(
-            error("struct A { x: i32 } fn main() { let a = A { x: 1 } let b = A { x: 2 } print(a < b) }").code,
+            error("struct A { x: i32 } fun main() { a := A { x: 1 } b := A { x: 2 } echo(a < b) }")
+                .code,
             "R0206"
         );
         assert_eq!(
-            error("struct A { x: i32 } struct B { x: i32 } fn main() { let a = A { x: 1 } let b = B { x: 1 } print(a == b) }").code,
+            error("struct A { x: i32 } struct B { x: i32 } fun main() { a := A { x: 1 } b := B { x: 1 } echo(a == b) }").code,
             "R0206"
         );
     }

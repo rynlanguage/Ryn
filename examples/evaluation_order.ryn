@@ -1,13 +1,13 @@
-fn item(value: i32) -> i32 {
-    print(value)
+fun item(value: i32) -> i32 {
+    echo value
     value
 }
 
-fn combine(first: i32, second: i32) -> i32 {
+fun combine(first: i32, second: i32) -> i32 {
     first * 10 + second
 }
 
-fn main() {
-    print(combine(item(1), item(2)))
-    print(item(3) + item(4))
+fun main() {
+    echo combine(item(1), item(2))
+    echo item(3) + item(4)
 }

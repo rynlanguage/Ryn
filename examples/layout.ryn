@@ -1,0 +1,21 @@
+struct Header {
+    tag: u8,
+    size: u32
+}
+
+fun value_size<T>(value: T) -> u64 {
+    sizeof(T)
+}
+
+fun main() {
+    echo sizeof(i8)
+    echo alignof(i8)
+    echo sizeof([i32; 3])
+    echo alignof([i32; 3])
+    echo sizeof(Header)
+    echo alignof(Header)
+    echo sizeof(str)
+    echo sizeof(String)
+    echo sizeof(&[u64])
+    echo value_size(3 as i32)
+}

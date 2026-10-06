@@ -1,29 +1,29 @@
-fn main() {
-    let mut score = 10
+fun main() {
+    mut score := 10
 
-    if score >= 10 && score < 20 {
+    when score >= 10 && score < 20 {
         score += 5
-        print("rank up")
+        echo "rank up"
     } else {
-        print("no rank")
+        echo "no rank"
     }
 
-    print(score)
-    print(score == 15)
+    echo score
+    echo score == 15
 
-    let mut selected = 0
-    if score == 15 {
+    mut selected := 0
+    when score == 15 {
         selected = 1
     } else {
         selected = 2
     }
-    print(selected)
+    echo selected
 
-    if !false {
-        if score > 0 {
-            print("boolean works")
+    when !false {
+        when score > 0 {
+            echo "boolean works"
         } else {
-            print("unexpected")
+            echo "unexpected"
         }
     }
 }

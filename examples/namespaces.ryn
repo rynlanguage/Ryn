@@ -1,0 +1,59 @@
+namespace math::integer;
+
+pub fun add(left: i32, right: i32) -> i32 {
+    return left + right
+}
+
+fun double_sum(value: i32) -> i32 {
+    return add(value, value)
+}
+
+pub struct Point {
+    x: i32,
+    y: i32
+}
+
+pub struct Pair {
+    left: Point,
+    right: Point
+}
+
+pub enum State {
+    Ready,
+    Code(i32)
+}
+
+type Score = i32
+
+fun double_x(point: Point) -> i32 {
+    return point.x * 2
+}
+
+fun alias_score(value: Score) -> Score {
+    return value
+}
+
+fun state_code(state: State) -> i32 {
+    choose state {
+        State::Ready => 0 as i32,
+        State::Code(value) => value
+    }
+}
+
+namespace;
+
+fun main() {
+    point := math::integer::Point { x: 3, y: 4 }
+    echo math::integer::add(point.x, point.y)
+    echo math::integer::double_sum(point.x)
+    pair := math::integer::Pair {
+        left: math::integer::Point { x: 6, y: 7 },
+        right: math::integer::Point { x: 8, y: 9 }
+    }
+    echo math::integer::double_x(pair.left)
+    echo math::integer::state_code(math::integer::State::Code(12))
+    echo math::integer::state_code(math::integer::State::Ready)
+    echo math::integer::alias_score(13)
+}
+
+

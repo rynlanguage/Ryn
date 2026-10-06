@@ -1,0 +1,13 @@
+namespace arithmetic;
+
+fun double(value: i32) -> i32 {
+    return value * 2
+}
+
+pub fun quadruple(value: i32) -> i32 {
+    return double(double(value))
+}
+
+pub fun identity<T>(value: T) -> T {
+    value
+}

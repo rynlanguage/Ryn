@@ -1,0 +1,15 @@
+fun main() {
+    loaded := try_read_file("examples/self_hosted/sample.ryn")
+    loaded_length := choose loaded {
+        Option::Some(contents) => contents.char_count(),
+        Option::None => 0
+    }
+    echo loaded_length
+
+    missing := try_read_file("examples/self_hosted/this-file-does-not-exist.ryn")
+    missing_result := choose missing {
+        Option::Some(_) => 1,
+        Option::None => 0
+    }
+    echo missing_result
+}

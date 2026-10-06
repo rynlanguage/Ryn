@@ -1,0 +1,7 @@
+lock_version: 1
+root: path-api-demo
+packages:
+- parent: path-api-demo
+  name: ryn_path
+  version: 0.0.2
+  source: path:../../stdlib/path

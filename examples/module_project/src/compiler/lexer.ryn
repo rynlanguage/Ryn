@@ -1,0 +1,31 @@
+pub struct Token {
+    value: i32
+}
+
+pub type TokenId = i32
+pub type TokenAlias = Token
+pub type TokenList<T> = Vec<T>
+
+pub enum Kind {
+    Number(i32),
+    End
+}
+
+pub fun token() -> Token {
+    return Token { value: token_name(6) }
+}
+
+pub fun token_name(value: i32) -> i32 {
+    return helper(value)
+}
+
+fun helper(value: i32) -> i32 {
+    return value + 1
+}
+
+namespace ids;
+pub type TokenCount = i32
+
+pub extern "C" fun abs(value: i32) -> i32;
+
+namespace;

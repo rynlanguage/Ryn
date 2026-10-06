@@ -1,0 +1,16 @@
+#[drop(release)]
+struct Resource { handle: *i32 }
+fun release(resource: Resource) { echo 77 }
+fun pass_all(resources: [Resource; 2]) -> [Resource; 2] {
+    return resources
+}
+fun consume_all(resources: [Resource; 2]) { echo 88 }
+fun main() {
+    mut left: i32 = 1
+    mut right: i32 = 2
+    resources := pass_all([
+        Resource { handle: &raw mut left },
+        Resource { handle: &raw mut right }
+    ])
+    consume_all(resources)
+}

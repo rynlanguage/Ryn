@@ -1,0 +1,28 @@
+enum Shape {
+    Empty,
+    Circle(i32),
+    Named(String, i32),
+}
+
+fun main() {
+    empty := Shape::Empty
+    echo empty
+
+    circle := Shape::Circle(7)
+    echo circle
+    echo "circle: {circle}"
+
+    named := Shape::Named(String("box"), 3)
+    echo named
+    echo "label: {named}"
+
+    matched := when true { Shape::Circle(9) } else { Shape::Empty }
+    echo matched
+
+    wrapped := Shape::Named(String("moved"), 8)
+    echo choose wrapped {
+        Shape::Empty => Shape::Circle(0),
+        Shape::Circle(radius) => Shape::Circle(radius),
+        Shape::Named(text, number) => Shape::Named(text, number)
+    }
+}

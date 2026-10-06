@@ -6,10 +6,20 @@ use std::{
 
 pub mod ast;
 pub mod codegen;
+pub mod filesystem_ops;
+mod generics;
+mod guard;
 pub mod lexer;
+pub mod lockfile;
+pub mod manifest;
+pub mod map_ops;
+mod modules;
 pub mod parser;
 pub mod sema;
 pub mod source;
+pub mod string_ops;
+pub mod system_ops;
+pub mod vector_ops;
 
 /// Checks Ryn source and returns its typed intermediate representation.
 ///
@@ -19,7 +29,7 @@ pub mod source;
 /// # Example
 ///
 /// ```
-/// let ir = ryn::check("fn main() { print(42) }").expect("source is valid");
+/// let ir = ryn::check("fun main() { echo 42 }").expect("source is valid");
 /// assert_eq!(ir.functions.len(), 1);
 /// ```
 pub fn check(source: &str) -> Result<sema::RynIr, source::Diagnostic> {
@@ -41,13 +51,13 @@ pub fn check(source: &str) -> Result<sema::RynIr, source::Diagnostic> {
 /// signature. When signatures are valid, it reports all duplicate parameter
 /// names and skips each affected function body. In other bodies, it collects
 /// errors across independent statements and nested blocks, including each
-/// missing name in a print interpolation and errors in arguments to known or
+/// missing name in an echo interpolation and errors in arguments to known or
 /// unknown calls, including known calls with the wrong arity. It also gathers
 /// errors from both operands of a binary expression and independent field
 /// initializers in structure literals. It checks an assignment's right-hand
 /// expression even when its target is invalid, and checks a local initializer
 /// even when its declaration is invalid. It also checks return expressions
-/// when the function has no declared result type. An invalid `if` or `while`
+/// when the function has no declared result type. An invalid `when` or `while`
 /// condition does not prevent checking its branches or loop body. If a `for`
 /// start bound is invalid, it still checks the end bound and, when that bound
 /// is an integer, checks the loop body using its type. A duplicate loop
@@ -59,6 +69,33 @@ pub fn check(source: &str) -> Result<sema::RynIr, source::Diagnostic> {
 pub fn check_recovering(source: &str) -> Result<sema::RynIr, Vec<source::Diagnostic>> {
     let program = parser::parse_recovering(source)?;
     sema::analyze_recovering(program)
+}
+
+/// Loads and checks a project rooted at a directory containing `src/main.ryn`.
+/// Module imports use paths relative to `src/`, such as `use compiler::lexer`.
+pub fn check_project(project: impl AsRef<Path>) -> Result<sema::RynIr, String> {
+    modules::check_project(project.as_ref()).map(|(ir, _)| ir)
+}
+
+/// Compiles a project and its imported Ryn modules into a native executable.
+pub fn compile_project_with_optimize(
+    project: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    optimize: manifest::Optimize,
+) -> Result<(), String> {
+    let output = output.as_ref();
+    let (ir, source_paths) = modules::check_project(project.as_ref())?;
+    for source in source_paths {
+        if paths_refer_to_same_file(&source, output) {
+            return Err(format!(
+                "error[R0303]: output {} would overwrite module source {}",
+                output.display(),
+                source.display()
+            ));
+        }
+    }
+    codegen::build_native_with_optimize(&ir, output, optimize.codegen_value())
+        .map_err(|error| error.to_string())
 }
 
 /// Checks a [`source::SourceFile`] and returns its typed intermediate representation.
@@ -143,6 +180,15 @@ pub fn compile_source(
     source: &source::SourceFile,
     output: impl AsRef<Path>,
 ) -> Result<(), CompileError> {
+    compile_source_with_optimize(source, output, manifest::Optimize::Speed)
+}
+
+/// Compiles source using the project's selected Cranelift optimization level.
+pub fn compile_source_with_optimize(
+    source: &source::SourceFile,
+    output: impl AsRef<Path>,
+    optimize: manifest::Optimize,
+) -> Result<(), CompileError> {
     let output = output.as_ref();
     if paths_refer_to_same_file(source.path(), output) {
         return Err(CompileError::OutputWouldOverwriteSource {
@@ -150,7 +196,9 @@ pub fn compile_source(
             output: output.to_path_buf(),
         });
     }
-    compile(source.text(), output)
+    let ir = check(source.text()).map_err(CompileError::Source)?;
+    codegen::build_native_with_optimize(&ir, output, optimize.codegen_value())
+        .map_err(CompileError::Native)
 }
 
 fn paths_refer_to_same_file(input: &Path, output: &Path) -> bool {

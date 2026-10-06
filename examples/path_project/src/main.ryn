@@ -1,0 +1,16 @@
+use ryn_path::path
+
+fun main() {
+    path::remove_directory_all(path::from("build/path-api-contract"))
+    path::create_directories(path::from("build/path-api-contract"))
+    path::write_string(path::join(path::from("build/path-api-contract"), "notes.txt"), "hello path")
+
+    echo path::file_name(path::join(path::from("build/path-api-contract"), "notes.txt"))
+    echo path::extension(path::join(path::from("build/path-api-contract"), "notes.txt"))
+    echo path::is_absolute(path::join(path::from("build/path-api-contract"), "notes.txt"))
+    echo path::exists(path::join(path::from("build/path-api-contract"), "notes.txt"))
+    echo path::read_to_string(path::join(path::from("build/path-api-contract"), "notes.txt"))
+
+    path::remove_file(path::join(path::from("build/path-api-contract"), "notes.txt"))
+    path::remove_directory(path::from("build/path-api-contract"))
+}

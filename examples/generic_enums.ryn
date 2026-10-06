@@ -1,0 +1,77 @@
+enum Outcome<T> {
+    Value(T),
+    Empty
+}
+
+type OutcomeAlias<T> = Outcome<T>
+
+enum Inner<T> {
+    Data(T),
+    None
+}
+
+enum Outer<T> {
+    Nested(Inner<T>),
+    Direct(T)
+}
+
+enum Selection<T, E> {
+    Value(T),
+    Problem(E)
+}
+
+fun read_outcome(value: Outcome<i32>) -> i32 {
+    choose value {
+        Outcome::Value(number) => number,
+        Outcome::Empty => 0
+    }
+}
+
+fun empty_outcome() -> Outcome<String> {
+    Outcome::Empty
+}
+
+fun alias_value(value: OutcomeAlias<i32>) -> i32 {
+    choose value {
+        Outcome::Value(number) => number,
+        Outcome::Empty => 0
+    }
+}
+
+fun nested_length(value: Outer<String>) -> u64 {
+    choose value {
+        Outer::Nested(inner) => choose inner {
+            Inner::Data(text) => text.char_count(),
+            Inner::None => 0 as u64
+        },
+        Outer::Direct(text) => text.char_count()
+    }
+}
+
+fun selection_length(value: Selection<String, i32>) -> u64 {
+    choose value {
+        Selection::Value(text) => text.char_count(),
+        Selection::Problem(code) => code as u64
+    }
+}
+
+fun main() {
+    value: Outcome<i32> = Outcome::Value(42)
+    echo read_outcome(value)
+    typed_value: OutcomeAlias<i32> = Outcome::Value(11)
+    echo alias_value(typed_value)
+
+    echo choose Outcome::<String>::Value(String("Ryn")) {
+        Outcome::<String>::Value(text) => text.char_count(),
+        Outcome::<String>::Empty => 0 as u64
+    }
+    echo choose empty_outcome() {
+        Outcome::Value(text) => text.char_count(),
+        Outcome::Empty => 0 as u64
+    }
+
+    nested: Outer<String> = Outer::Nested(Inner::Data(String("nested")))
+    echo nested_length(nested)
+    echo selection_length(Selection::<String, i32>::Value(String("two")))
+    echo selection_length(Selection::<String, i32>::Problem(0 as i32))
+}

@@ -1,0 +1,21 @@
+fun sum(values: &[i32]) -> i32 {
+    mut total := 0 as i32
+    for value in values {
+        total += value
+    }
+    total
+}
+
+fun first_string(values: &[String]) -> String {
+    return values[0]
+}
+
+fun main() {
+    values: [i32; 4] = [2, 4, 6, 8]
+    echo sum(values)
+    echo sum([1, 3, 5])
+    echo sum([])
+
+    names: [String; 2] = [String("hi"), String("🦀")]
+    echo first_string(names)
+}

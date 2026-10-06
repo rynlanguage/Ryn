@@ -1,0 +1,48 @@
+enum Data {
+    Count(i32),
+    Text(String),
+    Items(Vec<i32>),
+    Empty
+}
+
+enum Wrapped { Value(Data), Empty }
+
+struct Envelope { payload: Data }
+
+fun inspect(value: Data) -> u64 {
+    choose value {
+        Data::Count(number) => number as u64,
+        Data::Text(text) => text.char_count(),
+        Data::Items(items) => items.len(),
+        Data::Empty => 0 as u64
+    }
+}
+
+fun take_text(value: Data) -> String {
+    choose value {
+        Data::Count(number) => String("count"),
+        Data::Text(text) => text,
+        Data::Items(items) => String("items"),
+        Data::Empty => String("empty")
+    }
+}
+
+fun inspect_envelope(value: Envelope) -> u64 {
+    inspect(value.payload)
+}
+
+fun main() {
+    mut items: Vec<i32> = Vec()
+    items.push(7)
+    items.push(11)
+    echo inspect(Data::Count(42))
+    echo inspect(Data::Text(String("🦀Ryn")))
+    echo inspect(Data::Items(items))
+    echo inspect(Data::Empty)
+    echo take_text(Data::Text(String("moved out")))
+    echo inspect_envelope(Envelope { payload: Data::Count(9) })
+    echo choose Wrapped::Value(Data::Text(String("nested 🦀"))) {
+        Wrapped::Value(inner) => inspect(inner),
+        Wrapped::Empty => 0 as u64
+    }
+}

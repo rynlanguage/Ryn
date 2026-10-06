@@ -1,0 +1,6 @@
+fun main() {
+    mut arguments := Vec<String>()
+    arguments.push(String("/C"))
+    arguments.push(String("exit 7"))
+    echo run_process_args("cmd.exe", arguments)
+}

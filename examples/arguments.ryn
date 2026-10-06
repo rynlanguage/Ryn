@@ -1,9 +1,9 @@
-fn main() {
-    let count = arg_count()
-    print("argument count: {count}")
+fun main() {
+    count := arg_count()
+    echo "argument count: {count}"
 
-    if count > 0 {
-        let first = arg(0)
-        print("first argument: {first}")
+    when count > 0 {
+        first := arg(0)
+        echo "first argument: {first}"
     }
 }

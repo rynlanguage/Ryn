@@ -48,6 +48,11 @@ fn fail_fixtures_are_rejected_with_the_expected_diagnostic_codes() {
         ("unknown_variable.ryn", "R0203"),
         ("operator_type_mismatch.ryn", "R0206"),
         ("malformed_interpolation.ryn", "R0014"),
+        ("mut_ref_immutable.ryn", "R0206"),
+        ("write_through_shared_ref.ryn", "R0206"),
+        ("return_local_reference.ryn", "R0248"),
+        ("return_aliased_local_reference.ryn", "R0248"),
+        ("ffi_unsupported_record.ryn", "R0247"),
     ];
     let failures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/fail");
 

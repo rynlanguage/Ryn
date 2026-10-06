@@ -1,11 +1,11 @@
-fn descend(value: i64) -> i64 {
-    if value > 0 {
-        print(value)
+fun descend(value: i64) -> i64 {
+    when value > 0 {
+        echo value
         descend(value - 1)
     }
     value
 }
 
-fn main() {
-    print(descend(3))
+fun main() {
+    echo descend(3)
 }

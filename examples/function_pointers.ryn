@@ -1,0 +1,40 @@
+type BinaryFn = extern "C" fun(i32, i32) -> i32
+type WindowEnum = extern "C" fun(*u8, *u32) -> i32
+
+fun add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+fun multiply(a: i32, b: i32) -> i32 {
+    a * b
+}
+
+fun invoke(function: BinaryFn, a: i32, b: i32) -> i32 {
+    function(a, b)
+}
+
+fun count_window(handle: *u8, output: *u32) -> i32 {
+    count := *output
+    *output = count + 1
+    1
+}
+
+fun main() {
+    addition: BinaryFn = add
+    echo invoke(addition, 20, 22)
+
+    multiplication := multiply as BinaryFn
+    echo invoke(multiplication, 6, 7)
+
+    echo invoke(add as BinaryFn, 1, 2)
+
+    library := load_library("user32.dll")
+    assert_message(!pointer_is_null(library), "could not load user32.dll")
+    enum_windows_symbol := load_symbol(library, "EnumWindows")
+    assert_message(!pointer_is_null(enum_windows_symbol), "could not find EnumWindows")
+    enum_windows: extern "C" fun(WindowEnum, *u32) -> i32 = enum_windows_symbol as extern "C" fun(WindowEnum, *u32) -> i32
+
+    mut windows: u32 = 0
+    enum_windows(count_window as WindowEnum, &raw mut windows)
+    echo windows > 0
+}

@@ -1,5 +1,5 @@
-fn main() {
-    let narrow: i32 = 1
-    let wide: i64 = 2
-    print(narrow + wide)
+fun main() {
+    narrow: i32 = 1
+    wide: i64 = 2
+    echo(narrow + wide)
 }

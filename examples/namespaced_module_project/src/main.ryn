@@ -1,0 +1,6 @@
+use calculator::integer
+
+fun main() {
+    echo integer::arithmetic::quadruple(5)
+    echo integer::arithmetic::identity::<i32>(19 as i32)
+}

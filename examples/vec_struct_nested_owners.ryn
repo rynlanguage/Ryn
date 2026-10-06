@@ -1,0 +1,64 @@
+enum State {
+    Ready(String),
+    Done
+}
+
+struct Metadata {
+    note: String
+}
+
+struct Record {
+    title: String,
+    metadata: Metadata,
+    words: [String; 2],
+    labels: Vec<String>,
+    attributes: Map<i32, String>,
+    state: State
+}
+
+fun make_record() -> Record {
+    mut labels: Vec<String> = Vec<String>()
+    labels.push(String("tag"))
+    mut attributes: Map<i32, String> = Map<i32, String>()
+    attributes.insert(1, String("one"))
+    return Record {
+        title: String("record"),
+        metadata: Metadata { note: String("original") },
+        words: [String("left"), String("right")],
+        labels: labels,
+        attributes: attributes,
+        state: State::Ready(String("ready"))
+    }
+}
+
+fun main() {
+    mut records: Vec<Record> = Vec<Record>()
+    records.push(make_record())
+    mut copies: Vec<Record> = records.clone()
+
+    mut item := copies.index(0)
+    item.metadata.note.append(" copy")
+    item.labels.push(String("extra"))
+    item.attributes.insert(2, String("two"))
+    echo item.metadata.note
+    echo item.words[1]
+    echo item.labels.len()
+    echo item.attributes.len()
+    echo choose item.state {
+        State::Ready(text) => text,
+        State::Done => String("done")
+    }
+
+    original := records.index(0)
+    echo original.metadata.note
+    echo original.words[1]
+    echo original.labels.len()
+    echo original.attributes.len()
+
+    records.set(0, make_record())
+    taken := records.take(0)
+    echo taken.title
+    for value in copies {
+        echo value.title
+    }
+}

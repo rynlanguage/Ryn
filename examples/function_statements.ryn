@@ -1,14 +1,14 @@
-fn announce() {
-    print("before result")
+fun announce() {
+    echo "before result"
 }
 
-fn answer(value: i32) -> i32 {
+fun answer(value: i32) -> i32 {
     announce()
-    let doubled = value * 2
-    print(doubled)
+    doubled := value * 2
+    echo doubled
     doubled + 1
 }
 
-fn main() {
-    print(answer(20))
+fun main() {
+    echo answer(20)
 }

@@ -1,0 +1,19 @@
+fun make_pair(number: i32, text: String) -> (i32, String) {
+    return (number, text)
+}
+
+fun rotate(pair: (i32, String)) -> (String, i32) {
+    return (pair.1, pair.0)
+}
+
+fun main() {
+    mut inferred := (7, String("seven"))
+    inferred.0 = 9
+    echo inferred.0
+    echo inferred.1
+
+    explicit: (i32, String) = make_pair(42, String("answer"))
+    rotated := rotate(explicit)
+    echo rotated.0
+    echo rotated.1
+}

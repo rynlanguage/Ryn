@@ -1,32 +1,32 @@
-fn main() {
-    let flags: u8 = 0b1100
-    let mask: u8 = 0b1010
+fun main() {
+    flags: u8 = 0b1100
+    mask: u8 = 0b1010
 
-    print(flags & mask)
-    print(flags | mask)
-    print(flags ^ mask)
-    print(~mask)
-    print(flags & ~mask)
-    print((flags & mask) == 8)
-    let mut updated: u8 = flags
+    echo flags & mask
+    echo flags | mask
+    echo flags ^ mask
+    echo ~mask
+    echo flags & ~mask
+    echo (flags & mask) == 8
+    mut updated: u8 = flags
     updated &= mask
     updated |= 1
     updated ^= 2
-    print(updated)
-    let count: u32 = 2
-    print(flags << count)
-    print(flags >> count)
-    print(flags << 8)
-    let mut shifted: u8 = flags
+    echo updated
+    count: u32 = 2
+    echo flags << count
+    echo flags >> count
+    echo flags << 8
+    mut shifted: u8 = flags
     shifted <<= 2
     shifted >>= 1
-    print(shifted)
-    let signed: i8 = -64
-    print(signed >> count)
-    print(signed >> 8)
-    print(1 | 2 ^ 3 & 4)
-    print(1 + 2 << 1)
-    print(1 << 2 & 6)
-    print(1 + 2 & 6)
-    print(false || true && false)
+    echo shifted
+    signed: i8 = -64
+    echo signed >> count
+    echo signed >> 8
+    echo 1 | 2 ^ 3 & 4
+    echo 1 + 2 << 1
+    echo 1 << 2 & 6
+    echo 1 + 2 & 6
+    echo false || true && false
 }

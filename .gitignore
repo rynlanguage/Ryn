@@ -3,3 +3,8 @@
 *.obj
 *.o
 /examples/*.exe
+/examples/**/*.exe
+/examples/*/build/
+/examples/**/build/cache/
+/.ryn/
+/examples/*/.ryn/

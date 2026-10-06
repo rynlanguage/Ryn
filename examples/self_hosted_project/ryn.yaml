@@ -1,0 +1,5 @@
+name: self-hosted-stage
+version: 0.1.0
+owner: guest
+build:
+  optimize: none

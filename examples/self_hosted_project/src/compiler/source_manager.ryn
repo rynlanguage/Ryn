@@ -1,0 +1,86 @@
+pub struct SourceFile {
+    name: String,
+    text: String,
+    line_starts: Vec<u64>
+}
+
+pub fun utf8_width(value: char) -> u64 {
+    when value <= '\u{7f}' { 1 as u64 }
+    else when value <= '\u{7ff}' { 2 as u64 }
+    else when value <= '\u{ffff}' { 3 as u64 }
+    else { 4 as u64 }
+}
+
+pub fun index_source(name: String, text: String) -> SourceFile {
+    mut starts: Vec<u64> = Vec()
+    starts.push(0)
+    mut byte := 0 as u64
+    mut scalar := 0 as u64
+    while byte < text.len() {
+        character := text.byte_at(byte)
+        when character == 13 || character == 10 {
+            byte += 1
+            scalar += 1
+            when character == 13 && byte < text.len() && text.byte_at(byte) == 10 {
+                byte += 1
+                scalar += 1
+            }
+            starts.push(byte)
+        } else {
+            byte += utf8_width(text.char_at(scalar))
+            scalar += 1
+        }
+    }
+    SourceFile { name: name, text: text, line_starts: starts }
+}
+
+pub fun load_source(path: str) -> SourceFile {
+    return index_source(String(path), read_file(path))
+}
+
+pub fun locate(text: String, line_starts: Vec<u64>, byte_offset: u64) -> Vec<u64> {
+    mut offset := byte_offset
+    when offset > text.len() {
+        offset = text.len()
+    }
+    while offset > 0 && offset < text.len() && text.byte_at(offset) >= 128 && text.byte_at(offset) < 192 {
+        offset -= 1
+    }
+    mut line := 0 as u64
+    for index in 0..line_starts.len() {
+        when line_starts.index(index) > offset { break }
+        line = index
+    }
+    prefix := text.slice(line_starts.index(line), offset)
+    mut location: Vec<u64> = Vec()
+    location.push(line + 1)
+    location.push(prefix.char_count() + 1)
+    location
+}
+
+pub fun read_line(text: String, line_starts: Vec<u64>, line: u64) -> String {
+    start := line_starts.index(line)
+    mut end := text.len()
+    when line + 1 < line_starts.len() {
+        end = line_starts.index(line + 1)
+    }
+    when end > start && text.byte_at(end - 1) == 10 {
+        end -= 1
+    }
+    when end > start && text.byte_at(end - 1) == 13 { end -= 1 }
+    text.slice(start, end)
+}
+
+fun demo_source_manager() {
+    source := load_source("examples/self_hosted/sample.ryn")
+    echo source.name
+    echo source.line_starts.len()
+
+    location := locate(source.text.clone(), source.line_starts.clone(), 18)
+    echo location.index(0)
+    echo location.index(1)
+    echo read_line(source.text.clone(), source.line_starts.clone(), 1)
+    echo source.text.char_count()
+    echo source.text.len()
+}
+

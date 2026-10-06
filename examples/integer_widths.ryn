@@ -1,45 +1,45 @@
-fn next_i8(value: i8) -> i8 { value + 1 }
-fn next_i16(value: i16) -> i16 { value + 1 }
-fn next_i32(value: i32) -> i32 { value + 1 }
-fn next_i64(value: i64) -> i64 { value + 1 }
-fn next_u8(value: u8) -> u8 { value + 1 }
-fn next_u16(value: u16) -> u16 { value + 1 }
-fn next_u32(value: u32) -> u32 { value + 1 }
-fn next_u64(value: u64) -> u64 { value + 1 }
-fn half_u64(value: u64) -> u64 { value / 2 }
-fn half_i64(value: i64) -> i64 { value / 2 }
-fn remainder_u16(value: u16) -> u16 { value % 10 }
-fn remainder_u64(value: u64) -> u64 { value % 10 }
+fun next_i8(value: i8) -> i8 { value + 1 }
+fun next_i16(value: i16) -> i16 { value + 1 }
+fun next_i32(value: i32) -> i32 { value + 1 }
+fun next_i64(value: i64) -> i64 { value + 1 }
+fun next_u8(value: u8) -> u8 { value + 1 }
+fun next_u16(value: u16) -> u16 { value + 1 }
+fun next_u32(value: u32) -> u32 { value + 1 }
+fun next_u64(value: u64) -> u64 { value + 1 }
+fun half_u64(value: u64) -> u64 { value / 2 }
+fun half_i64(value: i64) -> i64 { value / 2 }
+fun remainder_u16(value: u16) -> u16 { value % 10 }
+fun remainder_u64(value: u64) -> u64 { value % 10 }
 
-fn main() {
-    let min_i8: i8 = -128
-    let min_i16: i16 = -32768
-    let min_i32: i32 = -2147483648
-    let min_i64: i64 = -9223372036854775808
-    let max_u8: u8 = 255
-    let max_u16: u16 = 65535
-    let max_u32: u32 = 4294967295
-    let max_u64: u64 = 18446744073709551615
+fun main() {
+    min_i8: i8 = -128
+    min_i16: i16 = -32768
+    min_i32: i32 = -2147483648
+    min_i64: i64 = -9223372036854775808
+    max_u8: u8 = 255
+    max_u16: u16 = 65535
+    max_u32: u32 = 4294967295
+    max_u64: u64 = 18446744073709551615
 
-    print(next_i8(126))
-    print(next_i16(32766))
-    print(next_i32(2147483646))
-    print(next_i64(9223372036854775806))
-    print(next_u8(254))
-    print(next_u16(65534))
-    print(next_u32(4294967294))
-    print(next_u64(18446744073709551614))
-    print(half_u64(max_u64))
-    print(half_i64(-10))
-    print(remainder_u16(max_u16))
-    print(remainder_u64(max_u64))
-    print(max_u8 > 127)
-    print(max_u16 > 32767)
-    print(max_u32 > 2147483647)
-    print(max_u64 > 9223372036854775807)
-    print(min_i8 < 0)
-    print(min_i8)
-    print(min_i16)
-    print(min_i32)
-    print(min_i64)
+    echo next_i8(126)
+    echo next_i16(32766)
+    echo next_i32(2147483646)
+    echo next_i64(9223372036854775806)
+    echo next_u8(254)
+    echo next_u16(65534)
+    echo next_u32(4294967294)
+    echo next_u64(18446744073709551614)
+    echo half_u64(max_u64)
+    echo half_i64(-10)
+    echo remainder_u16(max_u16)
+    echo remainder_u64(max_u64)
+    echo max_u8 > 127
+    echo max_u16 > 32767
+    echo max_u32 > 2147483647
+    echo max_u64 > 9223372036854775807
+    echo min_i8 < 0
+    echo min_i8
+    echo min_i16
+    echo min_i32
+    echo min_i64
 }

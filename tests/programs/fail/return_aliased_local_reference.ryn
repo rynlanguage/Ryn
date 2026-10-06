@@ -1,0 +1,8 @@
+fun borrow(value: &i32) -> &i32 { return value }
+
+fun leak() -> &i32 {
+    mut local := 1
+    return borrow(&local)
+}
+
+fun main() { echo 0 }

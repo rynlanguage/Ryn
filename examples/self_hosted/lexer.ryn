@@ -1,0 +1,2962 @@
+enum Kind {
+    Keyword(u64),
+    Identifier(u64),
+    Integer(u64),
+    Float(f64),
+    Character(char),
+    StringLiteral(u64),
+    Punctuation(u64),
+    Operator(u64),
+    End
+}
+
+struct TokenSpan {
+    kind: u64,
+    start: u64,
+    end: u64,
+    scalar_start: u64,
+    scalar_end: u64,
+    payload: u64,
+    float_payload: f64,
+    character_payload: char
+}
+
+struct LexError {
+    code: u64,
+    start: u64,
+    end: u64
+}
+
+struct UnicodeEscape {
+    value: u64,
+    scalar_end: u64,
+    byte_end: u64,
+    valid: bool
+}
+
+struct Lexed {
+    tokens: Vec<TokenSpan>,
+    errors: Vec<LexError>,
+    string_values: Vec<String>,
+    symbols: Vec<String>
+}
+
+struct AstNode {
+    kind: u64,
+    start: u64,
+    end: u64,
+    first_child: u64,
+    child_count: u64,
+    payload: u64
+}
+
+struct ParseState {
+    source: String,
+    tokens: Vec<TokenSpan>,
+    index: u64,
+    nodes: Vec<AstNode>,
+    children: Vec<u64>,
+    failed: bool,
+    error_code: u64,
+    error_start: u64,
+    error_end: u64
+}
+
+struct ParseValue {
+    state: ParseState,
+    node_id: u64
+}
+
+struct TypeCheckResult {
+    type_code: u64,
+    error_node: u64,
+    valid: bool
+}
+
+struct ProgramTypeCheckResult {
+    name_ids: Vec<u64>,
+    variable_types: Vec<u64>,
+    error_node: u64,
+    valid: bool
+}
+
+struct FunctionTypeSignature {
+    name_id: u64,
+    parameter_types: Vec<u64>,
+    return_type: u64
+}
+
+struct AstArena {
+    source: String,
+    nodes: Vec<AstNode>,
+    children: Vec<u64>
+}
+
+fun utf8_width(value: char) -> u64 {
+    when value <= '\u{7f}' { 1 as u64 }
+    else when value <= '\u{7ff}' { 2 as u64 }
+    else when value <= '\u{ffff}' { 3 as u64 }
+    else { 4 as u64 }
+}
+
+fun digit_value(value: char) -> i64 {
+    when value == '0' { 0 }
+    else when value == '1' { 1 }
+    else when value == '2' { 2 }
+    else when value == '3' { 3 }
+    else when value == '4' { 4 }
+    else when value == '5' { 5 }
+    else when value == '6' { 6 }
+    else when value == '7' { 7 }
+    else when value == '8' { 8 }
+    else when value == '9' { 9 }
+    else { -1 }
+}
+
+fun lowercase_hex_digit(value: char) -> i64 {
+    when value == 'a' { 10 }
+    else when value == 'b' { 11 }
+    else when value == 'c' { 12 }
+    else when value == 'd' { 13 }
+    else when value == 'e' { 14 }
+    else when value == 'f' { 15 }
+    else { -1 }
+}
+
+fun uppercase_hex_digit(value: char) -> i64 {
+    when value == 'A' { 10 }
+    else when value == 'B' { 11 }
+    else when value == 'C' { 12 }
+    else when value == 'D' { 13 }
+    else when value == 'E' { 14 }
+    else when value == 'F' { 15 }
+    else { -1 }
+}
+
+fun radix_digit(value: char, radix: u64) -> i64 {
+    digit := digit_value(value)
+    when digit >= 0 && digit as u64 < radix { digit }
+    else when radix == 16 && lowercase_hex_digit(value) >= 0 { lowercase_hex_digit(value) }
+    else when radix == 16 { uppercase_hex_digit(value) }
+    else { -1 }
+}
+
+fun scan_unicode_escape(text: String, start_scalar: u64, start_byte: u64) -> UnicodeEscape {
+    mut scalar := start_scalar + 1
+    mut byte := start_byte + 1
+    mut value := 0 as u64
+    mut digits := 0 as u64
+    mut valid := scalar < text.char_count() && text.char_at(scalar) == '{'
+    when valid {
+        scalar += 1
+        byte += 1
+    }
+    when valid && scalar < text.char_count() && text.char_at(scalar) == '_' { valid = false }
+    while valid && scalar < text.char_count() && text.char_at(scalar) != '}' && text.char_at(scalar) != '\'' && text.char_at(scalar) != '"' {
+        character := text.char_at(scalar)
+        when character == '_' {
+            scalar += 1
+            byte += 1
+        } else {
+            digit := radix_digit(character, 16)
+            when digit < 0 || digits == 6 {
+                valid = false
+            } else {
+                value = value * 16 + digit as u64
+                digits += 1
+                scalar += 1
+                byte += 1
+            }
+        }
+    }
+    when scalar < text.char_count() && text.char_at(scalar) == '}' {
+        scalar += 1
+        byte += 1
+    } else {
+        valid = false
+    }
+    valid = valid && digits > 0 && value <= 1114111 && !(value >= 55296 && value <= 57343)
+    UnicodeEscape { value: value, scalar_end: scalar, byte_end: byte, valid: valid }
+}
+
+fun identifier_start(value: char) -> bool {
+    (value >= 'a' && value <= 'z') ||
+    (value >= 'A' && value <= 'Z') || value == '_'
+}
+
+fun identifier_continue(value: char) -> bool {
+    identifier_start(value) || digit_value(value) >= 0
+}
+
+fun operator_basic(current: char, next: char) -> u64 {
+    when current == ':' && next == '=' { 1 }
+    else when current == ':' && next == ':' { 2 }
+    else when current == '.' && next == '.' { 3 }
+    else when current == '=' && next == '=' { 4 }
+    else when current == '=' && next == '>' { 5 }
+    else when current == '!' && next == '=' { 6 }
+    else when current == '<' && next == '=' { 7 }
+    else when current == '>' && next == '=' { 8 }
+    else { 0 }
+}
+
+fun operator_logic(current: char, next: char) -> u64 {
+    when current == '&' && next == '=' { 9 }
+    else when current == '&' && next == '&' { 10 }
+    else when current == '|' && next == '=' { 11 }
+    else when current == '|' && next == '|' { 12 }
+    else when current == '^' && next == '=' { 13 }
+    else { 0 }
+}
+
+fun operator_shift(current: char, next: char, third: char) -> u64 {
+    when current == '<' && next == '<' && third == '=' { 14 }
+    else when current == '<' && next == '<' { 15 }
+    else when current == '>' && next == '>' && third == '=' { 16 }
+    else when current == '>' && next == '>' { 17 }
+    else { 0 }
+}
+
+fun operator_assign(current: char, next: char) -> u64 {
+    when current == '-' && next == '>' { 18 }
+    else when current == '+' && next == '=' { 19 }
+    else when current == '-' && next == '=' { 20 }
+    else when current == '*' && next == '=' { 21 }
+    else when current == '/' && next == '=' { 22 }
+    else when current == '%' && next == '=' { 23 }
+    else { 0 }
+}
+
+fun operator_code(current: char, next: char, third: char) -> u64 {
+    mut code := operator_basic(current, next)
+    when code != 0 { return code }
+    code = operator_logic(current, next)
+    when code != 0 { return code }
+    code = operator_shift(current, next, third)
+    when code != 0 { return code }
+    operator_assign(current, next)
+}
+
+fun punctuation(current: char, next: char, third: char) -> Kind {
+    code := operator_code(current, next, third)
+    when code == 0 { Kind::Punctuation(punctuation_code(current)) }
+    else { Kind::Operator(code) }
+}
+
+fun punctuation_bracket(value: char) -> u64 {
+    when value == '(' { 1 }
+    else when value == ')' { 2 }
+    else when value == '{' { 3 }
+    else when value == '}' { 4 }
+    else when value == '[' { 5 }
+    else when value == ']' { 6 }
+    else when value == ',' { 7 }
+    else when value == ';' { 8 }
+    else { 0 }
+}
+
+fun punctuation_operator(value: char) -> u64 {
+    when value == ':' { 9 }
+    else when value == '.' { 10 }
+    else when value == '=' { 11 }
+    else when value == '+' { 12 }
+    else when value == '-' { 13 }
+    else when value == '*' { 14 }
+    else when value == '/' { 15 }
+    else when value == '%' { 16 }
+    else { 0 }
+}
+
+fun punctuation_other(value: char) -> u64 {
+    when value == '<' { 17 }
+    else when value == '>' { 18 }
+    else when value == '&' { 19 }
+    else when value == '|' { 20 }
+    else when value == '^' { 21 }
+    else when value == '~' { 22 }
+    else when value == '!' { 23 }
+    else when value == '?' { 24 }
+    else { 0 }
+}
+
+fun punctuation_code(value: char) -> u64 {
+    mut code := punctuation_bracket(value)
+    when code != 0 { return code }
+    code = punctuation_operator(value)
+    when code != 0 { return code }
+    punctuation_other(value)
+}
+
+fun punctuation_width(current: char, next: char, third: char) -> u64 {
+    when (current == '<' || current == '>') && next == current && third == '=' { 3 as u64 }
+    else when operator_code(current, next, third) != 0 { 2 as u64 }
+    else { 1 as u64 }
+}
+
+fun keyword_first(value: String) -> u64 {
+    when value == String("fun") { 1 }
+    else when value == String("mut") { 2 }
+    else when value == String("true") { 3 }
+    else when value == String("false") { 4 }
+    else when value == String("when") { 5 }
+    else when value == String("else") { 6 }
+    else when value == String("for") { 7 }
+    else when value == String("in") { 8 }
+    else when value == String("return") { 9 }
+    else when value == String("echo") { 10 }
+    else when value == String("use") { 11 }
+    else { 0 }
+}
+
+fun keyword_second(value: String) -> u64 {
+    when value == String("while") { 12 }
+    else when value == String("break") { 13 }
+    else when value == String("continue") { 14 }
+    else when value == String("struct") { 15 }
+    else when value == String("as") { 16 }
+    else when value == String("enum") { 17 }
+    else when value == String("type") { 18 }
+    else when value == String("namespace") { 19 }
+    else when value == String("pub") { 20 }
+    else when value == String("choose") { 21 }
+    else { 0 }
+}
+
+fun keyword_code(value: String) -> u64 {
+    mut code := keyword_first(value.clone())
+    when code == 0 { code = keyword_second(value.clone()) }
+    code
+}
+
+fun encode_token(kind: Kind, start: u64, end: u64, scalar_start: u64, scalar_end: u64) -> TokenSpan {
+    choose kind {
+        Kind::Keyword(value) => TokenSpan { kind: value, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: 0, float_payload: 0.0, character_payload: '\0' },
+        Kind::Identifier(value) => TokenSpan { kind: 300, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: value, float_payload: 0.0, character_payload: '\0' },
+        Kind::Integer(value) => TokenSpan { kind: 301, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: value, float_payload: 0.0, character_payload: '\0' },
+        Kind::Float(value) => TokenSpan { kind: 303, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: 0, float_payload: value, character_payload: '\0' },
+        Kind::Character(value) => TokenSpan { kind: 304, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: 0, float_payload: 0.0, character_payload: value },
+        Kind::StringLiteral(value) => TokenSpan { kind: 302, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: value, float_payload: 0.0, character_payload: '\0' },
+        Kind::Punctuation(value) => TokenSpan { kind: 100 + value, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: 0, float_payload: 0.0, character_payload: '\0' },
+        Kind::Operator(value) => TokenSpan { kind: 200 + value, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: 0, float_payload: 0.0, character_payload: '\0' },
+        Kind::End => TokenSpan { kind: 0, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: 0, float_payload: 0.0, character_payload: '\0' }
+    }
+}
+
+fun lex(source: String) -> Lexed {
+    text := source
+    mut tokens: Vec<TokenSpan> = Vec()
+    mut errors: Vec<LexError> = Vec()
+    mut string_values: Vec<String> = Vec()
+    mut symbols: Vec<String> = Vec()
+    mut symbol_ids: Map<String, u64> = Map<String, u64>()
+    mut scalar := 0 as u64
+    mut byte := 0 as u64
+    scalar_count := text.char_count()
+
+    while scalar < scalar_count {
+        current := text.char_at(scalar)
+        when current == ' ' || current == '\t' || current == '\n' || current == '\r' {
+            scalar += 1
+            byte += utf8_width(current)
+            continue
+        }
+
+        when current == '/' && scalar + 1 < scalar_count && text.char_at(scalar + 1) == '/' {
+            while scalar < scalar_count && text.char_at(scalar) != '\n' {
+                byte += utf8_width(text.char_at(scalar))
+                scalar += 1
+            }
+            continue
+        }
+
+        when current == '/' && scalar + 1 < scalar_count && text.char_at(scalar + 1) == '*' {
+            comment_start := byte
+            scalar += 2
+            byte += 2
+            mut depth := 1 as u64
+            while scalar < scalar_count && depth > 0 {
+                character := text.char_at(scalar)
+                mut next := '\0'
+                when scalar + 1 < scalar_count {
+                    next = text.char_at(scalar + 1)
+                }
+                when character == '/' && next == '*' {
+                    depth += 1
+                    scalar += 2
+                    byte += 2
+                } else when character == '*' && next == '/' {
+                    depth -= 1
+                    scalar += 2
+                    byte += 2
+                } else {
+                    scalar += 1
+                    byte += utf8_width(character)
+                }
+            }
+            when depth > 0 {
+                errors.push(LexError { code: 8, start: comment_start, end: byte })
+            }
+            continue
+        }
+
+        start := byte
+        scalar_start := scalar
+        mut kind: Kind = Kind::End
+        mut error_code := 0 as u64
+        when identifier_start(current) {
+            mut value := String("")
+            while scalar < scalar_count && identifier_continue(text.char_at(scalar)) {
+                character := text.char_at(scalar)
+                value.push(character)
+                byte += utf8_width(character)
+                scalar += 1
+            }
+            code := keyword_code(value.clone())
+            when code != 0 {
+                kind = Kind::Keyword(code)
+            } else {
+                mut symbol_id := 0 as u64
+                when symbol_ids.contains_key(value.clone()) {
+                    symbol_id = choose symbol_ids.get(value.clone()) {
+                        Option::Some(existing_id) => existing_id,
+                        Option::None => 0
+                    }
+                } else {
+                    symbol_id = symbols.len()
+                    symbol_ids.insert(value.clone(), symbol_id)
+                    symbols.push(value)
+                }
+                kind = Kind::Identifier(symbol_id)
+            }
+        } else when current == '0' && scalar + 1 < scalar_count && (text.char_at(scalar + 1) == 'b' || text.char_at(scalar + 1) == 'B' || text.char_at(scalar + 1) == 'x' || text.char_at(scalar + 1) == 'X') {
+            mut radix := 16 as u64
+            when text.char_at(scalar + 1) == 'b' || text.char_at(scalar + 1) == 'B' {
+                radix = 2
+            }
+            mut value := 0 as u64
+            mut digits := 0 as u64
+            mut overflow := false
+            scalar += 2
+            byte += 2
+            while scalar < scalar_count && (identifier_continue(text.char_at(scalar)) || text.char_at(scalar) == '_') {
+                character := text.char_at(scalar)
+                digit := radix_digit(character, radix)
+                when digit >= 0 {
+                    when value > (18446744073709551615 - digit as u64) / radix {
+                        overflow = true
+                    } else when !overflow {
+                        value = value * radix + digit as u64
+                    }
+                    digits += 1
+                } else when character != '_' {
+                    error_code = 4
+                }
+                when character == '_' && (digits == 0 || scalar + 1 >= scalar_count || radix_digit(text.char_at(scalar + 1), radix) < 0) {
+                    error_code = 5
+                }
+                byte += 1
+                scalar += 1
+            }
+            when digits == 0 { error_code = 3 }
+            when overflow { error_code = 12 }
+            kind = Kind::Integer(value)
+        } else when digit_value(current) >= 0 {
+            mut value := 0 as u64
+            mut numeric_float := 0.0 as f64
+            mut fraction_scale := 0.0 as f64
+            mut is_float := false
+            mut integer_overflow := false
+            mut previous_digit := true
+            while scalar < scalar_count && (digit_value(text.char_at(scalar)) >= 0 || text.char_at(scalar) == '_') {
+                character := text.char_at(scalar)
+                digit := digit_value(character)
+                when digit >= 0 {
+                    when value > (18446744073709551615 - digit as u64) / 10 {
+                        integer_overflow = true
+                    } else when !integer_overflow {
+                        value = value * 10 + digit as u64
+                    }
+                    numeric_float = numeric_float * 10.0 + digit as f64
+                    previous_digit = true
+                } else {
+                    when !previous_digit || scalar + 1 >= scalar_count || digit_value(text.char_at(scalar + 1)) < 0 {
+                        error_code = 5
+                    }
+                    previous_digit = false
+                }
+                byte += 1
+                scalar += 1
+            }
+            when scalar + 1 < scalar_count && text.char_at(scalar) == '.' && text.char_at(scalar + 1) != '.' && (digit_value(text.char_at(scalar + 1)) >= 0 || text.char_at(scalar + 1) == '_') {
+                is_float = true
+                scalar += 1
+                byte += 1
+                fraction_scale = 0.1
+                previous_digit = false
+                while scalar < scalar_count && (digit_value(text.char_at(scalar)) >= 0 || text.char_at(scalar) == '_') {
+                    character := text.char_at(scalar)
+                    digit := digit_value(character)
+                    when digit >= 0 {
+                        numeric_float += digit as f64 * fraction_scale
+                        fraction_scale *= 0.1
+                        previous_digit = true
+                    } else {
+                        when !previous_digit || scalar + 1 >= scalar_count || digit_value(text.char_at(scalar + 1)) < 0 {
+                            error_code = 5
+                        }
+                        previous_digit = false
+                    }
+                    byte += 1
+                    scalar += 1
+                }
+            }
+            mut exponent_sign := 1 as i64
+            mut exponent := 0 as u64
+            when scalar < scalar_count && (text.char_at(scalar) == 'e' || text.char_at(scalar) == 'E') {
+                is_float = true
+                scalar += 1
+                byte += 1
+                when scalar < scalar_count && text.char_at(scalar) == '-' {
+                    exponent_sign = -1
+                    scalar += 1
+                    byte += 1
+                } else when scalar < scalar_count && text.char_at(scalar) == '+' {
+                    scalar += 1
+                    byte += 1
+                }
+                mut exponent_digits := 0 as u64
+                previous_digit = false
+                while scalar < scalar_count && (digit_value(text.char_at(scalar)) >= 0 || text.char_at(scalar) == '_') {
+                    character := text.char_at(scalar)
+                    digit := digit_value(character)
+                    when digit >= 0 {
+                        when exponent < 1000 {
+                            exponent = exponent * 10 + digit as u64
+                            when exponent > 1000 { exponent = 1000 }
+                        }
+                        exponent_digits += 1
+                        previous_digit = true
+                    } else {
+                        when !previous_digit || scalar + 1 >= scalar_count || digit_value(text.char_at(scalar + 1)) < 0 {
+                            error_code = 5
+                        }
+                        previous_digit = false
+                    }
+                    byte += 1
+                    scalar += 1
+                }
+                when exponent_digits == 0 { error_code = 6 }
+            }
+            when integer_overflow && !is_float { error_code = 12 }
+            mut exponent_step := 0 as u64
+            while exponent_step < exponent && error_code != 13 {
+                when exponent_sign < 0 { numeric_float /= 10.0 }
+                else {
+                    when numeric_float > 1.7976931348623157e307 {
+                        error_code = 13
+                    } else {
+                        numeric_float *= 10.0
+                    }
+                }
+                exponent_step += 1
+            }
+            when numeric_float > 1.7976931348623157e308 { error_code = 13 }
+            when is_float { kind = Kind::Float(numeric_float) }
+            else { kind = Kind::Integer(value) }
+        } else when current == '\'' {
+            scalar += 1
+            byte += 1
+            mut character_count := 0 as u64
+            mut character_value := '\0'
+            mut valid_escape := true
+            mut closed := false
+            while scalar < scalar_count && text.char_at(scalar) != '\'' {
+                character := text.char_at(scalar)
+                when character == '\\' && scalar + 1 < scalar_count {
+                    scalar += 1
+                    byte += 1
+                    escaped := text.char_at(scalar)
+                    when escaped == 'u' {
+                        decoded := scan_unicode_escape(text.clone(), scalar, byte)
+                        when character_count == 0 && decoded.valid {
+                            character_value = char_from_u32(decoded.value as u32)
+                        } else when !decoded.valid { valid_escape = false }
+                        scalar = decoded.scalar_end
+                        byte = decoded.byte_end
+                    } else {
+                        when character_count == 0 {
+                        when escaped == 'n' { character_value = '\n' }
+                        else when escaped == 'r' { character_value = '\r' }
+                        else when escaped == 't' { character_value = '\t' }
+                        else when escaped == '0' { character_value = '\0' }
+                        else when escaped == '\\' { character_value = '\\' }
+                        else when escaped == '\'' { character_value = '\'' }
+                        else when escaped == '"' { character_value = '"' }
+                        else { valid_escape = false }
+                        }
+                        byte += utf8_width(escaped)
+                        scalar += 1
+                    }
+                } else {
+                    when character_count == 0 { character_value = character }
+                    when character == '\n' || character == '\r' { valid_escape = false }
+                    byte += utf8_width(character)
+                    scalar += 1
+                }
+                character_count += 1
+            }
+            when scalar < scalar_count {
+                closed = true
+                scalar += 1
+                byte += 1
+            }
+            when !closed || character_count != 1 || !valid_escape { error_code = 9 }
+            kind = Kind::Character(character_value)
+        } else when current == '"' {
+            scalar += 1
+            byte += 1
+            mut value := String("")
+            mut closed := false
+            while scalar < scalar_count && text.char_at(scalar) != '"' {
+                character := text.char_at(scalar)
+                when character == '\\' && scalar + 1 < scalar_count {
+                    scalar += 1
+                    byte += 1
+                    escaped := text.char_at(scalar)
+                    when escaped == 'u' {
+                        decoded := scan_unicode_escape(text.clone(), scalar, byte)
+                        when decoded.valid { value.push(char_from_u32(decoded.value as u32)) }
+                        else { error_code = 10 }
+                        scalar = decoded.scalar_end
+                        byte = decoded.byte_end
+                    } else {
+                        when escaped == 'n' { value.push('\n') }
+                        else when escaped == 'r' { value.push('\r') }
+                        else when escaped == 't' { value.push('\t') }
+                        else when escaped == '0' { value.push('\0') }
+                        else when escaped == '"' { value.push('"') }
+                        else when escaped == '\\' { value.push('\\') }
+                        else when escaped == '\'' { value.push('\'') }
+                        else { error_code = 10 }
+                        byte += utf8_width(escaped)
+                        scalar += 1
+                    }
+                } else {
+                    value.push(character)
+                    byte += utf8_width(character)
+                    scalar += 1
+                }
+            }
+            when scalar < scalar_count {
+                closed = true
+                scalar += 1
+                byte += 1
+            }
+            when !closed { error_code = 2 }
+            when error_code == 0 {
+                string_values.push(value)
+                kind = Kind::StringLiteral(string_values.len() - 1)
+            } else {
+                kind = Kind::StringLiteral(0)
+            }
+        } else {
+            mut next := '\0'
+            mut third := '\0'
+            when scalar + 1 < scalar_count {
+                next = text.char_at(scalar + 1)
+            }
+            when scalar + 2 < scalar_count {
+                third = text.char_at(scalar + 2)
+            }
+            kind = punctuation(current, next, third)
+            when punctuation_code(current) == 0 && operator_code(current, next, third) == 0 {
+                error_code = 1
+            }
+            width := punctuation_width(current, next, third)
+            scalar += width
+            mut byte_width := width
+            when width == 1 {
+                byte_width = utf8_width(current)
+            }
+            byte += byte_width
+        }
+
+        when error_code == 0 {
+            tokens.push(encode_token(kind, start, byte, scalar_start, scalar))
+        } else {
+            errors.push(LexError { code: error_code, start: start, end: byte })
+        }
+    }
+
+    tokens.push(encode_token(Kind::End, byte, byte, scalar, scalar))
+    Lexed { tokens: tokens, errors: errors, string_values: string_values, symbols: symbols }
+}
+
+fun lex_file(path: str) -> Lexed {
+    loaded := try_read_file(path)
+    choose loaded {
+        Option::Some(source) => lex(source),
+        Option::None => file_error_lex()
+    }
+}
+
+fun file_error_lex() -> Lexed {
+    mut failed := lex(String(""))
+    failed.errors.push(LexError { code: 11, start: 0, end: 0 })
+    return failed
+}
+
+fun lex_error_message(code: u64) -> str {
+    when code == 1 { "unknown character" }
+    else when code == 2 { "unterminated string literal" }
+    else when code == 3 { "expected a digit after the radix prefix" }
+    else when code == 4 { "invalid digit in integer literal" }
+    else when code == 5 { "invalid numeric separator" }
+    else when code == 6 { "expected exponent digits" }
+    else when code == 8 { "unterminated block comment" }
+    else when code == 9 { "invalid character literal" }
+    else when code == 10 { "unsupported or invalid escape sequence" }
+    else when code == 11 { "could not read UTF-8 source file" }
+    else when code == 12 { "integer literal exceeds the u64 range" }
+    else when code == 13 { "floating-point literal exceeds the f64 range" }
+    else { "lexical error" }
+}
+
+fun format_diagnostic(source: String, code: u64, start: u64, end: u64, label: str) -> String {
+    mut scalar := 0 as u64
+    mut byte := 0 as u64
+    mut line := 1 as u64
+    mut column := 1 as u64
+    mut line_start_scalar := 0 as u64
+    mut line_start_byte := 0 as u64
+    scalar_count := source.char_count()
+    while scalar < scalar_count && byte < start {
+        character := source.char_at(scalar)
+        byte += utf8_width(character)
+        scalar += 1
+        when character == '\r' {
+            when scalar < scalar_count && source.char_at(scalar) == '\n' {
+                byte += 1
+                scalar += 1
+            }
+            line += 1
+            column = 1
+            line_start_scalar = scalar
+            line_start_byte = byte
+        } else when character == '\n' {
+            line += 1
+            column = 1
+            line_start_scalar = scalar
+            line_start_byte = byte
+        } else {
+            column += 1
+        }
+    }
+
+    mut line_end_scalar := line_start_scalar
+    mut line_end_byte := line_start_byte
+    while line_end_scalar < scalar_count {
+        character := source.char_at(line_end_scalar)
+        when character == '\r' || character == '\n' { break }
+        line_end_byte += utf8_width(character)
+        line_end_scalar += 1
+    }
+    line_text := source.slice(line_start_byte, line_end_byte)
+
+    mut underline_width := 0 as u64
+    mut span_scalar := scalar
+    mut span_byte := byte
+    while span_scalar < scalar_count && span_byte < end && span_byte < line_end_byte {
+        span_byte += utf8_width(source.char_at(span_scalar))
+        span_scalar += 1
+        underline_width += 1
+    }
+    when underline_width == 0 { underline_width = 1 }
+
+    mut message := String("error[R")
+    when code < 10 { message.append("000") }
+    else when code < 100 { message.append("00") }
+    else when code < 1000 { message.append("0") }
+    message.append(String(code))
+    message.append("]: ")
+    message.append(label)
+    message.append("\n --> ")
+    message.append(String(line))
+    message.append(":")
+    message.append(String(column))
+    message.append("\n")
+    message.append(String(line))
+    message.append(" | ")
+    message.append(line_text)
+    message.append("\n   | ")
+    for _ in 0..column - 1 { message.append(" ") }
+    message.append("^")
+    for _ in 1..underline_width { message.append("~") }
+    message
+}
+
+fun format_lex_error(source: String, error: LexError) -> String {
+    return format_diagnostic(source, error.code, error.start, error.end, lex_error_message(error.code))
+}
+
+fun parse_error_message(code: u64) -> str {
+    when code == 1 { "expected an expression" }
+    else when code == 2 { "expected a closing parenthesis" }
+    else when code == 3 { "unexpected token after expression" }
+    else when code == 4 { "unsupported statement" }
+    else when code == 5 { "parser made no progress" }
+    else when code == 6 { "expected a block after `when`" }
+    else when code == 7 { "expected `else` after the `when` branch" }
+    else when code == 8 { "expected an integer, boolean, range, or `_` pattern in this parser prototype" }
+    else when code == 9 { "expected `=>` after the `choose` pattern" }
+    else when code == 10 { "expected `for name in start..end`" }
+    else { "invalid source text" }
+}
+
+fun format_parse_error(source: String, code: u64, start: u64, end: u64) -> String {
+    return format_diagnostic(source, 200 + code, start, end, parse_error_message(code))
+}
+
+fun format_type_error(source: String, nodes: &[AstNode], error_node: u64) -> String {
+    node := nodes[error_node]
+    format_diagnostic(source, 300, node.start, node.end, "type mismatch or unresolved symbol in self-hosted checker")
+}
+
+fun arithmetic_precedence(kind: u64) -> u64 {
+    when kind == 212 { 1 }
+    else when kind == 210 { 2 }
+    else when kind == 120 { 3 }
+    else when kind == 121 { 4 }
+    else when kind == 119 { 5 }
+    else when kind == 204 || kind == 206 || (kind >= 117 && kind <= 118) || kind == 207 || kind == 208 { 6 }
+    else when kind == 215 || kind == 217 { 7 }
+    else when kind == 112 || kind == 113 { 8 }
+    else when kind == 114 || kind == 115 || kind == 116 { 9 }
+    else { 0 }
+}
+
+fun append_ast_node(state: ParseState, kind: u64, start: u64, end: u64, payload: u64, children: Vec<u64>) -> ParseValue {
+    mut next := state
+    first_child := next.children.len()
+    child_count := children.len()
+    for child in children {
+        next.children.push(child)
+    }
+    node_id := next.nodes.len()
+    next.nodes.push(AstNode {
+        kind: kind,
+        start: start,
+        end: end,
+        first_child: first_child,
+        child_count: child_count,
+        payload: payload
+    })
+    ParseValue { state: next, node_id: node_id }
+}
+
+fun parse_when_expression(state: ParseState) -> ParseValue {
+    mut next := state
+    keyword := next.tokens.index(next.index)
+    next.index += 1
+    condition := parse_arithmetic_expression(next, 1)
+    when condition.state.failed { return condition }
+    mut after_condition := condition.state
+    opening := after_condition.tokens.index(after_condition.index)
+    when opening.kind != 103 {
+        after_condition.failed = true
+        after_condition.error_code = 6
+        after_condition.error_start = opening.start
+        after_condition.error_end = opening.end
+        return ParseValue { state: after_condition, node_id: 0 }
+    }
+    after_condition.index += 1
+    then_value := parse_arithmetic_expression(after_condition, 1)
+    when then_value.state.failed { return then_value }
+    mut after_then := then_value.state
+    closing_then := after_then.tokens.index(after_then.index)
+    when closing_then.kind != 104 {
+        after_then.failed = true
+        after_then.error_code = 6
+        after_then.error_start = closing_then.start
+        after_then.error_end = closing_then.end
+        return ParseValue { state: after_then, node_id: 0 }
+    }
+    after_then.index += 1
+    else_keyword := after_then.tokens.index(after_then.index)
+    when else_keyword.kind != 6 {
+        after_then.failed = true
+        after_then.error_code = 7
+        after_then.error_start = else_keyword.start
+        after_then.error_end = else_keyword.end
+        return ParseValue { state: after_then, node_id: 0 }
+    }
+    after_then.index += 1
+    opening_else := after_then.tokens.index(after_then.index)
+    when opening_else.kind != 103 {
+        after_then.failed = true
+        after_then.error_code = 6
+        after_then.error_start = opening_else.start
+        after_then.error_end = opening_else.end
+        return ParseValue { state: after_then, node_id: 0 }
+    }
+    after_then.index += 1
+    else_value := parse_arithmetic_expression(after_then, 1)
+    when else_value.state.failed { return else_value }
+    mut after_else := else_value.state
+    closing_else := after_else.tokens.index(after_else.index)
+    when closing_else.kind != 104 {
+        after_else.failed = true
+        after_else.error_code = 6
+        after_else.error_start = closing_else.start
+        after_else.error_end = closing_else.end
+        return ParseValue { state: after_else, node_id: 0 }
+    }
+    after_else.index += 1
+    mut branches := Vec<u64>()
+    branches.push(condition.node_id)
+    branches.push(then_value.node_id)
+    branches.push(else_value.node_id)
+    append_ast_node(after_else, 8, keyword.start, closing_else.end, 0, branches)
+}
+
+fun parse_array_expression(state: ParseState) -> ParseValue {
+    mut next := state
+    opening := next.tokens.index(next.index)
+    next.index += 1
+    mut elements := Vec<u64>()
+    while next.tokens.index(next.index).kind != 106 && !next.failed {
+        element := parse_arithmetic_expression(next, 1)
+        when element.state.failed { return element }
+        next = element.state
+        elements.push(element.node_id)
+        separator := next.tokens.index(next.index)
+        when separator.kind == 107 {
+            next.index += 1
+        } else {
+            break
+        }
+    }
+    closing := next.tokens.index(next.index)
+    when closing.kind != 106 {
+        next.failed = true
+        next.error_code = 2
+        next.error_start = closing.start
+        next.error_end = closing.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    append_ast_node(next, 9, opening.start, closing.end, elements.len(), elements)
+}
+
+fun parse_choose_expression(state: ParseState) -> ParseValue {
+    mut next := state
+    keyword := next.tokens.index(next.index)
+    next.index += 1
+    scrutinee := parse_arithmetic_expression(next, 1)
+    when scrutinee.state.failed { return scrutinee }
+    next = scrutinee.state
+    opening := next.tokens.index(next.index)
+    when opening.kind != 103 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = opening.start
+        next.error_end = opening.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    mut children := Vec<u64>()
+    children.push(scrutinee.node_id)
+    mut arm_count := 0 as u64
+    while !next.failed && next.tokens.index(next.index).kind != 104 {
+        pattern := next.tokens.index(next.index)
+        is_wildcard := pattern.kind == 300 && next.source.slice(pattern.start, pattern.end) == String("_")
+        when pattern.kind != 301 && pattern.kind != 3 && pattern.kind != 4 && !is_wildcard {
+            next.failed = true
+            next.error_code = 8
+            next.error_start = pattern.start
+            next.error_end = pattern.end
+            break
+        }
+        mut pattern_node_id := 0 as u64
+        next.index += 1
+        when pattern.kind == 301 && next.tokens.index(next.index).kind == 203 {
+            next.index += 1
+            range_end := next.tokens.index(next.index)
+            when range_end.kind != 301 {
+                next.failed = true
+                next.error_code = 8
+                next.error_start = range_end.start
+                next.error_end = range_end.end
+                break
+            }
+            lower_node := append_ast_node(next, 1, pattern.start, pattern.end, pattern.payload, Vec<u64>())
+            next = lower_node.state
+            upper_node := append_ast_node(next, 1, range_end.start, range_end.end, range_end.payload, Vec<u64>())
+            next = upper_node.state
+            next.index += 1
+            mut range_children := Vec<u64>()
+            range_children.push(lower_node.node_id)
+            range_children.push(upper_node.node_id)
+            range_node := append_ast_node(next, 12, pattern.start, range_end.end, 0, range_children)
+            next = range_node.state
+            pattern_node_id = range_node.node_id
+        } else {
+            pattern_kind := when is_wildcard { 11 as u64 } else { when pattern.kind == 301 { 1 as u64 } else { 6 as u64 } }
+            pattern_payload := when pattern.kind == 4 { 0 as u64 } else { when pattern.kind == 3 { 1 as u64 } else { pattern.payload } }
+            pattern_node := append_ast_node(next, pattern_kind, pattern.start, pattern.end, pattern_payload, Vec<u64>())
+            next = pattern_node.state
+            pattern_node_id = pattern_node.node_id
+        }
+        arrow := next.tokens.index(next.index)
+        when arrow.kind != 205 {
+            next.failed = true
+            next.error_code = 9
+            next.error_start = arrow.start
+            next.error_end = arrow.end
+            break
+        }
+        children.push(pattern_node_id)
+        next.index += 1
+        arm_value := parse_arithmetic_expression(next, 1)
+        when arm_value.state.failed { return arm_value }
+        next = arm_value.state
+        children.push(arm_value.node_id)
+        arm_count += 1
+        separator := next.tokens.index(next.index)
+        when separator.kind == 107 { next.index += 1 }
+        else { break }
+    }
+    when next.failed { return ParseValue { state: next, node_id: 0 } }
+    closing := next.tokens.index(next.index)
+    when closing.kind != 104 || arm_count == 0 {
+        next.failed = true
+        next.error_code = 2
+        next.error_start = closing.start
+        next.error_end = closing.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    append_ast_node(next, 10, keyword.start, closing.end, arm_count, children)
+}
+
+fun parse_primary(state: ParseState) -> ParseValue {
+    mut next := state
+    when next.failed { return ParseValue { state: next, node_id: 0 } }
+    token := next.tokens.index(next.index)
+    when token.kind == 5 { return parse_when_expression(next) }
+    when token.kind == 21 { return parse_choose_expression(next) }
+    when token.kind == 105 { return parse_array_expression(next) }
+    when token.kind == 301 {
+        next.index += 1
+        return append_ast_node(next, 1, token.start, token.end, token.payload, Vec<u64>())
+    }
+    when token.kind == 300 {
+        next.index += 1
+        name_node := append_ast_node(next, 3, token.start, token.end, token.payload, Vec<u64>())
+        when name_node.state.tokens.index(name_node.state.index).kind == 101 {
+            return parse_call_expression(name_node.state, name_node.node_id)
+        }
+        return name_node
+    }
+    when token.kind == 302 {
+        next.index += 1
+        return append_ast_node(next, 38, token.start, token.end, token.payload, Vec<u64>())
+    }
+    when token.kind == 303 {
+        next.index += 1
+        return append_ast_node(next, 2, token.start, token.end, 0, Vec<u64>())
+    }
+    when token.kind == 304 {
+        next.index += 1
+        return append_ast_node(next, 37, token.start, token.end, 0, Vec<u64>())
+    }
+    when token.kind == 3 || token.kind == 4 {
+        next.index += 1
+        literal := when token.kind == 3 { 1 as u64 } else { 0 as u64 }
+        return append_ast_node(next, 6, token.start, token.end, literal, Vec<u64>())
+    }
+    when token.kind == 113 || token.kind == 122 || token.kind == 123 {
+        next.index += 1
+        operand := parse_arithmetic_expression(next, 10)
+        when operand.state.failed { return operand }
+        operand_node := operand.state.nodes.index(operand.node_id)
+        mut child := Vec<u64>()
+        child.push(operand.node_id)
+        return append_ast_node(operand.state, 4, token.start, operand_node.end, token.kind, child)
+    }
+    when token.kind == 101 {
+        next.index += 1
+        mut inner := parse_arithmetic_expression(next, 1)
+        mut after := inner.state
+        closing := after.tokens.index(after.index)
+        when closing.kind != 102 {
+            after.failed = true
+            after.error_code = 2
+            after.error_start = closing.start
+            after.error_end = closing.end
+        } else {
+            after.index += 1
+        }
+        inner.state = after
+        return inner
+    }
+    next.failed = true
+    next.error_code = 1
+    next.error_start = token.start
+    next.error_end = token.end
+    ParseValue { state: next, node_id: 0 }
+}
+
+fun parse_call_expression(state: ParseState, name_node_id: u64) -> ParseValue {
+    mut next := state
+    name_node := next.nodes.index(name_node_id)
+    next.index += 1
+    mut arguments := Vec<u64>()
+    while !next.failed && next.tokens.index(next.index).kind != 102 {
+        argument := parse_arithmetic_expression(next, 1)
+        when argument.state.failed { return argument }
+        next = argument.state
+        arguments.push(argument.node_id)
+        separator := next.tokens.index(next.index)
+        when separator.kind == 107 { next.index += 1 }
+        else { break }
+    }
+    closing := next.tokens.index(next.index)
+    when closing.kind != 102 {
+        next.failed = true
+        next.error_code = 2
+        next.error_start = closing.start
+        next.error_end = closing.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    argument_count := arguments.len()
+    mut children := Vec<u64>()
+    children.push(name_node_id)
+    for argument_id in arguments { children.push(argument_id) }
+    append_ast_node(next, 19, name_node.start, closing.end, argument_count, children)
+}
+
+fun clone_parse_state(state: ParseState) -> ParseState {
+    ParseState {
+        source: state.source.clone(),
+        tokens: state.tokens.clone(),
+        index: state.index,
+        nodes: state.nodes.clone(),
+        children: state.children.clone(),
+        failed: state.failed,
+        error_code: state.error_code,
+        error_start: state.error_start,
+        error_end: state.error_end
+    }
+}
+
+fun parse_postfix_expression(value: ParseValue) -> ParseValue {
+    mut current := value
+    while !current.state.failed {
+        token := current.state.tokens.index(current.state.index)
+        when token.kind == 105 {
+            mut next := current.state
+            next.index += 1
+            index_value := parse_arithmetic_expression(next, 1)
+            when index_value.state.failed { return index_value }
+            next = index_value.state
+            closing := next.tokens.index(next.index)
+            when closing.kind != 106 {
+                next.failed = true
+                next.error_code = 2
+                next.error_start = closing.start
+                next.error_end = closing.end
+                return ParseValue { state: next, node_id: 0 }
+            }
+            next.index += 1
+            base_node := next.nodes.index(current.node_id)
+            mut children := Vec<u64>()
+            children.push(current.node_id)
+            children.push(index_value.node_id)
+            current = append_ast_node(next, 34, base_node.start, closing.end, 0, children)
+        } else when token.kind == 110 {
+            mut next := current.state
+            next.index += 1
+            member := next.tokens.index(next.index)
+            when member.kind != 300 && member.kind != 301 {
+                next.failed = true
+                next.error_code = 1
+                next.error_start = member.start
+                next.error_end = member.end
+                return ParseValue { state: next, node_id: 0 }
+            }
+            member_kind := when member.kind == 300 { 3 as u64 } else { 1 as u64 }
+            member_node := append_ast_node(next, member_kind, member.start, member.end, member.payload, Vec<u64>())
+            next = member_node.state
+            next.index += 1
+            base_node := next.nodes.index(current.node_id)
+            mut children := Vec<u64>()
+            children.push(current.node_id)
+            children.push(member_node.node_id)
+            access := append_ast_node(next, 35, base_node.start, member.end, 0, children)
+            when access.state.tokens.index(access.state.index).kind == 101 {
+                current = parse_call_expression(clone_parse_state(access.state), access.node_id)
+            } else {
+                current = access
+            }
+        } else {
+            break
+        }
+    }
+    current
+}
+
+fun parse_arithmetic_expression(state: ParseState, minimum_precedence: u64) -> ParseValue {
+    mut left := parse_postfix_expression(parse_primary(state))
+    while !left.state.failed {
+        operator := left.state.tokens.index(left.state.index)
+        precedence := arithmetic_precedence(operator.kind)
+        when precedence < minimum_precedence { break }
+        mut after_operator := left.state
+        after_operator.index += 1
+        right := parse_arithmetic_expression(after_operator, precedence + 1)
+        when right.state.failed { return right }
+        left_node := right.state.nodes.index(left.node_id)
+        right_node := right.state.nodes.index(right.node_id)
+        mut operands := Vec<u64>()
+        operands.push(left.node_id)
+        operands.push(right.node_id)
+        left = append_ast_node(
+            right.state,
+            5,
+            left_node.start,
+            right_node.end,
+            operator.kind,
+            operands
+        )
+    }
+    left
+}
+
+fun parse_arithmetic(source: String) -> ParseValue {
+    lexed := lex(source.clone())
+    mut state := ParseState {
+        source: source,
+        tokens: lexed.tokens,
+        index: 0,
+        nodes: Vec<AstNode>(),
+        children: Vec<u64>(),
+        failed: lexed.errors.len() > 0,
+        error_code: 0,
+        error_start: 0,
+        error_end: 0
+    }
+    when state.failed {
+        error := lexed.errors.index(0)
+        state.error_code = 100 + error.code
+        state.error_start = error.start
+        state.error_end = error.end
+        return ParseValue { state: state, node_id: 0 }
+    }
+    mut result := parse_arithmetic_expression(state, 1)
+    mut finished := result.state
+    trailing := finished.tokens.index(finished.index)
+    when !finished.failed && trailing.kind != 0 {
+        finished.failed = true
+        finished.error_code = 3
+        finished.error_start = trailing.start
+        finished.error_end = trailing.end
+    }
+    result.state = finished
+    result
+}
+
+// Initial type pass for literals, unary and binary expressions. Type codes:
+// int=1, bool=2, float=3, String=4, char=5. Unknown AST forms fail closed.
+fun check_expression_type(nodes: &[AstNode], children: &[u64], node_id: u64, name_ids: &[u64], variable_types: &[u64], functions: &[FunctionTypeSignature]) -> TypeCheckResult {
+    node := nodes[node_id]
+    when node.kind == 3 {
+        for slot in 0 as u64..name_ids.len() {
+            when name_ids[slot] == node.payload { return TypeCheckResult { type_code: variable_types[slot], error_node: 0, valid: true } }
+        }
+        return TypeCheckResult { type_code: 0, error_node: node_id, valid: false }
+    }
+    when node.kind == 1 { return TypeCheckResult { type_code: 1, error_node: 0, valid: true } }
+    when node.kind == 2 { return TypeCheckResult { type_code: 3, error_node: 0, valid: true } }
+    when node.kind == 6 { return TypeCheckResult { type_code: 2, error_node: 0, valid: true } }
+    when node.kind == 37 { return TypeCheckResult { type_code: 5, error_node: 0, valid: true } }
+    when node.kind == 38 { return TypeCheckResult { type_code: 4, error_node: 0, valid: true } }
+    when node.kind == 4 {
+        operand := check_expression_type(nodes, children, children[node.first_child], name_ids, variable_types, functions)
+        when !operand.valid { return operand }
+        when node.payload == 123 && operand.type_code == 2 { return TypeCheckResult { type_code: 2, error_node: 0, valid: true } }
+        when (node.payload == 113 || node.payload == 122) && operand.type_code == 1 { return TypeCheckResult { type_code: 1, error_node: 0, valid: true } }
+        return TypeCheckResult { type_code: 0, error_node: node_id, valid: false }
+    }
+    when node.kind == 5 {
+        left := check_expression_type(nodes, children, children[node.first_child], name_ids, variable_types, functions)
+        when !left.valid { return left }
+        right := check_expression_type(nodes, children, children[node.first_child + 1], name_ids, variable_types, functions)
+        when !right.valid { return right }
+        when left.type_code != right.type_code { return TypeCheckResult { type_code: 0, error_node: node_id, valid: false } }
+        when node.payload == 210 || node.payload == 212 {
+            when left.type_code == 2 { return TypeCheckResult { type_code: 2, error_node: 0, valid: true } }
+            return TypeCheckResult { type_code: 0, error_node: node_id, valid: false }
+        }
+        when node.payload == 204 || node.payload == 206 || node.payload == 117 || node.payload == 118 || node.payload == 207 || node.payload == 208 {
+            when left.type_code == 1 || left.type_code == 3 || left.type_code == 5 || (left.type_code == 2 && (node.payload == 204 || node.payload == 206)) {
+                return TypeCheckResult { type_code: 2, error_node: 0, valid: true }
+            }
+            return TypeCheckResult { type_code: 0, error_node: node_id, valid: false }
+        }
+        when node.payload == 112 || node.payload == 113 || node.payload == 114 || node.payload == 115 {
+            when left.type_code == 1 || left.type_code == 3 { return TypeCheckResult { type_code: left.type_code, error_node: 0, valid: true } }
+        }
+        when node.payload == 116 || node.payload == 119 || node.payload == 120 || node.payload == 121 || node.payload == 215 || node.payload == 217 {
+            when left.type_code == 1 { return TypeCheckResult { type_code: 1, error_node: 0, valid: true } }
+        }
+        return TypeCheckResult { type_code: 0, error_node: node_id, valid: false }
+    }
+    when node.kind == 8 {
+        condition := check_expression_type(nodes, children, children[node.first_child], name_ids, variable_types, functions)
+        when !condition.valid { return condition }
+        when condition.type_code != 2 { return TypeCheckResult { type_code: 0, error_node: node_id, valid: false } }
+        then_type := check_expression_type(nodes, children, children[node.first_child + 1], name_ids, variable_types, functions)
+        when !then_type.valid { return then_type }
+        else_type := check_expression_type(nodes, children, children[node.first_child + 2], name_ids, variable_types, functions)
+        when !else_type.valid { return else_type }
+        when then_type.type_code == else_type.type_code { return then_type }
+        return TypeCheckResult { type_code: 0, error_node: node_id, valid: false }
+    }
+    when node.kind == 10 {
+        scrutinee := check_expression_type(nodes, children, children[node.first_child], name_ids, variable_types, functions)
+        when !scrutinee.valid { return scrutinee }
+        when scrutinee.type_code != 1 && scrutinee.type_code != 2 { return TypeCheckResult { type_code: 0, error_node: node_id, valid: false } }
+        mut result_type := 0 as u64
+        for arm in 0..node.payload {
+            pattern_id := children[node.first_child + 1 + arm * 2]
+            pattern := nodes[pattern_id]
+            when pattern.kind == 12 {
+                when scrutinee.type_code != 1 { return TypeCheckResult { type_code: 0, error_node: pattern_id, valid: false } }
+            } else when pattern.kind != 11 {
+                pattern_type := check_expression_type(nodes, children, pattern_id, name_ids, variable_types, functions)
+                when !pattern_type.valid { return pattern_type }
+                when pattern_type.type_code != scrutinee.type_code { return TypeCheckResult { type_code: 0, error_node: pattern_id, valid: false } }
+            }
+            value_type := check_expression_type(nodes, children, children[node.first_child + 2 + arm * 2], name_ids, variable_types, functions)
+            when !value_type.valid { return value_type }
+            when result_type == 0 { result_type = value_type.type_code }
+            else when result_type != value_type.type_code { return TypeCheckResult { type_code: 0, error_node: node_id, valid: false } }
+        }
+        when result_type > 0 { return TypeCheckResult { type_code: result_type, error_node: 0, valid: true } }
+    }
+    when node.kind == 19 {
+        name_node := nodes[children[node.first_child]]
+        mut signature_index := functions.len()
+        for slot in 0 as u64..functions.len() {
+            when functions[slot].name_id == name_node.payload {
+                signature_index = slot
+                break
+            }
+        }
+        when signature_index == functions.len() { return TypeCheckResult { type_code: 0, error_node: node_id, valid: false } }
+        signature := functions[signature_index]
+        when signature.parameter_types.len() != node.payload || signature.return_type == 0 {
+            return TypeCheckResult { type_code: 0, error_node: node_id, valid: false }
+        }
+        for argument_offset in 0..node.payload {
+            argument_id := children[node.first_child + 1 + argument_offset]
+            argument_type := check_expression_type(nodes, children, argument_id, name_ids, variable_types, functions)
+            when !argument_type.valid { return argument_type }
+            when argument_type.type_code != signature.parameter_types.index(argument_offset) {
+                return TypeCheckResult { type_code: 0, error_node: argument_id, valid: false }
+            }
+        }
+        return TypeCheckResult { type_code: signature.return_type, error_node: 0, valid: true }
+    }
+    TypeCheckResult { type_code: 0, error_node: node_id, valid: false }
+}
+
+fun source_type_code(source: String, type_node: AstNode) -> u64 {
+    type_name := source.slice(type_node.start, type_node.end)
+    when type_name == String("i8") || type_name == String("i16") || type_name == String("i32") || type_name == String("i64") || type_name == String("u8") || type_name == String("u16") || type_name == String("u32") || type_name == String("u64") { return 1 }
+    when type_name == String("bool") { return 2 }
+    when type_name == String("f32") || type_name == String("f64") { return 3 }
+    when type_name == String("String") || type_name == String("str") { return 4 }
+    when type_name == String("char") { return 5 }
+    0
+}
+
+// Checks blocks and non-generic functions with primitive parameter types.
+// Unsupported statement forms fail closed until later semantic passes.
+fun check_statement_block_types(source: String, nodes: &[AstNode], children: &[u64], root_id: u64, initial_names: Vec<u64>, initial_types: Vec<u64>, expected_return_type: u64, functions: &[FunctionTypeSignature]) -> ProgramTypeCheckResult {
+    mut result := ProgramTypeCheckResult { name_ids: initial_names, variable_types: initial_types, error_node: root_id, valid: false }
+    root := nodes[root_id]
+    when root.kind != 23 && root.kind != 13 { return result }
+    for offset in 0..root.child_count {
+        statement_id := children[root.first_child + offset]
+        statement := nodes[statement_id]
+        when statement.kind == 22 || statement.kind == 24 || statement.kind == 25 || statement.kind == 26 {
+            name_id := children[statement.first_child]
+            name := nodes[name_id]
+            annotated := statement.kind == 25 || statement.kind == 26
+            value_offset := when annotated { 2 as u64 } else { 1 as u64 }
+            expression_id := children[statement.first_child + value_offset]
+            value_type := check_expression_type(nodes, children, expression_id, result.name_ids.as_slice(), result.variable_types.as_slice(), functions)
+            when !value_type.valid {
+                result.error_node = value_type.error_node
+                return result
+            }
+            when annotated {
+                type_id := children[statement.first_child + 1]
+                expected_type := source_type_code(source.clone(), nodes[type_id])
+                when expected_type == 0 || expected_type != value_type.type_code {
+                    result.error_node = statement_id
+                    return result
+                }
+            }
+            mut existing := false
+            for slot in 0 as u64..result.name_ids.len() {
+                when result.name_ids.index(slot) == name.payload {
+                    existing = true
+                    when result.variable_types.index(slot) != value_type.type_code {
+                        result.error_node = statement_id
+                        return result
+                    }
+                    break
+                }
+            }
+            when !existing {
+                when statement.payload != 201 && !annotated {
+                    result.error_node = statement_id
+                    return result
+                }
+                result.name_ids.push(name.payload)
+                result.variable_types.push(value_type.type_code)
+            }
+        } else when statement.kind == 20 || statement.kind == 21 {
+            when statement.kind == 21 && statement.child_count == 0 && expected_return_type > 0 {
+                result.error_node = statement_id
+                return result
+            }
+            when statement.child_count > 0 {
+                expression_id := children[statement.first_child]
+                expression_type := check_expression_type(nodes, children, expression_id, result.name_ids.as_slice(), result.variable_types.as_slice(), functions)
+                when !expression_type.valid {
+                    result.error_node = expression_type.error_node
+                    return result
+                }
+                when statement.kind == 21 && expected_return_type > 0 && expression_type.type_code != expected_return_type {
+                    result.error_node = statement_id
+                    return result
+                }
+            }
+        } else when statement.kind == 18 {
+            condition_id := children[statement.first_child]
+            condition_type := check_expression_type(nodes, children, condition_id, result.name_ids.as_slice(), result.variable_types.as_slice(), functions)
+            when !condition_type.valid || condition_type.type_code != 2 {
+                result.error_node = when !condition_type.valid { condition_type.error_node } else { statement_id }
+                return result
+            }
+            then_id := children[statement.first_child + 1]
+            then_result := check_statement_block_types(source.clone(), nodes, children, then_id, result.name_ids.clone(), result.variable_types.clone(), expected_return_type, functions)
+            when !then_result.valid { return then_result }
+            else_id := children[statement.first_child + 2]
+            else_result := check_statement_block_types(source.clone(), nodes, children, else_id, result.name_ids.clone(), result.variable_types.clone(), expected_return_type, functions)
+            when !else_result.valid { return else_result }
+        } else when statement.kind == 14 {
+            condition_id := children[statement.first_child]
+            condition_type := check_expression_type(nodes, children, condition_id, result.name_ids.as_slice(), result.variable_types.as_slice(), functions)
+            when !condition_type.valid || condition_type.type_code != 2 {
+                result.error_node = when !condition_type.valid { condition_type.error_node } else { statement_id }
+                return result
+            }
+            body_id := children[statement.first_child + 1]
+            body_result := check_statement_block_types(source.clone(), nodes, children, body_id, result.name_ids.clone(), result.variable_types.clone(), expected_return_type, functions)
+            when !body_result.valid { return body_result }
+        } else when statement.kind == 17 {
+            start_id := children[statement.first_child + 1]
+            end_id := children[statement.first_child + 2]
+            start_type := check_expression_type(nodes, children, start_id, result.name_ids.as_slice(), result.variable_types.as_slice(), functions)
+            end_type := check_expression_type(nodes, children, end_id, result.name_ids.as_slice(), result.variable_types.as_slice(), functions)
+            when !start_type.valid || !end_type.valid || start_type.type_code != 1 || end_type.type_code != 1 {
+                result.error_node = statement_id
+                return result
+            }
+            loop_name := nodes[children[statement.first_child]]
+            mut loop_names := result.name_ids.clone()
+            mut loop_types := result.variable_types.clone()
+            loop_names.push(loop_name.payload)
+            loop_types.push(1)
+            body_id := children[statement.first_child + 3]
+            body_result := check_statement_block_types(source.clone(), nodes, children, body_id, loop_names, loop_types, expected_return_type, functions)
+            when !body_result.valid { return body_result }
+        } else when statement.kind == 30 {
+            when statement.child_count != 4 {
+                result.error_node = statement_id
+                return result
+            }
+            parameter_list := nodes[children[statement.first_child + 1]]
+            mut parameter_names := Vec<u64>()
+            mut parameter_types := Vec<u64>()
+            mut invalid_parameter := false
+            for parameter_offset in 0..parameter_list.child_count {
+                parameter_id := children[parameter_list.first_child + parameter_offset]
+                parameter := nodes[parameter_id]
+                parameter_name := nodes[children[parameter.first_child]]
+                parameter_type_node := nodes[children[parameter.first_child + 1]]
+                parameter_type := source_type_code(source.clone(), parameter_type_node)
+                when parameter_type == 0 {
+                    invalid_parameter = true
+                    break
+                }
+                parameter_names.push(parameter_name.payload)
+                parameter_types.push(parameter_type)
+            }
+            when invalid_parameter {
+                result.error_node = statement_id
+                return result
+            }
+            return_node := nodes[children[statement.first_child + 2]]
+            declared_return_type := source_type_code(source.clone(), return_node)
+            body_id := children[statement.first_child + 3]
+            function_result := check_statement_block_types(source.clone(), nodes, children, body_id, parameter_names, parameter_types, declared_return_type, functions)
+            when !function_result.valid { return function_result }
+        } else when statement.kind == 15 || statement.kind == 16 {
+            // Loop-control placement is validated by the later control-flow pass.
+        } else {
+            result.error_node = statement_id
+            return result
+        }
+    }
+    result.error_node = 0
+    result.valid = true
+    result
+}
+
+fun check_program_types(source: String, nodes: &[AstNode], children: &[u64], root_id: u64) -> ProgramTypeCheckResult {
+    mut signatures := Vec<FunctionTypeSignature>()
+    root := nodes[root_id]
+    when root.kind != 23 { return ProgramTypeCheckResult { name_ids: Vec<u64>(), variable_types: Vec<u64>(), error_node: root_id, valid: false } }
+    for offset in 0..root.child_count {
+        function_id := children[root.first_child + offset]
+        function := nodes[function_id]
+        when function.kind == 30 {
+            when function.child_count != 4 { return ProgramTypeCheckResult { name_ids: Vec<u64>(), variable_types: Vec<u64>(), error_node: function_id, valid: false } }
+            function_name := nodes[children[function.first_child]]
+            parameter_list := nodes[children[function.first_child + 1]]
+            mut parameter_types := Vec<u64>()
+            mut invalid_signature := false
+            for parameter_offset in 0..parameter_list.child_count {
+                parameter_id := children[parameter_list.first_child + parameter_offset]
+                parameter := nodes[parameter_id]
+                type_node := nodes[children[parameter.first_child + 1]]
+                parameter_type := source_type_code(source.clone(), type_node)
+                when parameter_type == 0 {
+                    invalid_signature = true
+                    break
+                }
+                parameter_types.push(parameter_type)
+            }
+            when invalid_signature { return ProgramTypeCheckResult { name_ids: Vec<u64>(), variable_types: Vec<u64>(), error_node: function_id, valid: false } }
+            return_node := nodes[children[function.first_child + 2]]
+            return_code := source_type_code(source.clone(), return_node)
+            signatures.push(FunctionTypeSignature { name_id: function_name.payload, parameter_types: parameter_types, return_type: return_code })
+        }
+    }
+    check_statement_block_types(source, nodes, children, root_id, Vec<u64>(), Vec<u64>(), 0, signatures.as_slice())
+}
+
+fun parse_while_statement(state: ParseState) -> ParseValue {
+    mut next := state
+    keyword := next.tokens.index(next.index)
+    next.index += 1
+    condition := parse_arithmetic_expression(next, 1)
+    when condition.state.failed { return condition }
+    next = condition.state
+    opening := next.tokens.index(next.index)
+    when opening.kind != 103 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = opening.start
+        next.error_end = opening.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    mut body_children := Vec<u64>()
+    mut last_end := opening.end
+    while !next.failed && next.tokens.index(next.index).kind != 104 && next.tokens.index(next.index).kind != 0 {
+        before := next.index
+        statement := parse_simple_statement(next)
+        next = statement.state
+        when next.index == before && !next.failed {
+            next.failed = true
+            next.error_code = 5
+        }
+        when !next.failed {
+            body_node := next.nodes.index(statement.node_id)
+            last_end = body_node.end
+            body_children.push(statement.node_id)
+        }
+    }
+    when next.failed { return ParseValue { state: next, node_id: 0 } }
+    closing := next.tokens.index(next.index)
+    when closing.kind != 104 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = closing.start
+        next.error_end = closing.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    when body_children.len() == 0 { last_end = closing.start }
+    mut body_elements := Vec<u64>()
+    for child in body_children { body_elements.push(child) }
+    body := append_ast_node(next, 13, opening.start, closing.end, body_elements.len(), body_elements)
+    mut loop_children := Vec<u64>()
+    loop_children.push(condition.node_id)
+    loop_children.push(body.node_id)
+    append_ast_node(body.state, 14, keyword.start, closing.end, 0, loop_children)
+}
+
+fun parse_for_statement(state: ParseState) -> ParseValue {
+    mut next := state
+    keyword := next.tokens.index(next.index)
+    name_token := next.tokens.index(next.index + 1)
+    in_token := next.tokens.index(next.index + 2)
+    when name_token.kind != 300 || in_token.kind != 8 {
+        next.failed = true
+        next.error_code = 10
+        next.error_start = name_token.start
+        next.error_end = in_token.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 3
+    name_node := append_ast_node(next, 3, name_token.start, name_token.end, name_token.payload, Vec<u64>())
+    start := parse_arithmetic_expression(name_node.state, 1)
+    when start.state.failed { return start }
+    next = start.state
+    range_token := next.tokens.index(next.index)
+    when range_token.kind != 203 {
+        next.failed = true
+        next.error_code = 10
+        next.error_start = range_token.start
+        next.error_end = range_token.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    end := parse_arithmetic_expression(next, 1)
+    when end.state.failed { return end }
+    next = end.state
+    opening := next.tokens.index(next.index)
+    when opening.kind != 103 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = opening.start
+        next.error_end = opening.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    mut body_children := Vec<u64>()
+    while !next.failed && next.tokens.index(next.index).kind != 104 && next.tokens.index(next.index).kind != 0 {
+        before := next.index
+        statement := parse_simple_statement(next)
+        next = statement.state
+        when next.index == before && !next.failed {
+            next.failed = true
+            next.error_code = 5
+        }
+        when !next.failed { body_children.push(statement.node_id) }
+    }
+    when next.failed { return ParseValue { state: next, node_id: 0 } }
+    closing := next.tokens.index(next.index)
+    when closing.kind != 104 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = closing.start
+        next.error_end = closing.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    body := append_ast_node(next, 13, opening.start, closing.end, body_children.len(), body_children)
+    mut loop_children := Vec<u64>()
+    loop_children.push(name_node.node_id)
+    loop_children.push(start.node_id)
+    loop_children.push(end.node_id)
+    loop_children.push(body.node_id)
+    append_ast_node(body.state, 17, keyword.start, closing.end, 0, loop_children)
+}
+
+fun parse_when_statement(state: ParseState) -> ParseValue {
+    mut next := state
+    keyword := next.tokens.index(next.index)
+    next.index += 1
+    condition := parse_arithmetic_expression(next, 1)
+    when condition.state.failed { return condition }
+    next = condition.state
+    opening := next.tokens.index(next.index)
+    when opening.kind != 103 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = opening.start
+        next.error_end = opening.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    mut then_children := Vec<u64>()
+    while !next.failed && next.tokens.index(next.index).kind != 104 && next.tokens.index(next.index).kind != 0 {
+        before := next.index
+        statement := parse_simple_statement(next)
+        next = statement.state
+        when next.index == before && !next.failed {
+            next.failed = true
+            next.error_code = 5
+        }
+        when !next.failed { then_children.push(statement.node_id) }
+    }
+    when next.failed { return ParseValue { state: next, node_id: 0 } }
+    then_close := next.tokens.index(next.index)
+    when then_close.kind != 104 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = then_close.start
+        next.error_end = then_close.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    then_block := append_ast_node(next, 13, opening.start, then_close.end, then_children.len(), then_children)
+    next = then_block.state
+    mut else_block_id := 0 as u64
+    mut statement_end := then_close.end
+    else_token := next.tokens.index(next.index)
+    when else_token.kind == 6 {
+        next.index += 1
+        else_open := next.tokens.index(next.index)
+        when else_open.kind != 103 {
+            next.failed = true
+            next.error_code = 6
+            next.error_start = else_open.start
+            next.error_end = else_open.end
+            return ParseValue { state: next, node_id: 0 }
+        }
+        next.index += 1
+        mut else_children := Vec<u64>()
+        while !next.failed && next.tokens.index(next.index).kind != 104 && next.tokens.index(next.index).kind != 0 {
+            before := next.index
+            statement := parse_simple_statement(next)
+            next = statement.state
+            when next.index == before && !next.failed {
+                next.failed = true
+                next.error_code = 5
+            }
+            when !next.failed { else_children.push(statement.node_id) }
+        }
+        when next.failed { return ParseValue { state: next, node_id: 0 } }
+        else_close := next.tokens.index(next.index)
+        when else_close.kind != 104 {
+            next.failed = true
+            next.error_code = 6
+            next.error_start = else_close.start
+            next.error_end = else_close.end
+            return ParseValue { state: next, node_id: 0 }
+        }
+        next.index += 1
+        else_block := append_ast_node(next, 13, else_open.start, else_close.end, else_children.len(), else_children)
+        next = else_block.state
+        else_block_id = else_block.node_id
+        statement_end = else_close.end
+    } else {
+        empty_children := Vec<u64>()
+        empty_block := append_ast_node(next, 13, then_close.end, then_close.end, 0, empty_children)
+        next = empty_block.state
+        else_block_id = empty_block.node_id
+    }
+    mut branch_children := Vec<u64>()
+    branch_children.push(condition.node_id)
+    branch_children.push(then_block.node_id)
+    branch_children.push(else_block_id)
+    append_ast_node(next, 18, keyword.start, statement_end, 0, branch_children)
+}
+
+fun parse_function_declaration(state: ParseState) -> ParseValue {
+    mut next := state
+    keyword := next.tokens.index(next.index)
+    name_token := next.tokens.index(next.index + 1)
+    mut opening_index := next.index + 2
+    mut opening := next.tokens.index(opening_index)
+    when name_token.kind != 300 {
+        next.failed = true
+        next.error_code = 10
+        next.error_start = name_token.start
+        next.error_end = opening.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    mut name_children := Vec<u64>()
+    name_node := append_ast_node(next, 3, name_token.start, name_token.end, name_token.payload, name_children)
+    next = name_node.state
+    next.index += 2
+    mut generic_node_id := 0 as u64
+    generic_open := next.tokens.index(next.index)
+    when next.source.slice(generic_open.start, generic_open.end) == String("<") {
+        generic_start := generic_open.start
+        next.index += 1
+        mut generic_names := Vec<u64>()
+        mut closed_generics := false
+        while next.index < next.tokens.len() && !closed_generics {
+            generic_token := next.tokens.index(next.index)
+            generic_text := next.source.slice(generic_token.start, generic_token.end)
+            when generic_token.kind == 300 {
+                generic_name := append_ast_node(next, 3, generic_token.start, generic_token.end, generic_token.payload, Vec<u64>())
+                next = generic_name.state
+                generic_names.push(generic_name.node_id)
+            } else when generic_text == String(">") {
+                closed_generics = true
+                generic_end := generic_token.end
+                next.index += 1
+                generic_list := append_ast_node(next, 33, generic_start, generic_end, generic_names.len(), generic_names)
+                next = generic_list.state
+                generic_node_id = generic_list.node_id
+                break
+            } else when generic_text != String(",") {
+                next.failed = true
+                next.error_code = 10
+                next.error_start = generic_token.start
+                next.error_end = generic_token.end
+                break
+            }
+            next.index += 1
+        }
+        when !closed_generics {
+            next.failed = true
+            next.error_code = 2
+            next.error_start = generic_open.start
+            next.error_end = next.tokens.index(next.index).end
+            return ParseValue { state: next, node_id: 0 }
+        }
+    }
+    opening_index = next.index
+    opening = next.tokens.index(opening_index)
+    when opening.kind != 101 {
+        next.failed = true
+        next.error_code = 10
+        next.error_start = opening.start
+        next.error_end = opening.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index = opening_index + 1
+    mut parameters := Vec<u64>()
+    while !next.failed && next.tokens.index(next.index).kind != 102 {
+        parameter_name := next.tokens.index(next.index)
+        colon := next.tokens.index(next.index + 1)
+        when parameter_name.kind != 300 || colon.kind != 109 {
+            next.failed = true
+            next.error_code = 10
+            next.error_start = parameter_name.start
+            next.error_end = colon.end
+            return ParseValue { state: next, node_id: 0 }
+        }
+        next.index += 2
+        type_token := next.tokens.index(next.index)
+        type_start := type_token.start
+        mut type_end := type_token.end
+        mut angle_depth := 0 as i64
+        mut square_depth := 0 as i64
+        mut tuple_depth := 0 as i64
+        while next.index < next.tokens.len() {
+            type_part := next.tokens.index(next.index)
+            type_text := next.source.slice(type_part.start, type_part.end)
+            at_type_end := angle_depth == 0 && square_depth == 0 && tuple_depth == 0 && (type_part.kind == 107 || type_part.kind == 102)
+            when at_type_end { break }
+            when type_text == String("<") { angle_depth += 1 }
+            else when type_text == String(">") { angle_depth -= 1 }
+            else when type_text == String("[") { square_depth += 1 }
+            else when type_text == String("]") { square_depth -= 1 }
+            else when type_text == String("(") { tuple_depth += 1 }
+            else when type_text == String(")") { tuple_depth -= 1 }
+            type_end = type_part.end
+            next.index += 1
+        }
+        when type_end == type_start {
+            next.failed = true
+            next.error_code = 10
+            next.error_start = type_start
+            next.error_end = type_token.end
+            return ParseValue { state: next, node_id: 0 }
+        }
+        empty_children := Vec<u64>()
+        parameter_name_node := append_ast_node(next, 3, parameter_name.start, parameter_name.end, parameter_name.payload, empty_children)
+        next = parameter_name_node.state
+        type_children := Vec<u64>()
+        mut type_payload := 0 as u64
+        when type_token.kind == 300 && type_end == type_token.end { type_payload = type_token.payload }
+        type_node := append_ast_node(next, 7, type_start, type_end, type_payload, type_children)
+        next = type_node.state
+        mut parameter_children := Vec<u64>()
+        parameter_children.push(parameter_name_node.node_id)
+        parameter_children.push(type_node.node_id)
+        parameter_node := append_ast_node(next, 32, parameter_name.start, type_end, 0, parameter_children)
+        next = parameter_node.state
+        parameters.push(parameter_node.node_id)
+        when next.tokens.index(next.index).kind == 107 { next.index += 1 }
+        else { break }
+    }
+    parameter_close := next.tokens.index(next.index)
+    when parameter_close.kind != 102 {
+        next.failed = true
+        next.error_code = 2
+        next.error_start = parameter_close.start
+        next.error_end = parameter_close.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    mut return_type_symbol := 0 as u64
+    mut return_type_start := parameter_close.end
+    mut return_type_end := parameter_close.end
+    arrow := next.tokens.index(next.index)
+    when next.source.slice(arrow.start, arrow.end) == String("->") {
+        next.index += 1
+        type_token := next.tokens.index(next.index)
+        when type_token.kind == 0 || type_token.kind == 103 {
+            next.failed = true
+            next.error_code = 10
+            next.error_start = type_token.start
+            next.error_end = type_token.end
+            return ParseValue { state: next, node_id: 0 }
+        }
+        return_type_start = type_token.start
+        mut return_angle_depth := 0 as i64
+        mut return_square_depth := 0 as i64
+        mut return_tuple_depth := 0 as i64
+        mut return_type_done := false
+        while next.index < next.tokens.len() && !return_type_done {
+            return_part := next.tokens.index(next.index)
+            return_text := next.source.slice(return_part.start, return_part.end)
+            at_body := return_angle_depth == 0 && return_square_depth == 0 && return_tuple_depth == 0 && return_part.kind == 103
+            when at_body { return_type_done = true }
+            else {
+                when return_text == String("<") { return_angle_depth += 1 }
+                else when return_text == String(">") { return_angle_depth -= 1 }
+                else when return_text == String("[") { return_square_depth += 1 }
+                else when return_text == String("]") { return_square_depth -= 1 }
+                else when return_text == String("(") { return_tuple_depth += 1 }
+                else when return_text == String(")") { return_tuple_depth -= 1 }
+                return_type_end = return_part.end
+                next.index += 1
+            }
+        }
+        when return_type_end == return_type_start {
+            next.failed = true
+            next.error_code = 10
+            next.error_start = return_type_start
+            next.error_end = type_token.end
+            return ParseValue { state: next, node_id: 0 }
+        }
+        when type_token.kind == 300 && return_type_end == type_token.end { return_type_symbol = type_token.payload }
+    }
+    type_children := Vec<u64>()
+    return_type_node := append_ast_node(next, 7, return_type_start, return_type_end, return_type_symbol, type_children)
+    next = return_type_node.state
+    body_open := next.tokens.index(next.index)
+    when body_open.kind != 103 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = body_open.start
+        next.error_end = body_open.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    mut body_children := Vec<u64>()
+    while !next.failed && next.tokens.index(next.index).kind != 104 && next.tokens.index(next.index).kind != 0 {
+        before := next.index
+        statement := parse_simple_statement(next)
+        next = statement.state
+        when next.index == before && !next.failed {
+            next.failed = true
+            next.error_code = 5
+        }
+        when !next.failed { body_children.push(statement.node_id) }
+    }
+    when next.failed { return ParseValue { state: next, node_id: 0 } }
+    body_close := next.tokens.index(next.index)
+    when body_close.kind != 104 {
+        next.failed = true
+        next.error_code = 6
+        next.error_start = body_close.start
+        next.error_end = body_close.end
+        return ParseValue { state: next, node_id: 0 }
+    }
+    next.index += 1
+    body := append_ast_node(next, 13, body_open.start, body_close.end, body_children.len(), body_children)
+    next = body.state
+    parameter_count := parameters.len()
+    parameter_list := append_ast_node(next, 31, opening.start, parameter_close.end, parameters.len(), parameters)
+    next = parameter_list.state
+    mut function_children := Vec<u64>()
+    function_children.push(name_node.node_id)
+    function_children.push(parameter_list.node_id)
+    function_children.push(return_type_node.node_id)
+    function_children.push(body.node_id)
+    when generic_node_id != 0 { function_children.push(generic_node_id) }
+    append_ast_node(next, 30, keyword.start, body_close.end, parameter_count, function_children)
+}
+
+fun parse_simple_statement(state: ParseState) -> ParseValue {
+    mut next := state
+    token := next.tokens.index(next.index)
+    when token.kind == 12 { return parse_while_statement(next) }
+    when token.kind == 7 { return parse_for_statement(next) }
+    when token.kind == 5 { return parse_when_statement(next) }
+    when token.kind == 1 { return parse_function_declaration(next) }
+    when token.kind == 13 || token.kind == 14 {
+        next.index += 1
+        statement_kind := when token.kind == 13 { 15 as u64 } else { 16 as u64 }
+        mut statement := append_ast_node(next, statement_kind, token.start, token.end, 0, Vec<u64>())
+        when statement.state.tokens.index(statement.state.index).kind == 108 {
+            statement.state.index += 1
+        }
+        return statement
+    }
+    when token.kind == 9 {
+        following := next.tokens.index(next.index + 1)
+        when following.kind == 108 || following.kind == 104 || following.kind == 0 {
+            next.index += 1
+            mut statement := append_ast_node(next, 21, token.start, token.end, token.kind, Vec<u64>())
+            mut after := statement.state
+            when after.tokens.index(after.index).kind == 108 { after.index += 1 }
+            statement.state = after
+            return statement
+        }
+    }
+    when token.kind == 10 || token.kind == 9 {
+        next.index += 1
+        statement_kind := when token.kind == 10 { 20 as u64 } else { 21 as u64 }
+        expression := parse_arithmetic_expression(next, 1)
+        when expression.state.failed { return expression }
+        expression_node := expression.state.nodes.index(expression.node_id)
+        mut children := Vec<u64>()
+        children.push(expression.node_id)
+        mut statement := append_ast_node(
+            expression.state,
+            statement_kind,
+            token.start,
+            expression_node.end,
+            token.kind,
+            children
+        )
+        terminator := statement.state.tokens.index(statement.state.index)
+        when terminator.kind == 108 { statement.state.index += 1 }
+        return statement
+    }
+    mut name_token := token
+    mut prefix_width := 0 as u64
+    when token.kind == 2 {
+        prefix_width = 1
+        name_token = next.tokens.index(next.index + 1)
+    }
+    following_kind := next.tokens.index(next.index + prefix_width + 1).kind
+    mut assignment_operator := following_kind
+    mut declaration_kind := when prefix_width == 1 { 24 as u64 } else { 22 as u64 }
+    mut declaration_width := prefix_width + 2
+    mut has_type_annotation := false
+    mut annotation_token := next.tokens.index(next.index)
+    when following_kind == 109 &&
+        next.tokens.index(next.index + prefix_width + 2).kind == 300 &&
+        next.tokens.index(next.index + prefix_width + 3).kind == 111 {
+        assignment_operator = 201
+        declaration_width = prefix_width + 4
+        declaration_kind = when prefix_width == 1 { 26 as u64 } else { 25 as u64 }
+        has_type_annotation = true
+        annotation_token = next.tokens.index(next.index + prefix_width + 2)
+    }
+    when name_token.kind == 300 &&
+        (is_assignment_operator(assignment_operator) || declaration_kind == 25 || declaration_kind == 26) {
+        next.index += declaration_width
+        mut children := Vec<u64>()
+        name_children := Vec<u64>()
+        name_node := append_ast_node(next, 3, name_token.start, name_token.end, name_token.payload, name_children)
+        children.push(name_node.node_id)
+        mut expression_state := name_node.state
+        when has_type_annotation {
+            type_children := Vec<u64>()
+            type_node := append_ast_node(
+                expression_state,
+                7,
+                annotation_token.start,
+                annotation_token.end,
+                0,
+                type_children
+            )
+            expression_state = type_node.state
+            children.push(type_node.node_id)
+        }
+        expression := parse_arithmetic_expression(expression_state, 1)
+        when expression.state.failed { return expression }
+        expression_node := expression.state.nodes.index(expression.node_id)
+        children.push(expression.node_id)
+        mut statement := append_ast_node(
+            expression.state,
+            declaration_kind,
+            name_token.start,
+            expression_node.end,
+            assignment_operator,
+            children
+        )
+        terminator := statement.state.tokens.index(statement.state.index)
+        when terminator.kind == 108 { statement.state.index += 1 }
+        return statement
+    }
+    next.failed = true
+    next.error_code = 4
+    next.error_start = token.start
+    next.error_end = token.end
+    ParseValue { state: next, node_id: 0 }
+}
+
+fun is_assignment_operator(kind: u64) -> bool {
+    kind == 201 || kind == 111 || kind == 209 || kind == 211 || kind == 213 ||
+    kind == 214 || kind == 216 || (kind >= 219 && kind <= 223)
+}
+
+fun compound_operator(kind: u64) -> u64 {
+    when kind == 219 { 112 }
+    else when kind == 220 { 113 }
+    else when kind == 221 { 114 }
+    else when kind == 222 { 115 }
+    else when kind == 223 { 116 }
+    else when kind == 209 { 119 }
+    else when kind == 211 { 120 }
+    else when kind == 213 { 121 }
+    else when kind == 214 { 215 }
+    else when kind == 216 { 217 }
+    else { 0 }
+}
+
+fun parse_simple_program(source: String) -> ParseValue {
+    lexed := lex(source.clone())
+    mut state := ParseState {
+        source: source,
+        tokens: lexed.tokens,
+        index: 0,
+        nodes: Vec<AstNode>(),
+        children: Vec<u64>(),
+        failed: lexed.errors.len() > 0,
+        error_code: 0,
+        error_start: 0,
+        error_end: 0
+    }
+    when state.failed {
+        error := lexed.errors.index(0)
+        state.error_code = 100 + error.code
+        state.error_start = error.start
+        state.error_end = error.end
+        return ParseValue { state: state, node_id: 0 }
+    }
+    mut statements := Vec<u64>()
+    mut first_start := 0 as u64
+    mut last_end := 0 as u64
+    mut has_statement := false
+    while !state.failed && state.tokens.index(state.index).kind != 0 {
+        before := state.index
+        statement := parse_simple_statement(state)
+        state = statement.state
+        when state.index == before && !state.failed {
+            state.failed = true
+            state.error_code = 5
+        }
+        when !state.failed {
+            node := state.nodes.index(statement.node_id)
+            when !has_statement { first_start = node.start }
+            last_end = node.end
+            has_statement = true
+            statements.push(statement.node_id)
+        }
+    }
+    when state.failed { return ParseValue { state: state, node_id: 0 } }
+    append_ast_node(state, 23, first_start, last_end, 0, statements)
+}
+
+fun eval_comparison(payload: u64, left: i64, right: i64) -> i64 {
+    when payload == 204 { when left == right { 1 as i64 } else { 0 as i64 } }
+    else when payload == 206 { when left != right { 1 as i64 } else { 0 as i64 } }
+    else when payload == 117 { when left < right { 1 as i64 } else { 0 as i64 } }
+    else when payload == 118 { when left > right { 1 as i64 } else { 0 as i64 } }
+    else when payload == 207 { when left <= right { 1 as i64 } else { 0 as i64 } }
+    else { when left >= right { 1 as i64 } else { 0 as i64 } }
+}
+
+fun eval_binary(payload: u64, left: i64, right: i64) -> i64 {
+    when payload == 112 { left + right }
+    else when payload == 113 { left - right }
+    else when payload == 114 { left * right }
+    else when payload == 115 && right != 0 { left / right }
+    else when payload == 116 && right != 0 { left % right }
+    else when payload == 204 || payload == 206 || payload == 117 || payload == 118 || payload == 207 || payload == 208 {
+        eval_comparison(payload, left, right)
+    }
+    else when payload == 119 { (left as u64 & right as u64) as i64 }
+    else when payload == 120 { (left as u64 | right as u64) as i64 }
+    else when payload == 121 { (left as u64 ^ right as u64) as i64 }
+    else when payload == 210 { when left != 0 && right != 0 { 1 as i64 } else { 0 as i64 } }
+    else when payload == 212 { when left != 0 || right != 0 { 1 as i64 } else { 0 as i64 } }
+    else when payload == 215 && right >= 0 && right < 64 { left << (right as u32) }
+    else when payload == 217 && right >= 0 && right < 64 { left >> (right as u32) }
+    else { 0 }
+}
+
+fun evaluate_arithmetic(arena: AstArena, root_id: u64) -> i64 {
+    mut values := Vec<i64>()
+    for node_id in 0..arena.nodes.len() {
+        node := arena.nodes.index(node_id)
+        when node.kind == 1 || node.kind == 6 {
+            values.push(node.payload as i64)
+        } else when node.kind == 4 {
+            child_id := arena.children.index(node.first_child)
+            operand := values.index(child_id)
+            when node.payload == 113 { values.push(-operand) }
+            else when node.payload == 123 { values.push(when operand == 0 { 1 as i64 } else { 0 as i64 }) }
+            else when node.payload == 122 { values.push(-operand - 1) }
+            else { values.push(operand) }
+        } else when node.kind == 5 {
+            left_id := arena.children.index(node.first_child)
+            right_id := arena.children.index(node.first_child + 1)
+            left := values.index(left_id)
+            right := values.index(right_id)
+            values.push(eval_binary(node.payload, left, right))
+        } else when node.kind == 8 {
+            condition_id := arena.children.index(node.first_child)
+            branch_offset := when values.index(condition_id) != 0 { 1 as u64 } else { 2 as u64 }
+            branch_id := arena.children.index(node.first_child + branch_offset)
+            values.push(values.index(branch_id))
+        } else when node.kind == 10 {
+            scrutinee_id := arena.children.index(node.first_child)
+            scrutinee := values.index(scrutinee_id)
+            mut matched := false
+            mut result := 0 as i64
+            for arm in 0..node.payload {
+                pattern_id := arena.children.index(node.first_child + 1 + arm * 2)
+                value_id := arena.children.index(node.first_child + 2 + arm * 2)
+                pattern := arena.nodes.index(pattern_id)
+                mut pattern_matches := pattern.kind == 11 || values.index(pattern_id) == scrutinee
+                when pattern.kind == 12 {
+                    lower_id := arena.children.index(pattern.first_child)
+                    upper_id := arena.children.index(pattern.first_child + 1)
+                    pattern_matches = scrutinee >= values.index(lower_id) && scrutinee < values.index(upper_id)
+                }
+                when !matched && pattern_matches {
+                    result = values.index(value_id)
+                    matched = true
+                }
+            }
+            values.push(result)
+        } else {
+            values.push(0)
+        }
+    }
+    values.index(root_id)
+}
+
+struct ProgramResult {
+    output: Vec<i64>,
+    return_value: i64,
+    name_ids: Vec<u64>,
+    variable_values: Vec<i64>,
+    flow: u64
+}
+
+fun eval_program_expression(nodes: &[AstNode], children: &[u64], functions: &[u64], node_id: u64, name_ids: Vec<u64>, variable_values: Vec<i64>) -> i64 {
+    node := nodes[node_id]
+    when node.kind == 1 || node.kind == 6 { return node.payload as i64 }
+    when node.kind == 3 {
+        mut value := 0 as i64
+        for slot in 0..variable_values.len() {
+            when name_ids.index(slot) == node.payload { value = variable_values.index(slot) }
+        }
+        return value
+    }
+    when node.kind == 4 {
+        child_id := children[node.first_child]
+        operand := eval_program_expression(nodes, children, functions, child_id, name_ids, variable_values)
+        when node.payload == 113 { return -operand }
+        when node.payload == 123 { return when operand == 0 { 1 as i64 } else { 0 as i64 } }
+        when node.payload == 122 { return -operand - 1 }
+        return operand
+    }
+    when node.kind == 5 {
+        left_id := children[node.first_child]
+        right_id := children[node.first_child + 1]
+        left := eval_program_expression(nodes, children, functions, left_id, name_ids.clone(), variable_values.clone())
+        right := eval_program_expression(nodes, children, functions, right_id, name_ids, variable_values)
+        return eval_binary(node.payload, left, right)
+    }
+    when node.kind == 8 {
+        condition_id := children[node.first_child]
+        condition := eval_program_expression(nodes, children, functions, condition_id, name_ids.clone(), variable_values.clone())
+        branch_offset := when condition != 0 { 1 as u64 } else { 2 as u64 }
+        branch_id := children[node.first_child + branch_offset]
+        return eval_program_expression(nodes, children, functions, branch_id, name_ids, variable_values)
+    }
+    when node.kind == 10 {
+        scrutinee_id := children[node.first_child]
+        scrutinee := eval_program_expression(nodes, children, functions, scrutinee_id, name_ids.clone(), variable_values.clone())
+        mut matched := false
+        mut result := 0 as i64
+        for arm in 0..node.payload {
+            pattern_id := children[node.first_child + 1 + arm * 2]
+            value_id := children[node.first_child + 2 + arm * 2]
+            pattern := nodes[pattern_id]
+            mut pattern_matches := pattern.kind == 11
+            when pattern.kind == 12 {
+                lower_id := children[pattern.first_child]
+                upper_id := children[pattern.first_child + 1]
+                lower := eval_program_expression(nodes, children, functions, lower_id, name_ids.clone(), variable_values.clone())
+                upper := eval_program_expression(nodes, children, functions, upper_id, name_ids.clone(), variable_values.clone())
+                pattern_matches = scrutinee >= lower && scrutinee < upper
+            } else when !pattern_matches {
+                pattern_matches = eval_program_expression(nodes, children, functions, pattern_id, name_ids.clone(), variable_values.clone()) == scrutinee
+            }
+            when !matched && pattern_matches {
+                result = eval_program_expression(nodes, children, functions, value_id, name_ids.clone(), variable_values.clone())
+                matched = true
+            }
+        }
+        return result
+    }
+    when node.kind == 19 {
+        name_node_id := children[node.first_child]
+        name_symbol := nodes[name_node_id].payload
+        mut argument_values := Vec<i64>()
+        for argument_offset in 0..node.payload {
+            argument_id := children[node.first_child + argument_offset + 1]
+            argument_values.push(eval_program_expression(nodes, children, functions, argument_id, name_ids.clone(), variable_values.clone()))
+        }
+        for function_id in functions {
+            function := nodes[function_id]
+            function_name_id := children[function.first_child]
+            when nodes[function_name_id].payload == name_symbol && function.payload == node.payload {
+                parameter_list_id := children[function.first_child + 1]
+                parameter_list := nodes[parameter_list_id]
+                mut local_names := Vec<u64>()
+                mut local_values := Vec<i64>()
+                for parameter_offset in 0..parameter_list.child_count {
+                    parameter_id := children[parameter_list.first_child + parameter_offset]
+                    parameter := nodes[parameter_id]
+                    parameter_name_id := children[parameter.first_child]
+                    local_names.push(nodes[parameter_name_id].payload)
+                    local_values.push(argument_values.index(parameter_offset))
+                }
+                body_id := children[function.first_child + 3]
+                call_result := evaluate_statement(nodes, children, functions, body_id, local_names, local_values)
+                return call_result.return_value
+            }
+        }
+        return 0
+    }
+    0
+}
+
+fun clone_ast_arena(arena: AstArena) -> AstArena {
+    AstArena {
+        source: arena.source.clone(),
+        nodes: arena.nodes.clone(),
+        children: arena.children.clone()
+    }
+}
+
+fun evaluate_statement(nodes: &[AstNode], children: &[u64], functions: &[u64], node_id: u64, name_ids: Vec<u64>, variable_values: Vec<i64>) -> ProgramResult {
+    mut result := ProgramResult { output: Vec<i64>(), return_value: 0, name_ids: name_ids, variable_values: variable_values, flow: 0 }
+    node := nodes[node_id]
+    when node.kind == 13 || node.kind == 23 {
+        for offset in 0..node.child_count {
+            child_id := children[node.first_child + offset]
+            child := evaluate_statement(nodes, children, functions, child_id, result.name_ids.clone(), result.variable_values.clone())
+            for value in child.output { result.output.push(value) }
+            result.name_ids = child.name_ids
+            result.variable_values = child.variable_values
+            result.return_value = child.return_value
+            result.flow = child.flow
+            when result.flow != 0 { break }
+        }
+        return result
+    }
+    when node.kind == 22 || node.kind == 24 || node.kind == 25 || node.kind == 26 {
+        name_node_id := children[node.first_child]
+        name_node := nodes[name_node_id]
+        symbol_id := name_node.payload
+        value_offset := when node.kind == 25 || node.kind == 26 { 2 as u64 } else { 1 as u64 }
+        value_id := children[node.first_child + value_offset]
+        mut value := eval_program_expression(nodes, children, functions, value_id, result.name_ids.clone(), result.variable_values.clone())
+        mut found := false
+        for slot in 0..result.variable_values.len() {
+            when result.name_ids.index(slot) == symbol_id {
+                operator := compound_operator(node.payload)
+                when operator != 0 { value = eval_binary(operator, result.variable_values.index(slot), value) }
+                result.variable_values.set(slot, value)
+                found = true
+                break
+            }
+        }
+        when !found {
+            result.name_ids.push(symbol_id)
+            result.variable_values.push(value)
+        }
+        return result
+    }
+    when node.kind == 20 {
+        expression_id := children[node.first_child]
+        result.output.push(eval_program_expression(nodes, children, functions, expression_id, result.name_ids.clone(), result.variable_values.clone()))
+        return result
+    }
+    when node.kind == 21 {
+        when node.child_count > 0 {
+            expression_id := children[node.first_child]
+            result.return_value = eval_program_expression(nodes, children, functions, expression_id, result.name_ids.clone(), result.variable_values.clone())
+        }
+        result.flow = 1
+        return result
+    }
+    when node.kind == 18 {
+        condition_id := children[node.first_child]
+        when eval_program_expression(nodes, children, functions, condition_id, result.name_ids.clone(), result.variable_values.clone()) != 0 {
+            branch_id := children[node.first_child + 1]
+            return evaluate_statement(nodes, children, functions, branch_id, result.name_ids, result.variable_values)
+        } else {
+            branch_id := children[node.first_child + 2]
+            return evaluate_statement(nodes, children, functions, branch_id, result.name_ids, result.variable_values)
+        }
+    }
+    when node.kind == 15 {
+        result.flow = 2
+        return result
+    }
+    when node.kind == 16 {
+        result.flow = 3
+        return result
+    }
+    when node.kind == 14 {
+        condition_id := children[node.first_child]
+        body_id := children[node.first_child + 1]
+        mut iterations := 0 as u64
+        while eval_program_expression(nodes, children, functions, condition_id, result.name_ids.clone(), result.variable_values.clone()) != 0 && iterations < 100000 {
+            child := evaluate_statement(nodes, children, functions, body_id, result.name_ids.clone(), result.variable_values.clone())
+            for value in child.output { result.output.push(value) }
+            result.name_ids = child.name_ids
+            result.variable_values = child.variable_values
+            result.return_value = child.return_value
+            iterations += 1
+            when child.flow == 1 {
+                result.flow = 1
+                return result
+            }
+            when child.flow == 2 { break }
+        }
+        return result
+    }
+    when node.kind == 17 {
+        name_node_id := children[node.first_child]
+        name_node := nodes[name_node_id]
+        symbol_id := name_node.payload
+        start_id := children[node.first_child + 1]
+        end_id := children[node.first_child + 2]
+        body_id := children[node.first_child + 3]
+        mut index := eval_program_expression(nodes, children, functions, start_id, result.name_ids.clone(), result.variable_values.clone())
+        end := eval_program_expression(nodes, children, functions, end_id, result.name_ids.clone(), result.variable_values.clone())
+        mut slot_found := false
+        mut variable_slot := 0 as u64
+        for slot in 0..result.variable_values.len() {
+            when result.name_ids.index(slot) == symbol_id {
+                slot_found = true
+                variable_slot = slot
+            }
+        }
+        when !slot_found {
+            result.name_ids.push(symbol_id)
+            result.variable_values.push(index)
+            variable_slot = result.variable_values.len() - 1
+        }
+        while index < end {
+            result.variable_values.set(variable_slot, index)
+            child := evaluate_statement(nodes, children, functions, body_id, result.name_ids.clone(), result.variable_values.clone())
+            for value in child.output { result.output.push(value) }
+            result.name_ids = child.name_ids
+            result.variable_values = child.variable_values
+            result.return_value = child.return_value
+            when child.flow == 1 {
+                result.flow = 1
+                return result
+            }
+            when child.flow == 2 { break }
+            index += 1
+        }
+        result.variable_values.set(variable_slot, index)
+        return result
+    }
+    result
+}
+
+fun evaluate_program(arena: AstArena, root_id: u64) -> ProgramResult {
+    root := arena.nodes.index(root_id)
+    mut functions := Vec<u64>()
+    mut main_function_id := 0 as u64
+    for offset in 0..root.child_count {
+        child_id := arena.children.index(root.first_child + offset)
+        child := arena.nodes.index(child_id)
+        when child.kind == 30 {
+            functions.push(child_id)
+            name_id := arena.children.index(child.first_child)
+            name := arena.nodes.index(name_id)
+            when arena.source.slice(name.start, name.end) == String("main") { main_function_id = child_id + 1 }
+        }
+    }
+    when main_function_id > 0 {
+        function := arena.nodes.index(main_function_id - 1)
+        body_id := arena.children.index(function.first_child + 3)
+        return evaluate_statement(arena.nodes.as_slice(), arena.children.as_slice(), functions.as_slice(), body_id, Vec<u64>(), Vec<i64>())
+    }
+    evaluate_statement(arena.nodes.as_slice(), arena.children.as_slice(), functions.as_slice(), root_id, Vec<u64>(), Vec<i64>())
+}
+
+fun main() {
+    interned := lex(String("alpha := 1; echo alpha; alpha := alpha + 2"))
+    assert(interned.symbols.len() == 1)
+    assert(interned.tokens.index(0).payload == interned.tokens.index(5).payload)
+    assert(interned.tokens.index(5).payload == interned.tokens.index(7).payload)
+    assert(interned.tokens.index(7).payload == interned.tokens.index(9).payload)
+    echo interned.symbols.len()
+    echo interned.tokens.index(0).payload
+    echo interned.tokens.index(5).payload
+    echo interned.tokens.index(7).payload
+    echo interned.tokens.index(9).payload
+
+    diagnostic_source := String("\"🦀\" @")
+    diagnostic_lexed := lex(diagnostic_source.clone())
+    diagnostic_error := diagnostic_lexed.errors.index(0)
+    echo format_lex_error(diagnostic_source, diagnostic_error)
+
+    sample := String("fun main() { echo \"Ryn 🦀\" /* outer /* nested */ comment */ // comment\n value <<= 0x2A; next != 0b10 && rate == 3.14 && exp == 1.2e3 && grouped == 1_000 && range == 1..2 && character == '🦀' && escaped == '\\u{1F980}' while break continue struct as enum type namespace pub choose }")
+    mut output := lex(sample.clone())
+    tokens := output.tokens
+    echo output.errors.len()
+    echo tokens.len()
+    for token in tokens {
+        echo token.kind
+        echo token.start
+        echo token.end
+        echo token.scalar_start
+        echo token.scalar_end
+        echo token.payload
+        echo token.float_payload
+        echo token.character_payload
+        echo sample.slice(token.start, token.end)
+        when token.kind == 302 { echo output.string_values.take(token.payload) }
+    }
+    mut malformed := lex(String("@"))
+    echo malformed.errors.len()
+    echo malformed.errors.take(0).code
+    malformed_numbers := lex(String("1__2 2e+ 0b"))
+    echo malformed_numbers.errors.len()
+    for error in malformed_numbers.errors {
+        echo error.code
+        echo error.start
+        echo error.end
+    }
+    maximum_integer := lex(String("18446744073709551615"))
+    assert(maximum_integer.errors.len() == 0)
+    assert(maximum_integer.tokens.index(0).payload == 18446744073709551615)
+    echo maximum_integer.errors.len()
+    echo maximum_integer.tokens.index(0).payload
+    mut decimal_overflow := lex(String("18446744073709551616"))
+    assert(decimal_overflow.errors.index(0).code == 12)
+    echo decimal_overflow.errors.index(0).code
+    mut hexadecimal_overflow := lex(String("0x10000000000000000"))
+    assert(hexadecimal_overflow.errors.index(0).code == 12)
+    echo hexadecimal_overflow.errors.index(0).code
+    mut binary_overflow := lex(String("0b10000000000000000000000000000000000000000000000000000000000000000"))
+    assert(binary_overflow.errors.index(0).code == 12)
+    echo binary_overflow.errors.index(0).code
+    large_float := lex(String("18446744073709551616.0"))
+    assert(large_float.errors.len() == 0)
+    maximum_float := lex(String("1.7976931348623157e308"))
+    assert(maximum_float.errors.len() == 0)
+    mut float_overflow := lex(String("1.7976931348623157e309"))
+    assert(float_overflow.errors.len() == 1)
+    assert(float_overflow.errors.index(0).code == 13)
+    mut exponent_overflow := lex(String("1e9999999"))
+    assert(exponent_overflow.errors.len() == 1)
+    assert(exponent_overflow.errors.index(0).code == 13)
+    echo large_float.errors.len()
+    mut malformed_comment := lex(String("/* open"))
+    echo malformed_comment.errors.len()
+    echo malformed_comment.errors.take(0).code
+    mut malformed_string := lex(String("\"open"))
+    echo malformed_string.errors.len()
+    echo malformed_string.errors.take(0).code
+    mut malformed_escape := lex(String("\"bad\\q\""))
+    echo malformed_escape.errors.len()
+    echo malformed_escape.errors.take(0).code
+    mut malformed_unicode := lex(String("'\\u{D800}'"))
+    echo malformed_unicode.errors.len()
+    echo malformed_unicode.errors.take(0).code
+    mut leading_unicode_separator := lex(String("'\\u{_41}'"))
+    assert(leading_unicode_separator.errors.len() == 1)
+    assert(leading_unicode_separator.errors.take(0).code == 9)
+    mut leading_unicode_string_separator := lex(String("\"\\u{_41}\""))
+    assert(leading_unicode_string_separator.errors.len() == 1)
+    assert(leading_unicode_string_separator.errors.take(0).code == 10)
+    mut separated_unicode_digits := lex(String("'\\u{4__1}'"))
+    assert(separated_unicode_digits.errors.len() == 0)
+    mut unicode_string := lex(String("\"\\u{1F980}\""))
+    echo unicode_string.string_values.len()
+    mut malformed_unicode_string := lex(String("\"\\u{110000}\""))
+    echo malformed_unicode_string.errors.len()
+    echo malformed_unicode_string.errors.take(0).code
+    mut malformed_character := lex(String("'ab'"))
+    echo malformed_character.errors.len()
+    echo malformed_character.errors.take(0).code
+    source_tokens := lex_file("examples/self_hosted/sample.ryn")
+    mut missing_source := lex_file("examples/self_hosted/missing-sample.ryn")
+    echo source_tokens.tokens.len()
+    echo source_tokens.errors.len()
+    echo missing_source.tokens.len()
+    echo missing_source.errors.len()
+
+    parsed := parse_arithmetic(String("7 + 9 * (2 + 1)"))
+    arithmetic_type := check_expression_type(parsed.state.nodes.as_slice(), parsed.state.children.as_slice(), parsed.node_id, Vec<u64>().as_slice(), Vec<u64>().as_slice(), Vec<FunctionTypeSignature>().as_slice())
+    assert(arithmetic_type.valid && arithmetic_type.type_code == 1)
+    echo parsed.state.failed
+    echo parsed.state.nodes.len()
+    echo parsed.state.children.len()
+    echo evaluate_arithmetic(AstArena {
+        source: parsed.state.source.clone(),
+        nodes: parsed.state.nodes.clone(),
+        children: parsed.state.children.clone()
+    }, parsed.node_id)
+    malformed_expression_source := String("7 + * 2")
+    malformed_expression := parse_arithmetic(malformed_expression_source.clone())
+    echo malformed_expression.state.failed
+    echo malformed_expression.state.error_code
+    echo malformed_expression.state.error_start
+    echo malformed_expression.state.error_end
+    echo format_parse_error(
+        malformed_expression_source,
+        malformed_expression.state.error_code,
+        malformed_expression.state.error_start,
+        malformed_expression.state.error_end
+    )
+
+    program := parse_simple_program(String("value := 3; echo 7 + 9 * 2; return 0"))
+    echo program.state.failed
+    typed_program := parse_simple_program(String("count := 2; mut total := count + 3; total += 1; echo total; return total"))
+    assert(!typed_program.state.failed)
+    typed_program_result := check_program_types(typed_program.state.source.clone(), typed_program.state.nodes.as_slice(), typed_program.state.children.as_slice(), typed_program.node_id)
+    assert(typed_program_result.valid && typed_program_result.name_ids.len() == 2)
+    invalid_program := parse_simple_program(String("value := true; echo value + 1"))
+    assert(!invalid_program.state.failed)
+    invalid_program_result := check_program_types(invalid_program.state.source.clone(), invalid_program.state.nodes.as_slice(), invalid_program.state.children.as_slice(), invalid_program.node_id)
+    assert(!invalid_program_result.valid)
+    invalid_program_diagnostic := format_type_error(invalid_program.state.source.clone(), invalid_program.state.nodes.as_slice(), invalid_program_result.error_node)
+    assert(invalid_program_diagnostic.contains("R0300"))
+    annotated_program := parse_simple_program(String("value: bool = true; return value"))
+    assert(!annotated_program.state.failed)
+    annotated_program_result := check_program_types(annotated_program.state.source.clone(), annotated_program.state.nodes.as_slice(), annotated_program.state.children.as_slice(), annotated_program.node_id)
+    assert(annotated_program_result.valid)
+    function_type_program := parse_simple_program(String("fun add(value: i32) -> i32 { result := value + 1; return result }"))
+    assert(!function_type_program.state.failed)
+    function_type_result := check_program_types(function_type_program.state.source.clone(), function_type_program.state.nodes.as_slice(), function_type_program.state.children.as_slice(), function_type_program.node_id)
+    assert(function_type_result.valid)
+    invalid_return_program := parse_simple_program(String("fun bad(value: i32) -> i32 { return true }"))
+    assert(!invalid_return_program.state.failed)
+    invalid_return_result := check_program_types(invalid_return_program.state.source.clone(), invalid_return_program.state.nodes.as_slice(), invalid_return_program.state.children.as_slice(), invalid_return_program.node_id)
+    assert(!invalid_return_result.valid)
+    typed_call_program := parse_simple_program(String("fun add(value: i32) -> i32 { return value + 1 } fun main() -> i32 { return add(41) }"))
+    assert(!typed_call_program.state.failed)
+    typed_call_result := check_program_types(typed_call_program.state.source.clone(), typed_call_program.state.nodes.as_slice(), typed_call_program.state.children.as_slice(), typed_call_program.node_id)
+    assert(typed_call_result.valid)
+    invalid_call_program := parse_simple_program(String("fun add(value: i32) -> i32 { return value + 1 } fun main() -> i32 { return add(true) }"))
+    assert(!invalid_call_program.state.failed)
+    invalid_call_result := check_program_types(invalid_call_program.state.source.clone(), invalid_call_program.state.nodes.as_slice(), invalid_call_program.state.children.as_slice(), invalid_call_program.node_id)
+    assert(!invalid_call_result.valid)
+    invalid_call_arity_program := parse_simple_program(String("fun add(value: i32) -> i32 { return value + 1 } fun main() -> i32 { return add() }"))
+    assert(!invalid_call_arity_program.state.failed)
+    invalid_call_arity_result := check_program_types(invalid_call_arity_program.state.source.clone(), invalid_call_arity_program.state.nodes.as_slice(), invalid_call_arity_program.state.children.as_slice(), invalid_call_arity_program.node_id)
+    assert(!invalid_call_arity_result.valid)
+    missing_return_value_program := parse_simple_program(String("fun bad(value: i32) -> i32 { return }"))
+    assert(!missing_return_value_program.state.failed)
+    missing_return_value_result := check_program_types(missing_return_value_program.state.source.clone(), missing_return_value_program.state.nodes.as_slice(), missing_return_value_program.state.children.as_slice(), missing_return_value_program.node_id)
+    assert(!missing_return_value_result.valid)
+    nested_scope_program := parse_simple_program(String("flag := true; when flag { local := 1; echo local } else { echo 0 } for index in 0..3 { echo index } return 0"))
+    assert(!nested_scope_program.state.failed)
+    nested_scope_result := check_program_types(nested_scope_program.state.source.clone(), nested_scope_program.state.nodes.as_slice(), nested_scope_program.state.children.as_slice(), nested_scope_program.node_id)
+    assert(nested_scope_result.valid && nested_scope_result.name_ids.len() == 1)
+    escaped_scope_program := parse_simple_program(String("flag := true; when flag { local := 1; echo local } else { echo 0 } echo local"))
+    assert(!escaped_scope_program.state.failed)
+    escaped_scope_result := check_program_types(escaped_scope_program.state.source.clone(), escaped_scope_program.state.nodes.as_slice(), escaped_scope_program.state.children.as_slice(), escaped_scope_program.node_id)
+    assert(!escaped_scope_result.valid)
+    program_root := program.state.nodes.index(program.node_id)
+    echo program_root.kind
+    echo program_root.child_count
+    echo_node_id := program.state.children.index(program_root.first_child + 1)
+    echo_node := program.state.nodes.index(echo_node_id)
+    expression_id := program.state.children.index(echo_node.first_child)
+    echo evaluate_arithmetic(AstArena {
+        source: program.state.source.clone(),
+        nodes: program.state.nodes.clone(),
+        children: program.state.children.clone()
+    }, expression_id)
+    condition_program := parse_simple_program(String("echo value >= 3 && true; return 0"))
+    echo condition_program.state.failed
+    operator_expression := parse_arithmetic(String("(8 >= 8) && ((6 & 3) == 2) && ((1 << 3) == 8)"))
+    operator_type := check_expression_type(operator_expression.state.nodes.as_slice(), operator_expression.state.children.as_slice(), operator_expression.node_id, Vec<u64>().as_slice(), Vec<u64>().as_slice(), Vec<FunctionTypeSignature>().as_slice())
+    assert(operator_type.valid && operator_type.type_code == 2)
+    echo operator_expression.state.failed
+    echo evaluate_arithmetic(AstArena {
+        source: operator_expression.state.source.clone(),
+        nodes: operator_expression.state.nodes.clone(),
+        children: operator_expression.state.children.clone()
+    }, operator_expression.node_id)
+    invalid_type_expression := parse_arithmetic(String("true + 1"))
+    invalid_expression_type := check_expression_type(invalid_type_expression.state.nodes.as_slice(), invalid_type_expression.state.children.as_slice(), invalid_type_expression.node_id, Vec<u64>().as_slice(), Vec<u64>().as_slice(), Vec<FunctionTypeSignature>().as_slice())
+    assert(!invalid_expression_type.valid)
+    named_expression := parse_arithmetic(String("value + 1"))
+    mut known_names := Vec<u64>()
+    mut known_types := Vec<u64>()
+    known_names.push(named_expression.state.tokens.index(0).payload)
+    known_types.push(1)
+    named_expression_type := check_expression_type(named_expression.state.nodes.as_slice(), named_expression.state.children.as_slice(), named_expression.node_id, known_names.as_slice(), known_types.as_slice(), Vec<FunctionTypeSignature>().as_slice())
+    assert(named_expression_type.valid && named_expression_type.type_code == 1)
+    known_types.set(0, 2)
+    named_mismatch_type := check_expression_type(named_expression.state.nodes.as_slice(), named_expression.state.children.as_slice(), named_expression.node_id, known_names.as_slice(), known_types.as_slice(), Vec<FunctionTypeSignature>().as_slice())
+    assert(!named_mismatch_type.valid)
+    conditional_expression := parse_arithmetic(String("when 1 + 1 == 2 { 40 } else { 0 } + 2"))
+    conditional_type := check_expression_type(conditional_expression.state.nodes.as_slice(), conditional_expression.state.children.as_slice(), conditional_expression.node_id, Vec<u64>().as_slice(), Vec<u64>().as_slice(), Vec<FunctionTypeSignature>().as_slice())
+    assert(conditional_type.valid && conditional_type.type_code == 1)
+    assert(!conditional_expression.state.failed)
+    assert(evaluate_arithmetic(AstArena {
+        source: conditional_expression.state.source.clone(),
+        nodes: conditional_expression.state.nodes.clone(),
+        children: conditional_expression.state.children.clone()
+    }, conditional_expression.node_id) == 42)
+    nested_conditional := parse_arithmetic(String("when false { 1 } else { when 3 > 2 { 7 } else { 9 } }"))
+    assert(!nested_conditional.state.failed)
+    assert(evaluate_arithmetic(AstArena {
+        source: nested_conditional.state.source.clone(),
+        nodes: nested_conditional.state.nodes.clone(),
+        children: nested_conditional.state.children.clone()
+    }, nested_conditional.node_id) == 7)
+    mismatched_conditional := parse_arithmetic(String("when true { 1 } else { false }"))
+    mismatched_conditional_type := check_expression_type(mismatched_conditional.state.nodes.as_slice(), mismatched_conditional.state.children.as_slice(), mismatched_conditional.node_id, Vec<u64>().as_slice(), Vec<u64>().as_slice(), Vec<FunctionTypeSignature>().as_slice())
+    assert(!mismatched_conditional_type.valid)
+    malformed_conditional := parse_arithmetic(String("when true { 1 }"))
+    assert(malformed_conditional.state.failed)
+    assert(malformed_conditional.state.error_code == 7)
+    conditional_program := parse_simple_program(String("mut chosen := when 2 > 1 { 40 } else { 1 }; echo chosen + 2; return chosen"))
+    assert(!conditional_program.state.failed)
+    conditional_execution := evaluate_program(AstArena {
+        source: conditional_program.state.source.clone(),
+        nodes: conditional_program.state.nodes.clone(),
+        children: conditional_program.state.children.clone()
+    }, conditional_program.node_id)
+    assert(conditional_execution.output.len() == 1)
+    assert(conditional_execution.output.index(0) == 42)
+    assert(conditional_execution.return_value == 40)
+    choose_expression := parse_arithmetic(String("choose 2 { 1 => 10, 2 => 20, _ => 30 } + 2"))
+    choose_type := check_expression_type(choose_expression.state.nodes.as_slice(), choose_expression.state.children.as_slice(), choose_expression.node_id, Vec<u64>().as_slice(), Vec<u64>().as_slice(), Vec<FunctionTypeSignature>().as_slice())
+    assert(choose_type.valid && choose_type.type_code == 1)
+    assert(!choose_expression.state.failed)
+    assert(evaluate_arithmetic(AstArena {
+        source: choose_expression.state.source.clone(),
+        nodes: choose_expression.state.nodes.clone(),
+        children: choose_expression.state.children.clone()
+    }, choose_expression.node_id) == 22)
+        missing_choose := parse_arithmetic(String("choose 9 { 1 => 10, _ => 99 }"))
+    assert(!missing_choose.state.failed)
+    assert(evaluate_arithmetic(AstArena {
+        source: missing_choose.state.source.clone(),
+        nodes: missing_choose.state.nodes.clone(),
+        children: missing_choose.state.children.clone()
+    }, missing_choose.node_id) == 99)
+        boolean_choose := parse_arithmetic(String("choose true { false => 0, true => 1, _ => 2 }"))
+    assert(!boolean_choose.state.failed)
+    assert(evaluate_arithmetic(AstArena {
+        source: boolean_choose.state.source.clone(),
+        nodes: boolean_choose.state.nodes.clone(),
+        children: boolean_choose.state.children.clone()
+    }, boolean_choose.node_id) == 1)
+    range_choose := parse_arithmetic(String("choose 4 { 0..3 => 10, 3..6 => 40, _ => 99 }"))
+    assert(!range_choose.state.failed)
+    assert(evaluate_arithmetic(AstArena {
+        source: range_choose.state.source.clone(),
+        nodes: range_choose.state.nodes.clone(),
+        children: range_choose.state.children.clone()
+    }, range_choose.node_id) == 40)
+    range_boundary := parse_arithmetic(String("choose 3 { 0..3 => 10, 3..6 => 40, _ => 99 }"))
+    assert(!range_boundary.state.failed)
+    assert(evaluate_arithmetic(AstArena {
+        source: range_boundary.state.source.clone(),
+        nodes: range_boundary.state.nodes.clone(),
+        children: range_boundary.state.children.clone()
+    }, range_boundary.node_id) == 40)
+        malformed_choose := parse_arithmetic(String("choose 1 { 'x' => 2 }"))
+    assert(malformed_choose.state.failed)
+    assert(malformed_choose.state.error_code == 8)
+    loop_program := parse_simple_program(String("while true { continue; break; } return;"))
+    assert(!loop_program.state.failed)
+    loop_root := loop_program.state.nodes.index(loop_program.node_id)
+    assert(loop_root.child_count == 2)
+    loop_id := loop_program.state.children.index(loop_root.first_child)
+    loop_node := loop_program.state.nodes.index(loop_id)
+    assert(loop_node.kind == 14)
+    loop_body_id := loop_program.state.children.index(loop_node.first_child + 1)
+    loop_body := loop_program.state.nodes.index(loop_body_id)
+    assert(loop_body.kind == 13)
+    assert(loop_body.child_count == 2)
+    first_loop_statement := loop_program.state.children.index(loop_body.first_child)
+    second_loop_statement := loop_program.state.children.index(loop_body.first_child + 1)
+    assert(loop_program.state.nodes.index(first_loop_statement).kind == 16)
+    assert(loop_program.state.nodes.index(second_loop_statement).kind == 15)
+    bare_return_id := loop_program.state.children.index(loop_root.first_child + 1)
+    bare_return := loop_program.state.nodes.index(bare_return_id)
+    assert(bare_return.kind == 21)
+    assert(bare_return.child_count == 0)
+    for_program := parse_simple_program(String("for index in 2..7 { echo index; }"))
+    assert(!for_program.state.failed)
+    for_root := for_program.state.nodes.index(for_program.node_id)
+    assert(for_root.child_count == 1)
+    for_id := for_program.state.children.index(for_root.first_child)
+    for_node := for_program.state.nodes.index(for_id)
+    assert(for_node.kind == 17)
+    assert(for_node.child_count == 4)
+    for_body_id := for_program.state.children.index(for_node.first_child + 3)
+    for_body := for_program.state.nodes.index(for_body_id)
+    assert(for_body.kind == 13)
+    assert(for_body.child_count == 1)
+    malformed_for := parse_simple_program(String("for index 2..7 { break; }"))
+    assert(malformed_for.state.failed)
+    assert(malformed_for.state.error_code == 10)
+    array_expression := parse_arithmetic(String("[1, 2 + 3, [4, 5]]"))
+    assert(!array_expression.state.failed)
+    array_root := array_expression.state.nodes.index(array_expression.node_id)
+    assert(array_root.kind == 9)
+    assert(array_root.child_count == 3)
+    nested_array_id := array_expression.state.children.index(array_root.first_child + 2)
+    nested_array := array_expression.state.nodes.index(nested_array_id)
+    assert(nested_array.kind == 9)
+    assert(nested_array.child_count == 2)
+    executable_program := parse_simple_program(String("limit := 7; mut value: i32 = 3; echo value + limit * 2; value += 1; value = value * 2; echo value; return value"))
+    execution := evaluate_program(AstArena {
+        source: executable_program.state.source.clone(),
+        nodes: executable_program.state.nodes.clone(),
+        children: executable_program.state.children.clone()
+    }, executable_program.node_id)
+    echo execution.output.len()
+    echo execution.output.index(0)
+    echo execution.output.index(1)
+    echo execution.return_value
+
+    while_source := parse_simple_program(String("mut count := 0; mut total := 0; while count < 4 { total += count; count += 1; } echo total; return total"))
+    assert(!while_source.state.failed)
+    while_execution := evaluate_program(AstArena {
+        source: while_source.state.source.clone(),
+        nodes: while_source.state.nodes.clone(),
+        children: while_source.state.children.clone()
+    }, while_source.node_id)
+    assert(while_execution.output.len() == 1)
+    assert(while_execution.output.index(0) == 6)
+    assert(while_execution.return_value == 6)
+
+    for_source := parse_simple_program(String("mut total := 0; for index in 2..5 { total += index; } echo total; return total"))
+    assert(!for_source.state.failed)
+    for_execution := evaluate_program(AstArena {
+        source: for_source.state.source.clone(),
+        nodes: for_source.state.nodes.clone(),
+        children: for_source.state.children.clone()
+    }, for_source.node_id)
+    assert(for_execution.output.index(0) == 9)
+    assert(for_execution.return_value == 9)
+
+    control_source := parse_simple_program(String("mut total := 0; for index in 0..4 { total += 1; continue; total += 100; } for index in 0..4 { break; total += 1000; } return total"))
+    assert(!control_source.state.failed)
+    control_execution := evaluate_program(AstArena {
+        source: control_source.state.source.clone(),
+        nodes: control_source.state.nodes.clone(),
+        children: control_source.state.children.clone()
+    }, control_source.node_id)
+    assert(control_execution.return_value == 4)
+
+    branch_source := parse_simple_program(String("mut selected := 0; when false { selected = 1; } else { when true { selected = 2; } else { selected = 3; } } echo selected; return selected"))
+    assert(!branch_source.state.failed)
+    branch_execution := evaluate_program(AstArena {
+        source: branch_source.state.source.clone(),
+        nodes: branch_source.state.nodes.clone(),
+        children: branch_source.state.children.clone()
+    }, branch_source.node_id)
+    assert(branch_execution.output.len() == 1)
+    assert(branch_execution.output.index(0) == 2)
+    assert(branch_execution.return_value == 2)
+
+    function_source := parse_simple_program(String("fun add(left: i32, right: i32) -> i32 { return left + right; } fun main() -> i32 { return add(20, 22); }"))
+    assert(!function_source.state.failed)
+    function_root := function_source.state.nodes.index(function_source.node_id)
+    assert(function_root.child_count == 2)
+    first_function_id := function_source.state.children.index(function_root.first_child)
+    first_function := function_source.state.nodes.index(first_function_id)
+    assert(first_function.kind == 30)
+    assert(first_function.child_count == 4)
+    function_params_id := function_source.state.children.index(first_function.first_child + 1)
+    function_params := function_source.state.nodes.index(function_params_id)
+    assert(function_params.kind == 31)
+    assert(function_params.child_count == 2)
+    second_function_id := function_source.state.children.index(function_root.first_child + 1)
+    second_function := function_source.state.nodes.index(second_function_id)
+    second_body_id := function_source.state.children.index(second_function.first_child + 3)
+    second_body := function_source.state.nodes.index(second_body_id)
+    return_id := function_source.state.children.index(second_body.first_child)
+    return_node := function_source.state.nodes.index(return_id)
+    call_id := function_source.state.children.index(return_node.first_child)
+    call_node := function_source.state.nodes.index(call_id)
+    assert(call_node.kind == 19)
+    assert(call_node.payload == 2)
+    function_execution := evaluate_program(AstArena {
+        source: function_source.state.source.clone(),
+        nodes: function_source.state.nodes.clone(),
+        children: function_source.state.children.clone()
+    }, function_source.node_id)
+    assert(function_execution.return_value == 42)
+
+    generic_signature := parse_simple_program(String("fun first<T>(items: &[T]) -> &T { return items[0].field; }"))
+    assert(!generic_signature.state.failed)
+    generic_root := generic_signature.state.nodes.index(generic_signature.node_id)
+    generic_function_id := generic_signature.state.children.index(generic_root.first_child)
+    generic_function := generic_signature.state.nodes.index(generic_function_id)
+    assert(generic_function.kind == 30)
+    assert(generic_function.child_count == 5)
+    generic_parameters_id := generic_signature.state.children.index(generic_function.first_child + 1)
+    generic_parameters := generic_signature.state.nodes.index(generic_parameters_id)
+    first_parameter_id := generic_signature.state.children.index(generic_parameters.first_child)
+    first_parameter := generic_signature.state.nodes.index(first_parameter_id)
+    parameter_type_id := generic_signature.state.children.index(first_parameter.first_child + 1)
+    parameter_type := generic_signature.state.nodes.index(parameter_type_id)
+    assert(generic_signature.state.source.slice(parameter_type.start, parameter_type.end) == String("&[T]"))
+    generic_names_id := generic_signature.state.children.index(generic_function.first_child + 4)
+    generic_names := generic_signature.state.nodes.index(generic_names_id)
+    assert(generic_names.kind == 33)
+    assert(generic_names.child_count == 1)
+    generic_return_id := generic_signature.state.children.index(generic_function.first_child + 2)
+    generic_return := generic_signature.state.nodes.index(generic_return_id)
+    assert(generic_signature.state.source.slice(generic_return.start, generic_return.end) == String("&T"))
+    generic_body_id := generic_signature.state.children.index(generic_function.first_child + 3)
+    generic_body := generic_signature.state.nodes.index(generic_body_id)
+    generic_return_statement_id := generic_signature.state.children.index(generic_body.first_child)
+    generic_return_statement := generic_signature.state.nodes.index(generic_return_statement_id)
+    generic_field_access_id := generic_signature.state.children.index(generic_return_statement.first_child)
+    generic_field_access := generic_signature.state.nodes.index(generic_field_access_id)
+    assert(generic_field_access.kind == 35)
+    generic_index_id := generic_signature.state.children.index(generic_field_access.first_child)
+    generic_index := generic_signature.state.nodes.index(generic_index_id)
+    assert(generic_index.kind == 34)
+
+    recursive_source := parse_simple_program(String("fun sum(value: i32) -> i32 { when value <= 0 { return 0; } return value + sum(value - 1); } fun main() -> i32 { return sum(5); }"))
+    assert(!recursive_source.state.failed)
+    recursive_execution := evaluate_program(AstArena {
+        source: recursive_source.state.source.clone(),
+        nodes: recursive_source.state.nodes.clone(),
+        children: recursive_source.state.children.clone()
+    }, recursive_source.node_id)
+    assert(recursive_execution.return_value == 15)
+}
+

@@ -1,0 +1,19 @@
+fun main() {
+    echo String(-8 as i8).to_i8()
+    echo String(-1600 as i16).to_i16()
+    integer := String(42 as i32)
+    echo integer
+    echo integer.to_i32() + 1
+    echo String(-40000 as i64).to_i64()
+
+    echo String(8 as u8).to_u8()
+    echo String(1600 as u16).to_u16()
+    echo String(42000 as u32).to_u32()
+    unsigned := String(184467 as u64)
+    echo unsigned.to_u64()
+
+    echo String(1.25 as f32).to_f32()
+    floating := String(-2.5 as f64)
+    echo floating
+    echo floating.to_f64() * 2.0
+}

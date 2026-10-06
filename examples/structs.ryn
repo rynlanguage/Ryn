@@ -8,8 +8,8 @@ struct Vitals {
     alive: bool
 }
 
-fn damage(player: Player, amount: i32) -> Player {
-    let mut updated = Player {
+fun damage(player: Player, amount: i32) -> Player {
+    mut updated := Player {
         name: player.name,
         vitals: player.vitals,
     }
@@ -18,19 +18,19 @@ fn damage(player: Player, amount: i32) -> Player {
     updated
 }
 
-fn main() {
-    let player = Player {
+fun main() {
+    player := Player {
         name: "Veni",
         vitals: Vitals {
             health: 100,
             alive: true,
         },
     }
-    let damaged = if true { damage(player, 35) } else { player }
-    print(damaged.name)
-    print(damaged.vitals.health)
-    print(damaged.vitals.alive)
-    print(player.vitals.health)
-    print(player)
-    print("updated={damaged}")
+    damaged := when true { damage(player, 35) } else { player }
+    echo damaged.name
+    echo damaged.vitals.health
+    echo damaged.vitals.alive
+    echo player.vitals.health
+    echo player
+    echo "updated={damaged}"
 }

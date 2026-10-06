@@ -1,0 +1,57 @@
+struct Point {
+    x: i32
+    y: i32
+}
+
+struct Entry {
+    point: Point
+    label: String
+    offsets: [i32; 2]
+    path: [Point; 2]
+    scores: Map<String, i32>
+}
+
+fun translate(points: [Point; 2], delta: i32) -> [Point; 2] {
+    [
+        Point { x: points[0].x + delta, y: points[0].y },
+        Point { x: points[1].x, y: points[1].y + delta },
+    ]
+}
+
+fun main() {
+    mut points: [Point; 2] = [
+        Point { x: 1, y: 2 },
+        Point { x: 10, y: 20 },
+    ]
+    points[0] = Point { x: points[0].x, y: 7 }
+    moved := translate(points, 100)
+    echo points[0].x
+    echo points[0].y
+    echo moved[0].x
+    echo moved[1].y
+
+    mut entries: [Entry; 2] = [
+        Entry {
+            point: Point { x: 3, y: 4 },
+            label: String("first"),
+            offsets: [5, 6],
+            path: [Point { x: 70, y: 80 }, Point { x: 90, y: 100 }],
+            scores: Map<String, i32>(),
+        },
+        Entry {
+            point: Point { x: 30, y: 40 },
+            label: String("second"),
+            offsets: [50, 60],
+            path: [Point { x: 700, y: 800 }, Point { x: 900, y: 1000 }],
+            scores: Map<String, i32>(),
+        },
+    ]
+    copied := entries[0]
+    entries[0] = entries[1]
+    echo copied.point.y
+    echo copied.label
+    echo copied.offsets[1]
+    echo copied.path[1].x
+    echo copied.scores.len()
+    echo entries[0].label
+}

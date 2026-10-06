@@ -1,0 +1,15 @@
+fun main() {
+    mut first: Set<i32> = Set<i32>()
+    first.add(5)
+    first.add(8)
+
+    mut groups: [Set<i32>; 2] = [first, Set<i32>()]
+    echo groups[0].contains(5)
+    echo groups[0].contains(8)
+    echo groups[1].contains(5)
+
+    groups[1] = groups[0]
+    echo groups[1].len()
+    echo groups[1].remove(8)
+    echo groups[1].contains(8)
+}

@@ -1,0 +1,1252 @@
+use compiler::source_manager
+
+enum Kind {
+    Keyword(u64),
+    Identifier(String),
+    Integer(u64),
+    Float(f64),
+    Character(char),
+    StringLiteral(u64),
+    Punctuation(u64),
+    Operator(u64),
+    End
+}
+
+struct TokenSpan {
+    kind: u64,
+    start: u64,
+    end: u64,
+    scalar_start: u64,
+    scalar_end: u64,
+    payload: u64,
+    float_payload: f64,
+    character_payload: char
+}
+
+struct LexError {
+    code: u64,
+    start: u64,
+    end: u64
+}
+
+struct UnicodeEscape {
+    value: u64,
+    scalar_end: u64,
+    byte_end: u64,
+    valid: bool
+}
+
+struct Lexed {
+    tokens: Vec<TokenSpan>,
+    errors: Vec<LexError>,
+    string_values: Vec<String>
+}
+
+struct AstNode {
+    kind: u64,
+    start: u64,
+    end: u64,
+    first_child: u64,
+    child_count: u64,
+    payload: u64
+}
+
+struct ParseState {
+    source: String,
+    tokens: Vec<TokenSpan>,
+    index: u64,
+    nodes: Vec<AstNode>,
+    children: Vec<u64>,
+    failed: bool,
+    error_code: u64,
+    error_start: u64,
+    error_end: u64
+}
+
+struct ParseValue {
+    state: ParseState,
+    node_id: u64
+}
+
+struct AstArena {
+    source: String,
+    nodes: Vec<AstNode>,
+    children: Vec<u64>
+}
+
+fun utf8_width(value: char) -> u64 {
+    when value <= '\u{7f}' { 1 as u64 }
+    else when value <= '\u{7ff}' { 2 as u64 }
+    else when value <= '\u{ffff}' { 3 as u64 }
+    else { 4 as u64 }
+}
+
+fun digit_value(value: char) -> i64 {
+    when value == '0' { 0 }
+    else when value == '1' { 1 }
+    else when value == '2' { 2 }
+    else when value == '3' { 3 }
+    else when value == '4' { 4 }
+    else when value == '5' { 5 }
+    else when value == '6' { 6 }
+    else when value == '7' { 7 }
+    else when value == '8' { 8 }
+    else when value == '9' { 9 }
+    else { -1 }
+}
+
+fun lowercase_hex_digit(value: char) -> i64 {
+    when value == 'a' { 10 }
+    else when value == 'b' { 11 }
+    else when value == 'c' { 12 }
+    else when value == 'd' { 13 }
+    else when value == 'e' { 14 }
+    else when value == 'f' { 15 }
+    else { -1 }
+}
+
+fun uppercase_hex_digit(value: char) -> i64 {
+    when value == 'A' { 10 }
+    else when value == 'B' { 11 }
+    else when value == 'C' { 12 }
+    else when value == 'D' { 13 }
+    else when value == 'E' { 14 }
+    else when value == 'F' { 15 }
+    else { -1 }
+}
+
+fun radix_digit(value: char, radix: u64) -> i64 {
+    digit := digit_value(value)
+    when digit >= 0 && digit as u64 < radix { digit }
+    else when radix == 16 && lowercase_hex_digit(value) >= 0 { lowercase_hex_digit(value) }
+    else when radix == 16 { uppercase_hex_digit(value) }
+    else { -1 }
+}
+
+fun scan_unicode_escape(text: String, start_scalar: u64, start_byte: u64) -> UnicodeEscape {
+    mut scalar := start_scalar + 1
+    mut byte := start_byte + 1
+    mut value := 0 as u64
+    mut digits := 0 as u64
+    mut valid := scalar < text.char_count() && text.char_at(scalar) == '{'
+    when valid {
+        scalar += 1
+        byte += 1
+    }
+    while valid && scalar < text.char_count() && text.char_at(scalar) != '}' && text.char_at(scalar) != '\'' && text.char_at(scalar) != '"' {
+        character := text.char_at(scalar)
+        when character == '_' {
+            scalar += 1
+            byte += 1
+        } else {
+            digit := radix_digit(character, 16)
+            when digit < 0 || digits == 6 {
+                valid = false
+            } else {
+                value = value * 16 + digit as u64
+                digits += 1
+                scalar += 1
+                byte += 1
+            }
+        }
+    }
+    when scalar < text.char_count() && text.char_at(scalar) == '}' {
+        scalar += 1
+        byte += 1
+    } else {
+        valid = false
+    }
+    valid = valid && digits > 0 && value <= 1114111 && !(value >= 55296 && value <= 57343)
+    UnicodeEscape { value: value, scalar_end: scalar, byte_end: byte, valid: valid }
+}
+
+fun identifier_start(value: char) -> bool {
+    (value >= 'a' && value <= 'z') ||
+    (value >= 'A' && value <= 'Z') || value == '_'
+}
+
+fun identifier_continue(value: char) -> bool {
+    identifier_start(value) || digit_value(value) >= 0
+}
+
+fun operator_basic(current: char, next: char) -> u64 {
+    when current == ':' && next == '=' { 1 }
+    else when current == ':' && next == ':' { 2 }
+    else when current == '.' && next == '.' { 3 }
+    else when current == '=' && next == '=' { 4 }
+    else when current == '=' && next == '>' { 5 }
+    else when current == '!' && next == '=' { 6 }
+    else when current == '<' && next == '=' { 7 }
+    else when current == '>' && next == '=' { 8 }
+    else { 0 }
+}
+
+fun operator_logic(current: char, next: char) -> u64 {
+    when current == '&' && next == '=' { 9 }
+    else when current == '&' && next == '&' { 10 }
+    else when current == '|' && next == '=' { 11 }
+    else when current == '|' && next == '|' { 12 }
+    else when current == '^' && next == '=' { 13 }
+    else { 0 }
+}
+
+fun operator_shift(current: char, next: char, third: char) -> u64 {
+    when current == '<' && next == '<' && third == '=' { 14 }
+    else when current == '<' && next == '<' { 15 }
+    else when current == '>' && next == '>' && third == '=' { 16 }
+    else when current == '>' && next == '>' { 17 }
+    else { 0 }
+}
+
+fun operator_assign(current: char, next: char) -> u64 {
+    when current == '-' && next == '>' { 18 }
+    else when current == '+' && next == '=' { 19 }
+    else when current == '-' && next == '=' { 20 }
+    else when current == '*' && next == '=' { 21 }
+    else when current == '/' && next == '=' { 22 }
+    else when current == '%' && next == '=' { 23 }
+    else { 0 }
+}
+
+fun operator_code(current: char, next: char, third: char) -> u64 {
+    mut code := operator_basic(current, next)
+    when code != 0 { return code }
+    code = operator_logic(current, next)
+    when code != 0 { return code }
+    code = operator_shift(current, next, third)
+    when code != 0 { return code }
+    operator_assign(current, next)
+}
+
+fun punctuation(current: char, next: char, third: char) -> Kind {
+    code := operator_code(current, next, third)
+    when code == 0 { Kind::Punctuation(punctuation_code(current)) }
+    else { Kind::Operator(code) }
+}
+
+fun punctuation_bracket(value: char) -> u64 {
+    when value == '(' { 1 }
+    else when value == ')' { 2 }
+    else when value == '{' { 3 }
+    else when value == '}' { 4 }
+    else when value == '[' { 5 }
+    else when value == ']' { 6 }
+    else when value == ',' { 7 }
+    else when value == ';' { 8 }
+    else { 0 }
+}
+
+fun punctuation_operator(value: char) -> u64 {
+    when value == ':' { 9 }
+    else when value == '.' { 10 }
+    else when value == '=' { 11 }
+    else when value == '+' { 12 }
+    else when value == '-' { 13 }
+    else when value == '*' { 14 }
+    else when value == '/' { 15 }
+    else when value == '%' { 16 }
+    else { 0 }
+}
+
+fun punctuation_other(value: char) -> u64 {
+    when value == '<' { 17 }
+    else when value == '>' { 18 }
+    else when value == '&' { 19 }
+    else when value == '|' { 20 }
+    else when value == '^' { 21 }
+    else when value == '~' { 22 }
+    else when value == '!' { 23 }
+    else when value == '?' { 24 }
+    else { 0 }
+}
+
+fun punctuation_code(value: char) -> u64 {
+    mut code := punctuation_bracket(value)
+    when code != 0 { return code }
+    code = punctuation_operator(value)
+    when code != 0 { return code }
+    punctuation_other(value)
+}
+
+fun punctuation_width(current: char, next: char, third: char) -> u64 {
+    when (current == '<' || current == '>') && next == current && third == '=' { 3 as u64 }
+    else when operator_code(current, next, third) != (0 as u64) { 2 as u64 }
+    else { 1 as u64 }
+}
+
+fun keyword_first(value: String) -> u64 {
+    when value == String("fun") { 1 }
+    else when value == String("mut") { 2 }
+    else when value == String("true") { 3 }
+    else when value == String("false") { 4 }
+    else when value == String("when") { 5 }
+    else when value == String("else") { 6 }
+    else when value == String("for") { 7 }
+    else when value == String("in") { 8 }
+    else when value == String("return") { 9 }
+    else when value == String("echo") { 10 }
+    else when value == String("use") { 11 }
+    else { 0 }
+}
+
+fun keyword_second(value: String) -> u64 {
+    when value == String("while") { 12 }
+    else when value == String("break") { 13 }
+    else when value == String("continue") { 14 }
+    else when value == String("struct") { 15 }
+    else when value == String("as") { 16 }
+    else when value == String("enum") { 17 }
+    else when value == String("type") { 18 }
+    else when value == String("namespace") { 19 }
+    else when value == String("pub") { 20 }
+    else when value == String("choose") { 21 }
+    else { 0 }
+}
+
+fun keyword(value: String) -> Kind {
+    mut code := keyword_first(value.clone())
+    when code == 0 { code = keyword_second(value.clone()) }
+    when code == 0 { Kind::Identifier(value) }
+    else { Kind::Keyword(code) }
+}
+
+fun encode_token(kind: Kind, start: u64, end: u64, scalar_start: u64, scalar_end: u64) -> TokenSpan {
+    choose kind {
+        Kind::Keyword(value) => TokenSpan { kind: value, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: 0, float_payload: 0.0, character_payload: '\0' },
+        Kind::Identifier(_) => TokenSpan { kind: 300, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: 0, float_payload: 0.0, character_payload: '\0' },
+        Kind::Integer(value) => TokenSpan { kind: 301, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: value, float_payload: 0.0, character_payload: '\0' },
+        Kind::Float(value) => TokenSpan { kind: 303, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: 0, float_payload: value, character_payload: '\0' },
+        Kind::Character(value) => TokenSpan { kind: 304, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: 0, float_payload: 0.0, character_payload: value },
+        Kind::StringLiteral(value) => TokenSpan { kind: 302, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: value, float_payload: 0.0, character_payload: '\0' },
+        Kind::Punctuation(value) => TokenSpan { kind: 100 + value, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: 0, float_payload: 0.0, character_payload: '\0' },
+        Kind::Operator(value) => TokenSpan { kind: 200 + value, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: 0, float_payload: 0.0, character_payload: '\0' },
+        Kind::End => TokenSpan { kind: 0, start: start, end: end, scalar_start: scalar_start, scalar_end: scalar_end, payload: 0, float_payload: 0.0, character_payload: '\0' }
+    }
+}
+
+fun lex(source: String) -> Lexed {
+    text := source
+    mut tokens: Vec<TokenSpan> = Vec()
+    mut errors: Vec<LexError> = Vec()
+    mut string_values: Vec<String> = Vec()
+    mut scalar := 0 as u64
+    mut byte := 0 as u64
+    scalar_count := text.char_count()
+
+    while scalar < scalar_count {
+        current := text.char_at(scalar)
+        when current == ' ' || current == '\t' || current == '\n' || current == '\r' {
+            scalar += 1
+            byte += utf8_width(current)
+            continue
+        }
+
+        when current == '/' && scalar + 1 < scalar_count && text.char_at(scalar + 1) == '/' {
+            while scalar < scalar_count && text.char_at(scalar) != '\n' {
+                byte += utf8_width(text.char_at(scalar))
+                scalar += 1
+            }
+            continue
+        }
+
+        when current == '/' && scalar + 1 < scalar_count && text.char_at(scalar + 1) == '*' {
+            comment_start := byte
+            scalar += 2
+            byte += 2
+            mut depth := 1 as u64
+            while scalar < scalar_count && depth > 0 {
+                character := text.char_at(scalar)
+                mut next := '\0'
+                when scalar + 1 < scalar_count {
+                    next = text.char_at(scalar + 1)
+                }
+                when character == '/' && next == '*' {
+                    depth += 1
+                    scalar += 2
+                    byte += 2
+                } else when character == '*' && next == '/' {
+                    depth -= 1
+                    scalar += 2
+                    byte += 2
+                } else {
+                    scalar += 1
+                    byte += utf8_width(character)
+                }
+            }
+            when depth > 0 {
+                errors.push(LexError { code: 8, start: comment_start, end: byte })
+            }
+            continue
+        }
+
+        start := byte
+        scalar_start := scalar
+        mut kind: Kind = Kind::End
+        mut error_code := 0 as u64
+        when identifier_start(current) {
+            mut value := String("")
+            while scalar < scalar_count && identifier_continue(text.char_at(scalar)) {
+                character := text.char_at(scalar)
+                value.push(character)
+                byte += utf8_width(character)
+                scalar += 1
+            }
+            kind = keyword(value)
+        } else when current == '0' && scalar + 1 < scalar_count && (text.char_at(scalar + 1) == 'b' || text.char_at(scalar + 1) == 'B' || text.char_at(scalar + 1) == 'x' || text.char_at(scalar + 1) == 'X') {
+            mut radix := 16 as u64
+            when text.char_at(scalar + 1) == 'b' || text.char_at(scalar + 1) == 'B' {
+                radix = 2
+            }
+            mut value := 0 as u64
+            mut digits := 0 as u64
+            scalar += 2
+            byte += 2
+            while scalar < scalar_count && (identifier_continue(text.char_at(scalar)) || text.char_at(scalar) == '_') {
+                character := text.char_at(scalar)
+                digit := radix_digit(character, radix)
+                when digit >= 0 {
+                    value = value * radix + digit as u64
+                    digits += 1
+                } else when character != '_' {
+                    error_code = 4
+                }
+                when character == '_' && (digits == 0 || scalar + 1 >= scalar_count || radix_digit(text.char_at(scalar + 1), radix) < 0) {
+                    error_code = 5
+                }
+                byte += 1
+                scalar += 1
+            }
+            when digits == 0 { error_code = 3 }
+            kind = Kind::Integer(value)
+        } else when digit_value(current) >= 0 {
+            mut value := 0 as u64
+            mut numeric_float := 0.0 as f64
+            mut fraction_scale := 0.0 as f64
+            mut is_float := false
+            mut previous_digit := true
+            while scalar < scalar_count && (digit_value(text.char_at(scalar)) >= 0 || text.char_at(scalar) == '_') {
+                character := text.char_at(scalar)
+                digit := digit_value(character)
+                when digit >= 0 {
+                    value = value * 10 + digit as u64
+                    numeric_float = numeric_float * 10.0 + digit as f64
+                    previous_digit = true
+                } else {
+                    when !previous_digit || scalar + 1 >= scalar_count || digit_value(text.char_at(scalar + 1)) < 0 {
+                        error_code = 5
+                    }
+                    previous_digit = false
+                }
+                byte += 1
+                scalar += 1
+            }
+            when scalar + 1 < scalar_count && text.char_at(scalar) == '.' && text.char_at(scalar + 1) != '.' && (digit_value(text.char_at(scalar + 1)) >= 0 || text.char_at(scalar + 1) == '_') {
+                is_float = true
+                scalar += 1
+                byte += 1
+                fraction_scale = 0.1
+                previous_digit = false
+                while scalar < scalar_count && (digit_value(text.char_at(scalar)) >= 0 || text.char_at(scalar) == '_') {
+                    character := text.char_at(scalar)
+                    digit := digit_value(character)
+                    when digit >= 0 {
+                        numeric_float += digit as f64 * fraction_scale
+                        fraction_scale *= 0.1
+                        previous_digit = true
+                    } else {
+                        when !previous_digit || scalar + 1 >= scalar_count || digit_value(text.char_at(scalar + 1)) < 0 {
+                            error_code = 5
+                        }
+                        previous_digit = false
+                    }
+                    byte += 1
+                    scalar += 1
+                }
+            }
+            mut exponent_sign := 1 as i64
+            mut exponent := 0 as u64
+            when scalar < scalar_count && (text.char_at(scalar) == 'e' || text.char_at(scalar) == 'E') {
+                is_float = true
+                scalar += 1
+                byte += 1
+                when scalar < scalar_count && text.char_at(scalar) == '-' {
+                    exponent_sign = -1
+                    scalar += 1
+                    byte += 1
+                } else when scalar < scalar_count && text.char_at(scalar) == '+' {
+                    scalar += 1
+                    byte += 1
+                }
+                mut exponent_digits := 0 as u64
+                previous_digit = false
+                while scalar < scalar_count && (digit_value(text.char_at(scalar)) >= 0 || text.char_at(scalar) == '_') {
+                    character := text.char_at(scalar)
+                    digit := digit_value(character)
+                    when digit >= 0 {
+                        exponent = exponent * 10 + digit as u64
+                        exponent_digits += 1
+                        previous_digit = true
+                    } else {
+                        when !previous_digit || scalar + 1 >= scalar_count || digit_value(text.char_at(scalar + 1)) < 0 {
+                            error_code = 5
+                        }
+                        previous_digit = false
+                    }
+                    byte += 1
+                    scalar += 1
+                }
+                when exponent_digits == 0 { error_code = 6 }
+            }
+            when exponent > 308 { exponent = 308 }
+            mut exponent_step := 0 as u64
+            while exponent_step < exponent {
+                when exponent_sign < 0 { numeric_float /= 10.0 }
+                else { numeric_float *= 10.0 }
+                exponent_step += 1
+            }
+            when is_float { kind = Kind::Float(numeric_float) }
+            else { kind = Kind::Integer(value) }
+        } else when current == '\'' {
+            scalar += 1
+            byte += 1
+            mut character_count := 0 as u64
+            mut character_value := '\0'
+            mut valid_escape := true
+            mut closed := false
+            while scalar < scalar_count && text.char_at(scalar) != '\'' {
+                character := text.char_at(scalar)
+                when character == '\\' && scalar + 1 < scalar_count {
+                    scalar += 1
+                    byte += 1
+                    escaped := text.char_at(scalar)
+                    when escaped == 'u' {
+                        decoded := scan_unicode_escape(text.clone(), scalar, byte)
+                        when character_count == 0 && decoded.valid {
+                            character_value = char_from_u32(decoded.value as u32)
+                        } else when !decoded.valid { valid_escape = false }
+                        scalar = decoded.scalar_end
+                        byte = decoded.byte_end
+                    } else {
+                        when character_count == 0 {
+                        when escaped == 'n' { character_value = '\n' }
+                        else when escaped == 'r' { character_value = '\r' }
+                        else when escaped == 't' { character_value = '\t' }
+                        else when escaped == '0' { character_value = '\0' }
+                        else when escaped == '\\' { character_value = '\\' }
+                        else when escaped == '\'' { character_value = '\'' }
+                        else when escaped == '"' { character_value = '"' }
+                        else { valid_escape = false }
+                        }
+                        byte += utf8_width(escaped)
+                        scalar += 1
+                    }
+                } else {
+                    when character_count == 0 { character_value = character }
+                    when character == '\n' || character == '\r' { valid_escape = false }
+                    byte += utf8_width(character)
+                    scalar += 1
+                }
+                character_count += 1
+            }
+            when scalar < scalar_count {
+                closed = true
+                scalar += 1
+                byte += 1
+            }
+            when !closed || character_count != 1 || !valid_escape { error_code = 9 }
+            kind = Kind::Character(character_value)
+        } else when current == '"' {
+            scalar += 1
+            byte += 1
+            mut value := String("")
+            mut closed := false
+            while scalar < scalar_count && text.char_at(scalar) != '"' {
+                character := text.char_at(scalar)
+                when character == '\\' && scalar + 1 < scalar_count {
+                    scalar += 1
+                    byte += 1
+                    escaped := text.char_at(scalar)
+                    when escaped == 'u' {
+                        decoded := scan_unicode_escape(text.clone(), scalar, byte)
+                        when decoded.valid { value.push(char_from_u32(decoded.value as u32)) }
+                        else { error_code = 10 }
+                        scalar = decoded.scalar_end
+                        byte = decoded.byte_end
+                    } else {
+                        when escaped == 'n' { value.push('\n') }
+                        else when escaped == 'r' { value.push('\r') }
+                        else when escaped == 't' { value.push('\t') }
+                        else when escaped == '0' { value.push('\0') }
+                        else when escaped == '"' { value.push('"') }
+                        else when escaped == '\\' { value.push('\\') }
+                        else when escaped == '\'' { value.push('\'') }
+                        else { error_code = 10 }
+                        byte += utf8_width(escaped)
+                        scalar += 1
+                    }
+                } else {
+                    value.push(character)
+                    byte += utf8_width(character)
+                    scalar += 1
+                }
+            }
+            when scalar < scalar_count {
+                closed = true
+                scalar += 1
+                byte += 1
+            }
+            when !closed { error_code = 2 }
+            when error_code == 0 {
+                string_values.push(value)
+                kind = Kind::StringLiteral(string_values.len() - 1)
+            } else {
+                kind = Kind::StringLiteral(0)
+            }
+        } else {
+            mut next := '\0'
+            mut third := '\0'
+            when scalar + 1 < scalar_count {
+                next = text.char_at(scalar + 1)
+            }
+            when scalar + 2 < scalar_count {
+                third = text.char_at(scalar + 2)
+            }
+            kind = punctuation(current, next, third)
+            when punctuation_code(current) == (0 as u64) && operator_code(current, next, third) == (0 as u64) {
+                error_code = 1
+            }
+            width := punctuation_width(current, next, third)
+            scalar += width
+            mut byte_width := width
+            when width == 1 {
+                byte_width = utf8_width(current)
+            }
+            byte += byte_width
+        }
+
+        when error_code == 0 {
+            tokens.push(encode_token(kind, start, byte, scalar_start, scalar))
+        } else {
+            errors.push(LexError { code: error_code, start: start, end: byte })
+        }
+    }
+
+    tokens.push(encode_token(Kind::End, byte, byte, scalar, scalar))
+    Lexed { tokens: tokens, errors: errors, string_values: string_values }
+}
+
+fun lex_file(path: str) -> Lexed {
+    loaded := try_read_file(path)
+    choose loaded {
+        Option::Some(source) => lex(source),
+        Option::None => file_error_lex()
+    }
+}
+
+fun file_error_lex() -> Lexed {
+    mut failed := lex(String(""))
+    failed.errors.push(LexError { code: 11, start: 0, end: 0 })
+    return failed
+}
+
+fun lex_error_message(code: u64) -> str {
+    when code == 1 { "unknown character" }
+    else when code == 2 { "unterminated string literal" }
+    else when code == 3 { "expected a digit after the radix prefix" }
+    else when code == 4 { "invalid digit in integer literal" }
+    else when code == 5 { "invalid numeric separator" }
+    else when code == 6 { "expected exponent digits" }
+    else when code == 8 { "unterminated block comment" }
+    else when code == 9 { "invalid character literal" }
+    else when code == 10 { "unsupported or invalid escape sequence" }
+    else when code == 11 { "could not read UTF-8 source file" }
+    else { "lexical error" }
+}
+
+fun format_lex_error(source: source_manager::SourceFile, error: LexError) -> String {
+    location := source_manager::locate(source.text.clone(), source.line_starts.clone(), error.start)
+    line := location.index(0)
+    column := location.index(1)
+    line_text := source_manager::read_line(source.text.clone(), source.line_starts.clone(), line - 1)
+
+    mut underline_width := 0 as u64
+    mut span_byte := error.start
+    mut span_scalar := 0 as u64
+    while span_byte < error.end && span_byte < source.text.len() {
+        span_byte += utf8_width(source.text.char_at(source.text.slice(0, span_byte).char_count()))
+        underline_width += 1
+    }
+    when underline_width == 0 { underline_width = 1 }
+
+    mut message := String("error[R00")
+    when error.code < 10 { message.append("0") }
+    message.append(String(error.code))
+    message.append("]: ")
+    message.append(lex_error_message(error.code))
+    message.append("\n --> ")
+    message.append(String(line))
+    message.append(":")
+    message.append(String(column))
+    message.append("\n")
+    message.append(String(line))
+    message.append(" | ")
+    message.append(line_text)
+    message.append("\n   | ")
+    for _ in 0..column - 1 { message.append(" ") }
+    message.append("^")
+    for _ in 1..underline_width { message.append("~") }
+    message
+}
+
+pub fun formatted_sample() -> String {
+    source_text := String("\"🦀\" @")
+    source := source_manager::index_source(String("diagnostic.ryn"), source_text.clone())
+    result := lex(source_text)
+    return format_lex_error(source, result.errors.index(0))
+}
+
+fun arithmetic_precedence(kind: u64) -> u64 {
+    when kind == 212 { 1 }
+    else when kind == 210 { 2 }
+    else when kind == 120 { 3 }
+    else when kind == 121 { 4 }
+    else when kind == 119 { 5 }
+    else when kind == 204 || kind == 206 || (kind >= 117 && kind <= 118) || kind == 207 || kind == 208 { 6 }
+    else when kind == 215 || kind == 217 { 7 }
+    else when kind == 112 || kind == 113 { 8 }
+    else when kind == 114 || kind == 115 || kind == 116 { 9 }
+    else { 0 }
+}
+
+fun append_ast_node(state: ParseState, kind: u64, start: u64, end: u64, payload: u64, children: Vec<u64>) -> ParseValue {
+    mut next := state
+    first_child := next.children.len()
+    child_count := children.len()
+    for child in children {
+        next.children.push(child)
+    }
+    node_id := next.nodes.len()
+    next.nodes.push(AstNode {
+        kind: kind,
+        start: start,
+        end: end,
+        first_child: first_child,
+        child_count: child_count,
+        payload: payload
+    })
+    ParseValue { state: next, node_id: node_id }
+}
+
+fun parse_primary(state: ParseState) -> ParseValue {
+    mut next := state
+    when next.failed { return ParseValue { state: next, node_id: 0 } }
+    token := next.tokens.index(next.index)
+    when token.kind == 301 {
+        next.index += 1
+        return append_ast_node(next, 1, token.start, token.end, token.payload, Vec<u64>())
+    }
+    when token.kind == 300 {
+        next.index += 1
+        return append_ast_node(next, 3, token.start, token.end, token.start, Vec<u64>())
+    }
+    when token.kind == 302 {
+        next.index += 1
+        return append_ast_node(next, 2, token.start, token.end, token.payload, Vec<u64>())
+    }
+    when token.kind == 304 {
+        next.index += 1
+        return append_ast_node(next, 6, token.start, token.end, 0, Vec<u64>())
+    }
+    when token.kind == 3 || token.kind == 4 {
+        next.index += 1
+        literal := when token.kind == 3 { 1 as u64 } else { 0 as u64 }
+        return append_ast_node(next, 6, token.start, token.end, literal, Vec<u64>())
+    }
+    when token.kind == 113 || token.kind == 122 || token.kind == 123 {
+        next.index += 1
+        operand := parse_arithmetic_expression(next, 10)
+        when operand.state.failed { return operand }
+        operand_node := operand.state.nodes.index(operand.node_id)
+        mut child := Vec<u64>()
+        child.push(operand.node_id)
+        return append_ast_node(operand.state, 4, token.start, operand_node.end, token.kind, child)
+    }
+    when token.kind == 101 {
+        next.index += 1
+        mut inner := parse_arithmetic_expression(next, 1)
+        mut after := inner.state
+        closing := after.tokens.index(after.index)
+        when closing.kind != 102 {
+            after.failed = true
+            after.error_code = 2
+            after.error_start = closing.start
+            after.error_end = closing.end
+        } else {
+            after.index += 1
+        }
+        inner.state = after
+        return inner
+    }
+    next.failed = true
+    next.error_code = 1
+    next.error_start = token.start
+    next.error_end = token.end
+    ParseValue { state: next, node_id: 0 }
+}
+
+fun parse_arithmetic_expression(state: ParseState, minimum_precedence: u64) -> ParseValue {
+    mut left := parse_primary(state)
+    while !left.state.failed {
+        operator := left.state.tokens.index(left.state.index)
+        precedence := arithmetic_precedence(operator.kind)
+        when precedence < minimum_precedence { break }
+        mut after_operator := left.state
+        after_operator.index += 1
+        right := parse_arithmetic_expression(after_operator, precedence + 1)
+        when right.state.failed { return right }
+        left_node := right.state.nodes.index(left.node_id)
+        right_node := right.state.nodes.index(right.node_id)
+        mut operands := Vec<u64>()
+        operands.push(left.node_id)
+        operands.push(right.node_id)
+        left = append_ast_node(
+            right.state,
+            5,
+            left_node.start,
+            right_node.end,
+            operator.kind,
+            operands
+        )
+    }
+    left
+}
+
+fun parse_arithmetic(source: String) -> ParseValue {
+    lexed := lex(source.clone())
+    mut state := ParseState {
+        source: source,
+        tokens: lexed.tokens,
+        index: 0,
+        nodes: Vec<AstNode>(),
+        children: Vec<u64>(),
+        failed: lexed.errors.len() > 0,
+        error_code: 0,
+        error_start: 0,
+        error_end: 0
+    }
+    when state.failed {
+        error := lexed.errors.index(0)
+        state.error_code = 100 + error.code
+        state.error_start = error.start
+        state.error_end = error.end
+        return ParseValue { state: state, node_id: 0 }
+    }
+    mut result := parse_arithmetic_expression(state, 1)
+    mut finished := result.state
+    trailing := finished.tokens.index(finished.index)
+    when !finished.failed && trailing.kind != 0 {
+        finished.failed = true
+        finished.error_code = 3
+        finished.error_start = trailing.start
+        finished.error_end = trailing.end
+    }
+    result.state = finished
+    result
+}
+
+fun parse_simple_statement(state: ParseState) -> ParseValue {
+    mut next := state
+    token := next.tokens.index(next.index)
+    when token.kind == 10 || token.kind == 9 {
+        next.index += 1
+        statement_kind := when token.kind == 10 { 20 as u64 } else { 21 as u64 }
+        expression := parse_arithmetic_expression(next, 1)
+        when expression.state.failed { return expression }
+        expression_node := expression.state.nodes.index(expression.node_id)
+        mut children := Vec<u64>()
+        children.push(expression.node_id)
+        mut statement := append_ast_node(
+            expression.state,
+            statement_kind,
+            token.start,
+            expression_node.end,
+            token.kind,
+            children
+        )
+        terminator := statement.state.tokens.index(statement.state.index)
+        when terminator.kind == 108 { statement.state.index += 1 }
+        return statement
+    }
+    mut name_token := token
+    mut prefix_width := 0 as u64
+    when token.kind == 2 {
+        prefix_width = 1
+        name_token = next.tokens.index(next.index + 1)
+    }
+    following_kind := next.tokens.index(next.index + prefix_width + 1).kind
+    mut assignment_operator := following_kind
+    mut declaration_kind := when prefix_width == 1 { 24 as u64 } else { 22 as u64 }
+    mut declaration_width := prefix_width + 2
+    mut has_type_annotation := false
+    mut annotation_token := next.tokens.index(next.index)
+    when following_kind == 109 &&
+        next.tokens.index(next.index + prefix_width + 2).kind == 300 &&
+        next.tokens.index(next.index + prefix_width + 3).kind == 111 {
+        assignment_operator = 201
+        declaration_width = prefix_width + 4
+        declaration_kind = when prefix_width == 1 { 26 as u64 } else { 25 as u64 }
+        has_type_annotation = true
+        annotation_token = next.tokens.index(next.index + prefix_width + 2)
+    }
+    when name_token.kind == 300 &&
+        (is_assignment_operator(assignment_operator) || declaration_kind == 25 || declaration_kind == 26) {
+        next.index += declaration_width
+        mut children := Vec<u64>()
+        name_children := Vec<u64>()
+        name_node := append_ast_node(next, 3, name_token.start, name_token.end, name_token.start, name_children)
+        children.push(name_node.node_id)
+        mut expression_state := name_node.state
+        when has_type_annotation {
+            type_children := Vec<u64>()
+            type_node := append_ast_node(
+                expression_state,
+                7,
+                annotation_token.start,
+                annotation_token.end,
+                0,
+                type_children
+            )
+            expression_state = type_node.state
+            children.push(type_node.node_id)
+        }
+        expression := parse_arithmetic_expression(expression_state, 1)
+        when expression.state.failed { return expression }
+        expression_node := expression.state.nodes.index(expression.node_id)
+        children.push(expression.node_id)
+        mut statement := append_ast_node(
+            expression.state,
+            declaration_kind,
+            name_token.start,
+            expression_node.end,
+            assignment_operator,
+            children
+        )
+        terminator := statement.state.tokens.index(statement.state.index)
+        when terminator.kind == 108 { statement.state.index += 1 }
+        return statement
+    }
+    next.failed = true
+    next.error_code = 4
+    next.error_start = token.start
+    next.error_end = token.end
+    ParseValue { state: next, node_id: 0 }
+}
+
+fun is_assignment_operator(kind: u64) -> bool {
+    kind == 201 || kind == 111 || kind == 209 || kind == 211 || kind == 213 ||
+    kind == 214 || kind == 216 || (kind >= 219 && kind <= 223)
+}
+
+fun compound_operator(kind: u64) -> u64 {
+    when kind == 219 { 112 }
+    else when kind == 220 { 113 }
+    else when kind == 221 { 114 }
+    else when kind == 222 { 115 }
+    else when kind == 223 { 116 }
+    else when kind == 209 { 119 }
+    else when kind == 211 { 120 }
+    else when kind == 213 { 121 }
+    else when kind == 214 { 215 }
+    else when kind == 216 { 217 }
+    else { 0 }
+}
+
+fun parse_simple_program(source: String) -> ParseValue {
+    lexed := lex(source.clone())
+    mut state := ParseState {
+        source: source,
+        tokens: lexed.tokens,
+        index: 0,
+        nodes: Vec<AstNode>(),
+        children: Vec<u64>(),
+        failed: lexed.errors.len() > 0,
+        error_code: 0,
+        error_start: 0,
+        error_end: 0
+    }
+    when state.failed {
+        error := lexed.errors.index(0)
+        state.error_code = 100 + error.code
+        state.error_start = error.start
+        state.error_end = error.end
+        return ParseValue { state: state, node_id: 0 }
+    }
+    mut statements := Vec<u64>()
+    mut first_start := 0 as u64
+    mut last_end := 0 as u64
+    mut has_statement := false
+    while !state.failed && state.tokens.index(state.index).kind != 0 {
+        before := state.index
+        statement := parse_simple_statement(state)
+        state = statement.state
+        when state.index == before && !state.failed {
+            state.failed = true
+            state.error_code = 5
+        }
+        when !state.failed {
+            node := state.nodes.index(statement.node_id)
+            when !has_statement { first_start = node.start }
+            last_end = node.end
+            has_statement = true
+            statements.push(statement.node_id)
+        }
+    }
+    when state.failed { return ParseValue { state: state, node_id: 0 } }
+    append_ast_node(state, 23, first_start, last_end, 0, statements)
+}
+
+fun eval_comparison(payload: u64, left: i64, right: i64) -> i64 {
+    when payload == 204 { when left == right { 1 as i64 } else { 0 as i64 } }
+    else when payload == 206 { when left != right { 1 as i64 } else { 0 as i64 } }
+    else when payload == 117 { when left < right { 1 as i64 } else { 0 as i64 } }
+    else when payload == 118 { when left > right { 1 as i64 } else { 0 as i64 } }
+    else when payload == 207 { when left <= right { 1 as i64 } else { 0 as i64 } }
+    else { when left >= right { 1 as i64 } else { 0 as i64 } }
+}
+
+fun eval_binary(payload: u64, left: i64, right: i64) -> i64 {
+    when payload == 112 { left + right }
+    else when payload == 113 { left - right }
+    else when payload == 114 { left * right }
+    else when payload == 115 && right != 0 { left / right }
+    else when payload == 116 && right != 0 { left % right }
+    else when payload == 204 || payload == 206 || payload == 117 || payload == 118 || payload == 207 || payload == 208 {
+        eval_comparison(payload, left, right)
+    }
+    else when payload == 119 { (left as u64 & right as u64) as i64 }
+    else when payload == 120 { (left as u64 | right as u64) as i64 }
+    else when payload == 121 { (left as u64 ^ right as u64) as i64 }
+    else when payload == 210 { when left != 0 && right != 0 { 1 as i64 } else { 0 as i64 } }
+    else when payload == 212 { when left != 0 || right != 0 { 1 as i64 } else { 0 as i64 } }
+    else when payload == 215 && right >= 0 && right < 64 { left << (right as u32) }
+    else when payload == 217 && right >= 0 && right < 64 { left >> (right as u32) }
+    else { 0 }
+}
+
+fun evaluate_arithmetic(arena: AstArena, root_id: u64) -> i64 {
+    mut values := Vec<i64>()
+    for node_id in 0..arena.nodes.len() {
+        node := arena.nodes.index(node_id)
+        when node.kind == 1 || node.kind == 6 {
+            values.push(node.payload as i64)
+        } else when node.kind == 4 {
+            child_id := arena.children.index(node.first_child)
+            operand := values.index(child_id)
+            when node.payload == 113 { values.push(-operand) }
+            else when node.payload == 123 { values.push(when operand == 0 { 1 as i64 } else { 0 as i64 }) }
+            else when node.payload == 122 { values.push(-operand - 1) }
+            else { values.push(operand) }
+        } else when node.kind == 5 {
+            left_id := arena.children.index(node.first_child)
+            right_id := arena.children.index(node.first_child + 1)
+            left := values.index(left_id)
+            right := values.index(right_id)
+            values.push(eval_binary(node.payload, left, right))
+        } else {
+            values.push(0)
+        }
+    }
+    values.index(root_id)
+}
+
+struct ProgramResult {
+    output: Vec<i64>,
+    return_value: i64
+}
+
+fun evaluate_program(arena: AstArena, root_id: u64) -> ProgramResult {
+    mut values := Vec<i64>()
+    mut name_starts := Vec<u64>()
+    mut name_ends := Vec<u64>()
+    mut variable_values := Vec<i64>()
+    mut output := Vec<i64>()
+    mut return_value := 0 as i64
+    root := arena.nodes.index(root_id)
+    for node_id in 0..arena.nodes.len() {
+        node := arena.nodes.index(node_id)
+        when node.kind == 1 || node.kind == 6 {
+            values.push(node.payload as i64)
+        } else when node.kind == 3 {
+            name := arena.source.slice(node.start, node.end)
+            mut value := 0 as i64
+            for slot in 0..variable_values.len() {
+                existing_name := arena.source.slice(name_starts.index(slot), name_ends.index(slot))
+                when existing_name == name { value = variable_values.index(slot) }
+            }
+            values.push(value)
+        } else when node.kind == 4 {
+            child_id := arena.children.index(node.first_child)
+            operand := values.index(child_id)
+            when node.payload == 113 { values.push(-operand) }
+            else when node.payload == 123 { values.push(when operand == 0 { 1 as i64 } else { 0 as i64 }) }
+            else when node.payload == 122 { values.push(-operand - 1) }
+            else { values.push(operand) }
+        } else when node.kind == 5 {
+            left_id := arena.children.index(node.first_child)
+            right_id := arena.children.index(node.first_child + 1)
+            left := values.index(left_id)
+            right := values.index(right_id)
+            values.push(eval_binary(node.payload, left, right))
+        } else when node.kind == 22 || node.kind == 24 || node.kind == 25 || node.kind == 26 {
+            name_id := arena.children.index(node.first_child)
+            name_node := arena.nodes.index(name_id)
+            name := arena.source.slice(name_node.start, name_node.end)
+            value_child_offset := when node.kind == 25 || node.kind == 26 { 2 as u64 } else { 1 as u64 }
+            value_id := arena.children.index(node.first_child + value_child_offset)
+            mut value := values.index(value_id)
+            mut found := false
+            for slot in 0..variable_values.len() {
+                existing_name := arena.source.slice(name_starts.index(slot), name_ends.index(slot))
+                when existing_name == name {
+                    operator := compound_operator(node.payload)
+                    when operator != 0 { value = eval_binary(operator, variable_values.index(slot), value) }
+                    variable_values.set(slot, value)
+                    found = true
+                    break
+                }
+            }
+            when !found {
+                name_starts.push(name_node.start)
+                name_ends.push(name_node.end)
+                variable_values.push(value)
+            }
+            values.push(value)
+        } else when node.kind == 20 {
+            value_id := arena.children.index(node.first_child)
+            output.push(values.index(value_id))
+            values.push(0)
+        } else when node.kind == 21 {
+            value_id := arena.children.index(node.first_child)
+            return_value = values.index(value_id)
+            values.push(return_value)
+            break
+        } else {
+            values.push(0)
+        }
+    }
+    ProgramResult { output: output, return_value: return_value }
+}
+
+fun demo_lexer() {
+    diagnostic_text := String("\"🦀\" @")
+    diagnostic_source := source_manager::index_source(String("diagnostic.ryn"), diagnostic_text.clone())
+    diagnostic_lexed := lex(diagnostic_text.clone())
+    diagnostic_error := diagnostic_lexed.errors.index(0)
+    echo format_lex_error(diagnostic_source, diagnostic_error)
+
+    sample := String("fun demo_lexer() { echo \"Ryn 🦀\" /* outer /* nested */ comment */ // comment\n value <<= 0x2A; next != 0b10 && rate == 3.14 && exp == 1.2e3 && grouped == 1_000 && range == 1..2 && character == '🦀' && escaped == '\\u{1F980}' while break continue struct as enum type namespace pub choose }")
+    mut output := lex(sample.clone())
+    tokens := output.tokens
+    echo output.errors.len()
+    echo tokens.len()
+    for token in tokens {
+        echo token.kind
+        echo token.start
+        echo token.end
+        echo token.scalar_start
+        echo token.scalar_end
+        echo token.payload
+        echo token.float_payload
+        echo token.character_payload
+        echo sample.slice(token.start, token.end)
+        when token.kind == 302 { echo output.string_values.take(token.payload) }
+    }
+    mut malformed := lex(String("@"))
+    echo malformed.errors.len()
+    echo malformed.errors.take(0).code
+    malformed_numbers := lex(String("1__2 2e+ 0b"))
+    echo malformed_numbers.errors.len()
+    for error in malformed_numbers.errors {
+        echo error.code
+        echo error.start
+        echo error.end
+    }
+    mut malformed_comment := lex(String("/* open"))
+    echo malformed_comment.errors.len()
+    echo malformed_comment.errors.take(0).code
+    mut malformed_string := lex(String("\"open"))
+    echo malformed_string.errors.len()
+    echo malformed_string.errors.take(0).code
+    mut malformed_escape := lex(String("\"bad\\q\""))
+    echo malformed_escape.errors.len()
+    echo malformed_escape.errors.take(0).code
+    mut malformed_unicode := lex(String("'\\u{D800}'"))
+    echo malformed_unicode.errors.len()
+    echo malformed_unicode.errors.take(0).code
+    mut unicode_string := lex(String("\"\\u{1F980}\""))
+    echo unicode_string.string_values.len()
+    mut malformed_unicode_string := lex(String("\"\\u{110000}\""))
+    echo malformed_unicode_string.errors.len()
+    echo malformed_unicode_string.errors.take(0).code
+    mut malformed_character := lex(String("'ab'"))
+    echo malformed_character.errors.len()
+    echo malformed_character.errors.take(0).code
+    source_tokens := lex_file("examples/self_hosted/sample.ryn")
+    mut missing_source := lex_file("examples/self_hosted/missing-sample.ryn")
+    echo source_tokens.tokens.len()
+    echo source_tokens.errors.len()
+    echo missing_source.tokens.len()
+    echo missing_source.errors.len()
+
+    parsed := parse_arithmetic(String("7 + 9 * (2 + 1)"))
+    echo parsed.state.failed
+    echo parsed.state.nodes.len()
+    echo parsed.state.children.len()
+    echo evaluate_arithmetic(AstArena {
+        source: parsed.state.source.clone(),
+        nodes: parsed.state.nodes.clone(),
+        children: parsed.state.children.clone()
+    }, parsed.node_id)
+    malformed_expression := parse_arithmetic(String("7 + * 2"))
+    echo malformed_expression.state.failed
+    echo malformed_expression.state.error_code
+    echo malformed_expression.state.error_start
+    echo malformed_expression.state.error_end
+
+    program := parse_simple_program(String("value := 3; echo 7 + 9 * 2; return 0"))
+    echo program.state.failed
+    program_root := program.state.nodes.index(program.node_id)
+    echo program_root.kind
+    echo program_root.child_count
+    echo_node_id := program.state.children.index(program_root.first_child + 1)
+    echo_node := program.state.nodes.index(echo_node_id)
+    expression_id := program.state.children.index(echo_node.first_child)
+    echo evaluate_arithmetic(AstArena {
+        source: program.state.source.clone(),
+        nodes: program.state.nodes.clone(),
+        children: program.state.children.clone()
+    }, expression_id)
+    condition_program := parse_simple_program(String("echo value >= 3 && true; return 0"))
+    echo condition_program.state.failed
+    operator_expression := parse_arithmetic(String("(8 >= 8) && ((6 & 3) == 2) && ((1 << 3) == 8)"))
+    echo operator_expression.state.failed
+    echo evaluate_arithmetic(AstArena {
+        source: operator_expression.state.source.clone(),
+        nodes: operator_expression.state.nodes.clone(),
+        children: operator_expression.state.children.clone()
+    }, operator_expression.node_id)
+    executable_program := parse_simple_program(String("limit := 7; mut value: i32 = 3; echo value + limit * 2; value += 1; value = value * 2; echo value; return value"))
+    execution := evaluate_program(AstArena {
+        source: executable_program.state.source.clone(),
+        nodes: executable_program.state.nodes.clone(),
+        children: executable_program.state.children.clone()
+    }, executable_program.node_id)
+    echo execution.output.len()
+    echo execution.output.index(0)
+    echo execution.output.index(1)
+    echo execution.return_value
+}
+
+
+
+

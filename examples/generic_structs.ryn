@@ -1,0 +1,47 @@
+struct Pair<T> {
+    first: T,
+    second: T
+}
+
+struct Batch<T> {
+    items: Vec<T>
+}
+
+struct Box<T> {
+    value: T
+}
+
+struct Nested<T> {
+    inner: Box<T>
+}
+
+fun sum_pair(pair: Pair<i32>) -> i32 {
+    pair.first + pair.second
+}
+
+fun batch_size(batch: Batch<String>) -> u64 {
+    batch.items.len()
+}
+
+fun nested_value(value: Nested<i32>) -> i32 {
+    value.inner.value
+}
+
+fun main() {
+    pair := Pair::<i32> { first: 20, second: 22 }
+    echo sum_pair(pair)
+
+    mut labels := Pair::<String> {
+        first: String("ryn"),
+        second: String("lang")
+    }
+    labels.first.append("-")
+    echo labels.first.concat(labels.second)
+
+    mut batch := Batch::<String> { items: Vec<String>() }
+    batch.items.push(String("owned"))
+    echo batch_size(batch)
+
+    nested := Nested::<i32> { inner: Box::<i32> { value: 9 } }
+    echo nested_value(nested)
+}

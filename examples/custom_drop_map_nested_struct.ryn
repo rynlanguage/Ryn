@@ -1,0 +1,30 @@
+#[drop(release)]
+struct Resource { handle: *i32, tag: i32 }
+
+fun release(resource: Resource) {
+    echo *resource.handle
+    echo resource.tag
+}
+
+struct Bundle { resource: Resource, id: i32 }
+struct Envelope { bundle: Bundle }
+struct Repository { records: Map<i32, Envelope> }
+
+fun forward(values: Map<i32, Envelope>) -> Map<i32, Envelope> {
+    values
+}
+
+fun main() {
+    mut first: i32 = 10
+    mut second: i32 = 20
+    mut third: i32 = 30
+    mut values := forward(Map<i32, Envelope>())
+    values.insert(1, Envelope { bundle: Bundle { resource: Resource { handle: &raw mut first, tag: 101 }, id: 1 } })
+    values.insert(1, Envelope { bundle: Bundle { resource: Resource { handle: &raw mut second, tag: 202 }, id: 2 } })
+    echo values.remove(1)
+    values.insert(3, Envelope { bundle: Bundle { resource: Resource { handle: &raw mut third, tag: 303 }, id: 3 } })
+    values.clear()
+
+    mut repository := Repository { records: Map<i32, Envelope>() }
+    repository.records.insert(4, Envelope { bundle: Bundle { resource: Resource { handle: &raw mut first, tag: 404 }, id: 4 } })
+}

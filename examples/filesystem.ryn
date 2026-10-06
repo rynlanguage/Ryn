@@ -1,0 +1,15 @@
+fun main() {
+    directory := arg(0)
+    file := arg(1)
+
+    echo create_dir(directory)
+    echo is_directory(directory)
+    echo write_file(file, "Zażółć gęślą jaźń")
+    echo file_exists(file)
+    echo is_file(file)
+    contents := read_file(file)
+    echo contents
+    echo delete_file(file)
+    echo file_exists(file)
+    echo delete_dir(directory)
+}

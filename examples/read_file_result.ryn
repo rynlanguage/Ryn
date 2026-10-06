@@ -1,0 +1,13 @@
+fun main() {
+    loaded := read_file_result("examples/self_hosted/sample.ryn")
+    echo choose loaded {
+        Result::Ok(contents) => contents,
+        Result::Err(code) => String(code)
+    }
+
+    invalid := read_file_result("examples/self_hosted/missing-file.ryn")
+    echo choose invalid {
+        Result::Ok(contents) => contents,
+        Result::Err(code) => String(code)
+    }
+}

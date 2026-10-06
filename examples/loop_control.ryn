@@ -1,42 +1,42 @@
-fn main() {
-    let mut count = 0
+fun main() {
+    mut count := 0
     while count < 5 {
         count += 1
-        if count == 2 {
+        when count == 2 {
             continue
         }
-        if count == 4 {
+        when count == 4 {
             break
         }
-        print(count)
+        echo count
     }
-    print(count)
+    echo count
 
-    let mut outer = 0
+    mut outer := 0
     while outer < 2 {
         outer += 1
-        let mut inner = 0
+        mut inner := 0
         while inner < 3 {
             inner += 1
-            if inner == 2 {
+            when inner == 2 {
                 continue
             }
-            if inner == 3 {
+            when inner == 3 {
                 break
             }
-            print(outer * 10 + inner)
+            echo outer * 10 + inner
         }
     }
 
-    let mut stop = 0
+    mut stop := 0
     while stop < 3 {
         stop += 1
-        if stop == 1 {
+        when stop == 1 {
             continue
         } else {
             break
         }
-        print(999)
+        echo 999
     }
-    print(stop)
+    echo stop
 }

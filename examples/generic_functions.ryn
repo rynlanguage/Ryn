@@ -1,0 +1,37 @@
+fun identity<T>(value: T) -> T {
+    value
+}
+
+fun first<T>(items: &[T]) -> &T {
+    &items[0]
+}
+
+fun first_value<T>(items: &[T]) -> T {
+    items[0]
+}
+
+fun take<T>(items: Vec<T>) -> Vec<T> {
+    items
+}
+
+fun main() {
+    answer := identity(23 as i32)
+
+    mut values: Vec<i32> = Vec()
+    values.push(41)
+    values.push(99)
+    initial := first_value(values.as_slice())
+    from_array := first_value([12 as i32, 34 as i32])
+    first_reference := first(values.as_slice())
+
+    mut owned: Vec<i32> = Vec()
+    owned.push(77)
+    transferred := take(owned)
+
+    echo answer
+    echo initial
+    echo from_array
+    echo *first_reference
+    echo *first([5 as i32, 6 as i32])
+    echo transferred.len()
+}

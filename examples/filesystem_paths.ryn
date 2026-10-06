@@ -1,0 +1,28 @@
+fun main() {
+    directory := "build/ryn_fs_read_dir_contract"
+    delete_dir_all(directory)
+    create_dir(directory)
+
+    write_file(path_join(directory, "a.ryn"), "first")
+    write_file(path_join(directory, "b.ryn"), "second")
+
+    nested_path := path_join(directory, "a.ryn")
+    echo path_parent(nested_path)
+    echo path_file_name(nested_path)
+    echo path_extension(nested_path)
+    echo path_is_absolute(nested_path)
+    echo path_file_name(".env")
+    echo path_extension(".env")
+    echo path_extension("archive.tar.gz")
+    echo path_parent("bare-name")
+
+    paths := read_dir(directory)
+    echo paths.len()
+    for path in paths {
+        echo path
+    }
+
+    delete_file(path_join(directory, "a.ryn"))
+    delete_file(path_join(directory, "b.ryn"))
+    delete_dir(directory)
+}

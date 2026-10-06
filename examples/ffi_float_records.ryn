@@ -1,0 +1,35 @@
+#[repr(C)]
+struct FloatPair {
+    first: f32,
+    second: f32,
+}
+
+#[repr(C)]
+struct DoubleValue {
+    value: f64,
+}
+
+type FloatPairSum = extern "C" fun(FloatPair) -> f32
+type MakeFloatPair = extern "C" fun(f32, f32) -> FloatPair
+
+extern "C" fun ryn_ffi_float_pair_sum(value: FloatPair) -> f32;
+extern "C" fun ryn_ffi_make_float_pair(first: f32, second: f32) -> FloatPair;
+extern "C" fun ryn_ffi_double_value(value: DoubleValue) -> DoubleValue;
+
+fun invoke_sum(function: FloatPairSum, value: FloatPair) -> f32 {
+    function(value)
+}
+
+fun invoke_make(function: MakeFloatPair, first: f32, second: f32) -> FloatPair {
+    function(first, second)
+}
+
+fun main() {
+    pair := ryn_ffi_make_float_pair(1.5, 2.25)
+    echo ryn_ffi_float_pair_sum(pair)
+    echo pair.first
+    echo pair.second
+    double := DoubleValue { value: 5.125 }
+    returned := ryn_ffi_double_value(double)
+    echo returned.value
+}

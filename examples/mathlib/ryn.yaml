@@ -1,0 +1,6 @@
+name: mathlib
+version: 0.1.0
+owner: guest
+dependencies:
+  coremath:
+    path: ../coremath

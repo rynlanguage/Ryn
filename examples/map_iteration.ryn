@@ -1,0 +1,60 @@
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+fun main() {
+    mut ages := Map<String, i32>()
+    ages.insert(String("Ala"), 10)
+    ages.insert(String("Bob"), 20)
+    ages.insert(String("Cy"), 30)
+
+    keys := ages.keys()
+    echo keys.len()
+    mut marks: i32 = 0
+    for key in keys {
+        when key == String("Ala") {
+            marks += 1
+        }
+        when key == String("Bob") {
+            marks += 10
+        }
+        when key == String("Cy") {
+            marks += 100
+        }
+    }
+    echo marks
+
+    values := ages.values()
+    echo values.len()
+    mut sum: i32 = 0
+    for value in values {
+        sum += value
+    }
+    echo sum
+
+    echo ages.len()
+    ages.clear()
+    echo ages.keys().len()
+    echo ages.values().len()
+
+    mut names := Map<i32, String>()
+    names.insert(1, String("Ryn"))
+    names.insert(2, String("window"))
+    mut joined := String("")
+    for name in names.values() {
+        joined.append(name)
+    }
+    echo joined
+    echo names.len()
+
+    mut points := Map<i32, Point>()
+    points.insert(1, Point { x: 4, y: 2 })
+    points.insert(2, Point { x: 10, y: 30 })
+    mut product: i64 = 0
+    for point in points.values() {
+        product += point.x * point.y
+    }
+    echo product
+}
+

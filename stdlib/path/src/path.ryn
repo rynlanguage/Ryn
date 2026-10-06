@@ -1,0 +1,67 @@
+pub struct Path {
+    raw: String,
+}
+
+pub fun from(value: str) -> Path {
+    return Path { raw: String(value) }
+}
+
+pub fun to_string(value: Path) -> String {
+    return String(value.raw)
+}
+
+pub fun join(base: Path, child: str) -> Path {
+    return Path { raw: path_join(base.raw, String(child)) }
+}
+
+pub fun parent(value: Path) -> Path {
+    return Path { raw: path_parent(value.raw) }
+}
+
+pub fun file_name(value: Path) -> String {
+    return path_file_name(value.raw)
+}
+
+pub fun extension(value: Path) -> String {
+    return path_extension(value.raw)
+}
+
+pub fun is_absolute(value: Path) -> bool {
+    return path_is_absolute(value.raw)
+}
+
+pub fun exists(value: Path) -> bool {
+    return file_exists(value.raw)
+}
+
+pub fun is_regular_file(value: Path) -> bool {
+    return is_file(value.raw)
+}
+
+pub fun is_dir(value: Path) -> bool {
+    return is_directory(value.raw)
+}
+
+pub fun read_to_string(value: Path) -> String {
+    return read_file(value.raw)
+}
+
+pub fun write_string(value: Path, contents: str) -> bool {
+    return write_file(value.raw, String(contents))
+}
+
+pub fun remove_file(value: Path) -> bool {
+    return delete_file(value.raw)
+}
+
+pub fun create_directories(value: Path) -> bool {
+    return create_dir(value.raw)
+}
+
+pub fun remove_directory(value: Path) -> bool {
+    return delete_dir(value.raw)
+}
+
+pub fun remove_directory_all(value: Path) -> bool {
+    return delete_dir_all(value.raw)
+}

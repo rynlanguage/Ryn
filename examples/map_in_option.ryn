@@ -1,0 +1,7 @@
+fun main() {
+    maybe_map: Option<Map<i32, String>> = Option::Some(Map<i32, String>())
+    echo choose maybe_map {
+        Option::Some(values) => values.len() as i32,
+        Option::None => -1
+    }
+}

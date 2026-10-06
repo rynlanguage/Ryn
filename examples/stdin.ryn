@@ -1,0 +1,4 @@
+fun main() {
+    input := stdin_read()
+    echo input
+}

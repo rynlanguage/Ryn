@@ -1,0 +1,8 @@
+fun main() {
+    value := String("A🦀e\u{301}Z")
+    echo value.slice_chars(1, 4)
+    echo value.slice_chars(2, 3)
+    echo value.slice_chars(4, 5)
+    echo value.slice_chars(3, 3)
+    echo value.slice(1, 5)
+}

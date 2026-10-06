@@ -1,0 +1,48 @@
+fun echo_scalars(text: str) {
+    for character in text {
+        echo character
+    }
+}
+
+fun decorate(value: String) -> String {
+    mut result := value
+    result.append("!")
+    result
+}
+
+fun main() {
+    mut text := String(" Ryn 🦀 ")
+    text.push('!')
+    text.append(" reliable")
+    echo text
+
+    trimmed := text.trim()
+    echo trimmed.starts_with("Ryn")
+    echo trimmed.ends_with("reliable")
+    echo trimmed.contains("🦀")
+    echo choose trimmed.find("🦀") {
+        Option::Some(index) => index as i64,
+        Option::None => -1
+    }
+    echo choose trimmed.find("missing") {
+        Option::Some(index) => index as i64,
+        Option::None => -1
+    }
+    mut words := trimmed.split(" ")
+    echo words.len()
+    echo words.take(0)
+    echo trimmed.char_at(4)
+    echo trimmed.slice(0, 3)
+
+    copy := trimmed.clone()
+    moved := decorate(copy)
+    echo moved
+
+    for index in 0..trimmed.char_count() {
+        echo trimmed.char_at(index)
+    }
+    for character in trimmed.clone() {
+        echo character
+    }
+    echo_scalars("view 🦀")
+}

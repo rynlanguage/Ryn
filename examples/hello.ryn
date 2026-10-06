@@ -1,4 +1,4 @@
-fn main() {
-    let name = "Ryn"
-    print("Hello, {name}!")
+fun main() {
+    name := "Ryn"
+    echo "Hello, {name}!"
 }

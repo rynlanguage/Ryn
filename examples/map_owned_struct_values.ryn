@@ -1,0 +1,31 @@
+struct Label {
+    text: String,
+    score: i32
+}
+
+fun label_text(labels: Map<i32, Label>) -> Option<String> {
+    label: Label = labels.get(1)?
+    return Option::Some(label.text)
+}
+
+fun main() {
+    mut labels := Map<i32, Label>()
+    labels.insert(1, Label { text: String("original"), score: 10 })
+    mut snapshot := labels.clone()
+    text := choose labels.get(1) {
+        Option::Some(label) => label.text,
+        Option::None => String("missing")
+    }
+    echo text
+    echo choose label_text(labels.clone()) {
+        Option::Some(value) => value,
+        Option::None => String("missing")
+    }
+    labels.insert(1, Label { text: String("replacement"), score: 20 })
+    echo labels.len()
+    echo snapshot.len()
+    echo labels.remove(1)
+    echo snapshot.remove(1)
+    echo labels.len()
+    echo snapshot.len()
+}

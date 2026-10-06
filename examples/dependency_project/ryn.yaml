@@ -1,0 +1,6 @@
+name: dependency-demo
+version: 0.1.0
+owner: guest
+dependencies:
+  mathlib:
+    path: ../mathlib

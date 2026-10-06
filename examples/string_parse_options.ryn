@@ -1,0 +1,54 @@
+fun main() {
+    echo choose String("-128").try_to_i8() {
+        Option::Some(value) => value as i32,
+        Option::None => 999
+    }
+    echo choose String("32767").try_to_i16() {
+        Option::Some(value) => value as i32,
+        Option::None => 999
+    }
+    echo choose String("2147483647").try_to_i32() {
+        Option::Some(value) => value,
+        Option::None => -1
+    }
+    echo choose String("9223372036854775807").try_to_i64() {
+        Option::Some(value) => value,
+        Option::None => -1
+    }
+    echo choose String("255").try_to_u8() {
+        Option::Some(value) => value as i32,
+        Option::None => 999
+    }
+    echo choose String("65535").try_to_u16() {
+        Option::Some(value) => value as i32,
+        Option::None => 999
+    }
+    echo choose String("4294967295").try_to_u32() {
+        Option::Some(value) => value as i64,
+        Option::None => -1
+    }
+    echo choose String("18446744073709551615").try_to_u64() {
+        Option::Some(value) => value as i64,
+        Option::None => -1
+    }
+    echo choose String("3.5").try_to_f32() {
+        Option::Some(value) => value,
+        Option::None => -1.0
+    }
+    echo choose String("-2.25e2").try_to_f64() {
+        Option::Some(value) => value,
+        Option::None => -1.0
+    }
+    echo choose String("128").try_to_i8() {
+        Option::Some(_) => 1,
+        Option::None => 0
+    }
+    echo choose String("not a number").try_to_i32() {
+        Option::Some(_) => 1,
+        Option::None => 0
+    }
+    echo choose String("-1").try_to_u32() {
+        Option::Some(_) => 1,
+        Option::None => 0
+    }
+}

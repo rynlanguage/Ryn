@@ -1,13 +1,13 @@
-fn select(first: str, second: str) -> str {
+fun select(first: str, second: str) -> str {
     second
 }
 
-fn relay(value: str) -> str {
+fun relay(value: str) -> str {
     select("", value)
 }
 
-fn main() {
-    print(relay("Łódź 🦀"))
-    print(select("ignored", "UTF-8 ✓"))
-    print(relay(""))
+fun main() {
+    echo relay("Łódź 🦀")
+    echo select("ignored", "UTF-8 ✓")
+    echo relay("")
 }

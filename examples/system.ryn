@@ -1,0 +1,14 @@
+fun main() {
+    key := "RYN_SYSTEM_SMOKE"
+    echo env_exists(key)
+    assert(true)
+    assert_message(true, "the condition must hold")
+    echo set_env(key, "Ryn")
+    echo env_exists(key)
+    value := env_or(key, "fallback")
+    echo value
+    stdout_write("stdout API\n")
+    stderr_write("stderr API\n")
+    echo remove_env(key)
+    echo env_exists(key)
+}

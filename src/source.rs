@@ -194,21 +194,21 @@ mod tests {
             .as_nanos();
         let path =
             std::env::temp_dir().join(format!("ryn-source-{}-{unique}.ryn", std::process::id()));
-        fs::write(&path, "fn main() {}").expect("source fixture is written");
+        fs::write(&path, "fun main() {}").expect("source fixture is written");
 
         let source = SourceFile::load(&path).expect("source file loads");
 
         assert_eq!(source.path(), path);
-        assert_eq!(source.text(), "fn main() {}");
+        assert_eq!(source.text(), "fun main() {}");
         fs::remove_file(path).expect("temporary source is removed");
     }
 
     #[test]
     fn source_file_exposes_its_path_and_text() {
-        let source = SourceFile::new("src/main.ryn", "fn main() {}");
+        let source = SourceFile::new("src/main.ryn", "fun main() {}");
 
         assert_eq!(source.path(), Path::new("src/main.ryn"));
-        assert_eq!(source.text(), "fn main() {}");
+        assert_eq!(source.text(), "fun main() {}");
     }
 
     #[test]
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn renders_source_line_and_exact_highlight() {
-        let source = "fn main() {\n    print(missing)\n}";
+        let source = "fun main() {\n    echo(missing)\n}";
         let start = source.find("missing").expect("identifier is present");
         let diagnostic = Diagnostic {
             code: "R0203",
@@ -252,21 +252,24 @@ mod tests {
 
         assert_eq!(
             diagnostic.render(&SourceFile::new(Path::new("src/main.ryn"), source)),
-            "error[R0203]: unknown variable `missing`\n  --> src/main.ryn:2:11\n  |\n2 |     print(missing)\n  |           ^~~~~~~"
+            "error[R0203]: unknown variable `missing`\n  --> src/main.ryn:2:10\n  |\n2 |     echo(missing)\n  |          ^~~~~~~"
         );
     }
 
     #[test]
     fn handles_empty_and_multiline_spans_without_panicking() {
-        let source = "fn main() {\r\n    print(1)\r\n}";
+        let source = "fun main() {\r\n    echo(1)\r\n}";
         let diagnostic = Diagnostic {
             code: "R0012",
             message: "expected expression".into(),
             help: None,
-            span: Span { start: 13, end: 24 },
+            span: Span {
+                start: source.find("echo").unwrap(),
+                end: source.find('}').unwrap() + 1,
+            },
         };
         let rendered = diagnostic.render(&SourceFile::new("main.ryn", source));
-        assert!(rendered.contains("main.ryn:2:1"));
+        assert!(rendered.contains("main.ryn:2:5"));
         assert!(rendered.contains("^"));
 
         let empty = Diagnostic {
@@ -287,7 +290,7 @@ mod tests {
 
     #[test]
     fn renders_diagnostics_on_lone_cr_lines() {
-        let text = "fn main() {\r let value = missing\r}\r";
+        let text = "fun main() {\r value := missing\r}\r";
         let start = text.find("missing").unwrap();
         let diagnostic = Diagnostic {
             code: "R0203",
@@ -301,14 +304,14 @@ mod tests {
 
         let rendered = diagnostic.render(&SourceFile::new("legacy.ryn", text));
 
-        assert!(rendered.contains("legacy.ryn:2:14"));
-        assert!(rendered.contains("2 |  let value = missing"));
-        assert!(rendered.contains(&format!("  | {}^~~~~~~", " ".repeat(13))));
+        assert!(rendered.contains("legacy.ryn:2:11"));
+        assert!(rendered.contains("2 |  value := missing"));
+        assert!(rendered.contains(&format!("  | {}^~~~~~~", " ".repeat(10))));
     }
 
     #[test]
     fn aligns_caret_when_source_uses_tabs() {
-        let source = "fn main() {\n\tprint(missing)\n}";
+        let source = "fun main() {\n\techo missing\n}";
         let start = source.find("missing").expect("identifier is present");
         let diagnostic = Diagnostic {
             code: "R0203",
@@ -320,8 +323,8 @@ mod tests {
             },
         };
         let rendered = diagnostic.render(&SourceFile::new("main.ryn", source));
-        assert!(rendered.contains("2 |     print(missing)"));
-        assert!(rendered.contains("  |           ^~~~~~~"));
+        assert!(rendered.contains("2 |     echo missing"));
+        assert!(rendered.contains("  |          ^~~~~~~"));
     }
 
     #[test]
@@ -389,12 +392,12 @@ mod tests {
             code: "R0204",
             message: "`value` is immutable".into(),
             span: Span { start: 0, end: 5 },
-            help: Some("declare `value` with `let mut`".into()),
+            help: Some("declare `mut value := ...`".into()),
         };
         assert!(
             diagnostic
                 .render(&SourceFile::new("main.ryn", "value"))
-                .ends_with("  help: declare `value` with `let mut`")
+                .ends_with("  help: declare `mut value := ...`")
         );
     }
 }

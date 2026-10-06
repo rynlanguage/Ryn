@@ -1,0 +1,26 @@
+struct Point { x: i32, y: i32 }
+
+fun point_sum(points: Map<i32, Point>) -> Option<i32> {
+    return Option::Some(points.get(3)?.x + points.get(3)?.y)
+}
+
+fun main() {
+    mut points := Map<i32, Point>()
+    points.insert(3, Point { x: 4, y: 5 })
+    echo choose points.get(3) {
+        Option::Some(point) => point.x + point.y,
+        Option::None => -1
+    }
+    echo choose points.get(8) {
+        Option::Some(point) => point.x + point.y,
+        Option::None => -1
+    }
+    mut for_sum := Map<i32, Point>()
+    for_sum.insert(3, Point { x: 10, y: 20 })
+    echo choose point_sum(for_sum) {
+        Option::Some(sum) => sum,
+        Option::None => -1
+    }
+    echo points.remove(3)
+    echo points.len()
+}

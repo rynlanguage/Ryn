@@ -1,0 +1,24 @@
+#[drop(release)]
+struct Resource { handle: *i32 }
+
+fun release(resource: Resource) { echo *resource.handle }
+
+struct Bundle { resource: Resource, tag: i32 }
+
+fun forward(items: [Bundle; 2]) -> [Bundle; 2] {
+    return items
+}
+
+fun consume(items: [Bundle; 2]) {
+    echo 99
+}
+
+fun main() {
+    mut first: i32 = 11
+    mut second: i32 = 22
+    items := forward([
+        Bundle { resource: Resource { handle: &raw mut first }, tag: 101 },
+        Bundle { resource: Resource { handle: &raw mut second }, tag: 202 }
+    ])
+    consume(items)
+}

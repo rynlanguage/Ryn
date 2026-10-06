@@ -10,20 +10,29 @@ Ryn explores a language with readable source, strong static types, predictable c
 
 ## Status
 
-Ryn is an experimental compiler at version `0.0.1`. The current subset is useful for small programs and compiler experiments; it is not yet a general-purpose production language.
+The last published milestone is `0.0.1`; the current working tree starts the `0.0.2` language-foundations work. Ryn remains an experimental compiler for small programs and compiler experiments, not yet a general-purpose production language.
 
 Implemented syntax and behavior include:
 
 - `//` line comments and nestable `/* ... */` block comments.
-- Functions, typed parameters and results, function calls and recursion, with early `return` statements or tail-expression returns. `main` may be `fn main()` or `fn main() -> i32`; the latter supplies the native process exit code.
-- Immutable `let` bindings, mutable `let mut` bindings, type inference, and signed and unsigned fixed-width integers, `f32`, `f64`, `str`, and `bool`.
+- Functions, typed parameters and results, function calls and recursion, with early `return` statements or tail-expression returns. `main` may be `fun main()` or `fun main() -> i32`; the latter supplies the native process exit code.
+- Generic functions, structures, enums, and source-order type aliases specialize concrete type arguments; function calls accept inferred or explicit arguments, such as `convert::<i32>(value)`. Generic structures support direct type-parameter fields, collection fields such as `Vec<T>`, and nested generic structures when the inner template is declared first. Generic enums support direct type-parameter payloads, nested generic enum payloads, and `choose`. Generic aliases can be imported through project modules. Recursive generic fields and trait bounds are not implemented yet. See [generic functions](examples/generic_functions.ryn), [explicit type arguments](examples/generic_explicit.ryn), [generic structures](examples/generic_structs.ryn), and [generic enums and aliases](examples/generic_enums.ryn).
+- Inferred declarations use `name := value`; explicitly typed declarations use `name: Type = value`. Prefix either form with `mut` to allow mutation, for example `mut count := 0` or `mut count: i32 = 0`.
 - Numeric arithmetic and comparisons, explicit numeric casts with `as`, integer `%`, integer bitwise `~`, `&`, `^`, `|`, `<<`, and `>>`, equality for matching numeric, boolean, string, and structure values (structures compare fields recursively), `!`, and short-circuiting `&&` and `||`.
-- `if`/`else if`/`else` statements and value-producing `if` expressions with one value per branch, `while` and exclusive integer-range `for` loops with `break` and `continue`, `print`, simple string interpolation, numeric compound assignment (`+=`, `-=`, `*=`, `/=`, `%=`), and integer bitwise compound assignment (`&=`, `|=`, `^=`, `<<=`, `>>=`) on mutable locals and structure fields.
-- String literals support `\0`, `\n`, `\r`, `\t`, `\"`, `\\`, and Unicode scalar escapes in the form `\u{1F980}`. Invalid, surrogate, and out-of-range Unicode values are rejected. Strings carry an explicit length, so an escaped NUL is preserved when printed.
-- Structures with named fields, including nested by-value structures, named-field construction, field reads and mutation through `let mut`, and pass/return by value. `print` displays structures in declaration order as `Type { field: value }`, including nested values; strings inside structures are printed without quotes, like standalone strings. Cyclic by-value layouts are not supported yet.
+- `when`/`else when`/`else` statements and value-producing `when` expressions with one value per branch, `while`, exclusive integer-range `for` loops, and consuming `for item in Vec<T>` loops with `break` and `continue`, `echo`, simple string interpolation, numeric compound assignment (`+=`, `-=`, `*=`, `/=`, `%=`), and integer bitwise compound assignment (`&=`, `|=`, `^=`, `<<=`, `>>=`) on mutable locals and structure fields.
+- String literals support `\0`, `\n`, `\r`, `\t`, `\"`, `\\`, and Unicode scalar escapes in the form `\u{1F980}`. Invalid, surrogate, and out-of-range Unicode values are rejected. Strings carry an explicit length, so an escaped NUL is preserved by `echo`.
+- Owning UTF-8 `String` values constructed with `String()` or `String(text)`, with methods for append/push, clone, concat, byte/scalar indexing, copying slices, trim, text predicates, `find`, and `split`. `find` returns `Option<u64>` containing the zero-based Unicode scalar index, or `Option::None`; `split` returns an owning `Vec<String>`. `char` literals and Unicode scalar ordering are supported. Ryn Guard checks moves across assignments, function calls, structures, branches and loops; String owners and temporaries are freed on normal scope exits, returns and loop exits. Restricted custom destructors support move-only resource-handle structs declared with `#[drop(function)]`; their current field/layout limits are documented in the [ownership model](docs/memory-model.md). See also the runnable [dynamic String example](examples/dynamic_strings.ryn).
+- `String(number)` formats any signed integer, unsigned integer, `f32`, or `f64`. `value.to_i8()` through `to_i64()`, `to_u8()` through `to_u64()`, and `to_f32()`/`to_f64()` parse a String into the named type. The `try_to_*` forms return `Option<T>` for malformed or out-of-range text; see the [numeric String examples](examples/string_numbers.ryn) and [fallible parsing example](examples/string_parse_options.ryn).
+- Structures with named fields, including nested by-value structures, named-field construction, field reads and mutation through `mut`, and pass/return by value. `echo` displays structures in declaration order as `Type { field: value }`, including nested values; strings inside structures are printed without quotes, like standalone strings. Cyclic by-value layouts are not supported yet.
+- Type aliases use `type Name = ExistingType` or `type Name<T> = ExistingType<T>` and can name primitive, structure, enum, vector, or array types. Aliases must appear before uses in the source file; they do not create distinct nominal types. See the [type aliases example](examples/type_aliases.ryn) and [generic enum alias example](examples/generic_enums.ryn).
+- Enums with unit and tuple-style variants, constructors such as `Data::Text(String("Ryn"))`, exhaustive `choose` expressions, and payload bindings. Enum payloads can own `String` and `Vec<T>` values; pattern matching transfers bound values and generated cleanup releases remaining payloads. Enums print directly and inside interpolation as `Variant` or `Variant(value, ...)`; nested enum payloads and generic enum declarations are not implemented yet. See [the enum example](examples/enums.ryn) and [the enum formatting example](examples/enum_formatting.ryn).
+- Fixed arrays such as `[i32; 4]` support literals, by-value parameters and returns, bounds-checked reads, and indexed assignment through mutable locals. Elements can be scalar values, `str`, owning `String`, `Vec<T>`, `Map<K,V>`, enums, structures, or nested arrays; reading an owning element clones it, while assignment replaces and drops the old value. Clone/drop-supported arrays can be passed as call-scoped `&[T]` views. See [the arrays example](examples/arrays.ryn), [the structure array example](examples/struct_arrays.ryn), and [the enum array example](examples/enum_arrays.ryn).
+- `Vec<T>` supports scalar and owning String elements, plus `Map<K,V>` elements with deep clone/drop callbacks. Restricted custom-destructor resource handles, including through nested ordinary structs, are supported as move-only Vec elements with drop callbacks. They support move-in, replacement, take, clear and consuming iteration; cloning, indexed reads and slices are rejected. Read-only `&[T]` parameters can borrow Vec ranges with `as_slice()` or `slice(start, end)` when the element has generated clone/drop support. Indexing and iteration clone owned elements for the callee; fixed arrays can also be passed as slices, using a call-scoped flattened stack buffer. Storing or returning a slice is rejected. See [the slice example](examples/slices.ryn) and [the array slice example](examples/array_slices.ryn). `Map<K,V>` and its `HashMap<K,V>` spelling support integer, bool, char, and String keys; values may be scalars, String, Vec, nested maps, structs with supported copyable or owned fields (including `get() -> Option<Struct>`), structs with custom destructors (insert/replace/remove/cleanup), or a move-only struct whose ordinary fields nest custom-drop resources. Custom-drop Map values, directly or through ordinary struct wrappers, are destroyed on replacement, removal, clear, and scope exit; `get` and clone are rejected for these move-only values. Such Maps can also be fields of ordinary owning structs. Struct values with supported owned fields use generated clone/drop callbacks for map insertion, replacement, removal, map cloning and cleanup; `.get()` returns an owning `Option<Struct>`, and choose bindings or `?` transfer nested owners safely. Custom-destructor values cannot be cloned or retrieved; custom-drop resources may be stored in regular nested structs and are moved/dropped with those structs, while whole fixed arrays may contain these resources through ordinary structs; nested custom-drop values in enum payloads remain unsupported. `keys()` returns an owning `Vec<K>` of cloned keys and `values()` returns an owning `Vec<V>` of cloned values, so `for key in map.keys()` iterates a Map with the existing Vec loop; `values()` is rejected for move-only value types. See [the map iteration example](examples/map_iteration.ryn). Vec supports move-only elements that contain resources through ordinary struct fields. `get` returns `Option<V>` for cloneable supported values, so a missing key yields `None`; use `choose` or `?` to handle it. `Set<T>` currently uses the same hashed map runtime with boolean marker values and provides `add`/`insert`, `contains`, `remove`, `len`, and `clear` for supported key types. General user-defined generic types and a distinct Set representation remain unsupported. See [the Map and Set example](examples/maps.ryn).
+- File-scoped namespaces qualify declared functions and types: `namespace math::integer;` declares symbols such as `math::integer::add`, and `namespace;` returns to the root namespace. Calls can use full `::` paths, and unqualified function calls inside a namespace resolve in that namespace. See [the namespace example](examples/namespaces.ryn).
+- `extern "C"` imports scalar C functions, and `#[repr(C)]` marks structures for C layout. A one-field integer, bool, or char repr(C) record can currently be passed to and returned from an imported function; [the FFI example](examples/ffi_repr_c.ryn) calls native C-ABI shims and verifies both directions and record layout. Float-field and multi-field aggregate ABI are supported for packed records up to 8 bytes; [the float record example](examples/ffi_float_records.ryn) covers those paths. Raw-pointer parameters, dynamic library loading through `load_library`/`load_symbol`, and typed function pointer calls are implemented; [the dynamic library example](examples/dynamic_library.ryn) resolves `abs` from `ucrtbase.dll` and calls it through a typed pointer. Ryn functions coerce to typed function pointers with matching scalar or pointer signatures through `handler as HandlerFn` or an annotated binding, and native code can call those pointers back; [the function pointer example](examples/function_pointers.ryn) invokes coerced functions indirectly and receives a Win32 `EnumWindows` callback that mutates a Ryn local through a raw pointer. Records larger than 8 bytes are not supported yet.
 - Process arguments through `arg_count() -> u32` and `arg(index: u32) -> str`. The count excludes the executable path, indexes start at zero, and an out-of-range index returns an empty string; compare with `arg_count()` to distinguish it from a deliberately empty argument. Non-Unicode operating-system arguments are converted lossily to valid UTF-8.
-- `ryn new` creates a project with `src/main.ryn`; `ryn check`, native `ryn build`, and `ryn run` accept either a source file or a project directory. Project commands use `src/main.ryn`, and their default executable is written under `build/`. `ryn clean <project-dir>` removes only that project's direct `build/` directory and refuses a symbolic link at that path. Rust library APIs are available through `ryn::check`, `ryn::check_recovering`, `ryn::check_source`, `ryn::check_source_recovering`, `ryn::compile`, `ryn::compile_source`, and the public compiler modules.
-- `ryn check` gathers recoverable lexical errors and, when lexing succeeds, recovers between structure fields, function parameters, call arguments, structure literal fields, and statements, inside nested blocks, and across top-level declarations to report independent parser errors together. It also checks control-flow bodies after malformed conditions or range headers. Semantic analysis reports duplicate structure and function declarations together in source order. With unique top-level names, it reports all invalid field declarations, function parameter/result types, and invalid `main` signatures. With valid signatures, it reports all duplicate parameter names and skips affected bodies. Other bodies collect errors across independent statements and nested blocks, including each missing name in a print interpolation, errors in arguments to known or unknown calls (including known calls with the wrong arity), independent field initializer errors in structure literals, and errors from both operands of a binary expression when both can be checked independently. It also checks an assignment's right-hand expression even when its target is invalid, a local initializer when its declaration is invalid, and return expressions when the function has no declared result type. A failed new local declaration stops later statements in that block to avoid cascading unknown-name errors. An invalid `if` or `while` condition does not prevent checking its branches or loop body. Tail-return validation also reports independent errors unless recovery stopped at a failed function-level local declaration. Recovering semantic analysis reports independent recursive by-value structure layout cycles together; other global layout errors stop at the first issue.
+- `ryn new` creates a project with `ryn.yaml` and `src/main.ryn`; `ryn check`, native `ryn build`, and `ryn run` validate and use the manifest when given a project directory. `build.optimize` accepts `speed`, `size`, and `none`; local `path` dependencies and their transitive local dependencies resolve modules from each package's `src/` directory. Version and Git dependencies can be declared but are not fetched. Project commands use `src/main.ryn`, and their default executable is written under `build/`. `ryn clean <project-dir>` removes only that project's direct `build/` directory and refuses a symbolic link at that path. Rust library APIs are available through `ryn::check`, `ryn::check_recovering`, `ryn::check_source`, `ryn::check_source_recovering`, `ryn::compile`, `ryn::compile_source`, and the public compiler modules.
+- `ryn check` gathers recoverable lexical errors and, when lexing succeeds, recovers between structure fields, function parameters, call arguments, structure literal fields, and statements, inside nested blocks, and across top-level declarations to report independent parser errors together. It also checks control-flow bodies after malformed conditions or range headers. Semantic analysis reports duplicate structure and function declarations together in source order. With unique top-level names, it reports all invalid field declarations, function parameter/result types, and invalid `main` signatures. With valid signatures, it reports all duplicate parameter names and skips affected bodies. Other bodies collect errors across independent statements and nested blocks, including each missing name in an `echo` interpolation, errors in arguments to known or unknown calls (including known calls with the wrong arity), independent field initializer errors in structure literals, and errors from both operands of a binary expression when both can be checked independently. It also checks an assignment's right-hand expression even when its target is invalid, a local initializer when its declaration is invalid, and return expressions when the function has no declared result type. A failed new local declaration stops later statements in that block to avoid cascading unknown-name errors. An invalid `when` or `while` condition does not prevent checking its branches or loop body. Tail-return validation also reports independent errors unless recovery stopped at a failed function-level local declaration. Recovering semantic analysis reports independent recursive by-value structure layout cycles together; other global layout errors stop at the first issue.
 
 Integer literals may be decimal, binary (`0b1010`), or hexadecimal (`0x2a`). Binary and hexadecimal prefixes may use uppercase letters, and `_` may group digits in any integer base. Decimal integers and floating-point literals may also use `_` between digits, including in the fractional part and exponent. Separators at the start or end of a digit sequence, next to a decimal point or exponent marker, or repeated together are rejected. Numeric conversions are explicit: mixed numeric operands are rejected unless converted with an explicit cast. Integer literals use an expected integer type when context provides one, or default to `i64`; floating-point literals use an expected `f32` or `f64`, or default to `f64`. Signed integer unary `-` and integer `+`, `-`, and `*` wrap at the operand width. Signed integer division truncates toward zero; `%` returns the corresponding signed remainder. Unsigned `/` and `%` use unsigned division and remainder. The signed minimum divided by `-1` wraps to that minimum, and its remainder is `0`. Integer `/` or `%` by zero prints a runtime diagnostic to stderr and exits with code `1`. Floating-point arithmetic follows IEEE-754: division by zero can produce infinity or NaN, NaN is unequal to itself, and ordered comparisons with NaN are false. Non-finite floating-point literals are rejected; non-finite runtime results are allowed.
 Numeric casts use `value as target`. Integer widening extends the source sign for signed values and fills with zero for unsigned values; integer narrowing keeps the low bits. A cast to a same-width integer type with different signedness preserves the bits and changes their interpretation. Integer-to-float conversions round to nearest, ties to even. `f32` to `f64` is exact; `f64` to `f32` rounds to nearest, ties to even. Float-to-integer conversions truncate toward zero and saturate to the target type's range; NaN converts to zero.
@@ -39,28 +48,28 @@ Function arguments, binary operands, and structure field initializers evaluate f
 The runnable [quick start](examples/quick_start.ryn) demonstrates a function, inferred and mutable locals, compound assignment, a value-producing conditional, and string interpolation:
 
 ```ryn
-fn add(a: i32, b: i32) -> i32 {
+fun add(a: i32, b: i32) -> i32 {
     a + b
 }
 
-fn main() {
-    let name = "Ryn"
-    let mut health = 100
+fun main() {
+    name := "Ryn"
+    mut health := 100
 
     health -= 20
 
-    let status = if health > 0 { "alive" } else { "down" }
-    print(status)
+    status := when health > 0 { "alive" } else { "down" }
+    echo status
 
-    if health > 0 {
-        print("Hello, {name}!")
-        print(add(20, 22))
-        print(health)
+    when health > 0 {
+        echo "Hello, {name}!"
+        echo add(20, 22)
+        echo health
     }
 }
 ```
 
-The [if-expression example](examples/if_expression.ryn) covers typed branch values, nested `else if`, and selected-branch evaluation through the native backend.
+The [conditional-expression example](examples/if_expression.ryn) covers typed branch values, nested `else when`, and selected-branch evaluation through the native backend.
 
 The [integer semantics example](examples/integer_semantics.ryn) demonstrates fixed-width wrapping, signed division toward zero, minimum-value division edge cases, and unsigned division and remainder at each integer width.
 
@@ -74,11 +83,25 @@ The [string-escapes example](examples/string_escapes.ryn) demonstrates escaped N
 
 Write a range loop as `for index in start..end { ... }`. The bounds must have the same integer type. The start is included and the end is excluded; both expressions are evaluated once from left to right before iteration. The immutable `index` binding is available only inside the loop body, and the loop advances it by one.
 
+Write `for item in values { ... }` to consume a `Vec<T>` in order. Each element moves into an immutable loop binding; the vector and any unconsumed elements are cleaned up on loop exit. See the [Vec iteration example](examples/vec_iteration.ryn).
+
 The [structures example](examples/structs.ryn) shows nested field initialization, reads and updates, pass/return by value, and whole-structure output both directly and inside string interpolation.
 
 The [exit-code example](examples/exit_code.ryn) shows a program returning a nonzero native process status.
 
 The [process-arguments example](examples/arguments.ryn) reads the number of command-line arguments and the first argument.
+
+The [filesystem example](examples/filesystem.ryn) demonstrates creating directories, writing and reading UTF-8 files, checking file and directory paths, and deleting files and empty directories. `try_read_file` returns `Option<String>` for success/failure; `read_file_result` returns `Result<String, i32>` with distinct codes for missing files, permissions, invalid UTF-8, invalid paths, and other I/O failures. The [Result file example](examples/read_file_result.ryn) shows both success and error handling. `read_file` remains the terminating convenience form.
+
+The [system example](examples/system.ryn) demonstrates environment access and direct stdout/stderr writes. `stdin_read()` reads UTF-8 input to EOF, as shown in the [stdin example](examples/stdin.ryn). `run_process(program)` launches one process without arguments; `run_process_args(program, Vec<String>)` passes UTF-8 arguments. Both return the exit code, or `-1` if launch fails or the process has no numeric exit code. [A Windows process example](examples/process_args_windows.ryn) checks argument delivery and exit status.
+
+Small `#[repr(C)]` aggregates of up to 8 bytes can use integer, boolean, character, `f32`, and `f64` fields with natural C layout on the currently supported Windows x86_64 ABI. [The float-record example](examples/ffi_float_records.ryn) passes and returns float records through runtime-shim functions using the real C ABI.
+
+`exit(code: i32)` terminates the current process with the requested status after releasing live compiler-known owners. Returning an `i32` from `main` is also supported and remains the ordinary way to choose a final status.
+
+`panic(message)`, `assert(condition)`, and `assert_message(condition, message)` write failures to stderr, release live compiler-known owners, and terminate with exit status 1. Generated cleanup includes supported custom destructors, but Ryn does not unwind its frames.
+
+The [panic cleanup](examples/panic_cleanup.ryn) and [assertion cleanup](examples/assert_cleanup.ryn) examples each keep an owning String live on the failure path.
 
 ## Build and run
 
@@ -105,7 +128,24 @@ cargo run --manifest-path ..\Cargo.toml -- build .
 cargo run --manifest-path ..\Cargo.toml -- run .
 ```
 
-When using an installed `ryn` executable, the commands from inside the project are simply `ryn check .`, `ryn build .`, and `ryn run .`. The project entry point is `src/main.ryn`; default native output goes to `build/<project-name>` (with `.exe` on Windows). `ryn new` refuses to overwrite an existing path. The generated project intentionally has no dependency manifest yet.
+When using an installed `ryn` executable, the commands from inside the project are simply `ryn check .`, `ryn build .`, and `ryn run .`. The project entry point is `src/main.ryn`; default native output goes to `build/debug/<project-name>` (with `.exe` on Windows), while `--release` selects `build/release/`. `ryn new` refuses to overwrite an existing path and creates `ryn.yaml` plus `build/cache`, `build/debug`, and `build/release` directories. Project builds reuse an unchanged, fingerprint-verified executable from `build/cache`; changed inputs trigger a rebuild.
+
+The generated manifest is intentionally small:
+
+```yaml
+name: hello-ryn
+version: 0.1.0
+owner: guest
+
+dependencies:
+
+build:
+  optimize: speed
+  debug: none
+  release: speed
+```
+
+`build.optimize`, `build.debug`, and `build.release` accept `speed`, `size`, or `none`. The profile-specific setting overrides `build.optimize`; when omitted, the legacy `build.optimize` value is used. `--release` selects the release output directory and release optimization, while the default build uses the debug profile. Standalone source builds use `none` for debug and `speed` for release. Direct and transitive local path dependencies are resolved as project packages. Git dependencies may specify an optional branch; `ryn lock <project>` writes a `ryn.lock` with the selected commit, and project check/build/run restore that locked revision in the project's ignored `.ryn/git` cache. Registry version dependencies are parsed but not resolved yet.
 
 ## Install the latest release
 
@@ -125,7 +165,7 @@ The repository is currently private. Sign in with `gh auth login` before running
 
 Remove the project's default build artifacts with `ryn clean .`. This command leaves source files and executables written outside `build/` untouched.
 
-`build` and `run` accept `-o` or `--output` to choose the native executable path. `run` keeps the generated executable at that path after it finishes.
+`build` and `run` accept `--release` to select the release output directory and `-o` or `--output` to choose the native executable path. `run` keeps the generated executable at that path after it finishes.
 
 When `main` returns `i32`, `ryn run` exits with that status after flushing the program's standard output. A `main` without a result returns process status `0`.
 
@@ -173,4 +213,4 @@ cargo test --release --workspace -- --test-threads=4
 
 ## License
 
-The project license has not been selected yet.
+Ryn is distributed under the [Mozilla Public License 2.0](LICENSE).

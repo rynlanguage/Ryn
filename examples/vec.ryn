@@ -1,0 +1,29 @@
+fun main() {
+    mut numbers: Vec<i32> = Vec()
+    numbers.push(10)
+    numbers.push(20)
+    numbers.push(30)
+    echo numbers.len()
+    echo numbers.capacity()
+    taken := numbers.take(1)
+    echo taken
+    numbers.set(0, 99)
+    echo numbers.index(0)
+    mut copy := numbers.clone()
+    echo copy.len()
+    copy.clear()
+    echo copy.len()
+
+    mut names := Vec<String>()
+    greeting := String("hello")
+    names.push(greeting)
+    echo names.len()
+    first := names.take(0)
+    echo first
+
+    mut both: Vec<i64> = Vec<i64>()
+    both.push(7)
+    both.push(8)
+    echo both.len()
+    echo both.index(1)
+}

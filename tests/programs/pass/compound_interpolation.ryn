@@ -1,14 +1,14 @@
-fn matches(left: str, right: str) -> bool {
+fun matches(left: str, right: str) -> bool {
     left == right
 }
 
-fn main() {
-    let mut health: i32 = 100
+fun main() {
+    mut health: i32 = 100
     health -= 20
 
-    if health == 80 && matches("Ryn", "Ryn") {
-        print("health={health}")
+    when health == 80 && matches("Ryn", "Ryn") {
+        echo("health={health}")
     } else {
-        print("unexpected health")
+        echo("unexpected health")
     }
 }

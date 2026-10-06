@@ -1,0 +1,77 @@
+fun maybe_value(value: i32) -> Option<i32> {
+    return Option::Some(value)
+}
+
+fun failed() -> Result<i32, String> {
+    return Result::Err(String("no value"))
+}
+
+fun parse_value(success: bool) -> Result<i32, String> {
+    when success {
+        return Result::Ok(41)
+    }
+    return Result::Err(String("parse failed"))
+}
+
+fun widened(success: bool) -> Result<i64, String> {
+    marker := String("scope cleanup")
+    incoming := parse_value(success)
+    value: i32 = incoming?
+    return Result::Ok(value as i64 + 1)
+}
+
+fun maybe_positive(value: i32) -> Option<i32> {
+    when value > 0 {
+        return Option::Some(value)
+    }
+    return Option::None
+}
+
+fun tripled(value: i32) -> Option<i64> {
+    marker := String("cleanup on None")
+    number: i32 = maybe_positive(value)?
+    return Option::Some(number as i64 * 3)
+}
+
+fun main() {
+    maybe: Option<i32> = maybe_value(17)
+    none: Option<i32> = Option::None
+    answer: Result<i32, String> = failed()
+    nested: Option<Result<i32, String>> = Option::Some(Result::Ok(31))
+
+    echo choose maybe {
+        Option::Some(value) => value,
+        Option::None => 0
+    }
+    echo choose none {
+        Option::Some(value) => value,
+        Option::None => 23
+    }
+    echo choose answer {
+        Result::Ok(value) => value,
+        Result::Err(message) => message.char_count() as i32
+    }
+    echo choose nested {
+        Option::Some(result) => choose result {
+            Result::Ok(value) => value,
+            Result::Err(message) => message.char_count() as i32
+        },
+        Option::None => 0
+    }
+    echo choose widened(true) {
+        Result::Ok(value) => value,
+        Result::Err(message) => message.char_count() as i64
+    }
+    echo choose widened(false) {
+        Result::Ok(value) => value,
+        Result::Err(message) => message.char_count() as i64
+    }
+    echo choose tripled(14) {
+        Option::Some(value) => value,
+        Option::None => 0 as i64
+    }
+    echo choose tripled(-2) {
+        Option::Some(value) => value,
+        Option::None => 0 as i64
+    }
+}

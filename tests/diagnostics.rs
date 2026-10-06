@@ -62,7 +62,7 @@ fn check_command_highlights_a_misplaced_numeric_separator() {
         "ryn-numeric-separator-{}-{unique}.ryn",
         std::process::id()
     ));
-    fs::write(&source_path, "fn main() { print(1__2) }").expect("temporary Ryn source is written");
+    fs::write(&source_path, "fun main() { echo(1__2) }").expect("temporary Ryn source is written");
 
     let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
         .arg("check")
@@ -77,7 +77,7 @@ fn check_command_highlights_a_misplaced_numeric_separator() {
         stderr.contains("error[R0008]: numeric separators must appear between digits"),
         "{stderr}"
     );
-    assert!(stderr.contains("print(1__2)"), "{stderr}");
+    assert!(stderr.contains("echo(1__2)"), "{stderr}");
     assert!(stderr.contains("^"), "{stderr}");
 }
 
@@ -91,7 +91,7 @@ fn check_command_highlights_a_digit_invalid_for_the_literal_base() {
         "ryn-invalid-radix-digit-{}-{unique}.ryn",
         std::process::id()
     ));
-    fs::write(&source_path, "fn main() { print(0b2) }").expect("temporary Ryn source is written");
+    fs::write(&source_path, "fun main() { echo(0b2) }").expect("temporary Ryn source is written");
 
     let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
         .arg("check")
@@ -107,7 +107,7 @@ fn check_command_highlights_a_digit_invalid_for_the_literal_base() {
         "{stderr}"
     );
     assert!(stderr.contains("use only `0` and `1`"), "{stderr}");
-    assert!(stderr.contains("print(0b2)"), "{stderr}");
+    assert!(stderr.contains("echo(0b2)"), "{stderr}");
     assert!(stderr.contains("^"), "{stderr}");
 }
 
@@ -121,7 +121,7 @@ fn check_command_reports_an_unterminated_block_comment() {
         "ryn-unterminated-comment-{}-{unique}.ryn",
         std::process::id()
     ));
-    fs::write(&source_path, "fn main() { /* unfinished").expect("temporary Ryn source is written");
+    fs::write(&source_path, "fun main() { /* unfinished").expect("temporary Ryn source is written");
 
     let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
         .arg("check")
@@ -148,7 +148,7 @@ fn check_command_shows_source_and_caret_for_semantic_errors() {
         .as_nanos();
     let source_path =
         std::env::temp_dir().join(format!("ryn-invalid-{}-{unique}.ryn", std::process::id()));
-    fs::write(&source_path, "fn main() {\n    print(missing)\n}")
+    fs::write(&source_path, "fun main() {\n    echo(missing)\n}")
         .expect("temporary Ryn source is written");
 
     let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
@@ -164,9 +164,9 @@ fn check_command_shows_source_and_caret_for_semantic_errors() {
         "invalid source must fail `ryn check`"
     );
     assert!(stderr.contains("error[R0203]: unknown variable `missing`"));
-    assert!(stderr.contains(":2:11"));
-    assert!(stderr.contains("2 |     print(missing)"));
-    assert!(stderr.contains("|           ^~~~~~~"));
+    assert!(stderr.contains(":2:10"));
+    assert!(stderr.contains("2 |     echo(missing)"));
+    assert!(stderr.contains("|          ^~~~~~~"));
 }
 
 #[test]
@@ -181,7 +181,7 @@ fn check_command_reports_independent_recursive_structure_layout_cycles() {
     ));
     fs::write(
         &source_path,
-        "struct A { b: B }\nstruct B { a: A }\nstruct C { c: C }\nfn main() {}\n",
+        "struct A { b: B }\nstruct B { a: A }\nstruct C { c: C }\nfun main() {}\n",
     )
     .expect("temporary Ryn source is written");
 
@@ -209,7 +209,7 @@ fn check_command_renders_diagnostics_for_lone_cr_line_endings() {
         .as_nanos();
     let source_path =
         std::env::temp_dir().join(format!("ryn-cr-lines-{}-{unique}.ryn", std::process::id()));
-    fs::write(&source_path, "fn main() {\r let value = missing\r}\r")
+    fs::write(&source_path, "fun main() {\r value := missing\r}\r")
         .expect("temporary Ryn source is written");
 
     let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
@@ -222,9 +222,9 @@ fn check_command_renders_diagnostics_for_lone_cr_line_endings() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(!result.status.success());
     assert!(stderr.contains("error[R0203]: unknown variable `missing`"));
-    assert!(stderr.contains(":2:14"));
-    assert!(stderr.contains("2 |  let value = missing"));
-    assert!(stderr.contains(&format!("| {}^~~~~~~", " ".repeat(13))));
+    assert!(stderr.contains(":2:11"));
+    assert!(stderr.contains("2 |  value := missing"));
+    assert!(stderr.contains(&format!("| {}^~~~~~~", " ".repeat(10))));
 }
 
 #[test]
@@ -239,7 +239,7 @@ fn check_command_reports_multiple_independent_syntax_errors() {
     ));
     fs::write(
         &source_path,
-        "fn first() { let = 1 }\nfn second( { }\nfn main() {}",
+        "fun first() { mut := 1 }\nfun second( { }\nfun main() {}",
     )
     .expect("temporary Ryn source is written");
 
@@ -255,8 +255,8 @@ fn check_command_reports_multiple_independent_syntax_errors() {
     assert_eq!(stderr.matches("error[R0010]").count(), 2, "{stderr}");
     assert!(stderr.contains("expected variable name"));
     assert!(stderr.contains("expected parameter name"));
-    assert!(stderr.contains(":1:18"));
-    assert!(stderr.contains(":2:12"));
+    assert!(stderr.contains(":1:19"));
+    assert!(stderr.contains(":2:13"));
 }
 
 #[test]
@@ -271,7 +271,7 @@ fn check_command_reports_syntax_errors_inside_nested_blocks_together() {
     ));
     fs::write(
         &source_path,
-        "fn main() {\n    let = 1\n    if true {\n        print(1 + )\n        let = 2\n        print(3)\n    }\n    let = 4\n}\nfn other() { print(5 + ) }",
+        "fun main() {\n    mut := 1\n    when true {\n        echo(1 + )\n        mut := 2\n        echo(3)\n    }\n    mut := 4\n}\nfun other() { echo(5 + ) }",
     )
     .expect("temporary Ryn source is written");
 
@@ -293,7 +293,7 @@ fn check_command_reports_syntax_errors_inside_nested_blocks_together() {
     );
     assert_eq!(stderr.matches("expected expression").count(), 2, "{stderr}");
     assert!(stderr.contains(":2:9"));
-    assert!(stderr.contains(":4:19"));
+    assert!(stderr.contains(":4:18"));
     assert!(stderr.contains(":10:24"));
 }
 
@@ -309,7 +309,7 @@ fn check_command_reports_body_errors_after_malformed_control_flow_headers() {
     ));
     fs::write(
         &source_path,
-        "fn main() { if ) { let = 1 print(2 + ) } while { let = 3 } for index in 0.. { let = 4 print(5 + ) } for index in 0.. if true { 6 + } else { 7 } { let = 8 } while if true { 9 + } else { true } { let = 10 } for index in 0.. if ) { 11 } else { 12 } { let = 13 } while if ) { true } else { true } { let = 14 } }",
+        "fun main() { when ) { mut := 1 echo(2 + ) } while { mut := 3 } for index in 0.. { mut := 4 echo(5 + ) } for index in 0.. when true { 6 + } else { 7 } { mut := 8 } while when true { 9 + } else { true } { mut := 10 } for index in 0.. when ) { 11 } else { 12 } { mut := 13 } while when ) { true } else { true } { mut := 14 } }",
     )
     .expect("temporary Ryn source is written");
 
@@ -344,7 +344,7 @@ fn check_command_reports_semantic_range_errors_and_body_errors_together() {
     ));
     fs::write(
         &source_path,
-        "fn main() {\n    let item = true\n    for item in missing_start..2 {\n        print(missing_body)\n    }\n}\n",
+        "fun main() {\n    item := true\n    for item in missing_start..2 {\n        echo(missing_body)\n    }\n}\n",
     )
     .expect("temporary Ryn source is written");
 
@@ -364,7 +364,7 @@ fn check_command_reports_semantic_range_errors_and_body_errors_together() {
     assert!(stderr.contains("unknown variable `missing_body`"));
     assert!(stderr.contains(":3:9"));
     assert!(stderr.contains(":3:17"));
-    assert!(stderr.contains(":4:15"));
+    assert!(stderr.contains(":4:14"));
 }
 
 #[test]
@@ -379,7 +379,7 @@ fn check_command_reports_structure_field_syntax_errors_together() {
     ));
     fs::write(
         &source_path,
-        "struct Config { good: i32, broken: , next: str, : bool, last: f64 } fn main() {}",
+        "struct Config { good: i32, broken: , next: str, : bool, last: f64 } fun main() {}",
     )
     .expect("temporary Ryn source is written");
 
@@ -409,7 +409,7 @@ fn check_command_reports_function_parameter_syntax_errors_together() {
     ));
     fs::write(
         &source_path,
-        "fn broken(a i32, : bool, c: ) -> i32 { print(1 + ) 1 } fn main() {}",
+        "fun broken(a i32, : bool, c: ) -> i32 { echo(1 + ) 1 } fun main() {}",
     )
     .expect("temporary Ryn source is written");
 
@@ -442,7 +442,7 @@ fn check_command_reports_call_and_structure_literal_errors_together() {
     ));
     fs::write(
         &source_path,
-        "struct Pair { a: i32, b: i32, c: i32 } fn combine(a: i32, b: i32, c: i32) {} fn main() { print(combine(1 + , 2 + , 3)) print(combine(1 2)) let pair = Pair { a: 1 + , b: 2 + , c: } let other = Pair { a: 1 b: 2 } }",
+        "struct Pair { a: i32, b: i32, c: i32 } fun combine(a: i32, b: i32, c: i32) {} fun main() { echo(combine(1 + , 2 + , 3)) echo(combine(1 2)) pair := Pair { a: 1 + , b: 2 + , c: } other := Pair { a: 1 b: 2 } }",
     )
     .expect("temporary Ryn source is written");
 
@@ -471,7 +471,7 @@ fn check_command_reports_multiple_independent_lexical_errors() {
         "ryn-multiple-lexical-errors-{}-{unique}.ryn",
         std::process::id()
     ));
-    fs::write(&source_path, "@ fn main() { 💥 }").expect("temporary Ryn source is written");
+    fs::write(&source_path, "@ fun main() { 💥 }").expect("temporary Ryn source is written");
 
     let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
         .arg("check")
@@ -484,7 +484,7 @@ fn check_command_reports_multiple_independent_lexical_errors() {
     assert!(!result.status.success());
     assert_eq!(stderr.matches("error[R0005]").count(), 2, "{stderr}");
     assert!(stderr.contains(":1:1"));
-    assert!(stderr.contains(":1:15"));
+    assert!(stderr.contains(":1:16"));
 }
 
 #[test]
@@ -499,7 +499,7 @@ fn check_command_reports_semantic_errors_from_independent_functions() {
     ));
     fs::write(
         &source_path,
-        "fn first() {\n    print(missing_first)\n}\nfn second() {\n    print(missing_second)\n}\nfn main() {}\n",
+        "fun first() {\n    echo(missing_first)\n}\nfun second() {\n    echo(missing_second)\n}\nfun main() {}\n",
     )
     .expect("temporary Ryn source is written");
 
@@ -515,8 +515,8 @@ fn check_command_reports_semantic_errors_from_independent_functions() {
     assert_eq!(stderr.matches("error[R0203]").count(), 2, "{stderr}");
     assert!(stderr.contains("`missing_first`"));
     assert!(stderr.contains("`missing_second`"));
-    assert!(stderr.contains(":2:11"));
-    assert!(stderr.contains(":5:11"));
+    assert!(stderr.contains(":2:10"));
+    assert!(stderr.contains(":5:10"));
 }
 
 #[test]
@@ -531,7 +531,7 @@ fn check_command_reports_all_duplicate_global_declarations() {
     ));
     fs::write(
         &source_path,
-        "struct First { value: i32 }\nfn duplicate() {}\nstruct First { value: i32 }\nfn main() {}\nfn duplicate() {}\nstruct Second { value: i32 }\nstruct Second { value: i32 }\n",
+        "struct First { value: i32 }\nfun duplicate() {}\nstruct First { value: i32 }\nfun main() {}\nfun duplicate() {}\nstruct Second { value: i32 }\nstruct Second { value: i32 }\n",
     )
     .expect("temporary Ryn source is written");
 
@@ -571,7 +571,7 @@ fn check_command_reports_independent_structure_declaration_errors() {
     ));
     fs::write(
         &source_path,
-        "struct First { value: Missing, other: MissingToo }\nstruct Second { value: i32, value: MissingAgain }\nstruct Empty {}\nfn main() {}\n",
+        "struct First { value: Missing, other: MissingToo }\nstruct Second { value: i32, value: MissingAgain }\nstruct Empty {}\nfun main() {}\n",
     )
     .expect("temporary Ryn source is written");
 
@@ -635,7 +635,7 @@ fn check_command_explains_the_required_main_signature() {
         "ryn-main-signature-{}-{unique}.ryn",
         std::process::id()
     ));
-    fs::write(&source_path, "fn main(value: i32) {}").expect("temporary source is written");
+    fs::write(&source_path, "fun main(value: i32) {}").expect("temporary source is written");
 
     let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
         .arg("check")
@@ -649,7 +649,7 @@ fn check_command_explains_the_required_main_signature() {
     assert!(stderr.contains(
         "error[R0208]: `main` must take no parameters and return either no value or `i32`"
     ));
-    assert!(stderr.contains("help: use `fn main() { ... }` or `fn main() -> i32 { ... }`"));
+    assert!(stderr.contains("help: use `fun main() { ... }` or `fun main() -> i32 { ... }`"));
 }
 
 #[test]
@@ -664,7 +664,7 @@ fn check_command_highlights_the_incompatible_operator_operand() {
     ));
     fs::write(
         &source_path,
-        "fn main() {\n    let left: i32 = 1\n    let right: i64 = 2\n    print(left + right)\n}\n",
+        "fun main() {\n    left: i32 = 1\n    right: i64 = 2\n    echo(left + right)\n}\n",
     )
     .expect("temporary Ryn source is written");
 
@@ -680,8 +680,8 @@ fn check_command_highlights_the_incompatible_operator_operand() {
     assert!(stderr.contains(
         "error[R0206]: arithmetic operands must have matching numeric types, found `i32` and `i64`"
     ));
-    assert!(stderr.contains("4 |     print(left + right)"));
-    assert!(stderr.contains(&format!("  | {}^~~~~", " ".repeat(17))));
+    assert!(stderr.contains("4 |     echo(left + right)"));
+    assert!(stderr.contains(&format!("  | {}^~~~~", " ".repeat(16))));
     assert!(stderr.contains(
         "help: use matching numeric types; Ryn does not implicitly convert numeric values"
     ));
@@ -697,7 +697,7 @@ fn check_command_shows_actionable_help_for_immutable_assignment() {
         std::env::temp_dir().join(format!("ryn-immutable-{}-{unique}.ryn", std::process::id()));
     fs::write(
         &source_path,
-        "fn main() {\n    let value = 1\n    value = 2\n}",
+        "fun main() {\n    value := 1\n    value = 2\n}",
     )
     .expect("temporary Ryn source is written");
 
@@ -711,9 +711,7 @@ fn check_command_shows_actionable_help_for_immutable_assignment() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(!result.status.success());
     assert!(stderr.contains("error[R0204]: `value` is immutable"));
-    assert!(
-        stderr.contains("help: declare `value` with `let mut` if you intend to assign a new value")
-    );
+    assert!(stderr.contains("help: declare `mut value := ...` if this binding must be mutable"));
 }
 
 #[test]
@@ -726,7 +724,7 @@ fn check_command_suggests_the_required_type_for_a_bad_argument() {
         std::env::temp_dir().join(format!("ryn-type-{}-{unique}.ryn", std::process::id()));
     fs::write(
         &source_path,
-        "fn take(value: i32) {}\nfn main() {\n    take(\"wrong\")\n}",
+        "fun take(value: i32) {}\nfun main() {\n    take(\"wrong\")\n}",
     )
     .expect("temporary Ryn source is written");
 
@@ -754,7 +752,7 @@ fn check_command_suggests_a_boolean_condition() {
         .as_nanos();
     let source_path =
         std::env::temp_dir().join(format!("ryn-condition-{}-{unique}.ryn", std::process::id()));
-    fs::write(&source_path, "fn main() { if 1 { print(1) } }")
+    fs::write(&source_path, "fun main() { when 1 { echo(1) } }")
         .expect("temporary Ryn source is written");
 
     let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
@@ -766,7 +764,7 @@ fn check_command_suggests_a_boolean_condition() {
 
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(!result.status.success());
-    assert!(stderr.contains("error[R0207]: `if` condition must have type `bool`"));
+    assert!(stderr.contains("error[R0207]: `when` condition must have type `bool`"));
     assert!(
         stderr.contains("help: use a boolean expression, such as a comparison, for the condition")
     );
@@ -782,7 +780,7 @@ fn check_command_shows_the_valid_integer_literal_range() {
         "ryn-integer-range-{}-{unique}.ryn",
         std::process::id()
     ));
-    fs::write(&source_path, "fn main() { let value: i8 = 128 }")
+    fs::write(&source_path, "fun main() { value: i8 = 128 }")
         .expect("temporary Ryn source is written");
 
     let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
@@ -808,7 +806,7 @@ fn check_command_suggests_a_close_variable_name() {
         .as_nanos();
     let source_path =
         std::env::temp_dir().join(format!("ryn-name-{}-{unique}.ryn", std::process::id()));
-    fs::write(&source_path, "fn main() { let count = 1 print(cout) }")
+    fs::write(&source_path, "fun main() { mut count := 1 echo(cout) }")
         .expect("temporary Ryn source is written");
 
     let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
@@ -834,7 +832,7 @@ fn check_command_suggests_process_argument_builtins() {
         "ryn-builtin-name-{}-{unique}.ryn",
         std::process::id()
     ));
-    fs::write(&source_path, "fn main() { arg_coun(0) }").expect("temporary Ryn source is written");
+    fs::write(&source_path, "fun main() { arg_coun(0) }").expect("temporary Ryn source is written");
 
     let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
         .arg("check")
@@ -865,7 +863,7 @@ fn check_command_suggests_a_close_variable_name_for_assignment_targets() {
         "ryn-assignment-name-{}-{unique}.ryn",
         std::process::id()
     ));
-    fs::write(&source_path, "fn main() { let mut count = 1 cout += 2 }")
+    fs::write(&source_path, "fun main() { mut count := 1 cout += 2 }")
         .expect("temporary Ryn source is written");
 
     let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
@@ -885,17 +883,17 @@ fn check_command_suggests_a_close_variable_name_for_assignment_targets() {
 fn check_command_suggests_close_structure_field_names() {
     let cases = [
         (
-            "struct Point { width: i32 height: i32 }\nfn main() { let point = Point { widht: 10, height: 20 } }",
+            "struct Point { width: i32 height: i32 }\nfun main() { point := Point { widht: 10, height: 20 } }",
             "structure `Point` has no field `widht`",
             "did you mean `width`?",
         ),
         (
-            "struct Point { width: i32 height: i32 }\nfn main() { let point = Point { width: 10, height: 20 } print(point.heigth) }",
+            "struct Point { width: i32 height: i32 }\nfun main() { point := Point { width: 10, height: 20 } echo(point.heigth) }",
             "structure `Point` has no field `heigth`",
             "did you mean `height`?",
         ),
         (
-            "struct Point { width: i32 } struct Bounds { min: Point }\nfn main() { let mut bounds = Bounds { min: Point { width: 0 } } bounds.min.widht = 1 }",
+            "struct Point { width: i32 } struct Bounds { min: Point }\nfun main() { mut bounds := Bounds { min: Point { width: 0 } } bounds.min.widht = 1 }",
             "structure `Point` has no field `widht`",
             "did you mean `width`?",
         ),
@@ -946,7 +944,7 @@ fn check_command_reports_truncated_function_declarations_without_panicking() {
         .as_nanos();
     let source_path =
         std::env::temp_dir().join(format!("ryn-truncated-{}-{unique}.ryn", std::process::id()));
-    fs::write(&source_path, "fn").expect("temporary Ryn source is written");
+    fs::write(&source_path, "fun").expect("temporary Ryn source is written");
 
     let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
         .arg("check")
@@ -972,7 +970,7 @@ fn check_command_reports_excessive_nesting_without_panicking() {
         std::process::id()
     ));
     let source = format!(
-        "fn main() {{ print({}true{}) }}",
+        "fun main() {{ echo({}true{}) }}",
         "(".repeat(129),
         ")".repeat(129),
     );
@@ -1004,7 +1002,7 @@ fn check_command_rejects_loop_control_outside_a_while_loop() {
     ));
 
     for (keyword, code) in [("break", "R0016"), ("continue", "R0017")] {
-        fs::write(&source_path, format!("fn main() {{ {keyword} }}"))
+        fs::write(&source_path, format!("fun main() {{ {keyword} }}"))
             .expect("temporary source is written");
         let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
             .arg("check")
@@ -1035,7 +1033,7 @@ fn check_command_suggests_valid_expression_forms() {
         "ryn-missing-expression-{}-{unique}.ryn",
         std::process::id()
     ));
-    fs::write(&source_path, "fn main() {\n    let value =\n}\n")
+    fs::write(&source_path, "fun main() {\n    value :=\n}\n")
         .expect("temporary source is written");
 
     let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
@@ -1076,8 +1074,8 @@ fn unknown_cli_command_shows_usage_without_reading_the_input_file() {
     assert!(!result.status.success());
     assert!(stderr.contains("usage:\n  ryn new <path>"));
     assert!(stderr.contains("ryn check <file.ryn|project-dir>"));
-    assert!(stderr.contains("ryn build <file.ryn|project-dir> [-o|--output <path>]"));
-    assert!(stderr.contains("ryn run <file.ryn|project-dir> [-o|--output <path>]"));
+    assert!(stderr.contains("ryn build <file.ryn|project-dir> [--release] [-o|--output <path>]"));
+    assert!(stderr.contains("ryn run <file.ryn|project-dir> [--release] [-o|--output <path>]"));
     assert!(stderr.contains("ryn clean <project-dir>"));
     assert!(!stderr.contains("error[R0001]"));
 }
@@ -1115,7 +1113,7 @@ fn output_option_is_rejected_for_check_and_when_missing_its_path() {
     ));
     fs::create_dir(&directory).expect("temporary directory is created");
     let source = directory.join("fixture.ryn");
-    fs::write(&source, "fn main() {}").expect("temporary source is written");
+    fs::write(&source, "fun main() {}").expect("temporary source is written");
 
     let check = Command::new(env!("CARGO_BIN_EXE_ryn"))
         .arg("check")
@@ -1141,11 +1139,11 @@ fn output_option_is_rejected_for_check_and_when_missing_its_path() {
             "{stderr}"
         );
         assert!(
-            stderr.contains("ryn build <file.ryn|project-dir> [-o|--output <path>]"),
+            stderr.contains("ryn build <file.ryn|project-dir> [--release] [-o|--output <path>]"),
             "{stderr}"
         );
         assert!(
-            stderr.contains("ryn run <file.ryn|project-dir> [-o|--output <path>]"),
+            stderr.contains("ryn run <file.ryn|project-dir> [--release] [-o|--output <path>]"),
             "{stderr}"
         );
         assert!(stderr.contains("ryn clean <project-dir>"), "{stderr}");

@@ -1,40 +1,40 @@
-fn main() {
+fun main() {
     notify()
-    print(twice(add(10, 11)))
-    print(next(41))
-    print(echo("native calls"))
-    print(invert(false))
-    print(false && mark())
-    print(true || mark())
-    print(true && mark())
-    print(false || mark())
+    echo twice(add(10, 11))
+    echo next(41)
+    echo say("native calls")
+    echo invert(false)
+    echo false && mark()
+    echo true || mark()
+    echo true && mark()
+    echo false || mark()
 }
 
-fn add(a: i64, b: i64) -> i64 {
+fun add(a: i64, b: i64) -> i64 {
     a + b
 }
 
-fn twice(value: i64) -> i64 {
+fun twice(value: i64) -> i64 {
     add(value, value)
 }
 
-fn next(value: i64) -> i64 {
+fun next(value: i64) -> i64 {
     return value + 1
 }
 
-fn echo(value: str) -> str {
+fun say(value: str) -> str {
     value
 }
 
-fn invert(value: bool) -> bool {
+fun invert(value: bool) -> bool {
     !value
 }
 
-fn mark() -> bool {
-    print("rhs")
+fun mark() -> bool {
+    echo "rhs"
     true
 }
 
-fn notify() {
-    print("void call")
+fun notify() {
+    echo "void call"
 }

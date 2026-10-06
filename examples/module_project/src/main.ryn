@@ -1,0 +1,32 @@
+use compiler::lexer
+
+fun passthrough(value: lexer::TokenId) -> lexer::TokenId {
+    return value
+}
+
+fun passthrough_token(value: lexer::TokenAlias) -> lexer::TokenAlias {
+    return value
+}
+
+fun token_count(value: lexer::ids::TokenCount) -> lexer::ids::TokenCount {
+    return value
+}
+
+fun list_count(value: lexer::TokenList<i32>) -> u64 {
+    return value.len()
+}
+
+fun main() {
+    token := passthrough_token(lexer::Token { value: passthrough(lexer::token_name(6)) })
+    count: lexer::ids::TokenCount = token_count(2)
+    echo token.value
+    echo count
+    echo lexer::ids::abs(-17)
+    echo choose lexer::Kind::Number(token.value) {
+        lexer::Kind::Number(value) => value,
+        lexer::Kind::End => 0
+    }
+    mut values: lexer::TokenList<i32> = Vec<i32>()
+    values.push(5)
+    echo list_count(values)
+}

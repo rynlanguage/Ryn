@@ -1,0 +1,4 @@
+fun main() {
+    owner := String("released before panic exit")
+    panic("panic cleanup example")
+}

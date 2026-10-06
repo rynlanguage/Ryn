@@ -1,0 +1,33 @@
+fun assign_through_reference(value: &mut i32, next: i32) {
+    *value = next
+}
+
+fun read_through_reference(value: &i32) -> i32 {
+    return *value
+}
+
+fun identity_reference(value: &i32) -> &i32 {
+    return value
+}
+
+fun assign_through_raw_pointer(value: *i32, next: i32) {
+    *value = next
+}
+
+fun update_score(value: &mut i32) -> i32 {
+    assign_through_reference(value, 27)
+    echo *value
+    *value = *value + 5
+    return *value
+}
+
+fun main() {
+    mut score: i32 = 10
+    echo read_through_reference(identity_reference(&score))
+    updated_score := update_score(&mut score)
+    echo updated_score
+
+    raw := &raw mut score
+    assign_through_raw_pointer(raw, 33)
+    echo score
+}

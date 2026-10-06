@@ -4,7 +4,6 @@ use std::borrow::Cow;
 #[derive(Clone, Debug, PartialEq)]
 pub enum TokenKind {
     Fn,
-    Let,
     Mut,
     True,
     False,
@@ -16,15 +15,23 @@ pub enum TokenKind {
     Break,
     Continue,
     Return,
-    Print,
+    Echo,
     Struct,
     As,
+    Enum,
+    TypeAlias,
+    Choose,
+    Use,
+    Namespace,
+    Pub,
     Ident(String),
     String(String),
+    Character(char),
     Integer(u64),
     Float(f64),
     EqualEqual,
     Bang,
+    Question,
     BangEqual,
     Less,
     LessEqual,
@@ -45,10 +52,15 @@ pub enum TokenKind {
     OrOr,
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     LBrace,
     RBrace,
     Comma,
+    Semicolon,
     Colon,
+    ColonColon,
+    Define,
     Dot,
     DotDot,
     Equal,
@@ -63,6 +75,8 @@ pub enum TokenKind {
     Slash,
     Percent,
     Arrow,
+    FatArrow,
+    Hash,
     Eof,
 }
 #[derive(Clone, Debug)]
@@ -138,6 +152,14 @@ fn lex_all(text: &str, recovering: bool) -> (Vec<Token>, Vec<Diagnostic>) {
                 i += 1;
                 TokenKind::RParen
             }
+            b'[' => {
+                i += 1;
+                TokenKind::LBracket
+            }
+            b']' => {
+                i += 1;
+                TokenKind::RBracket
+            }
             b'{' => {
                 i += 1;
                 TokenKind::LBrace
@@ -149,6 +171,18 @@ fn lex_all(text: &str, recovering: bool) -> (Vec<Token>, Vec<Diagnostic>) {
             b',' => {
                 i += 1;
                 TokenKind::Comma
+            }
+            b';' => {
+                i += 1;
+                TokenKind::Semicolon
+            }
+            b':' if bytes.get(i + 1) == Some(&b'=') => {
+                i += 2;
+                TokenKind::Define
+            }
+            b':' if bytes.get(i + 1) == Some(&b':') => {
+                i += 2;
+                TokenKind::ColonColon
             }
             b':' => {
                 i += 1;
@@ -166,6 +200,10 @@ fn lex_all(text: &str, recovering: bool) -> (Vec<Token>, Vec<Diagnostic>) {
                 i += 2;
                 TokenKind::EqualEqual
             }
+            b'=' if bytes.get(i + 1) == Some(&b'>') => {
+                i += 2;
+                TokenKind::FatArrow
+            }
             b'=' => {
                 i += 1;
                 TokenKind::Equal
@@ -177,6 +215,10 @@ fn lex_all(text: &str, recovering: bool) -> (Vec<Token>, Vec<Diagnostic>) {
             b'!' => {
                 i += 1;
                 TokenKind::Bang
+            }
+            b'?' => {
+                i += 1;
+                TokenKind::Question
             }
             b'<' if bytes.get(i + 2) == Some(&b'=') && bytes.get(i + 1) == Some(&b'<') => {
                 i += 3;
@@ -246,6 +288,10 @@ fn lex_all(text: &str, recovering: bool) -> (Vec<Token>, Vec<Diagnostic>) {
                 i += 1;
                 TokenKind::Tilde
             }
+            b'#' => {
+                i += 1;
+                TokenKind::Hash
+            }
             b'+' if bytes.get(i + 1) == Some(&b'=') => {
                 i += 2;
                 TokenKind::PlusEqual
@@ -290,6 +336,17 @@ fn lex_all(text: &str, recovering: bool) -> (Vec<Token>, Vec<Diagnostic>) {
                 i += 1;
                 TokenKind::Percent
             }
+            b'\'' => match character_literal(text, i) {
+                Ok((character, end)) => {
+                    i = end;
+                    TokenKind::Character(character)
+                }
+                Err(diagnostic) => {
+                    i = diagnostic.span.end;
+                    diagnostics.push(diagnostic);
+                    continue 'tokens;
+                }
+            },
             b'"' => {
                 i += 1;
                 let mut value = String::new();
@@ -389,12 +446,11 @@ fn lex_all(text: &str, recovering: bool) -> (Vec<Token>, Vec<Diagnostic>) {
                     i += 1;
                 }
                 match &text[start..i] {
-                    "fn" => TokenKind::Fn,
-                    "let" => TokenKind::Let,
+                    "fun" => TokenKind::Fn,
                     "mut" => TokenKind::Mut,
                     "true" => TokenKind::True,
                     "false" => TokenKind::False,
-                    "if" => TokenKind::If,
+                    "when" => TokenKind::If,
                     "else" => TokenKind::Else,
                     "while" => TokenKind::While,
                     "for" => TokenKind::For,
@@ -402,9 +458,15 @@ fn lex_all(text: &str, recovering: bool) -> (Vec<Token>, Vec<Diagnostic>) {
                     "break" => TokenKind::Break,
                     "continue" => TokenKind::Continue,
                     "return" => TokenKind::Return,
-                    "print" => TokenKind::Print,
+                    "echo" => TokenKind::Echo,
                     "struct" => TokenKind::Struct,
                     "as" => TokenKind::As,
+                    "enum" => TokenKind::Enum,
+                    "type" => TokenKind::TypeAlias,
+                    "use" => TokenKind::Use,
+                    "namespace" => TokenKind::Namespace,
+                    "pub" => TokenKind::Pub,
+                    "choose" => TokenKind::Choose,
                     other => TokenKind::Ident(other.into()),
                 }
             }
@@ -712,6 +774,60 @@ fn numeric_separator_diagnostic(span: Span) -> Diagnostic {
     }
 }
 
+fn character_literal(text: &str, start: usize) -> Result<(char, usize), Diagnostic> {
+    let bytes = text.as_bytes();
+    let mut at = start + 1;
+    let parsed = if bytes.get(at) == Some(&b'\\') {
+        at += 1;
+        match bytes.get(at).copied() {
+            Some(b'u') => decode_unicode_escape(text, at).ok().map(|(ch, end)| {
+                at = end;
+                ch
+            }),
+            Some(byte) => {
+                at += 1;
+                match byte {
+                    b'n' => Some('\n'),
+                    b'r' => Some('\r'),
+                    b't' => Some('\t'),
+                    b'0' => Some('\0'),
+                    b'\\' => Some('\\'),
+                    b'\'' => Some('\''),
+                    b'"' => Some('"'),
+                    _ => None,
+                }
+            }
+            None => None,
+        }
+    } else if matches!(bytes.get(at), None | Some(b'\'' | b'\n' | b'\r')) {
+        None
+    } else {
+        text[at..].chars().next().inspect(|ch| {
+            at += ch.len_utf8();
+        })
+    };
+    if let Some(character) = parsed
+        && bytes.get(at) == Some(&b'\'')
+    {
+        return Ok((character, at + 1));
+    }
+    while at < bytes.len() && !matches!(bytes[at], b'\'' | b'\n' | b'\r') {
+        at += 1;
+    }
+    if bytes.get(at) == Some(&b'\'') {
+        at += 1;
+    }
+    Err(Diagnostic {
+        code: "R0019",
+        message: "character literal must contain exactly one Unicode scalar value".into(),
+        span: Span {
+            start,
+            end: at.max(start + 1),
+        },
+        help: Some("use a single character such as 'a', '\\n', or '\\u{1F980}'".into()),
+    })
+}
+
 fn skip_to_string_end(text: &str, mut at: usize) -> usize {
     let bytes = text.as_bytes();
     while at < bytes.len() {
@@ -790,24 +906,41 @@ mod tests {
 
     #[test]
     fn lexes_comments_and_escaped_strings() {
-        let tokens = lex("// note\nprint(\"line\\nnext\\0end\")").expect("valid tokens");
-        assert!(matches!(tokens[0].kind, TokenKind::Print));
+        let tokens = lex("// note\necho(\"line\\nnext\\0end\")").expect("valid tokens");
+        assert!(matches!(tokens[0].kind, TokenKind::Echo));
         assert!(matches!(&tokens[2].kind, TokenKind::String(s) if s == "line\nnext\0end"));
     }
 
     #[test]
+    fn recognizes_only_the_canonical_declaration_and_control_keywords() {
+        let tokens = lex("fun when mut value := 10 count: i32 = 2 fn let if print")
+            .expect("removed spellings are ordinary identifiers");
+
+        assert!(matches!(tokens[0].kind, TokenKind::Fn));
+        assert!(matches!(tokens[1].kind, TokenKind::If));
+        assert!(matches!(tokens[2].kind, TokenKind::Mut));
+        assert!(matches!(tokens[4].kind, TokenKind::Define));
+        assert!(matches!(tokens[7].kind, TokenKind::Colon));
+        assert!(matches!(tokens[9].kind, TokenKind::Equal));
+        assert!(matches!(&tokens[11].kind, TokenKind::Ident(name) if name == "fn"));
+        assert!(matches!(&tokens[12].kind, TokenKind::Ident(name) if name == "let"));
+        assert!(matches!(&tokens[13].kind, TokenKind::Ident(name) if name == "if"));
+        assert!(matches!(&tokens[14].kind, TokenKind::Ident(name) if name == "print"));
+    }
+
+    #[test]
     fn lexes_nested_block_comments_without_treating_string_contents_as_comments() {
-        let tokens = lex("/* outer /* nested */ still outer */ print(\"/* text */\") /* tail */")
+        let tokens = lex("/* outer /* nested */ still outer */ echo(\"/* text */\") /* tail */")
             .expect("nested block comments are valid");
 
-        assert!(matches!(tokens[0].kind, TokenKind::Print));
+        assert!(matches!(tokens[0].kind, TokenKind::Echo));
         assert!(matches!(&tokens[2].kind, TokenKind::String(value) if value == "/* text */"));
         assert!(matches!(tokens[4].kind, TokenKind::Eof));
     }
 
     #[test]
     fn unterminated_nested_block_comment_reports_its_full_span() {
-        let source = "print(1) /* outer /* nested */";
+        let source = "echo(1) /* outer /* nested */";
         let diagnostics =
             lex_recovering(source).expect_err("unterminated block comment is rejected");
 
@@ -821,7 +954,7 @@ mod tests {
 
     #[test]
     fn lexes_unicode_scalar_escapes() {
-        let tokens = lex(r##"print("\u{1F980}\u{E9}\u{0}")"##)
+        let tokens = lex(r##"echo("\u{1F980}\u{E9}\u{0}")"##)
             .expect("valid Unicode scalar escapes are accepted");
 
         assert!(matches!(&tokens[2].kind, TokenKind::String(value) if value == "🦀é\0"));
@@ -837,7 +970,7 @@ mod tests {
             r#"\u{1234567}"#,
             r#"\u{123"#,
         ] {
-            let source = format!("print(\"{escape}\")");
+            let source = format!("echo(\"{escape}\")");
             let diagnostic = lex(&source).expect_err("invalid Unicode escape is rejected");
             assert_eq!(diagnostic.code, "R0004", "source: {source:?}");
             assert!(diagnostic.message.contains("Unicode escape"));
@@ -851,7 +984,7 @@ mod tests {
 
     #[test]
     fn unicode_escape_recovery_continues_after_the_string() {
-        let diagnostics = lex_recovering("print(\"\\u{D800}\") @")
+        let diagnostics = lex_recovering("echo(\"\\u{D800}\") @")
             .expect_err("invalid Unicode escape and trailing token are rejected");
 
         assert_eq!(
@@ -865,23 +998,23 @@ mod tests {
 
     #[test]
     fn line_comments_end_on_cr_lf_and_crlf() {
-        let tokens = lex("// first\rprint(1)\r\n// second\nprint(2)")
+        let tokens = lex("// first\recho(1)\r\n// second\necho(2)")
             .expect("comments with all supported line endings are valid");
 
-        assert!(matches!(tokens[0].kind, TokenKind::Print));
-        assert!(matches!(tokens[4].kind, TokenKind::Print));
+        assert!(matches!(tokens[0].kind, TokenKind::Echo));
+        assert!(matches!(tokens[4].kind, TokenKind::Echo));
         assert!(matches!(tokens[8].kind, TokenKind::Eof));
     }
 
     #[test]
     fn reports_unterminated_strings() {
-        let error = lex("print(\"unfinished").expect_err("string should be closed");
+        let error = lex("echo(\"unfinished").expect_err("string should be closed");
         assert_eq!(error.code, "R0003");
     }
 
     #[test]
     fn lexes_decimal_and_exponent_float_literals() {
-        let tokens = lex("print(1.25) print(2e3) print(4.5E-1)").expect("valid floats");
+        let tokens = lex("echo(1.25) echo(2e3) echo(4.5E-1)").expect("valid floats");
         assert!(matches!(tokens[2].kind, TokenKind::Float(v) if (v - 1.25).abs() < f64::EPSILON));
         assert!(matches!(tokens[6].kind, TokenKind::Float(v) if v == 2000.0));
         assert!(matches!(tokens[10].kind, TokenKind::Float(v) if (v - 0.45).abs() < 1e-12));
@@ -977,7 +1110,7 @@ mod tests {
 
     #[test]
     fn lex_recovering_reports_multiple_unexpected_characters() {
-        let source = "fn main() { @ print(💥) }";
+        let source = "fun main() { @ echo(💥) }";
         let diagnostics = lex_recovering(source).expect_err("invalid characters are rejected");
         let first_error = lex(source).expect_err("the original lexer API returns its first error");
 
@@ -996,7 +1129,7 @@ mod tests {
 
     #[test]
     fn lex_recovering_skips_bad_literals_and_strings_before_continuing() {
-        let diagnostics = lex_recovering("18446744073709551616 @ 1e999 💥 print(\"bad\\q\") @")
+        let diagnostics = lex_recovering("18446744073709551616 @ 1e999 💥 echo(\"bad\\q\") @")
             .expect_err("malformed literals and characters are rejected");
 
         assert_eq!(
@@ -1007,7 +1140,7 @@ mod tests {
             ["R0006", "R0005", "R0007", "R0005", "R0004", "R0005"]
         );
 
-        let source = "print(\"bad\\💥 then \\\"still\\\"\") @";
+        let source = "echo(\"bad\\💥 then \\\"still\\\"\") @";
         let diagnostics = lex_recovering(source)
             .expect_err("an invalid Unicode escape and trailing token should be reported");
         assert_eq!(

@@ -1,0 +1,70 @@
+#[drop(release)]
+struct Resource {
+    handle: *i32
+}
+
+fun release(resource: Resource) {
+    echo *resource.handle
+}
+
+struct ResourceBundle {
+    resource: Resource,
+    label: String
+}
+
+struct ResourceEnvelope {
+    bundle: ResourceBundle,
+    note: String
+}
+
+struct ResourceQueue {
+    items: Vec<ResourceEnvelope>
+}
+
+fun wrap(resource: Resource) -> ResourceBundle {
+    return ResourceBundle { resource: resource, label: String("nested owner") }
+}
+
+fun forward(bundle: ResourceBundle) -> ResourceBundle {
+    return bundle
+}
+
+fun nest(bundle: ResourceBundle) -> ResourceEnvelope {
+    return ResourceEnvelope { bundle: bundle, note: String("outer owner") }
+}
+
+fun forward_envelope(envelope: ResourceEnvelope) -> ResourceEnvelope {
+    return envelope
+}
+
+fun make_queue(resource: Resource) -> ResourceQueue {
+    mut items := Vec<ResourceEnvelope>()
+    items.push(nest(wrap(resource)))
+    return ResourceQueue { items: items }
+}
+
+fun consume(envelope: ResourceEnvelope) {
+    echo 8
+}
+
+fun consume_queue(queue: ResourceQueue) {
+    echo 10
+}
+
+fun main() {
+    mut handle: i32 = 42
+    bundle := forward(wrap(Resource { handle: &raw mut handle }))
+    envelope := forward_envelope(nest(bundle))
+    consume(envelope)
+
+    mut second_handle: i32 = 77
+    mut envelopes := Vec<ResourceEnvelope>()
+    envelopes.push(nest(wrap(Resource { handle: &raw mut second_handle })))
+    for item in envelopes {
+        echo 9
+    }
+
+    mut third_handle: i32 = 88
+    queue := make_queue(Resource { handle: &raw mut third_handle })
+    consume_queue(queue)
+}

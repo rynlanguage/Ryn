@@ -1,0 +1,36 @@
+enum Payload {
+    Text(String),
+    Numbers(Vec<i32>),
+    Scores(Map<String, i32>),
+    Empty
+}
+
+fun describe(value: Payload) -> String {
+    choose value {
+        Payload::Text(text) => text,
+        Payload::Numbers(numbers) => String(numbers.len()),
+        Payload::Scores(scores) => String(scores.len()),
+        Payload::Empty => String("empty")
+    }
+}
+
+fun main() {
+    mut numbers := Vec<i32>()
+    numbers.push(4)
+    numbers.push(8)
+    mut scores := Map<String, i32>()
+    scores.insert(String("Ryn"), 42)
+    mut values: [Payload; 3] = [
+        Payload::Text(String("first")),
+        Payload::Numbers(numbers),
+        Payload::Scores(scores),
+    ]
+
+    copied := values[2]
+    values[0] = values[1]
+    values[2] = values[0]
+    echo describe(copied)
+    echo describe(values[0])
+    echo describe(values[1])
+    echo describe(values[2])
+}

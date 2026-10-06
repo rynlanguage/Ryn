@@ -1,0 +1,93 @@
+struct Registry {
+    entries: Map<String, i32>
+}
+
+fun lookup_first(values: Map<i32, String>) -> Option<String> {
+    text: String = values.get(1)?
+    return Option::Some(text)
+}
+
+fun main() {
+    mut scores := Map<String, i32>()
+    scores.insert(String("ada"), 12)
+    scores.insert(String("lin"), 8)
+    echo scores.len()
+    echo choose scores.get(String("ada")) {
+        Option::Some(score) => score,
+        Option::None => -1
+    }
+    echo choose scores.get(String("missing")) {
+        Option::Some(score) => score,
+        Option::None => -2
+    }
+    echo scores.contains_key(String("lin"))
+    echo scores.remove(String("lin"))
+    echo scores.len()
+
+    mut labels := HashMap<i32, String>()
+    labels.insert(1, String("compiler"))
+    labels.insert(1, String("Ryn"))
+    echo choose labels.get(1) {
+        Option::Some(label) => label,
+        Option::None => String("missing")
+    }
+    labels.clear()
+    echo labels.len()
+
+    mut words := Vec<String>()
+    words.push(String("map"))
+    mut lists := Map<i32, Vec<String>>()
+    lists.insert(7, words)
+    echo choose lists.get(7) {
+        Option::Some(words) => words.len() as i32,
+        Option::None => -1
+    }
+
+    mut registry := Registry { entries: Map<String, i32>() }
+    registry.entries.insert(String("Ryn"), 2)
+    echo choose registry.entries.get(String("Ryn")) {
+        Option::Some(count) => count,
+        Option::None => -1
+    }
+
+    mut nested := Map<i32, String>()
+    nested.insert(9, String("nested map"))
+    mut map_list := Vec<Map<i32, String>>()
+    map_list.push(nested)
+    mut cloned_map_list := map_list.clone()
+    cloned_nested := cloned_map_list.take(0)
+    echo choose cloned_nested.get(9) {
+        Option::Some(text) => text,
+        Option::None => String("missing")
+    }
+
+    mut map_values := Map<i32, Map<i32, String>>()
+    mut owned_value := Map<i32, String>()
+    owned_value.insert(4, String("deep value"))
+    map_values.insert(3, owned_value)
+    echo choose map_values.get(3) {
+        Option::Some(inner_map) => choose inner_map.get(4) {
+            Option::Some(text) => text,
+            Option::None => String("missing value")
+        },
+        Option::None => String("missing map")
+    }
+
+    mut lookup_map := Map<i32, String>()
+    lookup_map.insert(1, String("propagated"))
+    echo choose lookup_first(lookup_map) {
+        Option::Some(text) => text,
+        Option::None => String("not found")
+    }
+    echo choose lookup_first(Map<i32, String>()) {
+        Option::Some(text) => text,
+        Option::None => String("not found")
+    }
+
+    mut seen: Set<String> = Set<String>()
+    seen.add(String("Ryn"))
+    seen.insert(String("compiler"))
+    echo seen.contains(String("Ryn"))
+    echo seen.remove(String("compiler"))
+    echo seen.len()
+}

@@ -10,8 +10,8 @@ use std::{
 use cranelift_codegen::{
     Context,
     ir::{
-        AbiParam, BlockArg, FuncRef, InstBuilder, MemFlagsData, Signature, StackSlotData,
-        StackSlotKind, Value,
+        AbiParam, BlockArg, FuncRef, InstBuilder, MemFlagsData, Signature, StackSlot,
+        StackSlotData, StackSlotKind, TrapCode, Value,
         condcodes::{FloatCC, IntCC},
         types,
     },
@@ -44,10 +44,16 @@ fn main() {
 
 use crate::{
     ast::BinaryOp,
+    filesystem_ops::FilesystemOp,
+    map_ops::MapOp,
     sema::{
-        IrCallTarget, IrExpression, IrPrintPart, IrStatement, LocalBinding, LocalType, RynFunction,
-        RynIr, RynStruct, Type,
+        IrCallTarget, IrExpression, IrPrintPart, IrStatement, LocalBinding, LocalType, RynEnum,
+        RynFunction, RynIr, RynStruct, Type, array_info, map_info, slot_width, storage_slot_width,
+        vec_elem,
     },
+    string_ops::StringOp,
+    system_ops::SystemOp,
+    vector_ops::VecOp,
 };
 
 #[derive(Debug)]
@@ -79,9 +85,16 @@ impl std::error::Error for BuildError {}
 
 /// Compiles typed Ryn IR into a native object file for the current host.
 pub fn emit_object(ir: &RynIr) -> Result<Vec<u8>, BuildError> {
+    emit_object_with_optimize(ir, "speed")
+}
+
+fn emit_object_with_optimize(ir: &RynIr, optimize: &str) -> Result<Vec<u8>, BuildError> {
     let mut flag_builder = settings::builder();
     flag_builder
         .set("is_pic", "true")
+        .map_err(|e| BuildError::Internal(e.to_string()))?;
+    flag_builder
+        .set("opt_level", optimize)
         .map_err(|e| BuildError::Internal(e.to_string()))?;
     let flags = settings::Flags::new(flag_builder);
     let isa = cranelift_native::builder()
@@ -95,6 +108,30 @@ pub fn emit_object(ir: &RynIr) -> Result<Vec<u8>, BuildError> {
 
     let print_functions =
         declare_print_functions(&mut module, pointer_type).map_err(BuildError::Internal)?;
+    let mut enum_drop_plans = Vec::with_capacity(ir.enums.len());
+    for definition in &ir.enums {
+        let mut bytes = Vec::new();
+        for (variant_index, variant) in definition.variants.iter().enumerate() {
+            let mut offset = 0;
+            for field in &variant.fields {
+                append_enum_drop_entries(&mut bytes, variant_index, *field, offset, &ir.structs);
+                offset += value_width(*field, &ir.structs);
+            }
+        }
+        if bytes.is_empty() {
+            enum_drop_plans.push(None);
+        } else {
+            let mut desc = DataDescription::new();
+            desc.define(bytes.into_boxed_slice());
+            let id = module
+                .declare_anonymous_data(false, false)
+                .map_err(|error| BuildError::Internal(error.to_string()))?;
+            module
+                .define_data(id, &desc)
+                .map_err(|error| BuildError::Internal(error.to_string()))?;
+            enum_drop_plans.push(Some(id));
+        }
+    }
     let mut string_data = HashMap::new();
     for value in collect_strings(ir) {
         let mut desc = DataDescription::new();
@@ -115,24 +152,64 @@ pub fn emit_object(ir: &RynIr) -> Result<Vec<u8>, BuildError> {
         .iter()
         .map(|function| function.return_type)
         .collect::<Vec<_>>();
+    let external_functions = ir
+        .functions
+        .iter()
+        .map(|function| function.external_symbol.is_some())
+        .collect::<Vec<_>>();
+    let function_parameters = ir
+        .functions
+        .iter()
+        .map(|function| {
+            function
+                .parameters
+                .iter()
+                .map(|parameter| parameter.ty)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     for (index, function) in ir.functions.iter().enumerate() {
         let signature = make_signature(&mut module, function, pointer_type, &ir.structs);
-        let symbol = format!("ryn_fn_{index}");
+        let symbol = function
+            .external_symbol
+            .clone()
+            .unwrap_or_else(|| format!("ryn_fn_{index}"));
+        let linkage = if function.external_symbol.is_some() {
+            Linkage::Import
+        } else {
+            Linkage::Export
+        };
         let id = module
-            .declare_function(&symbol, Linkage::Export, &signature)
+            .declare_function(&symbol, linkage, &signature)
             .map_err(|e| BuildError::Internal(e.to_string()))?;
         signatures.push(signature);
         function_ids.push(id);
     }
+    let vec_struct_callbacks = declare_vec_struct_callbacks(
+        &mut module,
+        &ir.structs,
+        print_functions,
+        pointer_type,
+        &function_ids,
+    )
+    .map_err(BuildError::Internal)?;
 
     let codegen_env = FunctionCodegenEnv {
         function_ids: &function_ids,
         strings: &string_data,
         print_ids: print_functions,
+        vec_struct_callbacks: &vec_struct_callbacks,
         structs: &ir.structs,
+        enums: &ir.enums,
+        enum_drop_plans: &enum_drop_plans,
         return_types: &return_types,
+        external_functions: &external_functions,
+        function_parameters: &function_parameters,
     };
     for (index, function) in ir.functions.iter().enumerate() {
+        if function.external_symbol.is_some() {
+            continue;
+        }
         define_function(
             &mut module,
             function,
@@ -254,7 +331,15 @@ pub fn link_object(object: &[u8], output: &Path) -> Result<(), BuildError> {
 
 /// Emits a native object from Ryn IR and links it into an executable.
 pub fn build_native(ir: &RynIr, output: &Path) -> Result<(), BuildError> {
-    let object = emit_object(ir)?;
+    build_native_with_optimize(ir, output, "speed")
+}
+
+pub(crate) fn build_native_with_optimize(
+    ir: &RynIr,
+    output: &Path,
+    optimize: &str,
+) -> Result<(), BuildError> {
+    let object = emit_object_with_optimize(ir, optimize)?;
     link_object(&object, output)
 }
 
@@ -377,7 +462,319 @@ fn declare_print_functions(
             &integer_division_by_zero_sig,
         )
         .map_err(|e| e.to_string())?;
+    let mut array_index_out_of_bounds_sig = module.make_signature();
+    array_index_out_of_bounds_sig.call_conv = call_conv;
+    let array_index_out_of_bounds = module
+        .declare_function(
+            "ryn_array_index_out_of_bounds",
+            Linkage::Import,
+            &array_index_out_of_bounds_sig,
+        )
+        .map_err(|e| e.to_string())?;
+    let mut try_read_file_sig = module.make_signature();
+    try_read_file_sig.call_conv = call_conv;
+    try_read_file_sig
+        .params
+        .extend([AbiParam::new(pointer_type), AbiParam::new(types::I64)]);
+    try_read_file_sig.returns.push(AbiParam::new(pointer_type));
+    let try_read_file = module
+        .declare_function("ryn_fs_try_read_file", Linkage::Import, &try_read_file_sig)
+        .map_err(|e| e.to_string())?;
+    let mut read_file_result_sig = module.make_signature();
+    read_file_result_sig.call_conv = call_conv;
+    read_file_result_sig
+        .params
+        .extend([AbiParam::new(pointer_type), AbiParam::new(types::I64)]);
+    read_file_result_sig
+        .returns
+        .push(AbiParam::new(pointer_type));
+    let read_file_result = module
+        .declare_function(
+            "ryn_fs_read_file_result",
+            Linkage::Import,
+            &read_file_result_sig,
+        )
+        .map_err(|error| error.to_string())?;
+    let mut owned_strings = Vec::new();
+    for operation in StringOp::ALL {
+        let mut signature = module.make_signature();
+        for ty in operation.parameters() {
+            append_type(&mut signature.params, ty, pointer_type, &[]);
+        }
+        if let Some(ty) = operation.result() {
+            append_type(&mut signature.returns, ty, pointer_type, &[]);
+        }
+        owned_strings.push(
+            module
+                .declare_function(operation.symbol(), Linkage::Import, &signature)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let mut filesystem = Vec::new();
+    for operation in FilesystemOp::ALL {
+        let mut signature = module.make_signature();
+        for ty in operation.parameters() {
+            append_type(&mut signature.params, ty, pointer_type, &[]);
+        }
+        append_type(
+            &mut signature.returns,
+            operation.result(),
+            pointer_type,
+            &[],
+        );
+        filesystem.push(
+            module
+                .declare_function(operation.symbol(), Linkage::Import, &signature)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let mut system = Vec::new();
+    for operation in SystemOp::ALL {
+        let mut signature = module.make_signature();
+        for ty in operation.parameters() {
+            append_type(&mut signature.params, ty, pointer_type, &[]);
+        }
+        if let Some(ty) = operation.result() {
+            append_type(&mut signature.returns, ty, pointer_type, &[]);
+        }
+        system.push(
+            module
+                .declare_function(operation.symbol(), Linkage::Import, &signature)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let mut owned_vecs = Vec::new();
+    for operation in VecOp::ALL {
+        let mut signature = module.make_signature();
+        match operation {
+            VecOp::New => {
+                signature.call_conv = call_conv;
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.returns.push(AbiParam::new(pointer_type));
+            }
+            VecOp::Clone => {
+                signature.call_conv = call_conv;
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.returns.push(AbiParam::new(pointer_type));
+            }
+            VecOp::Drop | VecOp::Clear | VecOp::Len | VecOp::Capacity => {
+                signature.call_conv = call_conv;
+                signature.params.push(AbiParam::new(pointer_type));
+                if matches!(operation, VecOp::Len | VecOp::Capacity) {
+                    signature.returns.push(AbiParam::new(types::I64));
+                }
+            }
+            VecOp::Reserve => {
+                signature.call_conv = call_conv;
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.params.push(AbiParam::new(types::I64));
+            }
+            VecOp::Push => {
+                signature.call_conv = call_conv;
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.params.push(AbiParam::new(pointer_type));
+            }
+            VecOp::Take | VecOp::Extract => {
+                signature.call_conv = call_conv;
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(pointer_type));
+            }
+            VecOp::Index => {
+                signature.call_conv = call_conv;
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.returns.push(AbiParam::new(pointer_type));
+            }
+            VecOp::Set => {
+                signature.call_conv = call_conv;
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(pointer_type));
+            }
+        }
+        owned_vecs.push(
+            module
+                .declare_function(operation.symbol(), Linkage::Import, &signature)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let mut vec_slice_signature = module.make_signature();
+    vec_slice_signature.call_conv = call_conv;
+    vec_slice_signature.params.extend([
+        AbiParam::new(pointer_type),
+        AbiParam::new(types::I64),
+        AbiParam::new(types::I64),
+        AbiParam::new(pointer_type),
+    ]);
+    vec_slice_signature
+        .returns
+        .push(AbiParam::new(pointer_type));
+    let vec_slice = module
+        .declare_function("ryn_vec_slice", Linkage::Import, &vec_slice_signature)
+        .map_err(|error| error.to_string())?;
+    let mut maps = Vec::new();
+    for operation in MapOp::ALL {
+        let mut signature = module.make_signature();
+        signature.call_conv = call_conv;
+        match operation {
+            MapOp::New => {
+                signature
+                    .params
+                    .extend((0..4).map(|_| AbiParam::new(types::I64)));
+                signature
+                    .params
+                    .extend((0..2).map(|_| AbiParam::new(pointer_type)));
+                signature.returns.push(AbiParam::new(pointer_type));
+            }
+            MapOp::Drop | MapOp::Clear => {
+                signature.params.push(AbiParam::new(pointer_type));
+            }
+            MapOp::Clone => {
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.returns.push(AbiParam::new(pointer_type));
+            }
+            MapOp::Len => {
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.returns.push(AbiParam::new(types::I64));
+            }
+            MapOp::ContainsKey | MapOp::Remove => {
+                signature
+                    .params
+                    .extend([AbiParam::new(pointer_type), AbiParam::new(pointer_type)]);
+                signature.returns.push(AbiParam::new(types::I8));
+            }
+            MapOp::Insert => {
+                signature
+                    .params
+                    .extend((0..3).map(|_| AbiParam::new(pointer_type)));
+                signature.returns.push(AbiParam::new(types::I8));
+            }
+            MapOp::Get => {
+                signature
+                    .params
+                    .extend((0..3).map(|_| AbiParam::new(pointer_type)));
+                signature.returns.push(AbiParam::new(types::I8));
+            }
+            MapOp::Keys | MapOp::Values => {
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.returns.push(AbiParam::new(pointer_type));
+            }
+        }
+        maps.push(
+            module
+                .declare_function(operation.symbol(), Linkage::Import, &signature)
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let maps: [FuncId; 11] = maps
+        .try_into()
+        .map_err(|_| "internal error: expected eleven Map runtime functions")?;
+    let mut vec_string_element_signature = module.make_signature();
+    vec_string_element_signature.call_conv = call_conv;
+    vec_string_element_signature
+        .params
+        .push(AbiParam::new(pointer_type));
+    vec_string_element_signature
+        .params
+        .push(AbiParam::new(pointer_type));
+    let vec_string_element = module
+        .declare_function(
+            "ryn_vec_string_element",
+            Linkage::Import,
+            &vec_string_element_signature,
+        )
+        .map_err(|error| error.to_string())?;
+    let vec_map_element = module
+        .declare_function(
+            "ryn_vec_map_element",
+            Linkage::Import,
+            &vec_string_element_signature,
+        )
+        .map_err(|error| error.to_string())?;
+    let mut enum_drop_signature = module.make_signature();
+    enum_drop_signature.call_conv = call_conv;
+    enum_drop_signature.params.push(AbiParam::new(pointer_type));
+    let enum_drop = module
+        .declare_function("ryn_enum_drop", Linkage::Import, &enum_drop_signature)
+        .map_err(|error| error.to_string())?;
+    let mut enum_clone_signature = module.make_signature();
+    enum_clone_signature.call_conv = call_conv;
+    enum_clone_signature
+        .params
+        .push(AbiParam::new(pointer_type));
+    enum_clone_signature
+        .returns
+        .push(AbiParam::new(pointer_type));
+    let enum_clone = module
+        .declare_function("ryn_enum_clone", Linkage::Import, &enum_clone_signature)
+        .map_err(|error| error.to_string())?;
+    let mut enum_new_signature = module.make_signature();
+    enum_new_signature.call_conv = call_conv;
+    enum_new_signature.params.extend([
+        AbiParam::new(types::I64),
+        AbiParam::new(pointer_type),
+        AbiParam::new(types::I64),
+        AbiParam::new(pointer_type),
+        AbiParam::new(types::I64),
+    ]);
+    enum_new_signature.returns.push(AbiParam::new(pointer_type));
+    let enum_new = module
+        .declare_function("ryn_enum_new", Linkage::Import, &enum_new_signature)
+        .map_err(|error| error.to_string())?;
+    let mut enum_tag_signature = module.make_signature();
+    enum_tag_signature.call_conv = call_conv;
+    enum_tag_signature.params.push(AbiParam::new(pointer_type));
+    enum_tag_signature.returns.push(AbiParam::new(types::I64));
+    let enum_tag = module
+        .declare_function("ryn_enum_tag", Linkage::Import, &enum_tag_signature)
+        .map_err(|error| error.to_string())?;
+    let mut enum_word_signature = module.make_signature();
+    enum_word_signature.call_conv = call_conv;
+    enum_word_signature
+        .params
+        .extend([AbiParam::new(pointer_type), AbiParam::new(types::I64)]);
+    enum_word_signature.returns.push(AbiParam::new(types::I64));
+    let enum_word = module
+        .declare_function("ryn_enum_word", Linkage::Import, &enum_word_signature)
+        .map_err(|error| error.to_string())?;
+    let mut enum_clear_word_signature = module.make_signature();
+    enum_clear_word_signature.call_conv = call_conv;
+    enum_clear_word_signature
+        .params
+        .extend([AbiParam::new(pointer_type), AbiParam::new(types::I64)]);
+    let enum_clear_word = module
+        .declare_function(
+            "ryn_enum_clear_word",
+            Linkage::Import,
+            &enum_clear_word_signature,
+        )
+        .map_err(|error| error.to_string())?;
     Ok(PrintFunctionIds {
+        owned_strings: owned_strings
+            .try_into()
+            .map_err(|_| "invalid String runtime table")?,
+        filesystem: filesystem
+            .try_into()
+            .map_err(|_| "invalid filesystem runtime table")?,
+        system: system
+            .try_into()
+            .map_err(|_| "invalid system runtime table")?,
+        owned_vecs: owned_vecs
+            .try_into()
+            .map_err(|_| "invalid Vec runtime table")?,
+        vec_slice,
+        maps,
+        enum_drop,
+        enum_clone,
+        enum_new,
+        enum_tag,
+        enum_word,
+        enum_clear_word,
+        vec_string_element,
+        vec_map_element,
         string,
         string_equals,
         integers,
@@ -389,7 +786,384 @@ fn declare_print_functions(
         arg_pointer,
         arg_length,
         integer_division_by_zero,
+        array_index_out_of_bounds,
+        try_read_file,
+        read_file_result,
     })
+}
+
+fn declare_vec_struct_callbacks(
+    module: &mut ObjectModule,
+    structs: &[RynStruct],
+    runtime: PrintFunctionIds,
+    pointer_type: types::Type,
+    function_ids: &[FuncId],
+) -> Result<Vec<Option<(FuncId, FuncId)>>, String> {
+    let mut callbacks = Vec::with_capacity(structs.len());
+    for (index, definition) in structs.iter().enumerate() {
+        let custom_drop = definition.drop_function.is_some();
+        let nested_custom_drop = definition
+            .fields
+            .iter()
+            .any(|field| type_has_custom_drop(field.ty, structs));
+        if !custom_drop
+            && !nested_custom_drop
+            && (!structure_clone_supported(definition, structs)
+                || !definition
+                    .fields
+                    .iter()
+                    .any(|field| type_has_owned_data(field.ty, structs)))
+        {
+            callbacks.push(None);
+            continue;
+        }
+        let call_conv = module.isa().default_call_conv();
+        let mut drop_signature = module.make_signature();
+        drop_signature.call_conv = call_conv;
+        drop_signature.params.push(AbiParam::new(pointer_type));
+        let mut clone_signature = module.make_signature();
+        clone_signature.call_conv = call_conv;
+        clone_signature
+            .params
+            .extend([AbiParam::new(pointer_type), AbiParam::new(pointer_type)]);
+        let drop_id = module
+            .declare_function(
+                &format!("ryn_vec_struct_{index}_drop"),
+                Linkage::Local,
+                &drop_signature,
+            )
+            .map_err(|error| error.to_string())?;
+        let clone_id = module
+            .declare_function(
+                &format!("ryn_vec_struct_{index}_clone"),
+                Linkage::Local,
+                &clone_signature,
+            )
+            .map_err(|error| error.to_string())?;
+        callbacks.push(Some((drop_id, clone_id)));
+    }
+    for (index, definition) in structs.iter().enumerate() {
+        let Some((drop_id, clone_id)) = callbacks[index] else {
+            continue;
+        };
+        let call_conv = module.isa().default_call_conv();
+        let mut drop_signature = module.make_signature();
+        drop_signature.call_conv = call_conv;
+        drop_signature.params.push(AbiParam::new(pointer_type));
+        let mut clone_signature = module.make_signature();
+        clone_signature.call_conv = call_conv;
+        clone_signature
+            .params
+            .extend([AbiParam::new(pointer_type), AbiParam::new(pointer_type)]);
+        define_vec_struct_callback(
+            module,
+            drop_id,
+            drop_signature,
+            definition,
+            structs,
+            &callbacks,
+            runtime,
+            pointer_type,
+            function_ids,
+            false,
+        )?;
+        define_vec_struct_callback(
+            module,
+            clone_id,
+            clone_signature,
+            definition,
+            structs,
+            &callbacks,
+            runtime,
+            pointer_type,
+            function_ids,
+            true,
+        )?;
+    }
+    Ok(callbacks)
+}
+
+fn structure_clone_supported(definition: &RynStruct, structs: &[RynStruct]) -> bool {
+    definition.drop_function.is_none()
+        && definition
+            .fields
+            .iter()
+            .all(|field| type_clone_supported(field.ty, structs))
+}
+
+fn type_clone_supported(ty: Type, structs: &[RynStruct]) -> bool {
+    match ty {
+        Type::Slice(_) => false,
+        Type::Struct(id) => structure_clone_supported(&structs[id], structs),
+        Type::Vec(id) => type_clone_supported(vec_elem(id), structs),
+        Type::Array(id) => type_clone_supported(array_info(id).0, structs),
+        _ => true,
+    }
+}
+
+fn type_has_owned_data(ty: Type, structs: &[RynStruct]) -> bool {
+    match ty {
+        Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Enum(_) => true,
+        Type::Struct(id) => {
+            structs[id].drop_function.is_some()
+                || structs[id]
+                    .fields
+                    .iter()
+                    .any(|field| type_has_owned_data(field.ty, structs))
+        }
+        Type::Array(id) => type_has_owned_data(array_info(id).0, structs),
+        _ => false,
+    }
+}
+
+fn type_has_custom_drop(ty: Type, structs: &[RynStruct]) -> bool {
+    match ty {
+        Type::Struct(id) => {
+            structs[id].drop_function.is_some()
+                || structs[id]
+                    .fields
+                    .iter()
+                    .any(|field| type_has_custom_drop(field.ty, structs))
+        }
+        Type::Array(id) => type_has_custom_drop(array_info(id).0, structs),
+        Type::Vec(id) => type_has_custom_drop(vec_elem(id), structs),
+        Type::Map(id) => type_has_custom_drop(map_info(id).1, structs),
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn define_vec_struct_callback(
+    module: &mut ObjectModule,
+    function_id: FuncId,
+    signature: Signature,
+    definition: &RynStruct,
+    structs: &[RynStruct],
+    callbacks: &[Option<(FuncId, FuncId)>],
+    runtime: PrintFunctionIds,
+    pointer_type: types::Type,
+    function_ids: &[FuncId],
+    clone: bool,
+) -> Result<(), String> {
+    let mut context = Context::new();
+    context.func.signature = signature;
+    let mut builder_context = FunctionBuilderContext::new();
+    {
+        let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        let source = builder.block_params(entry)[0];
+        let destination = if clone {
+            Some(builder.block_params(entry)[1])
+        } else {
+            None
+        };
+        let destination = destination.unwrap_or(source);
+        if clone && definition.drop_function.is_some() {
+            builder.ins().trap(TrapCode::unwrap_user(1));
+        } else if let Some(drop_function) = definition.drop_function {
+            let handle_address = callback_field_pointer(&mut builder, source, 0);
+            let handle = builder
+                .ins()
+                .load(pointer_type, MemFlagsData::new(), handle_address, 0);
+            let is_null = builder.ins().icmp_imm_s(IntCC::Equal, handle, 0);
+            let skip = builder.create_block();
+            let invoke = builder.create_block();
+            let merge = builder.create_block();
+            builder.ins().brif(is_null, skip, &[], invoke, &[]);
+            builder.switch_to_block(invoke);
+            let mut arguments = Vec::new();
+            for field in &definition.fields {
+                let address = callback_field_pointer(&mut builder, source, field.slot_offset);
+                let field_types = clif_types(field.ty, pointer_type, structs);
+                let [field_type] = field_types.as_slice() else {
+                    return Err("custom destructor field must occupy one ABI value".into());
+                };
+                arguments.push(
+                    builder
+                        .ins()
+                        .load(*field_type, MemFlagsData::new(), address, 0),
+                );
+            }
+            let function = module.declare_func_in_func(function_ids[drop_function], builder.func);
+            builder.ins().call(function, &arguments);
+            builder.ins().jump(merge, &[]);
+            builder.seal_block(invoke);
+            builder.switch_to_block(skip);
+            builder.ins().jump(merge, &[]);
+            builder.seal_block(skip);
+            builder.switch_to_block(merge);
+            builder.seal_block(merge);
+            builder.ins().return_(&[]);
+        } else if clone {
+            for field in &definition.fields {
+                emit_vec_struct_field_callback(
+                    &mut builder,
+                    module,
+                    field.ty,
+                    source,
+                    destination,
+                    field.slot_offset,
+                    structs,
+                    callbacks,
+                    runtime,
+                    pointer_type,
+                    true,
+                )?;
+            }
+        } else {
+            for field in definition.fields.iter().rev() {
+                emit_vec_struct_field_callback(
+                    &mut builder,
+                    module,
+                    field.ty,
+                    source,
+                    destination,
+                    field.slot_offset,
+                    structs,
+                    callbacks,
+                    runtime,
+                    pointer_type,
+                    false,
+                )?;
+            }
+        }
+        if !(clone && definition.drop_function.is_some()) && definition.drop_function.is_none() {
+            builder.ins().return_(&[]);
+        }
+        builder.seal_block(entry);
+        builder.finalize(module.target_config());
+    }
+    module
+        .define_function(function_id, &mut context)
+        .map_err(|error| error.to_string())?;
+    module.clear_context(&mut context);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_vec_struct_field_callback(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut ObjectModule,
+    ty: Type,
+    source: Value,
+    destination: Value,
+    slot_offset: usize,
+    structs: &[RynStruct],
+    callbacks: &[Option<(FuncId, FuncId)>],
+    runtime: PrintFunctionIds,
+    pointer_type: types::Type,
+    clone: bool,
+) -> Result<(), String> {
+    match ty {
+        Type::OwnedString
+        | Type::Vec(_)
+        | Type::Map(_)
+        | Type::Enum(_)
+        | Type::Reference(_, _)
+        | Type::RawPointer(_)
+        | Type::FunctionPointer(_) => {
+            let function_id = match ty {
+                Type::OwnedString => {
+                    runtime.owned_strings[if clone {
+                        StringOp::Clone as usize
+                    } else {
+                        StringOp::Drop as usize
+                    }]
+                }
+                Type::Vec(_) => {
+                    runtime.owned_vecs[if clone {
+                        VecOp::Clone as usize
+                    } else {
+                        VecOp::Drop as usize
+                    }]
+                }
+                Type::Map(_) => {
+                    runtime.maps[if clone {
+                        MapOp::Clone as usize
+                    } else {
+                        MapOp::Drop as usize
+                    }]
+                }
+                Type::Enum(_) => {
+                    if clone {
+                        runtime.enum_clone
+                    } else {
+                        runtime.enum_drop
+                    }
+                }
+                _ => unreachable!(),
+            };
+            let source_field = callback_field_pointer(builder, source, slot_offset);
+            let value = builder
+                .ins()
+                .load(pointer_type, MemFlagsData::new(), source_field, 0);
+            let function = module.declare_func_in_func(function_id, builder.func);
+            let call = builder.ins().call(function, &[value]);
+            if clone {
+                let cloned = builder.func.dfg.inst_results(call)[0];
+                let destination_field = callback_field_pointer(builder, destination, slot_offset);
+                builder
+                    .ins()
+                    .store(MemFlagsData::new(), cloned, destination_field, 0);
+            }
+        }
+        Type::Struct(struct_id) => {
+            if let Some((drop_id, clone_id)) = callbacks[struct_id] {
+                let function_id = if clone { clone_id } else { drop_id };
+                let function = module.declare_func_in_func(function_id, builder.func);
+                let source_field = callback_field_pointer(builder, source, slot_offset);
+                if clone {
+                    let destination_field =
+                        callback_field_pointer(builder, destination, slot_offset);
+                    builder
+                        .ins()
+                        .call(function, &[source_field, destination_field]);
+                } else {
+                    builder.ins().call(function, &[source_field]);
+                }
+            }
+        }
+        Type::Array(array_id) => {
+            let (element, length) = array_info(array_id);
+            let stride = storage_slot_width(element, structs);
+            let indices: Box<dyn Iterator<Item = usize>> = if clone {
+                Box::new(0..length)
+            } else {
+                Box::new((0..length).rev())
+            };
+            for index in indices {
+                emit_vec_struct_field_callback(
+                    builder,
+                    module,
+                    element,
+                    source,
+                    destination,
+                    slot_offset + index * stride,
+                    structs,
+                    callbacks,
+                    runtime,
+                    pointer_type,
+                    clone,
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn callback_field_pointer(
+    builder: &mut FunctionBuilder<'_>,
+    base: Value,
+    slot_offset: usize,
+) -> Value {
+    if slot_offset == 0 {
+        base
+    } else {
+        builder.ins().iadd_imm_s(base, (slot_offset * 8) as i64)
+    }
 }
 
 fn string_signature(call_conv: CallConv, pointer_type: types::Type) -> Signature {
@@ -434,18 +1208,175 @@ fn make_signature(
     let mut signature = module.make_signature();
     signature.call_conv = module.isa().default_call_conv();
     for parameter in &function.parameters {
-        append_type(&mut signature.params, parameter.ty, pointer_type, structs);
+        if function.external_symbol.is_some()
+            && let Some((size, _)) = c_abi_packed_record_layout(parameter.ty, structs)
+        {
+            signature
+                .params
+                .push(AbiParam::new(c_abi_integer_type(size)));
+        } else {
+            append_type(&mut signature.params, parameter.ty, pointer_type, structs);
+        }
     }
     if let Some(ty) = function.return_type {
-        if matches!(ty, Type::Struct(_)) {
+        let direct_c_record =
+            function.external_symbol.is_some() && is_direct_c_abi_record(ty, structs);
+        if matches!(ty, Type::Struct(_) | Type::Array(_)) && !direct_c_record {
             // Aggregate returns use a caller-provided stack buffer because the
             // native ABI may not support the record's flattened result count.
             signature.params.insert(0, AbiParam::new(pointer_type));
+        } else if function.external_symbol.is_some()
+            && let Some((size, _)) = c_abi_packed_record_layout(ty, structs)
+        {
+            signature
+                .returns
+                .push(AbiParam::new(c_abi_integer_type(size)));
         } else {
             append_type(&mut signature.returns, ty, pointer_type, structs);
         }
     }
     signature
+}
+
+fn c_abi_packed_record_layout(
+    ty: Type,
+    structs: &[RynStruct],
+) -> Option<(usize, Vec<(usize, Type)>)> {
+    let Type::Struct(id) = ty else {
+        return None;
+    };
+    if !structs[id].repr_c || structs[id].fields.is_empty() {
+        return None;
+    }
+    let mut offset = 0_usize;
+    let mut aggregate_align = 1_usize;
+    let mut fields = Vec::with_capacity(structs[id].fields.len());
+    for field in &structs[id].fields {
+        let (field_size, field_align) = match field.ty {
+            Type::I8 | Type::U8 | Type::Bool => (1, 1),
+            Type::I16 | Type::U16 => (2, 2),
+            Type::I32 | Type::U32 | Type::Char => (4, 4),
+            Type::F32 => (4, 4),
+            Type::I64 | Type::U64 | Type::F64 => (8, 8),
+            _ => return None,
+        };
+        offset = offset.saturating_add(field_align - 1) / field_align * field_align;
+        fields.push((offset, field.ty));
+        offset = offset.checked_add(field_size)?;
+        aggregate_align = aggregate_align.max(field_align);
+    }
+    offset = offset.saturating_add(aggregate_align - 1) / aggregate_align * aggregate_align;
+    matches!(offset, 1 | 2 | 4 | 8).then_some((offset, fields))
+}
+
+fn is_direct_c_abi_record(ty: Type, structs: &[RynStruct]) -> bool {
+    matches!(ty, Type::Struct(id)
+        if structs[id].repr_c
+            && (structs[id].fields.len() == 1
+                || c_abi_packed_record_layout(ty, structs).is_some()))
+}
+
+fn c_abi_integer_type(size: usize) -> types::Type {
+    match size {
+        1 => types::I8,
+        2 => types::I16,
+        4 => types::I32,
+        8 => types::I64,
+        _ => unreachable!("unsupported packed C aggregate size"),
+    }
+}
+
+fn c_abi_field_clif_type(ty: Type) -> types::Type {
+    match ty {
+        Type::I8 | Type::U8 | Type::Bool => types::I8,
+        Type::I16 | Type::U16 => types::I16,
+        Type::I32 | Type::U32 | Type::Char => types::I32,
+        Type::I64 | Type::U64 => types::I64,
+        Type::F32 => types::I32,
+        Type::F64 => types::I64,
+        _ => unreachable!("unsupported packed C aggregate field"),
+    }
+}
+
+fn pack_c_abi_record(
+    b: &mut FunctionBuilder<'_>,
+    values: &[Value],
+    size: usize,
+    fields: &[(usize, Type)],
+) -> Result<Value, String> {
+    if values.len() != fields.len() {
+        return Err("internal error: C aggregate field count mismatch".into());
+    }
+    let mut packed = b.ins().iconst(types::I64, 0);
+    for (value, (offset, ty)) in values.iter().zip(fields) {
+        let bits = match ty {
+            Type::F32 => b.ins().bitcast(types::I32, MemFlagsData::new(), *value),
+            Type::F64 => b.ins().bitcast(types::I64, MemFlagsData::new(), *value),
+            _ => *value,
+        };
+        let mut part = if b.func.dfg.value_type(bits) == types::I64 {
+            bits
+        } else {
+            b.ins().uextend(types::I64, bits)
+        };
+        if *offset != 0 {
+            part = b.ins().ishl_imm_u(part, (*offset * 8) as i64);
+        }
+        packed = b.ins().bor(packed, part);
+    }
+    if size == 8 {
+        Ok(packed)
+    } else {
+        Ok(b.ins().ireduce(c_abi_integer_type(size), packed))
+    }
+}
+
+fn unpack_c_abi_record(
+    b: &mut FunctionBuilder<'_>,
+    value: Value,
+    size: usize,
+    fields: &[(usize, Type)],
+) -> Vec<Value> {
+    let value = if size == 8 {
+        value
+    } else {
+        b.ins().uextend(types::I64, value)
+    };
+    fields
+        .iter()
+        .map(|(offset, ty)| {
+            let mut field = value;
+            if *offset != 0 {
+                field = b.ins().ushr_imm_u(field, (*offset * 8) as i64);
+            }
+            let width = match ty {
+                Type::I8 | Type::U8 | Type::Bool => 8,
+                Type::I16 | Type::U16 => 16,
+                Type::I32 | Type::U32 | Type::Char => 32,
+                Type::I64 | Type::U64 => 64,
+                Type::F64 => 64,
+                Type::F32 => 32,
+                _ => unreachable!("unsupported packed C aggregate field"),
+            };
+            let field = if width == 64 {
+                field
+            } else {
+                let mask = (1_u64 << width) - 1;
+                b.ins().band_imm_u(field, mask as i64)
+            };
+            let field_type = c_abi_field_clif_type(*ty);
+            let bits = if field_type == types::I64 {
+                field
+            } else {
+                b.ins().ireduce(field_type, field)
+            };
+            match ty {
+                Type::F32 => b.ins().bitcast(types::F32, MemFlagsData::new(), bits),
+                Type::F64 => b.ins().bitcast(types::F64, MemFlagsData::new(), bits),
+                _ => bits,
+            }
+        })
+        .collect()
 }
 
 fn append_type(
@@ -457,15 +1388,30 @@ fn append_type(
     match ty {
         Type::I8 | Type::U8 => params.push(AbiParam::new(types::I8)),
         Type::I16 | Type::U16 => params.push(AbiParam::new(types::I16)),
-        Type::I32 | Type::U32 => params.push(AbiParam::new(types::I32)),
+        Type::I32 | Type::U32 | Type::Char => params.push(AbiParam::new(types::I32)),
         Type::I64 | Type::U64 => params.push(AbiParam::new(types::I64)),
         Type::F32 => params.push(AbiParam::new(types::F32)),
         Type::F64 => params.push(AbiParam::new(types::F64)),
         Type::Bool => params.push(AbiParam::new(types::I8)),
-        Type::Str => params.extend([AbiParam::new(pointer_type), AbiParam::new(types::I64)]),
+        Type::Str | Type::Slice(_) => {
+            params.extend([AbiParam::new(pointer_type), AbiParam::new(types::I64)])
+        }
+        Type::OwnedString
+        | Type::Vec(_)
+        | Type::Map(_)
+        | Type::Enum(_)
+        | Type::Reference(_, _)
+        | Type::RawPointer(_)
+        | Type::FunctionPointer(_) => params.push(AbiParam::new(pointer_type)),
         Type::Struct(struct_id) => {
             for field in &structs[struct_id].fields {
                 append_type(params, field.ty, pointer_type, structs);
+            }
+        }
+        Type::Array(id) => {
+            let (element, length) = array_info(id);
+            for _ in 0..length {
+                append_type(params, element, pointer_type, structs);
             }
         }
     }
@@ -475,7 +1421,7 @@ fn clif_integer_type(ty: Type) -> Option<types::Type> {
     match ty {
         Type::I8 | Type::U8 => Some(types::I8),
         Type::I16 | Type::U16 => Some(types::I16),
-        Type::I32 | Type::U32 => Some(types::I32),
+        Type::I32 | Type::U32 | Type::Char => Some(types::I32),
         Type::I64 | Type::U64 => Some(types::I64),
         _ => None,
     }
@@ -531,25 +1477,91 @@ fn define_function(
                 LocalType::I64 => types::I64,
                 LocalType::F32 => types::F32,
                 LocalType::F64 => types::F64,
-                LocalType::Ptr => pointer_type,
+                LocalType::Ptr | LocalType::OwnedPtr => pointer_type,
                 LocalType::I8 => types::I8,
                 LocalType::I16 => types::I16,
             };
             b.declare_var(ty);
+        }
+        let address_slots = function
+            .addressed_slot_types
+            .iter()
+            .map(|ty| {
+                ty.map(|ty| {
+                    let (size, align) = reference_storage_layout(ty);
+                    b.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        size,
+                        align.trailing_zeros() as u8,
+                    ))
+                })
+            })
+            .collect::<Vec<_>>();
+        let owned_slots = function
+            .owned_slot_types
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, ty)| ty.map(|ty| (slot, ty)))
+            .rev()
+            .collect::<Vec<_>>();
+        for (slot, _) in &owned_slots {
+            let null = b.ins().iconst(pointer_type, 0);
+            b.def_var(Variable::from_u32(*slot as u32), null);
         }
         bind_parameters(
             &mut b,
             &function.parameters,
             entry,
             codegen_env.structs,
-            usize::from(matches!(function.return_type, Some(Type::Struct(_)))),
+            usize::from(matches!(
+                function.return_type,
+                Some(Type::Struct(_) | Type::Array(_))
+            )),
         );
-        let sret_pointer = if matches!(function.return_type, Some(Type::Struct(_))) {
+        for parameter in &function.parameters {
+            if let Some(Some(slot)) = address_slots.get(parameter.slot) {
+                store_variable_to_stack_slot(&mut b, parameter.slot, *slot, pointer_type)?;
+            }
+        }
+        let sret_pointer = if matches!(function.return_type, Some(Type::Struct(_) | Type::Array(_)))
+        {
             Some(b.block_params(entry)[0])
         } else {
             None
         };
         let print_functions = PrintFunctions {
+            owned_strings: codegen_env
+                .print_ids
+                .owned_strings
+                .map(|id| module.declare_func_in_func(id, b.func)),
+            filesystem: codegen_env
+                .print_ids
+                .filesystem
+                .map(|id| module.declare_func_in_func(id, b.func)),
+            system: codegen_env
+                .print_ids
+                .system
+                .map(|id| module.declare_func_in_func(id, b.func)),
+            owned_vecs: codegen_env
+                .print_ids
+                .owned_vecs
+                .map(|id| module.declare_func_in_func(id, b.func)),
+            vec_slice: module.declare_func_in_func(codegen_env.print_ids.vec_slice, b.func),
+            maps: codegen_env
+                .print_ids
+                .maps
+                .map(|id| module.declare_func_in_func(id, b.func)),
+            enum_drop: module.declare_func_in_func(codegen_env.print_ids.enum_drop, b.func),
+            enum_clone: module.declare_func_in_func(codegen_env.print_ids.enum_clone, b.func),
+            enum_new: module.declare_func_in_func(codegen_env.print_ids.enum_new, b.func),
+            enum_tag: module.declare_func_in_func(codegen_env.print_ids.enum_tag, b.func),
+            enum_word: module.declare_func_in_func(codegen_env.print_ids.enum_word, b.func),
+            enum_clear_word: module
+                .declare_func_in_func(codegen_env.print_ids.enum_clear_word, b.func),
+            vec_string_element: module
+                .declare_func_in_func(codegen_env.print_ids.vec_string_element, b.func),
+            vec_map_element: module
+                .declare_func_in_func(codegen_env.print_ids.vec_map_element, b.func),
             string: module.declare_func_in_func(codegen_env.print_ids.string, b.func),
             string_equals: module.declare_func_in_func(codegen_env.print_ids.string_equals, b.func),
             integers: codegen_env
@@ -565,20 +1577,44 @@ fn define_function(
             arg_length: module.declare_func_in_func(codegen_env.print_ids.arg_length, b.func),
             integer_division_by_zero: module
                 .declare_func_in_func(codegen_env.print_ids.integer_division_by_zero, b.func),
+            array_index_out_of_bounds: module
+                .declare_func_in_func(codegen_env.print_ids.array_index_out_of_bounds, b.func),
+            try_read_file: module.declare_func_in_func(codegen_env.print_ids.try_read_file, b.func),
+            read_file_result: module
+                .declare_func_in_func(codegen_env.print_ids.read_file_result, b.func),
         };
         let calls = codegen_env
             .function_ids
             .iter()
             .map(|id| module.declare_func_in_func(*id, b.func))
             .collect::<Vec<_>>();
+        let vec_struct_callbacks = codegen_env
+            .vec_struct_callbacks
+            .iter()
+            .map(|callbacks| {
+                callbacks.map(|(drop, clone)| {
+                    (
+                        module.declare_func_in_func(drop, b.func),
+                        module.declare_func_in_func(clone, b.func),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
         let env = ExprEnv {
+            owned_slots: &owned_slots,
             strings: codegen_env.strings,
             calls: &calls,
+            vec_struct_callbacks: &vec_struct_callbacks,
             print_functions,
             structs: codegen_env.structs,
+            enums: codegen_env.enums,
+            enum_drop_plans: codegen_env.enum_drop_plans,
             function_returns: codegen_env.return_types,
+            external_functions: codegen_env.external_functions,
+            function_parameters: codegen_env.function_parameters,
             function_return: function.return_type,
             sret_pointer,
+            address_slots: &address_slots,
         };
         let mut seal_state = BlockSealState::default();
         let mut loops = Vec::new();
@@ -592,10 +1628,11 @@ fn define_function(
         )? {
             let returns = if let Some(value) = &function.return_value {
                 let compiled = emit_expr(&mut b, module, value, &env, &mut seal_state)?;
-                if let Some(Type::Struct(struct_id)) = function.return_type {
-                    store_struct_return(
+                if let Some(return_type @ (Type::Struct(_) | Type::Array(_))) = function.return_type
+                {
+                    store_aggregate_return(
                         &mut b,
-                        struct_id,
+                        return_type,
                         compiled,
                         sret_pointer.ok_or_else(|| {
                             "internal error: missing structure return buffer".to_string()
@@ -609,6 +1646,7 @@ fn define_function(
             } else {
                 Vec::new()
             };
+            drop_slots(&mut b, &env, env.owned_slots, &mut seal_state);
             b.ins().return_(&returns);
         }
         seal_ready(&mut b, entry, &mut seal_state);
@@ -641,6 +1679,47 @@ fn bind_parameters(
     }
 }
 
+fn reference_storage_layout(ty: Type) -> (u32, u32) {
+    match ty {
+        Type::I8 | Type::U8 | Type::Bool => (1, 1),
+        Type::I16 | Type::U16 => (2, 2),
+        Type::I32 | Type::U32 | Type::F32 | Type::Char => (4, 4),
+        Type::I64 | Type::U64 | Type::F64 => (8, 8),
+        _ => unreachable!("reference target was validated as scalar"),
+    }
+}
+
+fn store_variable_to_stack_slot(
+    b: &mut FunctionBuilder<'_>,
+    variable: usize,
+    slot: StackSlot,
+    pointer_type: types::Type,
+) -> Result<(), String> {
+    let value = b.use_var(Variable::from_u32(variable as u32));
+    let address = b.ins().stack_addr(pointer_type, slot, 0);
+    b.ins().store(MemFlagsData::new(), value, address, 0);
+    Ok(())
+}
+
+fn load_addressed_local(
+    b: &mut FunctionBuilder<'_>,
+    slot: usize,
+    ty: Type,
+    address_slots: &[Option<StackSlot>],
+    pointer_type: types::Type,
+) -> Result<Option<Value>, String> {
+    let Some(Some(stack_slot)) = address_slots.get(slot) else {
+        return Ok(None);
+    };
+    let address = b.ins().stack_addr(pointer_type, *stack_slot, 0);
+    Ok(Some(b.ins().load(
+        clif_scalar_type(ty, pointer_type)?,
+        MemFlagsData::new(),
+        address,
+        0,
+    )))
+}
+
 fn bind_parameter_value(
     b: &mut FunctionBuilder<'_>,
     ty: Type,
@@ -660,11 +1739,25 @@ fn bind_parameter_value(
         | Type::U64
         | Type::F32
         | Type::F64
-        | Type::Bool => {
+        | Type::Bool
+        | Type::Char
+        | Type::OwnedString
+        | Type::Vec(_)
+        | Type::Map(_)
+        | Type::Enum(_) => {
+            b.def_var(Variable::from_u32(slot as u32), values[*offset]);
+            *offset += 1;
+        }
+        Type::Reference(_, _) | Type::RawPointer(_) | Type::FunctionPointer(_) => {
             b.def_var(Variable::from_u32(slot as u32), values[*offset]);
             *offset += 1;
         }
         Type::Str => {
+            b.def_var(Variable::from_u32(slot as u32), values[*offset]);
+            b.def_var(Variable::from_u32(slot as u32 + 1), values[*offset + 1]);
+            *offset += 2;
+        }
+        Type::Slice(_) => {
             b.def_var(Variable::from_u32(slot as u32), values[*offset]);
             b.def_var(Variable::from_u32(slot as u32 + 1), values[*offset + 1]);
             *offset += 2;
@@ -681,11 +1774,38 @@ fn bind_parameter_value(
                 );
             }
         }
+        Type::Array(id) => {
+            let (element, length) = array_info(id);
+            for index in 0..length {
+                bind_parameter_value(
+                    b,
+                    element,
+                    slot + index * storage_slot_width(element, structs),
+                    values,
+                    offset,
+                    structs,
+                );
+            }
+        }
     }
 }
 
 #[derive(Clone, Copy)]
 struct PrintFunctionIds {
+    owned_strings: [FuncId; 54],
+    filesystem: [FuncId; 15],
+    system: [FuncId; 18],
+    owned_vecs: [FuncId; 12],
+    vec_slice: FuncId,
+    maps: [FuncId; 11],
+    enum_drop: FuncId,
+    enum_clone: FuncId,
+    enum_new: FuncId,
+    enum_tag: FuncId,
+    enum_word: FuncId,
+    enum_clear_word: FuncId,
+    vec_string_element: FuncId,
+    vec_map_element: FuncId,
     string: FuncId,
     string_equals: FuncId,
     integers: [FuncId; 8],
@@ -697,18 +1817,40 @@ struct PrintFunctionIds {
     arg_pointer: FuncId,
     arg_length: FuncId,
     integer_division_by_zero: FuncId,
+    array_index_out_of_bounds: FuncId,
+    try_read_file: FuncId,
+    read_file_result: FuncId,
 }
 
 struct FunctionCodegenEnv<'a> {
     function_ids: &'a [FuncId],
     strings: &'a HashMap<String, DataId>,
     print_ids: PrintFunctionIds,
+    vec_struct_callbacks: &'a [Option<(FuncId, FuncId)>],
     structs: &'a [RynStruct],
+    enums: &'a [RynEnum],
+    enum_drop_plans: &'a [Option<DataId>],
     return_types: &'a [Option<Type>],
+    external_functions: &'a [bool],
+    function_parameters: &'a [Vec<Type>],
 }
 
 #[derive(Clone, Copy)]
 struct PrintFunctions {
+    owned_strings: [FuncRef; 54],
+    filesystem: [FuncRef; 15],
+    system: [FuncRef; 18],
+    owned_vecs: [FuncRef; 12],
+    vec_slice: FuncRef,
+    maps: [FuncRef; 11],
+    enum_drop: FuncRef,
+    enum_clone: FuncRef,
+    enum_new: FuncRef,
+    enum_tag: FuncRef,
+    enum_word: FuncRef,
+    enum_clear_word: FuncRef,
+    vec_string_element: FuncRef,
+    vec_map_element: FuncRef,
     string: FuncRef,
     string_equals: FuncRef,
     integers: [FuncRef; 8],
@@ -720,6 +1862,193 @@ struct PrintFunctions {
     arg_pointer: FuncRef,
     arg_length: FuncRef,
     integer_division_by_zero: FuncRef,
+    array_index_out_of_bounds: FuncRef,
+    try_read_file: FuncRef,
+    read_file_result: FuncRef,
+}
+
+fn drop_slots(
+    b: &mut FunctionBuilder<'_>,
+    env: &ExprEnv<'_>,
+    slots: &[(usize, Type)],
+    seal_state: &mut BlockSealState,
+) {
+    for (slot, ty) in slots {
+        let pointer = b.use_var(Variable::from_u32(*slot as u32));
+        match ty {
+            Type::Struct(struct_id) if env.structs[*struct_id].drop_function.is_some() => {
+                let drop_function = env.structs[*struct_id].drop_function.unwrap();
+                let is_null = b.ins().icmp_imm_s(IntCC::Equal, pointer, 0);
+                let skip = b.create_block();
+                let invoke = b.create_block();
+                let merge = b.create_block();
+                let from = b.current_block().expect("drop has a current block");
+                b.ins().brif(is_null, skip, &[], invoke, &[]);
+                seal_ready(b, from, seal_state);
+                b.switch_to_block(invoke);
+                let mut arguments = Vec::new();
+                for field in &env.structs[*struct_id].fields {
+                    for component in 0..crate::sema::storage_slot_width(field.ty, env.structs) {
+                        arguments.push(b.use_var(Variable::from_u32(
+                            (*slot + field.slot_offset + component) as u32,
+                        )));
+                    }
+                }
+                b.ins().call(env.calls[drop_function], &arguments);
+                b.ins().jump(merge, &[]);
+                seal_ready(b, invoke, seal_state);
+                b.switch_to_block(skip);
+                b.ins().jump(merge, &[]);
+                seal_ready(b, skip, seal_state);
+                b.switch_to_block(merge);
+                seal_ready(b, merge, seal_state);
+                let pointer_type = b.func.dfg.value_type(pointer);
+                let null = b.ins().iconst(pointer_type, 0);
+                b.def_var(Variable::from_u32(*slot as u32), null);
+                continue;
+            }
+            Type::Vec(_) => {
+                b.ins().call(
+                    env.print_functions.owned_vecs[VecOp::Drop as usize],
+                    &[pointer],
+                );
+            }
+            Type::Map(_) => {
+                b.ins()
+                    .call(env.print_functions.maps[MapOp::Drop as usize], &[pointer]);
+            }
+            Type::Enum(_) => {
+                b.ins().call(env.print_functions.enum_drop, &[pointer]);
+            }
+            _ => {
+                b.ins().call(
+                    env.print_functions.owned_strings[StringOp::Drop as usize],
+                    &[pointer],
+                );
+            }
+        }
+        let pointer_type = b.func.dfg.value_type(pointer);
+        let null = b.ins().iconst(pointer_type, 0);
+        b.def_var(Variable::from_u32(*slot as u32), null);
+    }
+}
+
+fn drop_binding(
+    b: &mut FunctionBuilder<'_>,
+    env: &ExprEnv<'_>,
+    slot: usize,
+    ty: Type,
+    seal_state: &mut BlockSealState,
+) {
+    let mut slots = crate::guard::owned_slots(ty, slot, env.structs);
+    slots.reverse();
+    drop_slots(b, env, &slots, seal_state);
+}
+
+fn drop_temporary(b: &mut FunctionBuilder<'_>, runtime: PrintFunctions, value: CompiledValue) {
+    match value {
+        CompiledValue::StrViewOwned {
+            owner,
+            temporary: true,
+            ..
+        } => {
+            b.ins()
+                .call(runtime.owned_strings[StringOp::Drop as usize], &[owner]);
+        }
+        CompiledValue::OwnedString {
+            ptr,
+            temporary: true,
+        } => {
+            b.ins()
+                .call(runtime.owned_strings[StringOp::Drop as usize], &[ptr]);
+        }
+        CompiledValue::Vec {
+            ptr,
+            temporary: true,
+        } => {
+            b.ins()
+                .call(runtime.owned_vecs[VecOp::Drop as usize], &[ptr]);
+        }
+        CompiledValue::Map {
+            ptr,
+            temporary: true,
+        } => {
+            b.ins().call(runtime.maps[MapOp::Drop as usize], &[ptr]);
+        }
+        CompiledValue::Enum {
+            ptr,
+            temporary: true,
+        } => {
+            b.ins().call(runtime.enum_drop, &[ptr]);
+        }
+        CompiledValue::Struct { fields, .. } => {
+            for value in fields.into_iter().rev() {
+                drop_temporary(b, runtime, value);
+            }
+        }
+        CompiledValue::Array(values) => {
+            for value in values.into_iter().rev() {
+                drop_temporary(b, runtime, value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn make_temporary(value: &mut CompiledValue) {
+    match value {
+        CompiledValue::OwnedString { temporary, .. } => *temporary = true,
+        CompiledValue::Vec { temporary, .. } => *temporary = true,
+        CompiledValue::Map { temporary, .. } => *temporary = true,
+        CompiledValue::Enum { temporary, .. } => *temporary = true,
+        CompiledValue::Struct { fields, .. } => {
+            for field in fields {
+                make_temporary(field);
+            }
+        }
+        CompiledValue::Array(values) => {
+            for value in values {
+                make_temporary(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn call_result(target: IrCallTarget, env: &ExprEnv<'_>) -> Option<Type> {
+    match target {
+        IrCallTarget::Function(index) => env.function_returns[index],
+        IrCallTarget::IndirectFunctionPointer(id) => crate::sema::function_pointer_info(id).result,
+        IrCallTarget::String(operation) => operation.result(),
+        IrCallTarget::Filesystem(operation) => Some(operation.result()),
+        IrCallTarget::TryReadFile(enum_id) => Some(Type::Enum(enum_id)),
+        IrCallTarget::ReadFileResult(enum_id) => Some(Type::Enum(enum_id)),
+        IrCallTarget::System(operation) => operation.result(),
+        IrCallTarget::Vec(op, elem_id) => op.result(vec_elem(elem_id)),
+        IrCallTarget::VecSlice(elem_id) => Some(Type::Slice(elem_id)),
+        IrCallTarget::SliceLen => Some(Type::U64),
+        IrCallTarget::Map(op, map_id) => {
+            let (key, value) = map_info(map_id);
+            if op == MapOp::Get {
+                env.enums
+                    .iter()
+                    .position(|definition| {
+                        definition.name.starts_with("$RynOption#")
+                            && definition.variants.len() == 2
+                            && definition.variants[0].name == "Some"
+                            && definition.variants[0].fields == [value]
+                            && definition.variants[1].name == "None"
+                            && definition.variants[1].fields.is_empty()
+                    })
+                    .map(Type::Enum)
+            } else {
+                op.result(key, value)
+            }
+        }
+        IrCallTarget::Argument => Some(Type::Str),
+        IrCallTarget::ArgumentCount => Some(Type::U32),
+        IrCallTarget::EnumNew { enum_id, .. } => Some(Type::Enum(enum_id)),
+    }
 }
 
 fn emit_statements(
@@ -732,14 +2061,148 @@ fn emit_statements(
 ) -> Result<bool, String> {
     for statement in statements {
         let falls_through = match statement {
-            IrStatement::Let { slot, ty, value } | IrStatement::Assign { slot, ty, value } => {
+            IrStatement::Block(statements) => {
+                emit_statements(b, module, env, statements, seal_state, loops)?
+            }
+            IrStatement::Let {
+                slot, ty, value, ..
+            } => {
                 let compiled = emit_expr(b, module, value, env, seal_state)?;
                 store_local(b, *slot, *ty, compiled, env.structs)?;
+                if let Some(Some(stack_slot)) = env.address_slots.get(*slot) {
+                    store_variable_to_stack_slot(
+                        b,
+                        *slot,
+                        *stack_slot,
+                        module.target_config().pointer_type(),
+                    )?;
+                }
+                true
+            }
+            IrStatement::Assign {
+                slot, ty, value, ..
+            } => {
+                let compiled = emit_expr(b, module, value, env, seal_state)?;
+                drop_binding(b, env, *slot, *ty, seal_state);
+                store_local(b, *slot, *ty, compiled, env.structs)?;
+                if let Some(Some(stack_slot)) = env.address_slots.get(*slot) {
+                    store_variable_to_stack_slot(
+                        b,
+                        *slot,
+                        *stack_slot,
+                        module.target_config().pointer_type(),
+                    )?;
+                }
                 true
             }
             IrStatement::FieldAssign { slot, ty, value } => {
                 let compiled = emit_expr(b, module, value, env, seal_state)?;
+                drop_binding(b, env, *slot, *ty, seal_state);
                 store_local(b, *slot, *ty, compiled, env.structs)?;
+                true
+            }
+            IrStatement::DereferenceAssign { pointer, ty, value } => {
+                let pointer = emit_expr(b, module, pointer, env, seal_state)?;
+                let CompiledValue::Integer(pointer, _) = pointer else {
+                    return Err(
+                        "internal error: dereference assignment target is not a pointer".into(),
+                    );
+                };
+                let value = emit_expr(b, module, value, env, seal_state)?;
+                let values = flatten_value(value);
+                let [value] = values.as_slice() else {
+                    return Err("internal error: dereference assignment value is not scalar".into());
+                };
+                let expected = clif_scalar_type(*ty, module.target_config().pointer_type())?;
+                if b.func.dfg.value_type(*value) != expected {
+                    return Err("internal error: dereference assignment type mismatch".into());
+                }
+                b.ins().store(MemFlagsData::new(), *value, pointer, 0);
+                true
+            }
+            IrStatement::ArrayAssign {
+                slot,
+                element,
+                length,
+                index,
+                value,
+                ..
+            } => {
+                let index = emit_expr(b, module, index, env, seal_state)?;
+                let CompiledValue::Integer(index, index_ty) = index else {
+                    return Err(
+                        "internal error: checked array assignment index is not integer".into(),
+                    );
+                };
+                let index64 = match index_ty {
+                    Type::I8 | Type::I16 | Type::I32 => b.ins().sextend(types::I64, index),
+                    Type::U8 | Type::U16 | Type::U32 => b.ins().uextend(types::I64, index),
+                    Type::I64 | Type::U64 => index,
+                    _ => return Err("internal error: invalid array assignment index type".into()),
+                };
+                let too_large =
+                    b.ins()
+                        .icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, index64, *length as i64);
+                let out_of_bounds =
+                    if matches!(index_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64) {
+                        let negative = b.ins().icmp_imm_s(IntCC::SignedLessThan, index64, 0);
+                        b.ins().bor(negative, too_large)
+                    } else {
+                        too_large
+                    };
+                let error_block = b.create_block();
+                let valid_block = b.create_block();
+                let from = b
+                    .current_block()
+                    .ok_or("internal error: array write has no source block")?;
+                b.ins()
+                    .brif(out_of_bounds, error_block, &[], valid_block, &[]);
+                seal_ready(b, from, seal_state);
+                b.switch_to_block(error_block);
+                b.ins()
+                    .call(env.print_functions.array_index_out_of_bounds, &[]);
+                b.ins().trap(TrapCode::unwrap_user(1));
+                seal_ready(b, error_block, seal_state);
+                b.switch_to_block(valid_block);
+                let assigned = flatten_value(emit_expr(b, module, value, env, seal_state)?);
+                let expected =
+                    clif_types(*element, module.target_config().pointer_type(), env.structs);
+                if assigned.len() != expected.len() {
+                    return Err(
+                        "internal error: array assignment value has an incompatible layout".into(),
+                    );
+                };
+                let owned_components = crate::guard::owned_slots(*element, 0, env.structs);
+                for element_index in 0..*length {
+                    let select = b
+                        .ins()
+                        .icmp_imm_u(IntCC::Equal, index64, element_index as i64);
+                    let base = *slot + element_index * storage_slot_width(*element, env.structs);
+                    for (component_index, assigned) in assigned.iter().enumerate() {
+                        let component_slot = base + component_index;
+                        let current = b.use_var(Variable::from_u32(component_slot as u32));
+                        if let Some((_, owner_ty)) = owned_components
+                            .iter()
+                            .find(|(owner_slot, _)| *owner_slot == component_index)
+                        {
+                            let pointer_type = b.func.dfg.value_type(current);
+                            let null = b.ins().iconst(pointer_type, 0);
+                            let old_if_selected = b.ins().select(select, current, null);
+                            let drop_op = match owner_ty {
+                                Type::Vec(_) => {
+                                    env.print_functions.owned_vecs[VecOp::Drop as usize]
+                                }
+                                Type::Enum(_) => env.print_functions.enum_drop,
+                                Type::Map(_) => env.print_functions.maps[MapOp::Drop as usize],
+                                _ => env.print_functions.owned_strings[StringOp::Drop as usize],
+                            };
+                            b.ins().call(drop_op, &[old_if_selected]);
+                        }
+                        let updated = b.ins().select(select, *assigned, current);
+                        b.def_var(Variable::from_u32(component_slot as u32), updated);
+                    }
+                }
+                seal_ready(b, valid_block, seal_state);
                 true
             }
             IrStatement::Print { value, ty } => {
@@ -750,8 +2213,10 @@ fn emit_statements(
                     env.print_functions,
                     env.strings,
                     env.structs,
+                    env.enums,
                     *ty,
                     compiled,
+                    seal_state,
                 )?;
                 b.ins().call(env.print_functions.newline, &[]);
                 true
@@ -769,16 +2234,58 @@ fn emit_statements(
                         env.print_functions,
                         env.strings,
                         env.structs,
+                        env.enums,
                         ty,
                         compiled,
+                        seal_state,
                     )?;
                 }
                 b.ins().call(env.print_functions.newline, &[]);
                 true
             }
             IrStatement::Call { target, arguments } => {
-                let _ = emit_call(b, module, *target, arguments, env, seal_state)?;
-                true
+                if matches!(target, IrCallTarget::System(SystemOp::Exit)) {
+                    let [argument] = arguments.as_slice() else {
+                        return Err("internal error: exit requires one argument".into());
+                    };
+                    let CompiledValue::Integer(code, Type::I32) =
+                        emit_expr(b, module, argument, env, seal_state)?
+                    else {
+                        return Err("internal error: exit code is not i32".into());
+                    };
+                    // Evaluate the exit code first, then release every live compiler-known
+                    // owner before the runtime terminates the process.
+                    drop_slots(b, env, env.owned_slots, seal_state);
+                    b.ins()
+                        .call(env.print_functions.system[SystemOp::Exit as usize], &[code]);
+                    b.ins().trap(TrapCode::unwrap_user(1));
+                    false
+                } else if matches!(target, IrCallTarget::System(SystemOp::Panic)) {
+                    emit_call(b, module, *target, arguments, env, seal_state)?;
+                    drop_slots(b, env, env.owned_slots, seal_state);
+                    let failure_code = b.ins().iconst(types::I32, 1);
+                    b.ins().call(
+                        env.print_functions.system[SystemOp::Exit as usize],
+                        &[failure_code],
+                    );
+                    b.ins().trap(TrapCode::unwrap_user(1));
+                    false
+                } else if matches!(
+                    target,
+                    IrCallTarget::System(SystemOp::Assert | SystemOp::AssertMessage)
+                ) {
+                    emit_assertion(b, module, *target, arguments, env, seal_state)?;
+                    true
+                } else {
+                    let result = emit_call(b, module, *target, arguments, env, seal_state)?;
+                    if let Some(ty) = call_result(*target, env) {
+                        let mut offset = 0;
+                        let result =
+                            compiled_value_from_type(ty, &result, &mut offset, env.structs)?;
+                        drop_temporary(b, env.print_functions, result);
+                    }
+                    true
+                }
             }
             IrStatement::If {
                 condition,
@@ -937,11 +2444,13 @@ fn emit_statements(
             IrStatement::Return { value } => {
                 let values = if let Some(value) = value {
                     let compiled = emit_expr(b, module, value, env, seal_state)?;
-                    if let Some(Type::Struct(struct_id)) = env.function_return {
+                    if let Some(return_type @ (Type::Struct(_) | Type::Array(_))) =
+                        env.function_return
+                    {
                         let ptr = env.sret_pointer.ok_or_else(|| {
                             "internal error: missing structure return buffer".to_string()
                         })?;
-                        store_struct_return(b, struct_id, compiled, ptr, env.structs)?;
+                        store_aggregate_return(b, return_type, compiled, ptr, env.structs)?;
                         Vec::new()
                     } else {
                         flatten_value(compiled)
@@ -949,8 +2458,13 @@ fn emit_statements(
                 } else {
                     Vec::new()
                 };
+                drop_slots(b, env, env.owned_slots, seal_state);
                 b.ins().return_(&values);
                 false
+            }
+            IrStatement::Drop { slots } => {
+                drop_slots(b, env, slots, seal_state);
+                true
             }
         };
         if !falls_through {
@@ -960,22 +2474,109 @@ fn emit_statements(
     Ok(true)
 }
 
+fn emit_assertion(
+    b: &mut FunctionBuilder<'_>,
+    module: &ObjectModule,
+    target: IrCallTarget,
+    arguments: &[IrExpression],
+    env: &ExprEnv<'_>,
+    seal_state: &mut BlockSealState,
+) -> Result<(), String> {
+    let IrCallTarget::System(operation @ (SystemOp::Assert | SystemOp::AssertMessage)) = target
+    else {
+        return Err("internal error: assertion helper received a non-assert operation".into());
+    };
+    let mut borrowed = Vec::with_capacity(arguments.len());
+    let mut values = Vec::new();
+    for argument in arguments {
+        let value = emit_expr(b, module, argument, env, seal_state)?;
+        values.extend(flatten_value(value.clone()));
+        borrowed.push(value);
+    }
+    let Some(CompiledValue::Bool(condition)) = borrowed.first() else {
+        return Err("internal error: assertion condition is not bool".into());
+    };
+    let condition = *condition;
+    b.ins()
+        .call(env.print_functions.system[operation as usize], &values);
+    for value in borrowed.into_iter().rev() {
+        drop_temporary(b, env.print_functions, value);
+    }
+
+    let success = b.create_block();
+    let failure = b.create_block();
+    let from = b
+        .current_block()
+        .ok_or_else(|| "internal error: assertion has no current block".to_string())?;
+    b.ins().brif(condition, success, &[], failure, &[]);
+    seal_ready(b, from, seal_state);
+
+    b.switch_to_block(failure);
+    drop_slots(b, env, env.owned_slots, seal_state);
+    let failure_code = b.ins().iconst(types::I32, 1);
+    b.ins().call(
+        env.print_functions.system[SystemOp::Exit as usize],
+        &[failure_code],
+    );
+    b.ins().trap(TrapCode::unwrap_user(1));
+    seal_ready(b, failure, seal_state);
+
+    b.switch_to_block(success);
+    seal_ready(b, success, seal_state);
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct LoopBlocks {
     continue_target: cranelift_codegen::ir::Block,
     break_target: cranelift_codegen::ir::Block,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_print_value(
     b: &mut FunctionBuilder<'_>,
     module: &ObjectModule,
     print_functions: PrintFunctions,
     strings: &HashMap<String, DataId>,
     structs: &[RynStruct],
+    enums: &[RynEnum],
     ty: Type,
     compiled: CompiledValue,
+    seal_state: &mut BlockSealState,
 ) -> Result<(), String> {
     match (ty, compiled) {
+        (Type::Char, CompiledValue::Integer(value, Type::Char)) => {
+            b.ins().call(
+                print_functions.owned_strings[StringOp::PrintChar as usize],
+                &[value],
+            );
+        }
+        (Type::OwnedString, value @ CompiledValue::OwnedString { .. }) => {
+            let CompiledValue::OwnedString { ptr, .. } = value else {
+                unreachable!()
+            };
+            b.ins().call(
+                print_functions.owned_strings[StringOp::Print as usize],
+                &[ptr],
+            );
+            drop_temporary(b, print_functions, value);
+        }
+        (Type::Enum(enum_id), value @ CompiledValue::Enum { ptr, temporary }) => {
+            emit_print_enum(
+                b,
+                module,
+                print_functions,
+                strings,
+                structs,
+                enums,
+                enum_id,
+                ptr,
+                seal_state,
+            )?;
+            if temporary {
+                drop_temporary(b, print_functions, value);
+            }
+        }
         (ty, CompiledValue::Integer(value, actual)) if ty == actual => {
             let index = integer_print_index(ty)
                 .ok_or_else(|| "internal error: missing integer printer".to_string())?;
@@ -1006,8 +2607,10 @@ fn emit_print_value(
                 print_functions,
                 strings,
                 structs,
+                enums,
                 struct_id,
                 &fields,
+                seal_state,
             )?;
         }
         _ => return Err("internal error: print value differs from checked type".into()),
@@ -1073,6 +2676,26 @@ fn emit_equality_value(
     right: CompiledValue,
 ) -> Result<Value, String> {
     match (ty, left, right) {
+        (
+            Type::OwnedString,
+            left @ CompiledValue::OwnedString { .. },
+            right @ CompiledValue::OwnedString { .. },
+        ) => {
+            let CompiledValue::OwnedString { ptr: left_ptr, .. } = left else {
+                unreachable!()
+            };
+            let CompiledValue::OwnedString { ptr: right_ptr, .. } = right else {
+                unreachable!()
+            };
+            let call = b.ins().call(
+                print_functions.owned_strings[StringOp::Equals as usize],
+                &[left_ptr, right_ptr],
+            );
+            let result = b.func.dfg.inst_results(call)[0];
+            drop_temporary(b, print_functions, left);
+            drop_temporary(b, print_functions, right);
+            Ok(result)
+        }
         (ty, CompiledValue::Integer(left, left_ty), CompiledValue::Integer(right, right_ty))
             if ty == left_ty && ty == right_ty =>
         {
@@ -1113,14 +2736,17 @@ fn emit_equality_value(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_print_struct(
     b: &mut FunctionBuilder<'_>,
     module: &ObjectModule,
     print_functions: PrintFunctions,
     strings: &HashMap<String, DataId>,
     structs: &[RynStruct],
+    enums: &[RynEnum],
     struct_id: usize,
     fields: &[CompiledValue],
+    seal_state: &mut BlockSealState,
 ) -> Result<(), String> {
     let definition = structs
         .get(struct_id)
@@ -1143,11 +2769,99 @@ fn emit_print_struct(
             print_functions,
             strings,
             structs,
+            enums,
             field.ty,
             value.clone(),
+            seal_state,
         )?;
     }
     emit_print_text(b, module, print_functions, strings, " }")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_print_enum(
+    b: &mut FunctionBuilder<'_>,
+    module: &ObjectModule,
+    print_functions: PrintFunctions,
+    strings: &HashMap<String, DataId>,
+    structs: &[RynStruct],
+    enums: &[RynEnum],
+    enum_id: usize,
+    ptr: Value,
+    seal_state: &mut BlockSealState,
+) -> Result<(), String> {
+    let definition = enums
+        .get(enum_id)
+        .ok_or_else(|| "internal error: printed enum type is out of range".to_string())?;
+    let pointer_type = module.target_config().pointer_type();
+    let tag_call = b.ins().call(print_functions.enum_tag, &[ptr]);
+    let tag = b.func.dfg.inst_results(tag_call)[0];
+
+    let variant_blocks = (0..definition.variants.len())
+        .map(|_| b.create_block())
+        .collect::<Vec<_>>();
+    let merge_block = b.create_block();
+    let mut test_block = b
+        .current_block()
+        .ok_or_else(|| "internal error: enum print has no source block".to_string())?;
+    for (index, block) in variant_blocks.iter().enumerate() {
+        if index > 0 {
+            b.switch_to_block(test_block);
+        }
+        if index + 1 == variant_blocks.len() {
+            b.ins().jump(*block, &[]);
+            seal_ready(b, test_block, seal_state);
+        } else {
+            let next_test = b.create_block();
+            let expected = b.ins().iconst(types::I64, index as i64);
+            let matches = b.ins().icmp(IntCC::Equal, tag, expected);
+            b.ins().brif(matches, *block, &[], next_test, &[]);
+            seal_ready(b, test_block, seal_state);
+            test_block = next_test;
+        }
+    }
+
+    for (index, variant) in definition.variants.iter().enumerate() {
+        b.switch_to_block(variant_blocks[index]);
+        emit_print_text(b, module, print_functions, strings, &variant.name)?;
+        if !variant.fields.is_empty() {
+            emit_print_text(b, module, print_functions, strings, "(")?;
+            let mut word_offset = 0usize;
+            for (field_index, field_ty) in variant.fields.iter().enumerate() {
+                if field_index != 0 {
+                    emit_print_text(b, module, print_functions, strings, ", ")?;
+                }
+                let value = decode_enum_value_payload(
+                    b,
+                    ptr,
+                    word_offset,
+                    *field_ty,
+                    pointer_type,
+                    structs,
+                    print_functions,
+                    false,
+                )?;
+                emit_print_value(
+                    b,
+                    module,
+                    print_functions,
+                    strings,
+                    structs,
+                    enums,
+                    *field_ty,
+                    value,
+                    seal_state,
+                )?;
+                word_offset += value_width(*field_ty, structs);
+            }
+            emit_print_text(b, module, print_functions, strings, ")")?;
+        }
+        b.ins().jump(merge_block, &[]);
+        seal_ready(b, variant_blocks[index], seal_state);
+    }
+    b.switch_to_block(merge_block);
+    seal_ready(b, merge_block, seal_state);
+    Ok(())
 }
 
 fn emit_print_text(
@@ -1183,9 +2897,43 @@ fn store_local(
         (Type::F32, CompiledValue::F32(v))
         | (Type::F64, CompiledValue::F64(v))
         | (Type::Bool, CompiledValue::Bool(v)) => b.def_var(Variable::from_u32(slot as u32), v),
+        (Type::Reference(_, _) | Type::RawPointer(_), CompiledValue::Integer(v, _)) => {
+            b.def_var(Variable::from_u32(slot as u32), v)
+        }
         (Type::Str, CompiledValue::Str { ptr, len }) => {
             b.def_var(Variable::from_u32(slot as u32), ptr);
             b.def_var(Variable::from_u32(slot as u32 + 1), len);
+        }
+        (Type::Slice(_), CompiledValue::Slice { ptr, len }) => {
+            b.def_var(Variable::from_u32(slot as u32), ptr);
+            b.def_var(Variable::from_u32(slot as u32 + 1), len);
+        }
+        (Type::OwnedString, CompiledValue::OwnedString { ptr, .. }) => {
+            b.def_var(Variable::from_u32(slot as u32), ptr)
+        }
+        (Type::Vec(_), CompiledValue::Vec { ptr, .. }) => {
+            b.def_var(Variable::from_u32(slot as u32), ptr)
+        }
+        (Type::Map(_), CompiledValue::Map { ptr, .. }) => {
+            b.def_var(Variable::from_u32(slot as u32), ptr)
+        }
+        (Type::Enum(_), CompiledValue::Enum { ptr, .. }) => {
+            b.def_var(Variable::from_u32(slot as u32), ptr)
+        }
+        (Type::Array(id), CompiledValue::Array(values)) => {
+            let (element, length) = array_info(id);
+            if values.len() != length {
+                return Err("internal error: array value has the wrong element count".into());
+            }
+            for (index, value) in values.into_iter().enumerate() {
+                store_local(
+                    b,
+                    slot + index * storage_slot_width(element, structs),
+                    element,
+                    value,
+                    structs,
+                )?;
+            }
         }
         (
             Type::Struct(struct_id),
@@ -1222,7 +2970,11 @@ fn load_local(
         | Type::U8
         | Type::U16
         | Type::U32
-        | Type::U64 => CompiledValue::Integer(first, ty),
+        | Type::U64
+        | Type::Char => CompiledValue::Integer(first, ty),
+        Type::Reference(_, _) | Type::RawPointer(_) | Type::FunctionPointer(_) => {
+            CompiledValue::Integer(first, ty)
+        }
         Type::F32 => CompiledValue::F32(first),
         Type::F64 => CompiledValue::F64(first),
         Type::Bool => CompiledValue::Bool(first),
@@ -1230,12 +2982,45 @@ fn load_local(
             ptr: first,
             len: b.use_var(Variable::from_u32(slot as u32 + 1)),
         },
+        Type::Slice(_) => CompiledValue::Slice {
+            ptr: first,
+            len: b.use_var(Variable::from_u32(slot as u32 + 1)),
+        },
+        Type::OwnedString => CompiledValue::OwnedString {
+            ptr: first,
+            temporary: false,
+        },
+        Type::Vec(_) => CompiledValue::Vec {
+            ptr: first,
+            temporary: false,
+        },
+        Type::Map(_) => CompiledValue::Map {
+            ptr: first,
+            temporary: false,
+        },
+        Type::Enum(_) => CompiledValue::Enum {
+            ptr: first,
+            temporary: false,
+        },
         Type::Struct(struct_id) => {
             let mut fields = Vec::with_capacity(structs[struct_id].fields.len());
             for field in &structs[struct_id].fields {
                 fields.push(load_local(b, slot + field.slot_offset, field.ty, structs)?);
             }
             CompiledValue::Struct { struct_id, fields }
+        }
+        Type::Array(id) => {
+            let (element, length) = array_info(id);
+            let mut values = Vec::with_capacity(length);
+            for index in 0..length {
+                values.push(load_local(
+                    b,
+                    slot + index * storage_slot_width(element, structs),
+                    element,
+                    structs,
+                )?);
+            }
+            CompiledValue::Array(values)
         }
     })
 }
@@ -1258,19 +3043,30 @@ fn seal_ready(
 }
 
 fn collect_strings(ir: &RynIr) -> BTreeSet<String> {
-    fn print_type(ty: Type, structs: &[RynStruct], out: &mut BTreeSet<String>) {
-        let Type::Struct(struct_id) = ty else {
-            return;
-        };
-        let definition = &structs[struct_id];
-        out.insert(definition.name.clone());
-        out.insert(" { ".into());
-        out.insert(", ".into());
-        out.insert(": ".into());
-        out.insert(" }".into());
-        for field in &definition.fields {
-            out.insert(field.name.clone());
-            print_type(field.ty, structs, out);
+    fn print_type(ty: Type, structs: &[RynStruct], enums: &[RynEnum], out: &mut BTreeSet<String>) {
+        match ty {
+            Type::Struct(struct_id) => {
+                let definition = &structs[struct_id];
+                out.insert(definition.name.clone());
+                out.insert(" { ".into());
+                out.insert(", ".into());
+                out.insert(": ".into());
+                out.insert(" }".into());
+                for field in &definition.fields {
+                    out.insert(field.name.clone());
+                    print_type(field.ty, structs, enums, out);
+                }
+            }
+            Type::Enum(enum_id) => {
+                let definition = &enums[enum_id];
+                out.insert("(".into());
+                out.insert(", ".into());
+                out.insert(")".into());
+                for variant in &definition.variants {
+                    out.insert(variant.name.clone());
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1283,6 +3079,28 @@ fn collect_strings(ir: &RynIr) -> BTreeSet<String> {
                 for arg in arguments {
                     expr(arg, out);
                 }
+            }
+            IrExpression::ArrayValue(values) => {
+                for value in values {
+                    expr(value, out);
+                }
+            }
+            IrExpression::ArrayAsSlice { array, .. } => expr(array, out),
+            IrExpression::ArrayIndex { array, index, .. } => {
+                expr(array, out);
+                expr(index, out);
+            }
+            IrExpression::SliceIndex { slice, index, .. } => {
+                expr(slice, out);
+                expr(index, out);
+            }
+            IrExpression::SliceElementAddress { slice, index, .. } => {
+                expr(slice, out);
+                expr(index, out);
+            }
+            IrExpression::Dereference { pointer, .. } => expr(pointer, out),
+            IrExpression::StringFindOption { value, .. } | IrExpression::StringAsStr(value) => {
+                expr(value, out)
             }
             IrExpression::If {
                 condition,
@@ -1309,20 +3127,45 @@ fn collect_strings(ir: &RynIr) -> BTreeSet<String> {
             }
             IrExpression::Field { value, .. } => expr(value, out),
             IrExpression::Integer(..)
+            | IrExpression::Character(_)
+            | IrExpression::Move { .. }
             | IrExpression::Float(..)
             | IrExpression::Boolean(_)
-            | IrExpression::Local { .. } => {}
+            | IrExpression::Local { .. }
+            | IrExpression::AddressOf { .. }
+            | IrExpression::FunctionAddress { .. } => {}
+            IrExpression::EnumMatch { value, arms, .. } => {
+                expr(value, out);
+                for arm in arms {
+                    expr(&arm.body, out);
+                }
+            }
+            IrExpression::Propagate { value, .. } => expr(value, out),
         }
     }
-    fn stmts(values: &[IrStatement], structs: &[RynStruct], out: &mut BTreeSet<String>) {
+    fn stmts(
+        values: &[IrStatement],
+        structs: &[RynStruct],
+        enums: &[RynEnum],
+        out: &mut BTreeSet<String>,
+    ) {
         for stmt in values {
             match stmt {
+                IrStatement::Block(statements) => stmts(statements, structs, enums, out),
                 IrStatement::Let { value, .. }
                 | IrStatement::Assign { value, .. }
                 | IrStatement::FieldAssign { value, .. } => expr(value, out),
+                IrStatement::ArrayAssign { index, value, .. } => {
+                    expr(index, out);
+                    expr(value, out);
+                }
+                IrStatement::DereferenceAssign { pointer, value, .. } => {
+                    expr(pointer, out);
+                    expr(value, out);
+                }
                 IrStatement::Print { value, ty } => {
                     expr(value, out);
-                    print_type(*ty, structs, out);
+                    print_type(*ty, structs, enums, out);
                 }
                 IrStatement::PrintTemplate(parts) => {
                     for part in parts {
@@ -1332,7 +3175,7 @@ fn collect_strings(ir: &RynIr) -> BTreeSet<String> {
                             }
                             IrPrintPart::Value { value, ty } => {
                                 expr(value, out);
-                                print_type(*ty, structs, out);
+                                print_type(*ty, structs, enums, out);
                             }
                         }
                     }
@@ -1348,32 +3191,32 @@ fn collect_strings(ir: &RynIr) -> BTreeSet<String> {
                     else_body,
                 } => {
                     expr(condition, out);
-                    stmts(then_body, structs, out);
-                    stmts(else_body, structs, out);
+                    stmts(then_body, structs, enums, out);
+                    stmts(else_body, structs, enums, out);
                 }
                 IrStatement::While { condition, body } => {
                     expr(condition, out);
-                    stmts(body, structs, out);
+                    stmts(body, structs, enums, out);
                 }
                 IrStatement::For {
                     start, end, body, ..
                 } => {
                     expr(start, out);
                     expr(end, out);
-                    stmts(body, structs, out);
+                    stmts(body, structs, enums, out);
                 }
                 IrStatement::Return { value } => {
                     if let Some(value) = value {
                         expr(value, out);
                     }
                 }
-                IrStatement::Break | IrStatement::Continue => {}
+                IrStatement::Break | IrStatement::Continue | IrStatement::Drop { .. } => {}
             }
         }
     }
     let mut strings = BTreeSet::new();
     for function in &ir.functions {
-        stmts(&function.statements, &ir.structs, &mut strings);
+        stmts(&function.statements, &ir.structs, &ir.enums, &mut strings);
         if let Some(ret) = &function.return_value {
             expr(ret, &mut strings);
         }
@@ -1387,13 +3230,40 @@ enum CompiledValue {
     F32(Value),
     F64(Value),
     Bool(Value),
+    OwnedString {
+        ptr: Value,
+        temporary: bool,
+    },
+    Vec {
+        ptr: Value,
+        temporary: bool,
+    },
+    Map {
+        ptr: Value,
+        temporary: bool,
+    },
+    Enum {
+        ptr: Value,
+        temporary: bool,
+    },
     Str {
         ptr: Value,
         len: Value,
     },
+    StrViewOwned {
+        ptr: Value,
+        len: Value,
+        owner: Value,
+        temporary: bool,
+    },
     Struct {
         struct_id: usize,
         fields: Vec<CompiledValue>,
+    },
+    Array(Vec<CompiledValue>),
+    Slice {
+        ptr: Value,
+        len: Value,
     },
 }
 
@@ -1402,12 +3272,84 @@ fn flatten_value(value: CompiledValue) -> Vec<Value> {
         CompiledValue::Integer(v, _)
         | CompiledValue::F32(v)
         | CompiledValue::F64(v)
-        | CompiledValue::Bool(v) => vec![v],
+        | CompiledValue::Bool(v)
+        | CompiledValue::OwnedString { ptr: v, .. }
+        | CompiledValue::Vec { ptr: v, .. }
+        | CompiledValue::Map { ptr: v, .. }
+        | CompiledValue::Enum { ptr: v, .. } => vec![v],
         CompiledValue::Str { ptr, len } => vec![ptr, len],
+        CompiledValue::StrViewOwned { ptr, len, .. } => vec![ptr, len],
+        CompiledValue::Slice { ptr, len } => vec![ptr, len],
         CompiledValue::Struct { fields, .. } => {
             fields.into_iter().flat_map(flatten_value).collect()
         }
+        CompiledValue::Array(values) => values.into_iter().flat_map(flatten_value).collect(),
     }
+}
+
+fn zero_clif_value(b: &mut FunctionBuilder<'_>, ty: types::Type) -> Value {
+    if ty == types::F32 {
+        b.ins().f32const(0.0)
+    } else if ty == types::F64 {
+        b.ins().f64const(0.0)
+    } else {
+        b.ins().iconst(ty, 0)
+    }
+}
+
+fn clone_array_element(
+    b: &mut FunctionBuilder<'_>,
+    runtime: PrintFunctions,
+    value: CompiledValue,
+) -> Result<CompiledValue, String> {
+    Ok(match value {
+        CompiledValue::OwnedString { ptr, .. } => {
+            let call = b
+                .ins()
+                .call(runtime.owned_strings[StringOp::Clone as usize], &[ptr]);
+            CompiledValue::OwnedString {
+                ptr: b.func.dfg.inst_results(call)[0],
+                temporary: true,
+            }
+        }
+        CompiledValue::Vec { ptr, .. } => {
+            let call = b
+                .ins()
+                .call(runtime.owned_vecs[VecOp::Clone as usize], &[ptr]);
+            CompiledValue::Vec {
+                ptr: b.func.dfg.inst_results(call)[0],
+                temporary: true,
+            }
+        }
+        CompiledValue::Map { ptr, .. } => {
+            let call = b.ins().call(runtime.maps[MapOp::Clone as usize], &[ptr]);
+            CompiledValue::Map {
+                ptr: b.func.dfg.inst_results(call)[0],
+                temporary: true,
+            }
+        }
+        CompiledValue::Enum { ptr, .. } => {
+            let call = b.ins().call(runtime.enum_clone, &[ptr]);
+            CompiledValue::Enum {
+                ptr: b.func.dfg.inst_results(call)[0],
+                temporary: true,
+            }
+        }
+        CompiledValue::Struct { struct_id, fields } => CompiledValue::Struct {
+            struct_id,
+            fields: fields
+                .into_iter()
+                .map(|field| clone_array_element(b, runtime, field))
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+        CompiledValue::Array(values) => CompiledValue::Array(
+            values
+                .into_iter()
+                .map(|element| clone_array_element(b, runtime, element))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        other => other,
+    })
 }
 
 fn emit_expr(
@@ -1418,6 +3360,20 @@ fn emit_expr(
     seal_state: &mut BlockSealState,
 ) -> Result<CompiledValue, String> {
     Ok(match expr {
+        IrExpression::Character(character) => {
+            CompiledValue::Integer(b.ins().iconst(types::I32, *character as i64), Type::Char)
+        }
+        IrExpression::Move { slot, ty } => {
+            let mut value = load_local(b, *slot, *ty, env.structs)?;
+            make_temporary(&mut value);
+            for (owner, _) in crate::guard::owned_slots(*ty, *slot, env.structs) {
+                let pointer = b.use_var(Variable::from_u32(owner as u32));
+                let pointer_type = b.func.dfg.value_type(pointer);
+                let null = b.ins().iconst(pointer_type, 0);
+                b.def_var(Variable::from_u32(owner as u32), null);
+            }
+            value
+        }
         IrExpression::Integer(v, ty) => {
             let clif_ty = clif_integer_type(*ty)
                 .ok_or_else(|| "internal error: integer IR has a non-integer type".to_string())?;
@@ -1429,6 +3385,35 @@ fn emit_expr(
             return Err("internal error: float IR has a non-float type".into());
         }
         IrExpression::Boolean(v) => CompiledValue::Bool(b.ins().iconst(types::I8, i64::from(*v))),
+        IrExpression::AddressOf {
+            slot, pointer_type, ..
+        } => {
+            let Some(Some(address_slot)) = env.address_slots.get(*slot) else {
+                return Err("internal error: reference target has no stack storage".into());
+            };
+            let pointer =
+                b.ins()
+                    .stack_addr(module.target_config().pointer_type(), *address_slot, 0);
+            CompiledValue::Integer(pointer, *pointer_type)
+        }
+        IrExpression::Dereference { pointer, ty } => {
+            let pointer = emit_expr(b, module, pointer, env, seal_state)?;
+            let CompiledValue::Integer(pointer, _) = pointer else {
+                return Err("internal error: dereference operand is not a pointer".into());
+            };
+            let value = b.ins().load(
+                clif_scalar_type(*ty, module.target_config().pointer_type())?,
+                MemFlagsData::new(),
+                pointer,
+                0,
+            );
+            match ty {
+                Type::F32 => CompiledValue::F32(value),
+                Type::F64 => CompiledValue::F64(value),
+                Type::Bool => CompiledValue::Bool(value),
+                _ => CompiledValue::Integer(value, *ty),
+            }
+        }
         IrExpression::String(value) => {
             let id = *env
                 .strings
@@ -1441,7 +3426,7 @@ fn emit_expr(
             let len = b.ins().iconst(types::I64, value.len() as i64);
             CompiledValue::Str { ptr, len }
         }
-        IrExpression::Local { slot, ty }
+        IrExpression::Local { slot, ty, .. }
             if matches!(
                 ty,
                 Type::I8
@@ -1452,25 +3437,75 @@ fn emit_expr(
                     | Type::U16
                     | Type::U32
                     | Type::U64
+                    | Type::Char
+                    | Type::Reference(_, _)
+                    | Type::RawPointer(_)
+                    | Type::FunctionPointer(_)
             ) =>
+        {
+            CompiledValue::Integer(
+                load_addressed_local(
+                    b,
+                    *slot,
+                    *ty,
+                    env.address_slots,
+                    module.target_config().pointer_type(),
+                )?
+                .unwrap_or_else(|| b.use_var(Variable::from_u32(*slot as u32))),
+                *ty,
+            )
+        }
+        IrExpression::Local {
+            slot,
+            ty: Type::F32,
+            ..
+        } => CompiledValue::F32(
+            load_addressed_local(
+                b,
+                *slot,
+                Type::F32,
+                env.address_slots,
+                module.target_config().pointer_type(),
+            )?
+            .unwrap_or_else(|| b.use_var(Variable::from_u32(*slot as u32))),
+        ),
+        IrExpression::Local {
+            slot,
+            ty: Type::F64,
+            ..
+        } => CompiledValue::F64(
+            load_addressed_local(
+                b,
+                *slot,
+                Type::F64,
+                env.address_slots,
+                module.target_config().pointer_type(),
+            )?
+            .unwrap_or_else(|| b.use_var(Variable::from_u32(*slot as u32))),
+        ),
+        IrExpression::Local {
+            slot,
+            ty: Type::Bool,
+            ..
+        } => CompiledValue::Bool(
+            load_addressed_local(
+                b,
+                *slot,
+                Type::Bool,
+                env.address_slots,
+                module.target_config().pointer_type(),
+            )?
+            .unwrap_or_else(|| b.use_var(Variable::from_u32(*slot as u32))),
+        ),
+        IrExpression::Local { slot, ty, .. }
+            if matches!(ty, Type::Reference(_, _) | Type::RawPointer(_)) =>
         {
             CompiledValue::Integer(b.use_var(Variable::from_u32(*slot as u32)), *ty)
         }
         IrExpression::Local {
             slot,
-            ty: Type::F32,
-        } => CompiledValue::F32(b.use_var(Variable::from_u32(*slot as u32))),
-        IrExpression::Local {
-            slot,
-            ty: Type::F64,
-        } => CompiledValue::F64(b.use_var(Variable::from_u32(*slot as u32))),
-        IrExpression::Local {
-            slot,
-            ty: Type::Bool,
-        } => CompiledValue::Bool(b.use_var(Variable::from_u32(*slot as u32))),
-        IrExpression::Local {
-            slot,
             ty: Type::Str,
+            ..
         } => CompiledValue::Str {
             ptr: b.use_var(Variable::from_u32(*slot as u32)),
             len: b.use_var(Variable::from_u32(*slot as u32 + 1)),
@@ -1478,6 +3513,7 @@ fn emit_expr(
         IrExpression::Local {
             slot,
             ty: Type::Struct(struct_id),
+            ..
         } => {
             let mut fields = Vec::new();
             for field in &env.structs[*struct_id].fields {
@@ -1487,6 +3523,416 @@ fn emit_expr(
             CompiledValue::Struct {
                 struct_id: *struct_id,
                 fields,
+            }
+        }
+        IrExpression::Local {
+            slot,
+            ty: Type::OwnedString,
+            ..
+        } => CompiledValue::OwnedString {
+            ptr: b.use_var(Variable::from_u32(*slot as u32)),
+            temporary: false,
+        },
+        IrExpression::Local {
+            slot,
+            ty: Type::Vec(_),
+            ..
+        } => CompiledValue::Vec {
+            ptr: b.use_var(Variable::from_u32(*slot as u32)),
+            temporary: false,
+        },
+        IrExpression::Local {
+            slot,
+            ty: Type::Map(_),
+            ..
+        } => CompiledValue::Map {
+            ptr: b.use_var(Variable::from_u32(*slot as u32)),
+            temporary: false,
+        },
+        IrExpression::Local {
+            slot,
+            ty: Type::Enum(_),
+            ..
+        } => CompiledValue::Enum {
+            ptr: b.use_var(Variable::from_u32(*slot as u32)),
+            temporary: false,
+        },
+        IrExpression::Local {
+            slot,
+            ty: slice_ty @ Type::Slice(_),
+            ..
+        } => load_local(b, *slot, *slice_ty, env.structs)?,
+        IrExpression::Local {
+            slot,
+            ty: array_ty @ Type::Array(_),
+            ..
+        } => load_local(b, *slot, *array_ty, env.structs)?,
+        IrExpression::ArrayValue(values) => {
+            let mut compiled = Vec::with_capacity(values.len());
+            for value in values {
+                compiled.push(emit_expr(b, module, value, env, seal_state)?);
+            }
+            CompiledValue::Array(compiled)
+        }
+        IrExpression::ArrayAsSlice {
+            array,
+            slice_id,
+            length,
+        } => {
+            let array = emit_expr(b, module, array, env, seal_state)?;
+            let CompiledValue::Array(values) = array else {
+                return Err("internal error: array-to-slice source is not an array".into());
+            };
+            if values.len() != *length {
+                return Err("internal error: array-to-slice source has the wrong length".into());
+            }
+            let element = vec_elem(*slice_id);
+            let scalar_types =
+                clif_types(element, module.target_config().pointer_type(), env.structs);
+            let stride = storage_slot_width(element, env.structs);
+            if scalar_types.len() != stride {
+                return Err(
+                    "internal error: array slice element has an invalid storage layout".into(),
+                );
+            }
+            let slot_size = (*length).max(1) * stride * 8;
+            let slot = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                slot_size as u32,
+                3,
+            ));
+            for (index, value) in values.into_iter().enumerate() {
+                let components = flatten_value(value);
+                if components.len() != stride {
+                    return Err(
+                        "internal error: array slice element has an invalid value layout".into(),
+                    );
+                }
+                for (component_index, component) in components.into_iter().enumerate() {
+                    b.ins().stack_store(
+                        module.target_config().pointer_type(),
+                        component,
+                        slot,
+                        ((index * stride + component_index) * 8) as i32,
+                    );
+                }
+            }
+            let pointer = b
+                .ins()
+                .stack_addr(module.target_config().pointer_type(), slot, 0);
+            CompiledValue::Slice {
+                ptr: pointer,
+                len: b.ins().iconst(types::I64, *length as i64),
+            }
+        }
+        IrExpression::ArrayIndex {
+            array,
+            index,
+            ty,
+            length,
+        } => {
+            let array = emit_expr(b, module, array, env, seal_state)?;
+            let CompiledValue::Array(values) = array else {
+                return Err("internal error: array index base is not an array".into());
+            };
+            let temporary_elements = values.clone();
+            let index_value = emit_expr(b, module, index, env, seal_state)?;
+            let CompiledValue::Integer(index_value, index_ty) = index_value else {
+                return Err("internal error: checked array index is not an integer".into());
+            };
+            let index64 = match index_ty {
+                Type::I8 | Type::I16 | Type::I32 => b.ins().sextend(types::I64, index_value),
+                Type::U8 | Type::U16 | Type::U32 => b.ins().uextend(types::I64, index_value),
+                Type::I64 | Type::U64 => index_value,
+                _ => return Err("internal error: invalid array index type".into()),
+            };
+            let too_large =
+                b.ins()
+                    .icmp_imm_u(IntCC::UnsignedGreaterThanOrEqual, index64, *length as i64);
+            let out_of_bounds = if matches!(index_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64)
+            {
+                let negative = b.ins().icmp_imm_s(IntCC::SignedLessThan, index64, 0);
+                b.ins().bor(negative, too_large)
+            } else {
+                too_large
+            };
+            let error_block = b.create_block();
+            let valid_block = b.create_block();
+            let from = b
+                .current_block()
+                .ok_or("internal error: array index has no source block")?;
+            b.ins()
+                .brif(out_of_bounds, error_block, &[], valid_block, &[]);
+            seal_ready(b, from, seal_state);
+            b.switch_to_block(error_block);
+            b.ins()
+                .call(env.print_functions.array_index_out_of_bounds, &[]);
+            b.ins().trap(TrapCode::unwrap_user(1));
+            seal_ready(b, error_block, seal_state);
+            b.switch_to_block(valid_block);
+            let components = values.into_iter().map(flatten_value).collect::<Vec<_>>();
+            let component_types =
+                clif_types(*ty, module.target_config().pointer_type(), env.structs);
+            if components
+                .iter()
+                .any(|value| value.len() != component_types.len())
+            {
+                return Err("internal error: array element has an incompatible layout".into());
+            }
+            let mut selected = Vec::with_capacity(component_types.len());
+            for (component_index, component_type) in component_types.iter().enumerate() {
+                let mut value = if let Some(first) = components.first() {
+                    first[component_index]
+                } else {
+                    zero_clif_value(b, *component_type)
+                };
+                for (element_index, element) in components.iter().enumerate().skip(1) {
+                    let is_element =
+                        b.ins()
+                            .icmp_imm_u(IntCC::Equal, index64, element_index as i64);
+                    value = b.ins().select(is_element, element[component_index], value);
+                }
+                selected.push(value);
+            }
+            let mut offset = 0;
+            let selected = compiled_value_from_type(*ty, &selected, &mut offset, env.structs)?;
+            let result = clone_array_element(b, env.print_functions, selected)?;
+            for value in temporary_elements {
+                drop_temporary(b, env.print_functions, value);
+            }
+            seal_ready(b, valid_block, seal_state);
+            result
+        }
+        IrExpression::SliceIndex { slice, index, ty } => {
+            let CompiledValue::Slice { ptr, len } = emit_expr(b, module, slice, env, seal_state)?
+            else {
+                return Err("internal error: slice index base is not a slice".into());
+            };
+            let CompiledValue::Integer(index, index_ty) =
+                emit_expr(b, module, index, env, seal_state)?
+            else {
+                return Err("internal error: checked slice index is not an integer".into());
+            };
+            let index64 = match index_ty {
+                Type::I8 | Type::I16 | Type::I32 => b.ins().sextend(types::I64, index),
+                Type::U8 | Type::U16 | Type::U32 => b.ins().uextend(types::I64, index),
+                Type::I64 | Type::U64 => index,
+                _ => return Err("internal error: invalid slice index type".into()),
+            };
+            let too_large = b
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, index64, len);
+            let out_of_bounds = if matches!(index_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64)
+            {
+                let negative = b.ins().icmp_imm_s(IntCC::SignedLessThan, index64, 0);
+                b.ins().bor(negative, too_large)
+            } else {
+                too_large
+            };
+            let error_block = b.create_block();
+            let valid_block = b.create_block();
+            let from = b
+                .current_block()
+                .ok_or("internal error: slice index has no source block")?;
+            b.ins()
+                .brif(out_of_bounds, error_block, &[], valid_block, &[]);
+            seal_ready(b, from, seal_state);
+            b.switch_to_block(error_block);
+            b.ins()
+                .call(env.print_functions.array_index_out_of_bounds, &[]);
+            b.ins().trap(TrapCode::unwrap_user(1));
+            seal_ready(b, error_block, seal_state);
+            b.switch_to_block(valid_block);
+            let pointer_type = module.target_config().pointer_type();
+            let byte_offset = b
+                .ins()
+                .imul_imm_s(index64, (storage_slot_width(*ty, env.structs) * 8) as i64);
+            let byte_offset = if pointer_type == types::I64 {
+                byte_offset
+            } else {
+                b.ins().ireduce(pointer_type, byte_offset)
+            };
+            let address = b.ins().iadd(ptr, byte_offset);
+            let component_types = clif_types(*ty, pointer_type, env.structs);
+            let stride = storage_slot_width(*ty, env.structs);
+            if component_types.len() != stride {
+                return Err("internal error: slice element has an invalid storage layout".into());
+            }
+            let mut components = Vec::with_capacity(stride);
+            for (component_index, component_type) in component_types.into_iter().enumerate() {
+                let component_address = if component_index == 0 {
+                    address
+                } else {
+                    b.ins().iadd_imm_s(address, (component_index * 8) as i64)
+                };
+                components.push(b.ins().load(
+                    component_type,
+                    MemFlagsData::new(),
+                    component_address,
+                    0,
+                ));
+            }
+            let mut component_offset = 0;
+            let selected =
+                compiled_value_from_type(*ty, &components, &mut component_offset, env.structs)?;
+            let result = clone_array_element(b, env.print_functions, selected)?;
+            seal_ready(b, valid_block, seal_state);
+            result
+        }
+        IrExpression::SliceElementAddress {
+            slice, index, ty, ..
+        } => {
+            let CompiledValue::Slice { ptr, len } = emit_expr(b, module, slice, env, seal_state)?
+            else {
+                return Err("internal error: slice address base is not a slice".into());
+            };
+            let CompiledValue::Integer(index, index_ty) =
+                emit_expr(b, module, index, env, seal_state)?
+            else {
+                return Err("internal error: checked slice index is not an integer".into());
+            };
+            let index64 = match index_ty {
+                Type::I8 | Type::I16 | Type::I32 => b.ins().sextend(types::I64, index),
+                Type::U8 | Type::U16 | Type::U32 => b.ins().uextend(types::I64, index),
+                Type::I64 | Type::U64 => index,
+                _ => return Err("internal error: invalid slice index type".into()),
+            };
+            let too_large = b
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, index64, len);
+            let out_of_bounds = if matches!(index_ty, Type::I8 | Type::I16 | Type::I32 | Type::I64)
+            {
+                let negative = b.ins().icmp_imm_s(IntCC::SignedLessThan, index64, 0);
+                b.ins().bor(negative, too_large)
+            } else {
+                too_large
+            };
+            let error_block = b.create_block();
+            let valid_block = b.create_block();
+            let from = b
+                .current_block()
+                .ok_or("internal error: slice address has no source block")?;
+            b.ins()
+                .brif(out_of_bounds, error_block, &[], valid_block, &[]);
+            seal_ready(b, from, seal_state);
+            b.switch_to_block(error_block);
+            b.ins()
+                .call(env.print_functions.array_index_out_of_bounds, &[]);
+            b.ins().trap(TrapCode::unwrap_user(1));
+            seal_ready(b, error_block, seal_state);
+            b.switch_to_block(valid_block);
+            let pointer_type = module.target_config().pointer_type();
+            let byte_offset = b
+                .ins()
+                .imul_imm_s(index64, (storage_slot_width(*ty, env.structs) * 8) as i64);
+            let byte_offset = if pointer_type == types::I64 {
+                byte_offset
+            } else {
+                b.ins().ireduce(pointer_type, byte_offset)
+            };
+            let address = b.ins().iadd(ptr, byte_offset);
+            seal_ready(b, valid_block, seal_state);
+            CompiledValue::Integer(
+                address,
+                Type::Reference(crate::sema::intern_pointer_target(*ty), false),
+            )
+        }
+        IrExpression::StringAsStr(value) => {
+            let CompiledValue::OwnedString { ptr, temporary } =
+                emit_expr(b, module, value, env, seal_state)?
+            else {
+                return Err("internal error: String borrow is not an owning String".into());
+            };
+            let data_call = b.ins().call(
+                env.print_functions.owned_strings[StringOp::Data as usize],
+                &[ptr],
+            );
+            let length_call = b.ins().call(
+                env.print_functions.owned_strings[StringOp::Len as usize],
+                &[ptr],
+            );
+            CompiledValue::StrViewOwned {
+                ptr: b.func.dfg.inst_results(data_call)[0],
+                len: b.func.dfg.inst_results(length_call)[0],
+                owner: ptr,
+                temporary,
+            }
+        }
+        IrExpression::StringFindOption { value, enum_id } => {
+            let option = env.enums.get(*enum_id).ok_or_else(|| {
+                "internal error: String.find Option type is out of range".to_string()
+            })?;
+            let some_tag = option
+                .variants
+                .iter()
+                .position(|variant| variant.name == "Some")
+                .ok_or_else(|| "internal error: Option<u64> has no Some variant".to_string())?;
+            let none_tag = option
+                .variants
+                .iter()
+                .position(|variant| variant.name == "None")
+                .ok_or_else(|| "internal error: Option<u64> has no None variant".to_string())?;
+            let CompiledValue::Integer(index, Type::I64) =
+                emit_expr(b, module, value, env, seal_state)?
+            else {
+                return Err("internal error: String.find runtime result is not i64".into());
+            };
+            let pointer_type = module.target_config().pointer_type();
+            let some_block = b.create_block();
+            let none_block = b.create_block();
+            let merge_block = b.create_block();
+            b.append_block_param(merge_block, pointer_type);
+            let found = b
+                .ins()
+                .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, index, 0);
+            let from = b
+                .current_block()
+                .ok_or("internal error: String.find has no source block")?;
+            b.ins().brif(found, some_block, &[], none_block, &[]);
+            seal_ready(b, from, seal_state);
+
+            b.switch_to_block(some_block);
+            let payload_slot =
+                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+            b.ins().stack_store(types::I64, index, payload_slot, 0);
+            let payload = b.ins().stack_addr(pointer_type, payload_slot, 0);
+            let tag = b.ins().iconst(types::I64, some_tag as i64);
+            let payload_len = b.ins().iconst(types::I64, 8);
+            let no_drops = b.ins().iconst(pointer_type, 0);
+            let no_drop_len = b.ins().iconst(types::I64, 0);
+            let some_value = b.ins().call(
+                env.print_functions.enum_new,
+                &[tag, payload, payload_len, no_drops, no_drop_len],
+            );
+            let some_ptr = b.func.dfg.inst_results(some_value)[0];
+            b.ins().jump(merge_block, &[BlockArg::Value(some_ptr)]);
+            let from = b
+                .current_block()
+                .ok_or("internal error: Some block is missing")?;
+            seal_ready(b, from, seal_state);
+
+            b.switch_to_block(none_block);
+            let tag = b.ins().iconst(types::I64, none_tag as i64);
+            let no_payload = b.ins().iconst(pointer_type, 0);
+            let no_payload_len = b.ins().iconst(types::I64, 0);
+            let no_drops = b.ins().iconst(pointer_type, 0);
+            let no_drop_len = b.ins().iconst(types::I64, 0);
+            let none_value = b.ins().call(
+                env.print_functions.enum_new,
+                &[tag, no_payload, no_payload_len, no_drops, no_drop_len],
+            );
+            let none_ptr = b.func.dfg.inst_results(none_value)[0];
+            b.ins().jump(merge_block, &[BlockArg::Value(none_ptr)]);
+            let from = b
+                .current_block()
+                .ok_or("internal error: None block is missing")?;
+            seal_ready(b, from, seal_state);
+
+            b.switch_to_block(merge_block);
+            seal_ready(b, merge_block, seal_state);
+            CompiledValue::Enum {
+                ptr: b.block_params(merge_block)[0],
+                temporary: true,
             }
         }
         IrExpression::StructValue { struct_id, fields } => {
@@ -1537,10 +3983,15 @@ fn emit_expr(
             if actual != *struct_id {
                 return Err("internal error: field access structure type mismatch".into());
             }
-            fields
-                .get(*field_index)
-                .cloned()
-                .ok_or_else(|| "internal error: field index is out of range".to_string())?
+            let mut selected = None;
+            for (index, field) in fields.into_iter().enumerate() {
+                if index == *field_index {
+                    selected = Some(field);
+                } else {
+                    drop_temporary(b, env.print_functions, field);
+                }
+            }
+            selected.ok_or_else(|| "internal error: field index is out of range".to_string())?
         }
         IrExpression::Local { .. } => {
             return Err("internal error: local IR has an unsupported type".into());
@@ -1559,11 +4010,35 @@ fn emit_expr(
                 | Type::U8
                 | Type::U16
                 | Type::U32
-                | Type::U64 => CompiledValue::Integer(values[0], *return_type),
+                | Type::U64
+                | Type::Char => CompiledValue::Integer(values[0], *return_type),
                 Type::F32 => CompiledValue::F32(values[0]),
                 Type::F64 => CompiledValue::F64(values[0]),
                 Type::Bool => CompiledValue::Bool(values[0]),
+                Type::Reference(_, _) | Type::RawPointer(_) | Type::FunctionPointer(_) => {
+                    CompiledValue::Integer(values[0], *return_type)
+                }
+                Type::OwnedString => CompiledValue::OwnedString {
+                    ptr: values[0],
+                    temporary: true,
+                },
+                Type::Vec(_) => CompiledValue::Vec {
+                    ptr: values[0],
+                    temporary: true,
+                },
+                Type::Map(_) => CompiledValue::Map {
+                    ptr: values[0],
+                    temporary: true,
+                },
+                Type::Enum(_) => CompiledValue::Enum {
+                    ptr: values[0],
+                    temporary: true,
+                },
                 Type::Str => CompiledValue::Str {
+                    ptr: values[0],
+                    len: values[1],
+                },
+                Type::Slice(_) => CompiledValue::Slice {
                     ptr: values[0],
                     len: values[1],
                 },
@@ -1581,9 +4056,15 @@ fn emit_expr(
                         fields,
                     }
                 }
+                Type::Array(_) => {
+                    let mut offset = 0;
+                    compiled_value_from_type(*return_type, &values, &mut offset, env.structs)?
+                }
             }
         }
         IrExpression::If { .. } => emit_if_expression(b, module, expr, env, seal_state)?,
+        IrExpression::EnumMatch { .. } => emit_enum_match(b, module, expr, env, seal_state)?,
+        IrExpression::Propagate { .. } => emit_propagate(b, module, expr, env, seal_state)?,
         IrExpression::Negate(inner, ty) => {
             let (value, actual_ty) = as_numeric(emit_expr(b, module, inner, env, seal_state)?)?;
             if actual_ty != *ty {
@@ -1617,107 +4098,137 @@ fn emit_expr(
             }
             CompiledValue::Integer(b.ins().bnot(value), *ty)
         }
+        IrExpression::FunctionAddress { function, ty } => {
+            let address = b
+                .ins()
+                .func_addr(module.target_config().pointer_type(), env.calls[*function]);
+            CompiledValue::Integer(address, *ty)
+        }
         IrExpression::Cast {
             value,
             source,
             target,
         } => {
-            let (value, actual_source) = as_numeric(emit_expr(b, module, value, env, seal_state)?)?;
-            if actual_source != *source {
-                return Err("internal error: numeric cast source differs from checked type".into());
-            }
-            if let Some(source_width) = integer_width(*source) {
-                if let Some(target_width) = integer_width(*target) {
-                    let target_clif = clif_integer_type(*target).ok_or_else(|| {
-                        "internal error: integer cast target is not an integer".to_string()
-                    })?;
-                    let converted = match target_width.cmp(&source_width) {
-                        std::cmp::Ordering::Less => b.ins().ireduce(target_clif, value),
-                        std::cmp::Ordering::Greater if is_signed_integer_type(*source) => {
-                            b.ins().sextend(target_clif, value)
-                        }
-                        std::cmp::Ordering::Greater => b.ins().uextend(target_clif, value),
-                        std::cmp::Ordering::Equal => value,
-                    };
-                    CompiledValue::Integer(converted, *target)
-                } else {
-                    let converted = match target {
-                        Type::F32 if is_signed_integer_type(*source) => {
-                            b.ins().fcvt_from_sint(types::F32, value)
-                        }
-                        Type::F64 if is_signed_integer_type(*source) => {
-                            b.ins().fcvt_from_sint(types::F64, value)
-                        }
-                        Type::F32 => b.ins().fcvt_from_uint(types::F32, value),
-                        Type::F64 => b.ins().fcvt_from_uint(types::F64, value),
-                        _ => {
-                            return Err("internal error: numeric cast target is not numeric".into());
-                        }
-                    };
-                    if *target == Type::F32 {
-                        CompiledValue::F32(converted)
-                    } else {
-                        CompiledValue::F64(converted)
-                    }
+            if matches!(source, Type::RawPointer(_) | Type::FunctionPointer(_))
+                && matches!(target, Type::RawPointer(_) | Type::FunctionPointer(_))
+            {
+                let CompiledValue::Integer(pointer, actual_source) =
+                    emit_expr(b, module, value, env, seal_state)?
+                else {
+                    return Err("internal error: pointer cast source is not a pointer value".into());
+                };
+                if actual_source != *source {
+                    return Err(
+                        "internal error: pointer cast source differs from checked type".into(),
+                    );
                 }
+                CompiledValue::Integer(pointer, *target)
             } else {
-                if integer_width(*target).is_some() {
-                    let target_clif = clif_integer_type(*target).ok_or_else(|| {
-                        "internal error: float cast target is not an integer".to_string()
-                    })?;
-                    let target_width = integer_width(*target).ok_or_else(|| {
-                        "internal error: float cast target has no width".to_string()
-                    })?;
-                    let converted = if is_signed_integer_type(*target) {
-                        b.ins().fcvt_to_sint_sat(types::I64, value)
+                let (value, actual_source) =
+                    as_numeric(emit_expr(b, module, value, env, seal_state)?)?;
+                if actual_source != *source {
+                    return Err(
+                        "internal error: numeric cast source differs from checked type".into(),
+                    );
+                }
+                if let Some(source_width) = integer_width(*source) {
+                    if let Some(target_width) = integer_width(*target) {
+                        let target_clif = clif_integer_type(*target).ok_or_else(|| {
+                            "internal error: integer cast target is not an integer".to_string()
+                        })?;
+                        let converted = match target_width.cmp(&source_width) {
+                            std::cmp::Ordering::Less => b.ins().ireduce(target_clif, value),
+                            std::cmp::Ordering::Greater if is_signed_integer_type(*source) => {
+                                b.ins().sextend(target_clif, value)
+                            }
+                            std::cmp::Ordering::Greater => b.ins().uextend(target_clif, value),
+                            std::cmp::Ordering::Equal => value,
+                        };
+                        CompiledValue::Integer(converted, *target)
                     } else {
-                        b.ins().fcvt_to_uint_sat(types::I64, value)
-                    };
-                    let converted = if target_width == 64 {
-                        converted
-                    } else if is_signed_integer_type(*target) {
-                        let minimum = -(1i64 << (target_width - 1));
-                        let maximum = (1i64 << (target_width - 1)) - 1;
-                        let minimum_value = b.ins().iconst(types::I64, minimum);
-                        let maximum_value = b.ins().iconst(types::I64, maximum);
-                        let below_minimum =
-                            b.ins()
-                                .icmp(IntCC::SignedLessThan, converted, minimum_value);
-                        let lower_clamped = b.ins().select(below_minimum, minimum_value, converted);
-                        let above_maximum =
-                            b.ins()
-                                .icmp(IntCC::SignedGreaterThan, lower_clamped, maximum_value);
-                        b.ins().select(above_maximum, maximum_value, lower_clamped)
-                    } else {
-                        let maximum = ((1u64 << target_width) - 1) as i64;
-                        let maximum_value = b.ins().iconst(types::I64, maximum);
-                        let above_maximum =
-                            b.ins()
-                                .icmp(IntCC::UnsignedGreaterThan, converted, maximum_value);
-                        b.ins().select(above_maximum, maximum_value, converted)
-                    };
-                    let converted = if target_width < 64 {
-                        b.ins().ireduce(target_clif, converted)
-                    } else {
-                        converted
-                    };
-                    CompiledValue::Integer(converted, *target)
+                        let converted = match target {
+                            Type::F32 if is_signed_integer_type(*source) => {
+                                b.ins().fcvt_from_sint(types::F32, value)
+                            }
+                            Type::F64 if is_signed_integer_type(*source) => {
+                                b.ins().fcvt_from_sint(types::F64, value)
+                            }
+                            Type::F32 => b.ins().fcvt_from_uint(types::F32, value),
+                            Type::F64 => b.ins().fcvt_from_uint(types::F64, value),
+                            _ => {
+                                return Err(
+                                    "internal error: numeric cast target is not numeric".into()
+                                );
+                            }
+                        };
+                        if *target == Type::F32 {
+                            CompiledValue::F32(converted)
+                        } else {
+                            CompiledValue::F64(converted)
+                        }
+                    }
                 } else {
-                    let converted = match (source, target) {
-                        (Type::F32, Type::F64) => b.ins().fpromote(types::F64, value),
-                        (Type::F64, Type::F32) => b.ins().fdemote(types::F32, value),
-                        (Type::F32, Type::F32) | (Type::F64, Type::F64) => value,
-                        _ => {
-                            return Err(
+                    if integer_width(*target).is_some() {
+                        let target_clif = clif_integer_type(*target).ok_or_else(|| {
+                            "internal error: float cast target is not an integer".to_string()
+                        })?;
+                        let target_width = integer_width(*target).ok_or_else(|| {
+                            "internal error: float cast target has no width".to_string()
+                        })?;
+                        let converted = if is_signed_integer_type(*target) {
+                            b.ins().fcvt_to_sint_sat(types::I64, value)
+                        } else {
+                            b.ins().fcvt_to_uint_sat(types::I64, value)
+                        };
+                        let converted = if target_width == 64 {
+                            converted
+                        } else if is_signed_integer_type(*target) {
+                            let minimum = -(1i64 << (target_width - 1));
+                            let maximum = (1i64 << (target_width - 1)) - 1;
+                            let minimum_value = b.ins().iconst(types::I64, minimum);
+                            let maximum_value = b.ins().iconst(types::I64, maximum);
+                            let below_minimum =
+                                b.ins()
+                                    .icmp(IntCC::SignedLessThan, converted, minimum_value);
+                            let lower_clamped =
+                                b.ins().select(below_minimum, minimum_value, converted);
+                            let above_maximum = b.ins().icmp(
+                                IntCC::SignedGreaterThan,
+                                lower_clamped,
+                                maximum_value,
+                            );
+                            b.ins().select(above_maximum, maximum_value, lower_clamped)
+                        } else {
+                            let maximum = ((1u64 << target_width) - 1) as i64;
+                            let maximum_value = b.ins().iconst(types::I64, maximum);
+                            let above_maximum =
+                                b.ins()
+                                    .icmp(IntCC::UnsignedGreaterThan, converted, maximum_value);
+                            b.ins().select(above_maximum, maximum_value, converted)
+                        };
+                        let converted = if target_width < 64 {
+                            b.ins().ireduce(target_clif, converted)
+                        } else {
+                            converted
+                        };
+                        CompiledValue::Integer(converted, *target)
+                    } else {
+                        let converted = match (source, target) {
+                            (Type::F32, Type::F64) => b.ins().fpromote(types::F64, value),
+                            (Type::F64, Type::F32) => b.ins().fdemote(types::F32, value),
+                            (Type::F32, Type::F32) | (Type::F64, Type::F64) => value,
+                            _ => {
+                                return Err(
                                 "internal error: unsupported numeric cast reached code generation"
                                     .into(),
                             );
+                            }
+                        };
+                        if *target == Type::F32 {
+                            CompiledValue::F32(converted)
+                        } else {
+                            CompiledValue::F64(converted)
                         }
-                    };
-                    if *target == Type::F32 {
-                        CompiledValue::F32(converted)
-                    } else {
-                        CompiledValue::F64(converted)
                     }
                 }
             }
@@ -1880,6 +4391,14 @@ fn emit_expr(
                     }
                 };
                 CompiledValue::Bool(condition)
+            } else if *ty == Type::OwnedString {
+                let equal =
+                    emit_equality_value(b, env.print_functions, env.structs, *ty, left, right)?;
+                CompiledValue::Bool(if *op == BinaryOp::Eq {
+                    equal
+                } else {
+                    b.ins().icmp_imm_s(IntCC::Equal, equal, 0)
+                })
             } else if *ty == Type::Str {
                 let CompiledValue::Str {
                     ptr: left_ptr,
@@ -1975,6 +4494,684 @@ fn emit_expr(
     })
 }
 
+fn emit_vec_call(
+    b: &mut FunctionBuilder<'_>,
+    module: &ObjectModule,
+    operation: VecOp,
+    elem_id: usize,
+    arguments: &[IrExpression],
+    env: &ExprEnv<'_>,
+    seal_state: &mut BlockSealState,
+) -> Result<Vec<Value>, String> {
+    let elem = vec_elem(elem_id);
+    let pointer_type = module.target_config().pointer_type();
+    fn eval_arg(
+        b: &mut FunctionBuilder<'_>,
+        module: &ObjectModule,
+        argument: &IrExpression,
+        env: &ExprEnv<'_>,
+        seal_state: &mut BlockSealState,
+    ) -> Result<CompiledValue, String> {
+        emit_expr(b, module, argument, env, seal_state)
+    }
+    match operation {
+        VecOp::New => {
+            let stride = b
+                .ins()
+                .iconst(types::I64, value_width(elem, env.structs) as i64);
+            let (drop_ptr, clone_ptr) = match elem {
+                Type::OwnedString => {
+                    let slot = b.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        16,
+                        3,
+                    ));
+                    let addr = b.ins().stack_addr(pointer_type, slot, 0);
+                    let addr2 = b.ins().iadd_imm_s(addr, 8);
+                    b.ins()
+                        .call(env.print_functions.vec_string_element, &[addr, addr2]);
+                    let drop_ptr = b.ins().load(pointer_type, MemFlagsData::new(), addr, 0);
+                    let clone_ptr = b.ins().load(pointer_type, MemFlagsData::new(), addr, 8);
+                    (drop_ptr, clone_ptr)
+                }
+                Type::Map(_) => {
+                    let slot = b.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        16,
+                        3,
+                    ));
+                    let addr = b.ins().stack_addr(pointer_type, slot, 0);
+                    let addr2 = b.ins().iadd_imm_s(addr, 8);
+                    b.ins()
+                        .call(env.print_functions.vec_map_element, &[addr, addr2]);
+                    let drop_ptr = b.ins().load(pointer_type, MemFlagsData::new(), addr, 0);
+                    let clone_ptr = b.ins().load(pointer_type, MemFlagsData::new(), addr, 8);
+                    (drop_ptr, clone_ptr)
+                }
+                Type::Struct(struct_id) => {
+                    if let Some((drop_callback, clone_callback)) =
+                        env.vec_struct_callbacks[struct_id]
+                    {
+                        (
+                            b.ins().func_addr(pointer_type, drop_callback),
+                            b.ins().func_addr(pointer_type, clone_callback),
+                        )
+                    } else {
+                        (
+                            b.ins().iconst(pointer_type, 0),
+                            b.ins().iconst(pointer_type, 0),
+                        )
+                    }
+                }
+                _ => (
+                    b.ins().iconst(pointer_type, 0),
+                    b.ins().iconst(pointer_type, 0),
+                ),
+            };
+            let call = b.ins().call(
+                env.print_functions.owned_vecs[VecOp::New as usize],
+                &[stride, drop_ptr, clone_ptr],
+            );
+            Ok(b.func.dfg.inst_results(call).to_vec())
+        }
+        VecOp::Len | VecOp::Capacity | VecOp::Clear | VecOp::Clone | VecOp::Drop => {
+            let [argument] = arguments else {
+                return Err("internal error: `Vec` operation expects the receiver".into());
+            };
+            let receiver = emit_expr(b, module, argument, env, seal_state)?;
+            let receiver_values = flatten_value(receiver);
+            let call = b.ins().call(
+                env.print_functions.owned_vecs[operation as usize],
+                &receiver_values,
+            );
+            Ok(b.func.dfg.inst_results(call).to_vec())
+        }
+        VecOp::Reserve => {
+            let receiver = emit_expr(b, module, &arguments[0], env, seal_state)?;
+            let additional = emit_expr(b, module, &arguments[1], env, seal_state)?;
+            let mut args = flatten_value(receiver);
+            args.extend(flatten_value(additional));
+            let call = b
+                .ins()
+                .call(env.print_functions.owned_vecs[operation as usize], &args);
+            Ok(b.func.dfg.inst_results(call).to_vec())
+        }
+        VecOp::Push => {
+            let receiver = eval_arg(b, module, &arguments[0], env, seal_state)?;
+            let element = eval_arg(b, module, &arguments[1], env, seal_state)?;
+            let elem_addr = emit_elem_slot(b, element, elem, pointer_type, env.structs)?;
+            let receiver_values = flatten_value(receiver);
+            let call = b.ins().call(
+                env.print_functions.owned_vecs[VecOp::Push as usize],
+                &[receiver_values[0], elem_addr],
+            );
+            let _ = call;
+            Ok(Vec::new())
+        }
+        VecOp::Set => {
+            let receiver = eval_arg(b, module, &arguments[0], env, seal_state)?;
+            let index = eval_arg(b, module, &arguments[1], env, seal_state)?;
+            let element = eval_arg(b, module, &arguments[2], env, seal_state)?;
+            let elem_addr = emit_elem_slot(b, element, elem, pointer_type, env.structs)?;
+            let receiver_values = flatten_value(receiver);
+            let index_values = flatten_value(index);
+            b.ins().call(
+                env.print_functions.owned_vecs[VecOp::Set as usize],
+                &[receiver_values[0], index_values[0], elem_addr],
+            );
+            Ok(Vec::new())
+        }
+        VecOp::Index => {
+            let receiver = eval_arg(b, module, &arguments[0], env, seal_state)?;
+            let index = eval_arg(b, module, &arguments[1], env, seal_state)?;
+            let receiver_values = flatten_value(receiver);
+            let index_values = flatten_value(index);
+            let call = b.ins().call(
+                env.print_functions.owned_vecs[VecOp::Index as usize],
+                &[receiver_values[0], index_values[0]],
+            );
+            let slot_ptr = b.func.dfg.inst_results(call)[0];
+            let mut result = emit_elem_load(b, slot_ptr, elem, pointer_type, env.structs)?;
+            if matches!(elem, Type::Struct(_)) {
+                result = clone_array_element(b, env.print_functions, result)?;
+            }
+            Ok(flatten_value(result))
+        }
+        VecOp::Take | VecOp::Extract => {
+            let receiver = eval_arg(b, module, &arguments[0], env, seal_state)?;
+            let index = eval_arg(b, module, &arguments[1], env, seal_state)?;
+            let receiver_values = flatten_value(receiver);
+            let index_values = flatten_value(index);
+            let out_size = u32::try_from(value_width(elem, env.structs).saturating_mul(8))
+                .map_err(|_| "internal error: Vec element layout is too large".to_string())?;
+            let out_slot = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                out_size,
+                3,
+            ));
+            let out_addr = b.ins().stack_addr(pointer_type, out_slot, 0);
+            b.ins().call(
+                env.print_functions.owned_vecs[operation as usize],
+                &[receiver_values[0], index_values[0], out_addr],
+            );
+            let result = emit_elem_load(b, out_addr, elem, pointer_type, env.structs)?;
+            Ok(flatten_value(result))
+        }
+    }
+}
+
+fn emit_map_call(
+    b: &mut FunctionBuilder<'_>,
+    module: &ObjectModule,
+    operation: MapOp,
+    map_id: usize,
+    arguments: &[IrExpression],
+    env: &ExprEnv<'_>,
+    seal_state: &mut BlockSealState,
+) -> Result<Vec<Value>, String> {
+    let (key, value) = map_info(map_id);
+    let pointer_type = module.target_config().pointer_type();
+    let runtime = env.print_functions.maps[operation as usize];
+    match operation {
+        MapOp::New => {
+            let key_kind = i64::from(key == Type::OwnedString);
+            let value_kind = match value {
+                Type::OwnedString => 1,
+                Type::Vec(_) => 2,
+                Type::Map(_) => 3,
+                Type::Struct(id) if env.structs[id].drop_function.is_some() => 4,
+                Type::Struct(_) if type_has_custom_drop(value, env.structs) => 6,
+                Type::Struct(_) => 5,
+                _ => 0,
+            };
+            let mut args = vec![
+                b.ins().iconst(types::I64, slot_width(key) as i64),
+                b.ins()
+                    .iconst(types::I64, value_width(value, env.structs) as i64),
+                b.ins().iconst(types::I64, key_kind),
+                b.ins().iconst(types::I64, value_kind),
+            ];
+            if let Type::Struct(id) = value {
+                if let Some((drop_callback, clone_callback)) = env.vec_struct_callbacks[id] {
+                    args.push(b.ins().func_addr(pointer_type, drop_callback));
+                    args.push(b.ins().func_addr(pointer_type, clone_callback));
+                } else {
+                    args.push(b.ins().iconst(pointer_type, 0));
+                    args.push(b.ins().iconst(pointer_type, 0));
+                }
+            } else {
+                args.push(b.ins().iconst(pointer_type, 0));
+                args.push(b.ins().iconst(pointer_type, 0));
+            }
+            let call = b.ins().call(runtime, &args);
+            Ok(b.func.dfg.inst_results(call).to_vec())
+        }
+        MapOp::Drop | MapOp::Len | MapOp::Clear => {
+            let receiver = emit_expr(b, module, &arguments[0], env, seal_state)?;
+            let receiver = flatten_value(receiver);
+            let call = b.ins().call(runtime, &receiver);
+            Ok(b.func.dfg.inst_results(call).to_vec())
+        }
+        MapOp::Clone => {
+            let receiver = emit_expr(b, module, &arguments[0], env, seal_state)?;
+            let receiver = flatten_value(receiver);
+            let call = b.ins().call(runtime, &receiver);
+            Ok(b.func.dfg.inst_results(call).to_vec())
+        }
+        MapOp::Keys | MapOp::Values => {
+            let receiver = emit_expr(b, module, &arguments[0], env, seal_state)?;
+            let receiver = flatten_value(receiver);
+            let call = b.ins().call(runtime, &receiver);
+            Ok(b.func.dfg.inst_results(call).to_vec())
+        }
+        MapOp::ContainsKey | MapOp::Remove => {
+            let receiver = emit_expr(b, module, &arguments[0], env, seal_state)?;
+            let key_value = emit_expr(b, module, &arguments[1], env, seal_state)?;
+            let key_slot = emit_elem_slot(b, key_value.clone(), key, pointer_type, env.structs)?;
+            let receiver = flatten_value(receiver);
+            let call = b.ins().call(runtime, &[receiver[0], key_slot]);
+            drop_temporary(b, env.print_functions, key_value);
+            Ok(b.func.dfg.inst_results(call).to_vec())
+        }
+        MapOp::Insert => {
+            let receiver = emit_expr(b, module, &arguments[0], env, seal_state)?;
+            let key_value = emit_expr(b, module, &arguments[1], env, seal_state)?;
+            let value_value = emit_expr(b, module, &arguments[2], env, seal_state)?;
+            let key_slot = emit_elem_slot(b, key_value, key, pointer_type, env.structs)?;
+            let value_slot = emit_elem_slot(b, value_value, value, pointer_type, env.structs)?;
+            let receiver = flatten_value(receiver);
+            let call = b.ins().call(runtime, &[receiver[0], key_slot, value_slot]);
+            Ok(b.func.dfg.inst_results(call).to_vec())
+        }
+        MapOp::Get => {
+            let receiver = emit_expr(b, module, &arguments[0], env, seal_state)?;
+            let key_value = emit_expr(b, module, &arguments[1], env, seal_state)?;
+            let key_slot = emit_elem_slot(b, key_value.clone(), key, pointer_type, env.structs)?;
+            let output_slot = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                (value_width(value, env.structs) * 8) as u32,
+                3,
+            ));
+            let output = b.ins().stack_addr(pointer_type, output_slot, 0);
+            let receiver = flatten_value(receiver);
+            let get_call = b.ins().call(runtime, &[receiver[0], key_slot, output]);
+            let found = b.func.dfg.inst_results(get_call)[0];
+            drop_temporary(b, env.print_functions, key_value);
+            let option_id = env
+                .enums
+                .iter()
+                .position(|definition| {
+                    definition.name.starts_with("$RynOption#")
+                        && definition.variants.len() == 2
+                        && definition.variants[0].name == "Some"
+                        && definition.variants[0].fields == [value]
+                        && definition.variants[1].name == "None"
+                        && definition.variants[1].fields.is_empty()
+                })
+                .ok_or("internal error: Map.get Option specialization is missing")?;
+            let option = &env.enums[option_id];
+            let some_tag = option
+                .variants
+                .iter()
+                .position(|variant| variant.name == "Some")
+                .ok_or("internal error: Map.get Option has no Some variant")?;
+            let none_tag = option
+                .variants
+                .iter()
+                .position(|variant| variant.name == "None")
+                .ok_or("internal error: Map.get Option has no None variant")?;
+            let some_block = b.create_block();
+            let none_block = b.create_block();
+            let merge_block = b.create_block();
+            b.append_block_param(merge_block, pointer_type);
+            let is_found = b.ins().icmp_imm_u(IntCC::Equal, found, 1);
+            let from = b
+                .current_block()
+                .ok_or("internal error: Map.get has no source block")?;
+            b.ins().brif(is_found, some_block, &[], none_block, &[]);
+            seal_ready(b, from, seal_state);
+
+            b.switch_to_block(some_block);
+            let tag = b.ins().iconst(types::I64, some_tag as i64);
+            let payload_len = b
+                .ins()
+                .iconst(types::I64, (value_width(value, env.structs) * 8) as i64);
+            let drop_plan = if let Some(data_id) = env.enum_drop_plans[option_id] {
+                let global = module.declare_data_in_func(data_id, b.func);
+                b.ins().symbol_value(pointer_type, global)
+            } else {
+                b.ins().iconst(pointer_type, 0)
+            };
+            let drop_plan_len = b
+                .ins()
+                .iconst(types::I64, enum_drop_plan_len(option, env.structs) as i64);
+            let some_call = b.ins().call(
+                env.print_functions.enum_new,
+                &[tag, output, payload_len, drop_plan, drop_plan_len],
+            );
+            let some_value = b.func.dfg.inst_results(some_call)[0];
+            b.ins().jump(merge_block, &[BlockArg::Value(some_value)]);
+            let from = b
+                .current_block()
+                .ok_or("internal error: Map.get Some block is missing")?;
+            seal_ready(b, from, seal_state);
+
+            b.switch_to_block(none_block);
+            let tag = b.ins().iconst(types::I64, none_tag as i64);
+            let no_payload = b.ins().iconst(pointer_type, 0);
+            let no_payload_len = b.ins().iconst(types::I64, 0);
+            let no_drops = b.ins().iconst(pointer_type, 0);
+            let no_drop_len = b.ins().iconst(types::I64, 0);
+            let none_call = b.ins().call(
+                env.print_functions.enum_new,
+                &[tag, no_payload, no_payload_len, no_drops, no_drop_len],
+            );
+            let none_value = b.func.dfg.inst_results(none_call)[0];
+            b.ins().jump(merge_block, &[BlockArg::Value(none_value)]);
+            let from = b
+                .current_block()
+                .ok_or("internal error: Map.get None block is missing")?;
+            seal_ready(b, from, seal_state);
+
+            b.switch_to_block(merge_block);
+            seal_ready(b, merge_block, seal_state);
+            Ok(vec![b.block_params(merge_block)[0]])
+        }
+    }
+}
+
+fn emit_elem_slot(
+    b: &mut FunctionBuilder<'_>,
+    value: CompiledValue,
+    elem: Type,
+    pointer_type: types::Type,
+    structs: &[RynStruct],
+) -> Result<Value, String> {
+    let bytes = u32::try_from(value_width(elem, structs).saturating_mul(8))
+        .map_err(|_| "internal error: Vec element layout is too large".to_string())?;
+    let slot = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, bytes, 3));
+    let addr = b.ins().stack_addr(pointer_type, slot, 0);
+    for word in 0..value_width(elem, structs) {
+        let zero = b.ins().iconst(types::I64, 0);
+        b.ins()
+            .store(MemFlagsData::new(), zero, addr, (word * 8) as i32);
+    }
+    match (elem, value) {
+        (Type::I8 | Type::U8 | Type::Bool, CompiledValue::Integer(v, _)) => {
+            b.ins().store(MemFlagsData::new(), v, addr, 0);
+        }
+        (Type::I16 | Type::U16, CompiledValue::Integer(v, _)) => {
+            b.ins().store(MemFlagsData::new(), v, addr, 0);
+        }
+        (Type::I32 | Type::U32 | Type::Char, CompiledValue::Integer(v, _)) => {
+            b.ins().store(MemFlagsData::new(), v, addr, 0);
+        }
+        (Type::I64 | Type::U64, CompiledValue::Integer(v, _)) => {
+            b.ins().store(MemFlagsData::new(), v, addr, 0);
+        }
+        (Type::F32, CompiledValue::F32(v)) => {
+            b.ins().store(MemFlagsData::new(), v, addr, 0);
+        }
+        (Type::F64, CompiledValue::F64(v)) => {
+            b.ins().store(MemFlagsData::new(), v, addr, 0);
+        }
+        (Type::Bool, CompiledValue::Bool(v)) => {
+            b.ins().store(MemFlagsData::new(), v, addr, 0);
+        }
+        (Type::OwnedString, CompiledValue::OwnedString { ptr: v, .. }) => {
+            b.ins().store(MemFlagsData::new(), v, addr, 0);
+        }
+        (Type::Vec(_), CompiledValue::Vec { ptr: v, .. }) => {
+            b.ins().store(MemFlagsData::new(), v, addr, 0);
+        }
+        (Type::Map(_), CompiledValue::Map { ptr: v, .. }) => {
+            b.ins().store(MemFlagsData::new(), v, addr, 0);
+        }
+        (
+            Type::Struct(struct_id),
+            CompiledValue::Struct {
+                struct_id: actual,
+                fields,
+            },
+        ) if struct_id == actual && fields.len() == structs[struct_id].fields.len() => {
+            for (field, value) in structs[struct_id].fields.iter().zip(fields) {
+                let words = flatten_value(value);
+                if words.len() != value_width(field.ty, structs) {
+                    return Err(
+                        "internal error: Vec structure field has an incompatible layout".into(),
+                    );
+                }
+                for (word_index, word) in words.into_iter().enumerate() {
+                    b.ins().store(
+                        MemFlagsData::new(),
+                        word,
+                        addr,
+                        ((field.slot_offset + word_index) * 8) as i32,
+                    );
+                }
+            }
+        }
+        _ => return Err("internal error: cannot place a `Vec` element".into()),
+    }
+    Ok(addr)
+}
+
+fn emit_elem_load(
+    b: &mut FunctionBuilder<'_>,
+    ptr: Value,
+    elem: Type,
+    pointer_type: types::Type,
+    structs: &[RynStruct],
+) -> Result<CompiledValue, String> {
+    Ok(match elem {
+        Type::I8
+        | Type::U8
+        | Type::I16
+        | Type::U16
+        | Type::I32
+        | Type::U32
+        | Type::I64
+        | Type::U64
+        | Type::Char => {
+            let clif_ty = clif_scalar_type(elem, pointer_type)?;
+            CompiledValue::Integer(b.ins().load(clif_ty, MemFlagsData::new(), ptr, 0), elem)
+        }
+        Type::Bool => CompiledValue::Bool(b.ins().load(types::I8, MemFlagsData::new(), ptr, 0)),
+        Type::F32 => CompiledValue::F32(b.ins().load(types::F32, MemFlagsData::new(), ptr, 0)),
+        Type::F64 => CompiledValue::F64(b.ins().load(types::F64, MemFlagsData::new(), ptr, 0)),
+        Type::Reference(_, _) | Type::RawPointer(_) | Type::FunctionPointer(_) => {
+            CompiledValue::Integer(
+                b.ins().load(pointer_type, MemFlagsData::new(), ptr, 0),
+                elem,
+            )
+        }
+        Type::OwnedString => CompiledValue::OwnedString {
+            ptr: b.ins().load(pointer_type, MemFlagsData::new(), ptr, 0),
+            temporary: true,
+        },
+        Type::Vec(_) => CompiledValue::Vec {
+            ptr: b.ins().load(pointer_type, MemFlagsData::new(), ptr, 0),
+            temporary: true,
+        },
+        Type::Map(_) => CompiledValue::Map {
+            ptr: b.ins().load(pointer_type, MemFlagsData::new(), ptr, 0),
+            temporary: true,
+        },
+        Type::Enum(_) => CompiledValue::Enum {
+            ptr: b.ins().load(pointer_type, MemFlagsData::new(), ptr, 0),
+            temporary: true,
+        },
+        Type::Str | Type::Slice(_) => CompiledValue::Str {
+            ptr: b.ins().load(pointer_type, MemFlagsData::new(), ptr, 0),
+            len: b.ins().load(types::I64, MemFlagsData::new(), ptr, 8),
+        },
+        Type::Struct(struct_id) => {
+            let mut fields = Vec::with_capacity(structs[struct_id].fields.len());
+            for field in &structs[struct_id].fields {
+                let value = emit_vec_struct_field_load(
+                    b,
+                    ptr,
+                    field.ty,
+                    field.slot_offset,
+                    pointer_type,
+                    structs,
+                )?;
+                fields.push(value);
+            }
+            CompiledValue::Struct { struct_id, fields }
+        }
+        _ => return Err("internal error: unsupported `Vec` element type".into()),
+    })
+}
+
+fn emit_vec_struct_field_load(
+    builder: &mut FunctionBuilder<'_>,
+    base: Value,
+    ty: Type,
+    slot_offset: usize,
+    pointer_type: types::Type,
+    structs: &[RynStruct],
+) -> Result<CompiledValue, String> {
+    let pointer = callback_field_pointer(builder, base, slot_offset);
+    Ok(match ty {
+        Type::I8
+        | Type::U8
+        | Type::I16
+        | Type::U16
+        | Type::I32
+        | Type::U32
+        | Type::I64
+        | Type::U64
+        | Type::Char => CompiledValue::Integer(
+            builder.ins().load(
+                clif_scalar_type(ty, pointer_type)?,
+                MemFlagsData::new(),
+                pointer,
+                0,
+            ),
+            ty,
+        ),
+        Type::Bool => CompiledValue::Bool(builder.ins().load(
+            types::I8,
+            MemFlagsData::new(),
+            pointer,
+            0,
+        )),
+        Type::F32 => CompiledValue::F32(builder.ins().load(
+            types::F32,
+            MemFlagsData::new(),
+            pointer,
+            0,
+        )),
+        Type::F64 => CompiledValue::F64(builder.ins().load(
+            types::F64,
+            MemFlagsData::new(),
+            pointer,
+            0,
+        )),
+        Type::OwnedString => CompiledValue::OwnedString {
+            ptr: builder
+                .ins()
+                .load(pointer_type, MemFlagsData::new(), pointer, 0),
+            temporary: true,
+        },
+        Type::Vec(_) => CompiledValue::Vec {
+            ptr: builder
+                .ins()
+                .load(pointer_type, MemFlagsData::new(), pointer, 0),
+            temporary: true,
+        },
+        Type::Map(_) => CompiledValue::Map {
+            ptr: builder
+                .ins()
+                .load(pointer_type, MemFlagsData::new(), pointer, 0),
+            temporary: true,
+        },
+        Type::Enum(_) => CompiledValue::Enum {
+            ptr: builder
+                .ins()
+                .load(pointer_type, MemFlagsData::new(), pointer, 0),
+            temporary: true,
+        },
+        Type::Reference(_, _) | Type::RawPointer(_) | Type::FunctionPointer(_) => {
+            CompiledValue::Integer(
+                builder
+                    .ins()
+                    .load(pointer_type, MemFlagsData::new(), pointer, 0),
+                ty,
+            )
+        }
+        Type::Str | Type::Slice(_) => CompiledValue::Str {
+            ptr: builder
+                .ins()
+                .load(pointer_type, MemFlagsData::new(), pointer, 0),
+            len: builder
+                .ins()
+                .load(types::I64, MemFlagsData::new(), pointer, 8),
+        },
+        Type::Struct(struct_id) => {
+            let mut fields = Vec::with_capacity(structs[struct_id].fields.len());
+            for field in &structs[struct_id].fields {
+                fields.push(emit_vec_struct_field_load(
+                    builder,
+                    base,
+                    field.ty,
+                    slot_offset + field.slot_offset,
+                    pointer_type,
+                    structs,
+                )?);
+            }
+            CompiledValue::Struct { struct_id, fields }
+        }
+        Type::Array(array_id) => {
+            let (element, length) = array_info(array_id);
+            let stride = storage_slot_width(element, structs);
+            let mut values = Vec::with_capacity(length);
+            for index in 0..length {
+                values.push(emit_vec_struct_field_load(
+                    builder,
+                    base,
+                    element,
+                    slot_offset + index * stride,
+                    pointer_type,
+                    structs,
+                )?);
+            }
+            CompiledValue::Array(values)
+        }
+    })
+}
+
+fn value_width(ty: Type, structs: &[RynStruct]) -> usize {
+    match ty {
+        Type::Struct(id) => structs[id].slot_count,
+        Type::Array(id) => {
+            let (element, length) = array_info(id);
+            length.saturating_mul(value_width(element, structs))
+        }
+        Type::Str | Type::Slice(_) => 2,
+        _ => 1,
+    }
+}
+
+fn enum_payload_types(ty: Type, structs: &[RynStruct]) -> Vec<Type> {
+    match ty {
+        Type::Struct(id) => structs[id]
+            .fields
+            .iter()
+            .flat_map(|field| enum_payload_types(field.ty, structs))
+            .collect(),
+        Type::Array(id) => {
+            let (element, length) = array_info(id);
+            (0..length)
+                .flat_map(|_| enum_payload_types(element, structs))
+                .collect()
+        }
+        other => vec![other],
+    }
+}
+
+fn append_enum_drop_entries(
+    bytes: &mut Vec<u8>,
+    variant: usize,
+    ty: Type,
+    offset: usize,
+    structs: &[RynStruct],
+) {
+    let kind = match ty {
+        Type::OwnedString => Some(0),
+        Type::Vec(_) => Some(1),
+        Type::Enum(_) => Some(2),
+        Type::Map(_) => Some(3),
+        Type::Struct(id) => {
+            for field in &structs[id].fields {
+                append_enum_drop_entries(
+                    bytes,
+                    variant,
+                    field.ty,
+                    offset + field.slot_offset,
+                    structs,
+                );
+            }
+            None
+        }
+        Type::Array(id) => {
+            let (element, length) = array_info(id);
+            let stride = value_width(element, structs);
+            for index in 0..length {
+                append_enum_drop_entries(bytes, variant, element, offset + index * stride, structs);
+            }
+            None
+        }
+        _ => None,
+    };
+    if let Some(kind) = kind {
+        bytes.extend_from_slice(&(variant as u64).to_le_bytes());
+        bytes.extend_from_slice(&(offset as u64).to_le_bytes());
+        bytes.extend_from_slice(&(kind as u64).to_le_bytes());
+    }
+}
+
 fn emit_call(
     b: &mut FunctionBuilder<'_>,
     module: &ObjectModule,
@@ -1984,9 +5181,204 @@ fn emit_call(
     seal_state: &mut BlockSealState,
 ) -> Result<Vec<Value>, String> {
     match target {
+        IrCallTarget::String(operation) => {
+            let mut borrowed = Vec::new();
+            let mut values = Vec::new();
+            for argument in arguments {
+                let value = emit_expr(b, module, argument, env, seal_state)?;
+                values.extend(flatten_value(value.clone()));
+                borrowed.push(value);
+            }
+            let call = b.ins().call(
+                env.print_functions.owned_strings[operation as usize],
+                &values,
+            );
+            let results = b.func.dfg.inst_results(call).to_vec();
+            for value in borrowed.into_iter().rev() {
+                drop_temporary(b, env.print_functions, value);
+            }
+            Ok(results)
+        }
+        IrCallTarget::Filesystem(operation) => {
+            let mut borrowed = Vec::new();
+            let mut values = Vec::new();
+            for argument in arguments {
+                let value = emit_expr(b, module, argument, env, seal_state)?;
+                values.extend(flatten_value(value.clone()));
+                borrowed.push(value);
+            }
+            let call = b
+                .ins()
+                .call(env.print_functions.filesystem[operation as usize], &values);
+            let results = b.func.dfg.inst_results(call).to_vec();
+            for value in borrowed.into_iter().rev() {
+                drop_temporary(b, env.print_functions, value);
+            }
+            Ok(results)
+        }
+        IrCallTarget::TryReadFile(_) => {
+            let argument = arguments
+                .first()
+                .ok_or("internal error: try_read_file argument missing")?;
+            let value = emit_expr(b, module, argument, env, seal_state)?;
+            let values = flatten_value(value.clone());
+            let call = b.ins().call(env.print_functions.try_read_file, &values);
+            let results = b.func.dfg.inst_results(call).to_vec();
+            drop_temporary(b, env.print_functions, value);
+            Ok(results)
+        }
+        IrCallTarget::ReadFileResult(_) => {
+            let argument = arguments
+                .first()
+                .ok_or("internal error: read_file_result argument missing")?;
+            let value = emit_expr(b, module, argument, env, seal_state)?;
+            let values = flatten_value(value.clone());
+            let call = b.ins().call(env.print_functions.read_file_result, &values);
+            let results = b.func.dfg.inst_results(call).to_vec();
+            drop_temporary(b, env.print_functions, value);
+            Ok(results)
+        }
+        IrCallTarget::System(operation) => {
+            let mut borrowed = Vec::new();
+            let mut values = Vec::new();
+            for argument in arguments {
+                let value = emit_expr(b, module, argument, env, seal_state)?;
+                values.extend(flatten_value(value.clone()));
+                borrowed.push(value);
+            }
+            let call = b
+                .ins()
+                .call(env.print_functions.system[operation as usize], &values);
+            let results = b.func.dfg.inst_results(call).to_vec();
+            for value in borrowed.into_iter().rev() {
+                drop_temporary(b, env.print_functions, value);
+            }
+            Ok(results)
+        }
         IrCallTarget::ArgumentCount => {
             let inst = b.ins().call(env.print_functions.args_count, &[]);
             Ok(b.func.dfg.inst_results(inst).to_vec())
+        }
+        IrCallTarget::Vec(operation, elem_id) => {
+            emit_vec_call(b, module, operation, elem_id, arguments, env, seal_state)
+        }
+        IrCallTarget::VecSlice(_) => {
+            if arguments.len() != 3 {
+                return Err("internal error: Vec slice call has an invalid argument count".into());
+            }
+            let vector = emit_expr(b, module, &arguments[0], env, seal_state)?;
+            let CompiledValue::Vec { ptr, .. } = vector else {
+                return Err("internal error: Vec slice receiver is not a Vec".into());
+            };
+            let start = emit_expr(b, module, &arguments[1], env, seal_state)?;
+            let end = emit_expr(b, module, &arguments[2], env, seal_state)?;
+            let CompiledValue::Integer(start, Type::U64) = start else {
+                return Err("internal error: Vec slice start is not u64".into());
+            };
+            let CompiledValue::Integer(end, Type::U64) = end else {
+                return Err("internal error: Vec slice end is not u64".into());
+            };
+            let length_slot =
+                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+            let length_pointer =
+                b.ins()
+                    .stack_addr(module.target_config().pointer_type(), length_slot, 0);
+            let call = b.ins().call(
+                env.print_functions.vec_slice,
+                &[ptr, start, end, length_pointer],
+            );
+            let slice_pointer = b.func.dfg.inst_results(call)[0];
+            let slice_length = b.ins().stack_load(
+                module.target_config().pointer_type(),
+                types::I64,
+                length_slot,
+                0,
+            );
+            Ok(vec![slice_pointer, slice_length])
+        }
+        IrCallTarget::SliceLen => {
+            let Some(argument) = arguments.first() else {
+                return Err("internal error: slice length call is missing its value".into());
+            };
+            let CompiledValue::Slice { len, .. } = emit_expr(b, module, argument, env, seal_state)?
+            else {
+                return Err("internal error: slice length receiver is not a slice".into());
+            };
+            Ok(vec![len])
+        }
+        IrCallTarget::Map(operation, map_id) => {
+            emit_map_call(b, module, operation, map_id, arguments, env, seal_state)
+        }
+        IrCallTarget::EnumNew { enum_id, tag } => {
+            let definition = env
+                .enums
+                .get(enum_id)
+                .ok_or("internal error: enum type is out of range")?;
+            let variant = definition
+                .variants
+                .get(tag)
+                .ok_or("internal error: enum variant is out of range")?;
+            if arguments.len() != variant.fields.len() {
+                return Err(
+                    "internal error: enum constructor field count differs from checked IR".into(),
+                );
+            }
+            let pointer_type = module.target_config().pointer_type();
+            let flattened_types = variant
+                .fields
+                .iter()
+                .flat_map(|ty| enum_payload_types(*ty, env.structs))
+                .collect::<Vec<_>>();
+            let payload_len = flattened_types.len() * 8;
+            let payload_ptr = if payload_len == 0 {
+                b.ins().iconst(pointer_type, 0)
+            } else {
+                let slot = b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    payload_len as u32,
+                    3,
+                ));
+                let payload = b.ins().stack_addr(pointer_type, slot, 0);
+                let mut words = Vec::with_capacity(flattened_types.len());
+                for argument in arguments {
+                    let value = emit_expr(b, module, argument, env, seal_state)?;
+                    words.extend(flatten_value(value));
+                }
+                if words.len() != flattened_types.len() {
+                    return Err(
+                        "internal error: enum payload width differs from checked layout".into(),
+                    );
+                }
+                for (index, (word, ty)) in words.into_iter().zip(flattened_types).enumerate() {
+                    let encoded = encode_enum_word(b, word, ty, pointer_type)?;
+                    b.ins()
+                        .store(MemFlagsData::new(), encoded, payload, (index * 8) as i32);
+                }
+                payload
+            };
+            let drops = env.enum_drop_plans.get(enum_id).copied().flatten();
+            let (drop_ptr, drop_len) = if let Some(data_id) = drops {
+                let data = module.declare_data_in_func(data_id, b.func);
+                (
+                    b.ins().symbol_value(pointer_type, data),
+                    b.ins().iconst(
+                        types::I64,
+                        enum_drop_plan_len(definition, env.structs) as i64,
+                    ),
+                )
+            } else {
+                (
+                    b.ins().iconst(pointer_type, 0),
+                    b.ins().iconst(types::I64, 0),
+                )
+            };
+            let tag_value = b.ins().iconst(types::I64, tag as i64);
+            let payload_length = b.ins().iconst(types::I64, payload_len as i64);
+            let call = b.ins().call(
+                env.print_functions.enum_new,
+                &[tag_value, payload_ptr, payload_length, drop_ptr, drop_len],
+            );
+            Ok(b.func.dfg.inst_results(call).to_vec())
         }
         IrCallTarget::Argument => {
             let [argument] = arguments else {
@@ -2005,6 +5397,65 @@ fn emit_call(
         }
         IrCallTarget::Function(function_index) => {
             emit_function_call(b, module, function_index, arguments, env, seal_state)
+        }
+        IrCallTarget::IndirectFunctionPointer(signature_id) => {
+            let signature = crate::sema::function_pointer_info(signature_id);
+            if arguments.len() != signature.parameters.len() + 1 {
+                return Err("internal error: indirect function argument count mismatch".into());
+            }
+            let callee = emit_expr(b, module, &arguments[0], env, seal_state)?;
+            let CompiledValue::Integer(callee, Type::FunctionPointer(_)) = callee else {
+                return Err("internal error: indirect callee is not a function pointer".into());
+            };
+            let mut call_signature = Signature::new(module.isa().default_call_conv());
+            let mut values = Vec::with_capacity(signature.parameters.len());
+            for (argument, ty) in arguments[1..].iter().zip(&signature.parameters) {
+                let value = emit_expr(b, module, argument, env, seal_state)?;
+                if signature.extern_c
+                    && let Some((size, fields)) = c_abi_packed_record_layout(*ty, env.structs)
+                {
+                    call_signature
+                        .params
+                        .push(AbiParam::new(c_abi_integer_type(size)));
+                    values.push(pack_c_abi_record(b, &flatten_value(value), size, &fields)?);
+                } else {
+                    call_signature.params.push(AbiParam::new(clif_scalar_type(
+                        *ty,
+                        module.target_config().pointer_type(),
+                    )?));
+                    values.extend(flatten_value(value));
+                }
+            }
+            if let Some(result) = signature.result {
+                if signature.extern_c
+                    && let Some((size, _)) = c_abi_packed_record_layout(result, env.structs)
+                {
+                    call_signature
+                        .returns
+                        .push(AbiParam::new(c_abi_integer_type(size)));
+                } else {
+                    call_signature.returns.push(AbiParam::new(clif_scalar_type(
+                        result,
+                        module.target_config().pointer_type(),
+                    )?));
+                }
+            }
+            let signature_ref = b.import_signature(call_signature);
+            let call = b.ins().call_indirect(signature_ref, callee, &values);
+            let results = b.func.dfg.inst_results(call).to_vec();
+            if signature.extern_c
+                && let Some(result) = signature.result
+                && let Some((size, fields)) = c_abi_packed_record_layout(result, env.structs)
+            {
+                let [packed] = results.as_slice() else {
+                    return Err(
+                        "internal error: indirect C aggregate return must be one ABI value".into(),
+                    );
+                };
+                Ok(unpack_c_abi_record(b, *packed, size, &fields))
+            } else {
+                Ok(results)
+            }
         }
     }
 }
@@ -2026,33 +5477,60 @@ fn emit_function_call(
         .function_returns
         .get(function_index)
         .ok_or_else(|| "internal error: missing function return type".to_string())?;
-    let return_slot = if let Some(Type::Struct(struct_id)) = return_type {
+    let direct_c_record = env
+        .external_functions
+        .get(function_index)
+        .copied()
+        .unwrap_or(false)
+        && return_type.is_some_and(|ty| is_direct_c_abi_record(ty, env.structs));
+    let return_slot = if let Some(ty @ (Type::Struct(_) | Type::Array(_))) = return_type
+        && !direct_c_record
+    {
         let slot = b.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            (env.structs[struct_id].slot_count * 8) as u32,
+            (value_width(ty, env.structs) * 8) as u32,
             3,
         ));
         let pointer = b
             .ins()
             .stack_addr(module.target_config().pointer_type(), slot, 0);
         args.push(pointer);
-        Some((slot, struct_id))
+        Some((slot, ty))
     } else {
         None
     };
-    for arg in arguments {
-        args.extend(flatten_value(emit_expr(b, module, arg, env, seal_state)?));
+    let external = env
+        .external_functions
+        .get(function_index)
+        .copied()
+        .unwrap_or(false);
+    let parameter_types = env
+        .function_parameters
+        .get(function_index)
+        .ok_or_else(|| "internal error: missing function parameter types".to_string())?;
+    for (index, arg) in arguments.iter().enumerate() {
+        let value = emit_expr(b, module, arg, env, seal_state)?;
+        let flattened = flatten_value(value);
+        if external
+            && let Some((size, fields)) = parameter_types
+                .get(index)
+                .and_then(|ty| c_abi_packed_record_layout(*ty, env.structs))
+        {
+            args.push(pack_c_abi_record(b, &flattened, size, &fields)?);
+        } else {
+            args.extend(flattened);
+        }
     }
     let inst = b.ins().call(callee, &args);
     let results = b.func.dfg.inst_results(inst).to_vec();
-    if let Some((slot, struct_id)) = return_slot {
+    if let Some((slot, ty)) = return_slot {
         let pointer = b
             .ins()
             .stack_addr(module.target_config().pointer_type(), slot, 0);
         let mut values = Vec::new();
         let mut components = Vec::new();
         append_sret_components(
-            Type::Struct(struct_id),
+            ty,
             0,
             module.target_config().pointer_type(),
             env.structs,
@@ -2066,7 +5544,24 @@ fn emit_function_call(
                 (slot_offset * 8) as i32,
             ));
         }
-        Ok(values)
+        let mut offset = 0;
+        flatten_value(compiled_value_from_type(
+            ty,
+            &values,
+            &mut offset,
+            env.structs,
+        )?)
+        .into_iter()
+        .map(Ok)
+        .collect()
+    } else if external
+        && let Some((size, fields)) =
+            return_type.and_then(|ty| c_abi_packed_record_layout(ty, env.structs))
+    {
+        let [packed] = results.as_slice() else {
+            return Err("internal error: packed C aggregate return must be one ABI value".into());
+        };
+        Ok(unpack_c_abi_record(b, *packed, size, &fields))
     } else {
         Ok(results)
     }
@@ -2076,41 +5571,34 @@ fn clif_scalar_type(ty: Type, pointer_type: types::Type) -> Result<types::Type, 
     Ok(match ty {
         Type::I8 | Type::U8 | Type::Bool => types::I8,
         Type::I16 | Type::U16 => types::I16,
-        Type::I32 | Type::U32 => types::I32,
+        Type::I32 | Type::U32 | Type::Char => types::I32,
         Type::I64 | Type::U64 => types::I64,
         Type::F32 => types::F32,
         Type::F64 => types::F64,
-        Type::Str => pointer_type,
+        Type::Str
+        | Type::OwnedString
+        | Type::Vec(_)
+        | Type::Map(_)
+        | Type::Enum(_)
+        | Type::Reference(_, _)
+        | Type::RawPointer(_)
+        | Type::FunctionPointer(_) => pointer_type,
+        Type::Slice(_) => {
+            return Err("internal error: a borrowed slice cannot be returned as a scalar".into());
+        }
         Type::Struct(_) => return Err("internal error: nested structure in return layout".into()),
+        Type::Array(_) => return Err("internal error: array in scalar return layout".into()),
     })
 }
 
-fn store_struct_return(
+fn store_aggregate_return(
     b: &mut FunctionBuilder<'_>,
-    struct_id: usize,
+    ty: Type,
     value: CompiledValue,
     pointer: Value,
     structs: &[RynStruct],
 ) -> Result<(), String> {
-    let CompiledValue::Struct {
-        struct_id: actual,
-        fields,
-    } = value
-    else {
-        return Err("internal error: structure return expression is not a structure".into());
-    };
-    if actual != struct_id || fields.len() != structs[struct_id].fields.len() {
-        return Err("internal error: structure return value has an incompatible layout".into());
-    }
-    store_sret_value(
-        b,
-        Type::Struct(struct_id),
-        CompiledValue::Struct { struct_id, fields },
-        0,
-        pointer,
-        structs,
-    )?;
-    Ok(())
+    store_sret_value(b, ty, value, 0, pointer, structs)
 }
 
 fn append_sret_components(
@@ -2126,6 +5614,18 @@ fn append_sret_components(
                 append_sret_components(
                     field.ty,
                     slot_offset + field.slot_offset,
+                    pointer_type,
+                    structs,
+                    components,
+                )?;
+            }
+        }
+        Type::Array(id) => {
+            let (element, length) = array_info(id);
+            for index in 0..length {
+                append_sret_components(
+                    element,
+                    slot_offset + index * storage_slot_width(element, structs),
                     pointer_type,
                     structs,
                     components,
@@ -2163,6 +5663,22 @@ fn store_sret_value(
                     field.ty,
                     value,
                     slot_offset + field.slot_offset,
+                    pointer,
+                    structs,
+                )?;
+            }
+        }
+        (Type::Array(id), CompiledValue::Array(values)) => {
+            let (element, length) = array_info(id);
+            if values.len() != length {
+                return Err("internal error: returned array has the wrong length".into());
+            }
+            for (index, value) in values.into_iter().enumerate() {
+                store_sret_value(
+                    b,
+                    element,
+                    value,
+                    slot_offset + index * storage_slot_width(element, structs),
                     pointer,
                     structs,
                 )?;
@@ -2261,16 +5777,598 @@ fn emit_if_expression(
     compiled_value_from_type(ty, b.block_params(merge_block), &mut offset, env.structs)
 }
 
+fn emit_enum_match(
+    b: &mut FunctionBuilder<'_>,
+    module: &ObjectModule,
+    expression: &IrExpression,
+    env: &ExprEnv<'_>,
+    seal_state: &mut BlockSealState,
+) -> Result<CompiledValue, String> {
+    let IrExpression::EnumMatch {
+        value,
+        enum_id,
+        arms,
+        ty,
+    } = expression
+    else {
+        return Err("internal error: non-match IR reached enum code generation".into());
+    };
+    let definition = env
+        .enums
+        .get(*enum_id)
+        .ok_or("internal error: enum type is out of range")?;
+    let value = emit_expr(b, module, value, env, seal_state)?;
+    let CompiledValue::Enum { ptr, temporary } = value else {
+        return Err("internal error: choose scrutinee is not an enum handle".into());
+    };
+    let tag_call = b.ins().call(env.print_functions.enum_tag, &[ptr]);
+    let tag = b.func.dfg.inst_results(tag_call)[0];
+
+    let wildcard = arms.iter().position(|arm| arm.variant.is_none());
+    let mut selected = Vec::with_capacity(definition.variants.len());
+    for (variant, _) in definition.variants.iter().enumerate() {
+        let arm_index = arms
+            .iter()
+            .position(|arm| arm.variant == Some(variant))
+            .or(wildcard)
+            .ok_or("internal error: non-exhaustive choose reached code generation")?;
+        selected.push((variant, arm_index));
+    }
+    if selected.is_empty() {
+        return Err("internal error: empty enum reached choose code generation".into());
+    }
+    let mut arm_blocks = vec![None; arms.len()];
+    for (_, arm_index) in &selected {
+        if arm_blocks[*arm_index].is_none() {
+            arm_blocks[*arm_index] = Some(b.create_block());
+        }
+    }
+    let merge_block = b.create_block();
+    let pointer_type = module.target_config().pointer_type();
+    for result_type in clif_types(*ty, pointer_type, env.structs) {
+        b.append_block_param(merge_block, result_type);
+    }
+
+    let mut test_block = b
+        .current_block()
+        .ok_or("internal error: choose has no source block")?;
+    for (position, (variant, arm_index)) in selected.iter().enumerate() {
+        if position > 0 {
+            b.switch_to_block(test_block);
+        }
+        let target = arm_blocks[*arm_index].expect("selected choose arm has a block");
+        if position + 1 == selected.len() {
+            b.ins().jump(target, &[]);
+            seal_ready(b, test_block, seal_state);
+        } else {
+            let next_test = b.create_block();
+            let expected = b.ins().iconst(types::I64, *variant as i64);
+            let matches = b.ins().icmp(IntCC::Equal, tag, expected);
+            b.ins().brif(matches, target, &[], next_test, &[]);
+            seal_ready(b, test_block, seal_state);
+            test_block = next_test;
+        }
+    }
+
+    for (arm_index, arm) in arms.iter().enumerate() {
+        let Some(arm_block) = arm_blocks[arm_index] else {
+            continue;
+        };
+        b.switch_to_block(arm_block);
+        if let Some(variant_index) = arm.variant {
+            let variant = definition
+                .variants
+                .get(variant_index)
+                .ok_or("internal error: choose variant is out of range")?;
+            if arm.bindings.len() != variant.fields.len() {
+                return Err("internal error: choose binding count differs from checked IR".into());
+            }
+            for binding in &arm.bindings {
+                let field_type = *variant
+                    .fields
+                    .get(binding.field_index)
+                    .ok_or("internal error: choose field index is out of range")?;
+                if field_type != binding.ty {
+                    return Err(
+                        "internal error: choose binding type differs from checked IR".into(),
+                    );
+                }
+                let payload_word_offset = variant.fields[..binding.field_index]
+                    .iter()
+                    .map(|ty| value_width(*ty, env.structs))
+                    .sum::<usize>();
+                if let Type::Struct(struct_id) = field_type {
+                    let local_value = decode_enum_struct_payload(
+                        b,
+                        ptr,
+                        payload_word_offset,
+                        struct_id,
+                        pointer_type,
+                        env.structs,
+                        env.print_functions,
+                        true,
+                    )?;
+                    store_local(b, binding.slot, field_type, local_value, env.structs)?;
+                    continue;
+                }
+                let word_index = b.ins().iconst(types::I64, payload_word_offset as i64);
+                let local_value = match field_type {
+                    Type::OwnedString | Type::Vec(_) | Type::Enum(_) | Type::Map(_) => {
+                        let get = b
+                            .ins()
+                            .call(env.print_functions.enum_word, &[ptr, word_index]);
+                        let raw = b.func.dfg.inst_results(get)[0];
+                        let field = if pointer_type == types::I64 {
+                            raw
+                        } else {
+                            b.ins().ireduce(pointer_type, raw)
+                        };
+                        b.ins()
+                            .call(env.print_functions.enum_clear_word, &[ptr, word_index]);
+                        field
+                    }
+                    other => {
+                        let get = b
+                            .ins()
+                            .call(env.print_functions.enum_word, &[ptr, word_index]);
+                        let raw = b.func.dfg.inst_results(get)[0];
+                        match other {
+                            Type::F32 => {
+                                let bits = b.ins().ireduce(types::I32, raw);
+                                b.ins().bitcast(types::F32, MemFlagsData::new(), bits)
+                            }
+                            Type::F64 => b.ins().bitcast(types::F64, MemFlagsData::new(), raw),
+                            Type::I8
+                            | Type::I16
+                            | Type::I32
+                            | Type::U8
+                            | Type::U16
+                            | Type::U32
+                            | Type::Bool
+                            | Type::Char => {
+                                b.ins().ireduce(clif_scalar_type(other, pointer_type)?, raw)
+                            }
+                            Type::I64 | Type::U64 => raw,
+                            _ => {
+                                return Err("internal error: unsupported enum payload field".into());
+                            }
+                        }
+                    }
+                };
+                b.def_var(Variable::from_u32(binding.slot as u32), local_value);
+            }
+        }
+        let result = emit_expr(b, module, &arm.body, env, seal_state)?;
+        if !compiled_value_matches_type(&result, *ty) {
+            return Err("internal error: choose arm has the wrong result type".into());
+        }
+        for binding in arm.bindings.iter().rev() {
+            drop_binding(b, env, binding.slot, binding.ty, seal_state);
+        }
+        if temporary {
+            drop_temporary(
+                b,
+                env.print_functions,
+                CompiledValue::Enum {
+                    ptr,
+                    temporary: true,
+                },
+            );
+        }
+        let args = flatten_value(result)
+            .into_iter()
+            .map(BlockArg::Value)
+            .collect::<Vec<_>>();
+        let from = b
+            .current_block()
+            .ok_or("internal error: choose arm has no block")?;
+        b.ins().jump(merge_block, &args);
+        seal_ready(b, from, seal_state);
+    }
+    b.switch_to_block(merge_block);
+    seal_ready(b, merge_block, seal_state);
+    let mut offset = 0;
+    compiled_value_from_type(*ty, b.block_params(merge_block), &mut offset, env.structs)
+}
+
+fn emit_propagate(
+    b: &mut FunctionBuilder<'_>,
+    module: &ObjectModule,
+    expression: &IrExpression,
+    env: &ExprEnv<'_>,
+    seal_state: &mut BlockSealState,
+) -> Result<CompiledValue, String> {
+    let IrExpression::Propagate {
+        value,
+        input_enum,
+        output_enum,
+        success_type,
+        failure_type,
+        success_variant,
+        failure_variant,
+        output_failure_variant,
+    } = expression
+    else {
+        return Err(
+            "internal error: non-propagation IR reached propagation code generation".into(),
+        );
+    };
+    if env.function_return != Some(Type::Enum(*output_enum)) {
+        return Err(
+            "internal error: propagated Option/Result does not match the function return type"
+                .into(),
+        );
+    }
+    let input_definition = env
+        .enums
+        .get(*input_enum)
+        .ok_or("internal error: input Option/Result type is out of range")?;
+    let output_definition = env
+        .enums
+        .get(*output_enum)
+        .ok_or("internal error: output Option/Result type is out of range")?;
+    let input_value = emit_expr(b, module, value, env, seal_state)?;
+    let CompiledValue::Enum { ptr, .. } = input_value else {
+        return Err("internal error: `?` operand is not an enum handle".into());
+    };
+    let tag_call = b.ins().call(env.print_functions.enum_tag, &[ptr]);
+    let tag = b.func.dfg.inst_results(tag_call)[0];
+    let success_block = b.create_block();
+    let error_block = b.create_block();
+    let merge_block = b.create_block();
+    let pointer_type = module.target_config().pointer_type();
+    for ty in clif_types(*success_type, pointer_type, env.structs) {
+        b.append_block_param(merge_block, ty);
+    }
+    let success_tag = b.ins().iconst(types::I64, *success_variant as i64);
+    let is_success = b.ins().icmp(IntCC::Equal, tag, success_tag);
+    let source = b
+        .current_block()
+        .ok_or("internal error: `?` has no source block")?;
+    b.ins()
+        .brif(is_success, success_block, &[], error_block, &[]);
+    seal_ready(b, source, seal_state);
+
+    b.switch_to_block(success_block);
+    let success_definition = input_definition
+        .variants
+        .get(*success_variant)
+        .ok_or("internal error: generic success tag is out of range")?;
+    let success_field = *success_definition
+        .fields
+        .first()
+        .ok_or("internal error: generic success variant has no payload")?;
+    if success_field != *success_type {
+        return Err("internal error: Result `Ok` payload differs from the checked type".into());
+    }
+    let success_value = if let Type::Struct(struct_id) = success_field {
+        decode_enum_struct_payload(
+            b,
+            ptr,
+            0,
+            struct_id,
+            pointer_type,
+            env.structs,
+            env.print_functions,
+            true,
+        )?
+    } else {
+        let word_index = b.ins().iconst(types::I64, 0);
+        let get = b
+            .ins()
+            .call(env.print_functions.enum_word, &[ptr, word_index]);
+        let raw = b.func.dfg.inst_results(get)[0];
+        let decoded = decode_enum_payload(b, raw, *success_type, pointer_type)?;
+        b.ins()
+            .call(env.print_functions.enum_clear_word, &[ptr, word_index]);
+        decoded
+    };
+    b.ins().call(env.print_functions.enum_drop, &[ptr]);
+    let from = b
+        .current_block()
+        .ok_or("internal error: missing `?` success block")?;
+    let args = flatten_value(success_value)
+        .into_iter()
+        .map(BlockArg::Value)
+        .collect::<Vec<_>>();
+    b.ins().jump(merge_block, &args);
+    seal_ready(b, from, seal_state);
+
+    b.switch_to_block(error_block);
+    let failure_definition = input_definition
+        .variants
+        .get(*failure_variant)
+        .ok_or("internal error: generic failure tag is out of range")?;
+    let encoded_failure = if let Some(failure_type) = failure_type {
+        if failure_definition.fields.as_slice() != [*failure_type] {
+            return Err(
+                "internal error: generic failure payload differs from the checked type".into(),
+            );
+        }
+        let word_index = b.ins().iconst(types::I64, 0);
+        let get = b
+            .ins()
+            .call(env.print_functions.enum_word, &[ptr, word_index]);
+        let raw = b.func.dfg.inst_results(get)[0];
+        let failure_value = decode_enum_payload(b, raw, *failure_type, pointer_type)?;
+        let flattened = flatten_value(failure_value);
+        let [failure_word] = flattened.as_slice() else {
+            return Err("internal error: generic failure payload has an aggregate layout".into());
+        };
+        let encoded = encode_enum_word(b, *failure_word, *failure_type, pointer_type)?;
+        b.ins()
+            .call(env.print_functions.enum_clear_word, &[ptr, word_index]);
+        Some(encoded)
+    } else {
+        if !failure_definition.fields.is_empty() {
+            return Err("internal error: Option `None` unexpectedly has a payload".into());
+        }
+        None
+    };
+    b.ins().call(env.print_functions.enum_drop, &[ptr]);
+
+    let output_variant = output_definition
+        .variants
+        .get(*output_failure_variant)
+        .ok_or("internal error: return generic failure tag is out of range")?;
+    if let Some(failure_type) = failure_type {
+        if output_variant.fields.as_slice() != [*failure_type] {
+            return Err(
+                "internal error: return Result error payload differs from the checked type".into(),
+            );
+        }
+    } else if !output_variant.fields.is_empty() {
+        return Err("internal error: return Option `None` unexpectedly has a payload".into());
+    }
+    let (payload, payload_len) = if let Some(encoded) = encoded_failure {
+        let payload_slot =
+            b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+        let payload = b.ins().stack_addr(pointer_type, payload_slot, 0);
+        b.ins().store(MemFlagsData::new(), encoded, payload, 0);
+        (payload, 8_u64)
+    } else {
+        (b.ins().iconst(pointer_type, 0), 0_u64)
+    };
+    let (drop_ptr, drop_len) =
+        if let Some(data_id) = env.enum_drop_plans.get(*output_enum).copied().flatten() {
+            let data = module.declare_data_in_func(data_id, b.func);
+            (
+                b.ins().symbol_value(pointer_type, data),
+                b.ins().iconst(
+                    types::I64,
+                    enum_drop_plan_len(output_definition, env.structs) as i64,
+                ),
+            )
+        } else {
+            (
+                b.ins().iconst(pointer_type, 0),
+                b.ins().iconst(types::I64, 0),
+            )
+        };
+    let output_tag = b.ins().iconst(types::I64, *output_failure_variant as i64);
+    let payload_len = b.ins().iconst(types::I64, payload_len as i64);
+    let create = b.ins().call(
+        env.print_functions.enum_new,
+        &[output_tag, payload, payload_len, drop_ptr, drop_len],
+    );
+    let output_value = b.func.dfg.inst_results(create)[0];
+    drop_slots(b, env, env.owned_slots, seal_state);
+    b.ins().return_(&[output_value]);
+    let returned = b
+        .current_block()
+        .ok_or("internal error: missing `?` error block")?;
+    seal_ready(b, returned, seal_state);
+
+    b.switch_to_block(merge_block);
+    seal_ready(b, merge_block, seal_state);
+    let params = b.block_params(merge_block).to_vec();
+    let mut offset = 0;
+    compiled_value_from_type(*success_type, &params, &mut offset, env.structs)
+}
+
+fn decode_enum_payload(
+    b: &mut FunctionBuilder<'_>,
+    raw: Value,
+    ty: Type,
+    pointer_type: types::Type,
+) -> Result<CompiledValue, String> {
+    Ok(match ty {
+        Type::OwnedString | Type::Vec(_) | Type::Enum(_) | Type::Map(_) => {
+            let pointer = if pointer_type == types::I64 {
+                raw
+            } else {
+                b.ins().ireduce(pointer_type, raw)
+            };
+            match ty {
+                Type::OwnedString => CompiledValue::OwnedString {
+                    ptr: pointer,
+                    temporary: true,
+                },
+                Type::Vec(_) => CompiledValue::Vec {
+                    ptr: pointer,
+                    temporary: true,
+                },
+                Type::Enum(_) => CompiledValue::Enum {
+                    ptr: pointer,
+                    temporary: true,
+                },
+                Type::Map(_) => CompiledValue::Map {
+                    ptr: pointer,
+                    temporary: true,
+                },
+                _ => unreachable!(),
+            }
+        }
+        Type::RawPointer(_) | Type::Reference(_, _) | Type::FunctionPointer(_) => {
+            let pointer = if pointer_type == types::I64 {
+                raw
+            } else {
+                b.ins().ireduce(pointer_type, raw)
+            };
+            CompiledValue::Integer(pointer, ty)
+        }
+        Type::F64 => CompiledValue::F64(b.ins().bitcast(types::F64, MemFlagsData::new(), raw)),
+        Type::F32 => {
+            let bits = b.ins().ireduce(types::I32, raw);
+            CompiledValue::F32(b.ins().bitcast(types::F32, MemFlagsData::new(), bits))
+        }
+        Type::I8
+        | Type::I16
+        | Type::I32
+        | Type::U8
+        | Type::U16
+        | Type::U32
+        | Type::Bool
+        | Type::Char => {
+            let value = b.ins().ireduce(clif_scalar_type(ty, pointer_type)?, raw);
+            if ty == Type::Bool {
+                CompiledValue::Bool(value)
+            } else {
+                CompiledValue::Integer(value, ty)
+            }
+        }
+        Type::I64 | Type::U64 => CompiledValue::Integer(raw, ty),
+        _ => return Err("internal error: unsupported `?` payload layout".into()),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_enum_struct_payload(
+    b: &mut FunctionBuilder<'_>,
+    pointer: Value,
+    word_offset: usize,
+    struct_id: usize,
+    pointer_type: types::Type,
+    structs: &[RynStruct],
+    runtime: PrintFunctions,
+    clear: bool,
+) -> Result<CompiledValue, String> {
+    let mut values = Vec::new();
+    for field in &structs[struct_id].fields {
+        values.push(decode_enum_value_payload(
+            b,
+            pointer,
+            word_offset + field.slot_offset,
+            field.ty,
+            pointer_type,
+            structs,
+            runtime,
+            clear,
+        )?);
+    }
+    Ok(CompiledValue::Struct {
+        struct_id,
+        fields: values,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_enum_value_payload(
+    b: &mut FunctionBuilder<'_>,
+    pointer: Value,
+    offset: usize,
+    ty: Type,
+    pointer_type: types::Type,
+    structs: &[RynStruct],
+    runtime: PrintFunctions,
+    clear: bool,
+) -> Result<CompiledValue, String> {
+    match ty {
+        Type::Struct(struct_id) => decode_enum_struct_payload(
+            b,
+            pointer,
+            offset,
+            struct_id,
+            pointer_type,
+            structs,
+            runtime,
+            clear,
+        ),
+        Type::Array(array_id) => {
+            let (element, length) = array_info(array_id);
+            let stride = value_width(element, structs);
+            let mut values = Vec::with_capacity(length);
+            for index in 0..length {
+                values.push(decode_enum_value_payload(
+                    b,
+                    pointer,
+                    offset + index * stride,
+                    element,
+                    pointer_type,
+                    structs,
+                    runtime,
+                    clear,
+                )?);
+            }
+            Ok(CompiledValue::Array(values))
+        }
+        _ => {
+            let word_index = b.ins().iconst(types::I64, offset as i64);
+            let get = b.ins().call(runtime.enum_word, &[pointer, word_index]);
+            let raw = b.func.dfg.inst_results(get)[0];
+            let value = decode_enum_payload(b, raw, ty, pointer_type)?;
+            if matches!(
+                ty,
+                Type::OwnedString | Type::Vec(_) | Type::Enum(_) | Type::Map(_)
+            ) {
+                if clear {
+                    b.ins()
+                        .call(runtime.enum_clear_word, &[pointer, word_index]);
+                } else {
+                    return Ok(mark_borrowed(value));
+                }
+            }
+            Ok(value)
+        }
+    }
+}
+
+/// Rewrites decoded owner handles from moved temporaries into borrowed views.
+fn mark_borrowed(value: CompiledValue) -> CompiledValue {
+    match value {
+        CompiledValue::OwnedString { ptr, .. } => CompiledValue::OwnedString {
+            ptr,
+            temporary: false,
+        },
+        CompiledValue::Vec { ptr, .. } => CompiledValue::Vec {
+            ptr,
+            temporary: false,
+        },
+        CompiledValue::Enum { ptr, .. } => CompiledValue::Enum {
+            ptr,
+            temporary: false,
+        },
+        CompiledValue::Map { ptr, .. } => CompiledValue::Map {
+            ptr,
+            temporary: false,
+        },
+        CompiledValue::Struct { struct_id, fields } => CompiledValue::Struct {
+            struct_id,
+            fields: fields.into_iter().map(mark_borrowed).collect(),
+        },
+        CompiledValue::Array(values) => {
+            CompiledValue::Array(values.into_iter().map(mark_borrowed).collect())
+        }
+        other => other,
+    }
+}
+
 fn compiled_value_matches_type(value: &CompiledValue, ty: Type) -> bool {
     match (value, ty) {
         (CompiledValue::Integer(_, actual), expected) => *actual == expected,
         (CompiledValue::F32(_), Type::F32)
         | (CompiledValue::F64(_), Type::F64)
         | (CompiledValue::Str { .. }, Type::Str)
+        | (CompiledValue::Slice { .. }, Type::Slice(_))
+        | (CompiledValue::OwnedString { .. }, Type::OwnedString)
+        | (CompiledValue::Vec { .. }, Type::Vec(_))
+        | (CompiledValue::Enum { .. }, Type::Enum(_))
+        | (CompiledValue::Map { .. }, Type::Map(_))
         | (CompiledValue::Bool(_), Type::Bool) => true,
         (CompiledValue::Struct { struct_id, fields }, Type::Struct(expected)) => {
             *struct_id == expected && !fields.is_empty()
         }
+        (CompiledValue::Array(values), Type::Array(id)) => values.len() == array_info(id).1,
         _ => false,
     }
 }
@@ -2289,7 +6387,8 @@ fn compiled_value_from_type(
         | Type::U8
         | Type::U16
         | Type::U32
-        | Type::U64 => {
+        | Type::U64
+        | Type::Char => {
             let first = *params.get(*offset).ok_or_else(|| {
                 "internal error: aggregate value is missing a component".to_string()
             })?;
@@ -2317,6 +6416,13 @@ fn compiled_value_from_type(
             *offset += 1;
             CompiledValue::Bool(first)
         }
+        Type::Reference(_, _) | Type::RawPointer(_) | Type::FunctionPointer(_) => {
+            let first = *params.get(*offset).ok_or_else(|| {
+                "internal error: pointer value is missing its component".to_string()
+            })?;
+            *offset += 1;
+            CompiledValue::Integer(first, ty)
+        }
         Type::Str => {
             let first = *params.get(*offset).ok_or_else(|| {
                 "internal error: aggregate string is missing its pointer".to_string()
@@ -2327,6 +6433,56 @@ fn compiled_value_from_type(
             *offset += 2;
             CompiledValue::Str { ptr: first, len }
         }
+        Type::Slice(_) => {
+            let first = *params
+                .get(*offset)
+                .ok_or("internal error: slice aggregate is missing its pointer")?;
+            let len = *params
+                .get(*offset + 1)
+                .ok_or("internal error: slice aggregate is missing its length")?;
+            *offset += 2;
+            CompiledValue::Slice { ptr: first, len }
+        }
+        Type::OwnedString => {
+            let pointer = *params
+                .get(*offset)
+                .ok_or("internal error: missing String handle")?;
+            *offset += 1;
+            CompiledValue::OwnedString {
+                ptr: pointer,
+                temporary: true,
+            }
+        }
+        Type::Vec(_) => {
+            let pointer = *params
+                .get(*offset)
+                .ok_or("internal error: missing Vec handle")?;
+            *offset += 1;
+            CompiledValue::Vec {
+                ptr: pointer,
+                temporary: true,
+            }
+        }
+        Type::Map(_) => {
+            let pointer = *params
+                .get(*offset)
+                .ok_or("internal error: missing Map handle")?;
+            *offset += 1;
+            CompiledValue::Map {
+                ptr: pointer,
+                temporary: true,
+            }
+        }
+        Type::Enum(_) => {
+            let pointer = *params
+                .get(*offset)
+                .ok_or("internal error: missing enum handle")?;
+            *offset += 1;
+            CompiledValue::Enum {
+                ptr: pointer,
+                temporary: true,
+            }
+        }
         Type::Struct(struct_id) => {
             let mut fields = Vec::with_capacity(structs[struct_id].fields.len());
             for field in &structs[struct_id].fields {
@@ -2334,35 +6490,119 @@ fn compiled_value_from_type(
             }
             CompiledValue::Struct { struct_id, fields }
         }
+        Type::Array(id) => {
+            let (element, length) = array_info(id);
+            let mut values = Vec::with_capacity(length);
+            for _ in 0..length {
+                values.push(compiled_value_from_type(element, params, offset, structs)?);
+            }
+            CompiledValue::Array(values)
+        }
     };
     Ok(result)
 }
 
 #[derive(Clone, Copy)]
 struct ExprEnv<'a> {
+    owned_slots: &'a [(usize, Type)],
     strings: &'a HashMap<String, DataId>,
     calls: &'a [FuncRef],
+    vec_struct_callbacks: &'a [Option<(FuncRef, FuncRef)>],
     print_functions: PrintFunctions,
     structs: &'a [RynStruct],
+    enums: &'a [RynEnum],
+    enum_drop_plans: &'a [Option<DataId>],
     function_returns: &'a [Option<Type>],
+    external_functions: &'a [bool],
+    function_parameters: &'a [Vec<Type>],
     function_return: Option<Type>,
     sret_pointer: Option<Value>,
+    address_slots: &'a [Option<StackSlot>],
+}
+
+fn enum_drop_plan_len(definition: &RynEnum, structs: &[RynStruct]) -> usize {
+    let mut bytes = Vec::new();
+    for (variant_index, variant) in definition.variants.iter().enumerate() {
+        let mut offset = 0;
+        for field in &variant.fields {
+            append_enum_drop_entries(&mut bytes, variant_index, *field, offset, structs);
+            offset += value_width(*field, structs);
+        }
+    }
+    bytes.len()
+}
+
+fn encode_enum_word(
+    b: &mut FunctionBuilder<'_>,
+    value: Value,
+    ty: Type,
+    pointer_type: types::Type,
+) -> Result<Value, String> {
+    Ok(match ty {
+        Type::I64 | Type::U64 | Type::F64 => {
+            if ty == Type::F64 {
+                b.ins().bitcast(types::I64, MemFlagsData::new(), value)
+            } else {
+                value
+            }
+        }
+        Type::F32 => {
+            let bits = b.ins().bitcast(types::I32, MemFlagsData::new(), value);
+            b.ins().uextend(types::I64, bits)
+        }
+        Type::OwnedString | Type::Vec(_) | Type::Enum(_) | Type::Map(_) => {
+            if pointer_type == types::I64 {
+                value
+            } else {
+                b.ins().uextend(types::I64, value)
+            }
+        }
+        Type::RawPointer(_) | Type::Reference(_, _) | Type::FunctionPointer(_) => {
+            if pointer_type == types::I64 {
+                value
+            } else {
+                b.ins().uextend(types::I64, value)
+            }
+        }
+        Type::I8
+        | Type::I16
+        | Type::I32
+        | Type::U8
+        | Type::U16
+        | Type::U32
+        | Type::Bool
+        | Type::Char => b.ins().uextend(types::I64, value),
+        _ => return Err("internal error: unsupported enum payload layout".into()),
+    })
 }
 
 fn clif_types(ty: Type, pointer_type: types::Type, structs: &[RynStruct]) -> Vec<types::Type> {
     match ty {
         Type::I8 | Type::U8 | Type::Bool => vec![types::I8],
         Type::I16 | Type::U16 => vec![types::I16],
-        Type::I32 | Type::U32 => vec![types::I32],
+        Type::I32 | Type::U32 | Type::Char => vec![types::I32],
         Type::I64 | Type::U64 => vec![types::I64],
         Type::F32 => vec![types::F32],
         Type::F64 => vec![types::F64],
-        Type::Str => vec![pointer_type, types::I64],
+        Type::Str | Type::Slice(_) => vec![pointer_type, types::I64],
+        Type::OwnedString
+        | Type::Vec(_)
+        | Type::Map(_)
+        | Type::Enum(_)
+        | Type::Reference(_, _)
+        | Type::RawPointer(_)
+        | Type::FunctionPointer(_) => vec![pointer_type],
         Type::Struct(struct_id) => structs[struct_id]
             .fields
             .iter()
             .flat_map(|field| clif_types(field.ty, pointer_type, structs))
             .collect(),
+        Type::Array(id) => {
+            let (element, length) = array_info(id);
+            (0..length)
+                .flat_map(|_| clif_types(element, pointer_type, structs))
+                .collect()
+        }
     }
 }
 
@@ -2527,7 +6767,76 @@ fn write_linker_wrapper(wrapper: &Path, use_precompiled_shim: bool) -> Result<()
     let source = if use_precompiled_shim {
         LINKER_ENTRY_SOURCE.to_owned()
     } else {
-        format!("{}\n{LINKER_ENTRY_SOURCE}", include_str!("runtime_shim.rs"))
+        let shim = include_str!("runtime_shim.rs")
+            .replace(
+                "#[path = \"runtime/string.rs\"]\npub mod strings;",
+                &format!(
+                    "pub mod strings {{ {} }}",
+                    include_str!("runtime/string.rs")
+                ),
+            )
+            .replace(
+                "#[path = \"runtime/string.rs\"]\r\npub mod strings;",
+                &format!(
+                    "pub mod strings {{ {} }}",
+                    include_str!("runtime/string.rs")
+                ),
+            )
+            .replace(
+                "#[path = \"runtime/vector.rs\"]\npub mod vectors;",
+                &format!(
+                    "pub mod vectors {{ {} }}",
+                    include_str!("runtime/vector.rs")
+                ),
+            )
+            .replace(
+                "#[path = \"runtime/vector.rs\"]\r\npub mod vectors;",
+                &format!(
+                    "pub mod vectors {{ {} }}",
+                    include_str!("runtime/vector.rs")
+                ),
+            )
+            .replace(
+                "#[path = \"runtime/map.rs\"]\npub mod maps;",
+                &format!("pub mod maps {{ {} }}", include_str!("runtime/map.rs")),
+            )
+            .replace(
+                "#[path = \"runtime/map.rs\"]\r\npub mod maps;",
+                &format!("pub mod maps {{ {} }}", include_str!("runtime/map.rs")),
+            )
+            .replace(
+                "#[path = \"runtime/enum.rs\"]\npub mod enums;",
+                &format!("pub mod enums {{ {} }}", include_str!("runtime/enum.rs")),
+            )
+            .replace(
+                "#[path = \"runtime/enum.rs\"]\r\npub mod enums;",
+                &format!("pub mod enums {{ {} }}", include_str!("runtime/enum.rs")),
+            )
+            .replace(
+                "#[path = \"runtime/filesystem.rs\"]\npub mod filesystem;",
+                &format!(
+                    "pub mod filesystem {{ {} }}",
+                    include_str!("runtime/filesystem.rs")
+                ),
+            )
+            .replace(
+                "#[path = \"runtime/filesystem.rs\"]\r\npub mod filesystem;",
+                &format!(
+                    "pub mod filesystem {{ {} }}",
+                    include_str!("runtime/filesystem.rs")
+                ),
+            )
+            .replace(
+                "#[path = \"runtime/system.rs\"]\npub mod system;",
+                &format!("pub mod system {{ {} }}", include_str!("runtime/system.rs")),
+            )
+            .replace(
+                "#[path = \"runtime/system.rs\"]\r\npub mod system;",
+                &format!("pub mod system {{ {} }}", include_str!("runtime/system.rs")),
+            );
+        format!(
+            "#![allow(unused_unsafe, function_casts_as_integer)]\n{shim}\n{LINKER_ENTRY_SOURCE}"
+        )
     };
     fs::write(wrapper, source).map_err(|error| {
         BuildError::Environment(format!("could not create linker wrapper: {error}"))
@@ -2557,6 +6866,8 @@ fn run_rust_link(
             .arg("-C")
             .arg(format!("link-arg={}", runtime_object.display()));
     }
+    #[cfg(target_os = "linux")]
+    command.arg("-l").arg("dl");
     if suppress_linker_output {
         command.stdout(Stdio::null()).stderr(Stdio::null());
     }
@@ -2687,8 +6998,7 @@ mod tests {
     fn incompatible_precompiled_runtime_falls_back_to_source_shim() {
         let temp_dir = BuildTempDir::create().expect("temporary build directory is created");
         let object = emit_object(
-            &check("fn main() { print(42) print(arg_count()) print(arg(0)) }")
-                .expect("source checks"),
+            &check("fun main() { echo 42 echo arg_count() echo arg(0) }").expect("source checks"),
         )
         .expect("Cranelift object is emitted");
         let object_path = temp_dir.path().join(if cfg!(windows) {

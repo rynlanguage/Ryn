@@ -1,11 +1,18 @@
 use std::{
+    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use ryn::{check_source_recovering, compile_source, source::SourceFile};
+use ryn::{
+    check_project, check_source_recovering, compile_project_with_optimize,
+    compile_source_with_optimize,
+    lockfile::{validate_project_lock_if_present, write_project_lock},
+    manifest::{Dependency, Manifest, Optimize},
+    source::SourceFile,
+};
 
 fn main() {
     match run_cli() {
@@ -54,11 +61,21 @@ fn run_cli() -> Result<Option<i32>, String> {
         clean_project(&path)?;
         return Ok(None);
     }
+    if command == "lock" {
+        let path = args.next().map(PathBuf::from).ok_or_else(usage)?;
+        if args.next().is_some() || !path.is_dir() {
+            return Err(usage());
+        }
+        let lock = write_project_lock(&path)?;
+        println!("locked {}", lock.display());
+        return Ok(None);
+    }
     if !matches!(command.as_str(), "check" | "build" | "run") {
         return Err(usage());
     }
-    let requested_input = args.next().map(PathBuf::from).ok_or_else(usage)?;
+    let mut requested_input = None;
     let mut output = None;
+    let mut release = false;
     let mut program_args = Vec::new();
     while let Some(argument) = args.next() {
         match argument.to_str() {
@@ -74,29 +91,87 @@ fn run_cli() -> Result<Option<i32>, String> {
                     .ok_or_else(usage)?;
                 output = Some(path);
             }
+            Some("--release") if command != "check" && !release => release = true,
+            _ if requested_input.is_none() => requested_input = Some(PathBuf::from(argument)),
             _ => return Err(usage()),
         }
     }
+    let requested_input = requested_input.ok_or_else(usage)?;
 
+    let project_manifest = if requested_input.is_dir() {
+        Some(Manifest::load_project(&requested_input).map_err(|error| error.to_string())?)
+    } else {
+        None
+    };
+    if project_manifest.is_some() {
+        validate_project_lock_if_present(&requested_input)?;
+    }
     let input = source_path(&requested_input)?;
     let source = SourceFile::load(&input)
         .map_err(|e| format!("error[R0001]: cannot read {}: {e}", input.display()))?;
 
     match command.as_str() {
         "check" => {
-            check_source_recovering(&source).map_err(|errors| {
-                errors
-                    .iter()
-                    .map(|error| error.render(&source))
-                    .collect::<Vec<_>>()
-                    .join("\n\n")
-            })?;
+            if project_manifest.is_some() {
+                check_project(&requested_input)?;
+            } else {
+                check_source_recovering(&source).map_err(|errors| {
+                    errors
+                        .iter()
+                        .map(|error| error.render(&source))
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                })?;
+            }
             println!("{}: ok", input.display());
             Ok(None)
         }
         "build" | "run" => {
-            let output = output.unwrap_or_else(|| default_output_path(&requested_input, &input));
-            compile_source(&source, &output).map_err(|error| error.render(&source))?;
+            let output =
+                output.unwrap_or_else(|| default_output_path(&requested_input, &input, release));
+            let optimize = project_manifest
+                .as_ref()
+                .map(|manifest| manifest.build.optimize_for_profile(release))
+                .unwrap_or(if release {
+                    Optimize::Speed
+                } else {
+                    Optimize::None
+                });
+            let cache = if project_manifest.is_some() {
+                Some(project_cache_entry(&requested_input, &output, optimize)?)
+            } else {
+                None
+            };
+            let cache_hit = cache.as_ref().is_some_and(|(path, key)| {
+                output_fingerprint(&output).is_some_and(|artifact| {
+                    fs::read_to_string(path).ok().as_deref()
+                        == Some(format!("{key}:{artifact}").as_str())
+                })
+            });
+            if !cache_hit {
+                if project_manifest.is_some() {
+                    compile_project_with_optimize(&requested_input, &output, optimize)?;
+                } else {
+                    compile_source_with_optimize(&source, &output, optimize)
+                        .map_err(|error| error.render(&source))?;
+                }
+                if let Some((path, key)) = cache {
+                    let artifact = output_fingerprint(&output).ok_or_else(|| {
+                        format!(
+                            "error[R0401]: cannot fingerprint build output {}",
+                            output.display()
+                        )
+                    })?;
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent).map_err(|error| {
+                            format!("error[R0401]: cannot create build cache: {error}")
+                        })?;
+                    }
+                    fs::write(path, format!("{key}:{artifact}")).map_err(|error| {
+                        format!("error[R0401]: cannot write build cache: {error}")
+                    })?;
+                }
+            }
             if command == "run" {
                 let executable = fs::canonicalize(&output).map_err(|e| {
                     format!(
@@ -115,11 +190,147 @@ fn run_cli() -> Result<Option<i32>, String> {
                     .ok_or_else(|| format!("program terminated with {status}"))?;
                 Ok(Some(code))
             } else {
-                println!("built {}", output.display());
+                println!(
+                    "{} {}",
+                    if cache_hit { "up-to-date" } else { "built" },
+                    output.display()
+                );
                 Ok(None)
             }
         }
         _ => Err(usage()),
+    }
+}
+
+fn project_cache_entry(
+    project: &Path,
+    output: &Path,
+    optimize: Optimize,
+) -> Result<(PathBuf, String), String> {
+    let project = fs::canonicalize(project).map_err(|error| {
+        format!("error[R0401]: cannot resolve project for build cache: {error}")
+    })?;
+    let mut files = Vec::new();
+    let mut visited_projects = HashSet::new();
+    collect_project_inputs(&project, &mut visited_projects, &mut files)?;
+    files.sort();
+
+    let mut hash = StableHash::new();
+    hash.feed(env!("CARGO_PKG_VERSION").as_bytes());
+    hash.feed(format!("{optimize:?}").as_bytes());
+    hash.feed(output.to_string_lossy().as_bytes());
+    let compiler = env::current_exe().map_err(|error| {
+        format!("error[R0401]: cannot locate compiler for build cache: {error}")
+    })?;
+    hash_file(&mut hash, &compiler)?;
+    for file in files {
+        hash_file(&mut hash, &file)?;
+    }
+    let key = format!("{:016x}", hash.finish());
+    let cache_dir = project.join("build").join("cache").join(match optimize {
+        Optimize::Speed => "debug",
+        Optimize::Size => "size",
+        Optimize::None => "none",
+    });
+    let mut output_hash = StableHash::new();
+    output_hash.feed(output.to_string_lossy().as_bytes());
+    Ok((
+        cache_dir.join(format!("{:016x}.fingerprint", output_hash.finish())),
+        key,
+    ))
+}
+
+fn output_fingerprint(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let mut hash = StableHash::new();
+    hash.feed(&bytes);
+    Some(format!("{:016x}", hash.finish()))
+}
+
+fn collect_project_inputs(
+    project: &Path,
+    visited: &mut HashSet<PathBuf>,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let project = fs::canonicalize(project)
+        .map_err(|error| format!("error[R0410]: cannot resolve dependency project: {error}"))?;
+    if !visited.insert(project.clone()) {
+        return Ok(());
+    }
+    let manifest_path = project.join("ryn.yaml");
+    let manifest = Manifest::load_project(&project).map_err(|error| error.to_string())?;
+    files.push(manifest_path);
+    let lockfile_path = project.join("ryn.lock");
+    if lockfile_path.is_file() {
+        files.push(lockfile_path);
+    }
+    let source_root = project.join("src");
+    if source_root.is_dir() {
+        collect_ryn_files(&source_root, files)?;
+    }
+    for dependency in manifest.dependencies.values() {
+        if let Dependency::Path { path } = dependency {
+            let dependency = if path.is_absolute() {
+                path.clone()
+            } else {
+                project.join(path)
+            };
+            collect_project_inputs(&dependency, visited, files)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_ryn_files(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("error[R0001]: cannot read source directory: {error}"))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("error[R0001]: cannot inspect source entry: {error}"))?;
+        let kind = entry
+            .file_type()
+            .map_err(|error| format!("error[R0001]: cannot inspect source entry: {error}"))?;
+        if kind.is_dir() {
+            collect_ryn_files(&entry.path(), files)?;
+        } else if kind.is_file() && entry.path().extension().is_some_and(|ext| ext == "ryn") {
+            files.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn hash_file(hash: &mut StableHash, path: &Path) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(|error| {
+        format!(
+            "error[R0001]: cannot read {} for build cache: {error}",
+            path.display()
+        )
+    })?;
+    hash.feed(path.to_string_lossy().as_bytes());
+    hash.feed(&bytes);
+    Ok(())
+}
+
+struct StableHash(u64);
+
+impl StableHash {
+    fn new() -> Self {
+        Self(0xcbf29ce484222325)
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        for byte in (bytes.len() as u64).to_le_bytes() {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    fn finish(self) -> u64 {
+        self.0
     }
 }
 
@@ -167,18 +378,24 @@ fn create_project(path: &Path) -> Result<(), String> {
         fs::create_dir(&source_dir).map_err(|error| {
             format!("error[R0401]: cannot create project source directory: {error}")
         })?;
+        for directory in ["cache", "debug", "release"] {
+            fs::create_dir_all(staging.join("build").join(directory)).map_err(|error| {
+                format!("error[R0401]: cannot create build/{directory} directory: {error}")
+            })?;
+        }
         fs::write(
             source_dir.join("main.ryn"),
-            "fn main() {\n    print(\"Hello, Ryn!\")\n}\n",
+            "fun main() {\n    echo \"Hello, Ryn!\"\n}\n",
         )
         .map_err(|error| format!("error[R0401]: cannot write project entry point: {error}"))?;
         fs::write(
-            staging.join("README.md"),
+            staging.join("ryn.yaml"),
             format!(
-                "# {name}\n\nA native application written in Ryn.\n\nRun it from this directory with:\n\n```powershell\nryn run .\n```\n\nRemove the generated executable with:\n\n```powershell\nryn clean .\n```\n"
+                "name: {}\nversion: 0.1.0\nowner: guest\n\ndependencies:\n\nbuild:\n  optimize: speed\n",
+                yaml_scalar(&name)
             ),
         )
-        .map_err(|error| format!("error[R0401]: cannot write project README: {error}"))?;
+        .map_err(|error| format!("error[R0401]: cannot write project manifest: {error}"))?;
         fs::rename(&staging, path).map_err(|error| {
             format!(
                 "error[R0401]: cannot install project at {}: {error}",
@@ -192,6 +409,18 @@ fn create_project(path: &Path) -> Result<(), String> {
     result?;
     println!("created {}", path.display());
     Ok(())
+}
+
+fn yaml_scalar(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        value.to_owned()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
 }
 
 fn create_staging_directory(parent: &Path) -> Result<PathBuf, String> {
@@ -275,14 +504,15 @@ fn clean_project(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn default_output_path(requested_input: &Path, source: &Path) -> PathBuf {
+fn default_output_path(requested_input: &Path, source: &Path, release: bool) -> PathBuf {
     if requested_input.is_dir() {
         let name = fs::canonicalize(requested_input)
             .ok()
             .and_then(|directory| directory.file_name().map(PathBuf::from))
             .or_else(|| source.file_stem().map(PathBuf::from))
             .unwrap_or_default();
-        let mut output = requested_input.join("build").join(name);
+        let profile = if release { "release" } else { "debug" };
+        let mut output = requested_input.join("build").join(profile).join(name);
         if cfg!(windows) {
             output.set_extension("exe");
         }
@@ -304,12 +534,12 @@ fn output_path(input: &Path) -> PathBuf {
 }
 
 fn usage() -> String {
-    "usage:\n  ryn new <path>\n  ryn check <file.ryn|project-dir>\n  ryn build <file.ryn|project-dir> [-o|--output <path>]\n  ryn run <file.ryn|project-dir> [-o|--output <path>] [-- <program-args...>]\n  ryn clean <project-dir>".into()
+    "usage:\n  ryn new <path>\n  ryn check <file.ryn|project-dir>\n  ryn build <file.ryn|project-dir> [--release] [-o|--output <path>]\n  ryn run <file.ryn|project-dir> [--release] [-o|--output <path>] [-- <program-args...>]\n  ryn clean <project-dir>".into()
 }
 
 fn help_text() -> String {
     format!(
-        "Ryn — Reliable. Fast. Native.\n\n{}\n\nCommands:\n  new <path>        Create a project with a native Hello World example\n  check <source>    Check a .ryn file or project directory\n  build <source>    Compile a .ryn file or project directory\n  run <source>      Compile and run a .ryn file or project directory\n  clean <project>   Remove the project's build directory\n\nA project directory uses src/main.ryn as its entry point.\nAn i32 result from main becomes the process exit code for run.\nPass program arguments to run after --.\nclean removes only the direct build directory and refuses symbolic links.\n\nOptions:\n  -o, --output <path>  Set the executable path for build or run\n  -h, --help           Show this help\n  -V, --version        Show compiler version\n",
+        "Ryn — Reliable. Fast. Native.\n\n{}\n\nCommands:\n  new <path>        Create a project with a native Hello World example\n  check <source>    Check a .ryn file or project directory\n  build <source>    Compile a .ryn file or project directory\n  run <source>      Compile and run a .ryn file or project directory\n  lock <project>    Resolve and write ryn.lock for supported dependencies\n  clean <project>   Remove the project's build directory\n\nA project directory uses src/main.ryn as its entry point.\nProject outputs go under build/debug or build/release; build/cache is reserved for compiler caches.\nAn i32 result from main becomes the process exit code for run.\nPass program arguments to run after --.\nclean removes only the direct build directory and refuses symbolic links.\n\nOptions:\n  --release            Use the project's release output directory\n  -o, --output <path>  Set the executable path for build or run\n  -h, --help           Show this help\n  -V, --version        Show compiler version\n",
         usage()
     )
 }

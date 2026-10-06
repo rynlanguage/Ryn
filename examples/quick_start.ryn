@@ -1,19 +1,19 @@
-fn add(a: i32, b: i32) -> i32 {
+fun add(a: i32, b: i32) -> i32 {
     a + b
 }
 
-fn main() {
-    let name = "Ryn"
-    let mut health = 100
+fun main() {
+    name := "Ryn"
+    mut health := 100
 
     health -= 20
 
-    let status = if health > 0 { "alive" } else { "down" }
-    print(status)
+    status := when health > 0 { "alive" } else { "down" }
+    echo status
 
-    if health > 0 {
-        print("Hello, {name}!")
-        print(add(20, 22))
-        print(health)
+    when health > 0 {
+        echo "Hello, {name}!"
+        echo add(20, 22)
+        echo health
     }
 }

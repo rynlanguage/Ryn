@@ -1,0 +1,25 @@
+#[drop(release)]
+struct Resource {
+    handle: *i32,
+}
+
+fun release(resource: Resource) {
+    echo 99
+}
+
+fun consume(resource: Resource) {
+    echo 8
+}
+
+fun exercise() {
+    mut value: i32 = 7
+    mut resource := Resource { handle: &raw mut value }
+    raw := resource.handle
+    echo *raw
+    resource = Resource { handle: &raw mut value }
+    consume(resource)
+}
+
+fun main() {
+    exercise()
+}

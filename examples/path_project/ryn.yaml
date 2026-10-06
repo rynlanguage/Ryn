@@ -1,0 +1,6 @@
+name: path-api-demo
+version: 0.1.0
+owner: guest
+dependencies:
+  ryn_path:
+    path: ../../stdlib/path

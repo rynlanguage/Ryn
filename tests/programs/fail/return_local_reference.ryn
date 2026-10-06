@@ -1,0 +1,8 @@
+fun invalid_reference() -> &i32 {
+    value := 5
+    return &value
+}
+
+fun main() {
+    echo 0
+}

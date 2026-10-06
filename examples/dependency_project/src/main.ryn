@@ -1,0 +1,5 @@
+use mathlib::ops
+
+fun main() {
+    echo ops::add(4, 5)
+}

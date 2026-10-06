@@ -1,14 +1,14 @@
-fn main() {
-    let mut index = 0
-    let mut total = 0
+fun main() {
+    mut index := 0
+    mut total := 0
 
     while index < 5 && true {
-        if index % 2 == 0 {
-            print(index)
+        when index % 2 == 0 {
+            echo index
         }
         total = total + index
         index = index + 1
     }
 
-    print(total)
+    echo total
 }

@@ -22,7 +22,7 @@ const FRONTEND_CORPUS: &str = concat!(
 );
 const CHECK_SOURCE: &str = include_str!("../examples/evaluation_order.ryn");
 const RECOVERY_SOURCE: &str =
-    "fn main() { if ) { let = 1 print(2 + ) } for index in 0.. { let = 3 print(4 + ) } }";
+    "fun main() { when ) { mut := 1 echo(2 + ) } for index in 0.. { mut := 3 echo(4 + ) } }";
 const SAMPLES: usize = 5;
 
 fn measure_samples(iterations: usize, mut run: impl FnMut()) -> Vec<f64> {
@@ -129,9 +129,9 @@ fn main() {
         Some(recovery_bytes),
     );
 
-    let mut diagnostics_source = String::from("fn main() {\n");
+    let mut diagnostics_source = String::from("fun main() {\n");
     for _ in 0..100 {
-        diagnostics_source.push_str("    print(1 + )\n");
+        diagnostics_source.push_str("    echo(1 + )\n");
     }
     diagnostics_source.push_str("}\n");
     let diagnostics = check_recovering(&diagnostics_source)

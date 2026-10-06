@@ -1,0 +1,24 @@
+#[drop(release)]
+struct Resource { handle: *i32 }
+fun release(resource: Resource) { echo *resource.handle }
+fun consume_elements() {
+    mut value: i32 = 44
+    mut resources := Vec<Resource>()
+    resources.push(Resource { handle: &raw mut value })
+    for item in resources {
+        echo *item.handle
+    }
+}
+fun main() {
+    mut first: i32 = 11
+    mut second: i32 = 22
+    mut replacement: i32 = 33
+    mut resources := Vec<Resource>()
+    resources.push(Resource { handle: &raw mut first })
+    resources.push(Resource { handle: &raw mut second })
+    echo resources.len()
+    resources.set(0, Resource { handle: &raw mut replacement })
+    taken := resources.take(0)
+    echo *taken.handle
+    consume_elements()
+}

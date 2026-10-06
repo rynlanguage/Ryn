@@ -1,0 +1,11 @@
+lock_version: 1
+root: dependency-demo
+packages:
+- parent: dependency-demo
+  name: mathlib
+  version: 0.1.0
+  source: path:../mathlib
+- parent: mathlib
+  name: coremath
+  version: 0.1.0
+  source: path:../coremath

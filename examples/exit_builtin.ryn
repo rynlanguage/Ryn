@@ -1,0 +1,4 @@
+fun main() {
+    message := String("cleanup before exit")
+    exit(23)
+}

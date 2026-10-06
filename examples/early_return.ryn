@@ -1,30 +1,30 @@
-fn absolute(value: i32) -> i32 {
-    if value < 0 {
+fun absolute(value: i32) -> i32 {
+    when value < 0 {
         return -value
     }
     value
 }
 
-fn choose(value: i32) -> i32 {
-    if value == 0 {
+fun select_value(value: i32) -> i32 {
+    when value == 0 {
         return 10
     } else {
         return 20
     }
 }
 
-fn label(enabled: bool) -> str {
-    if enabled {
+fun label(enabled: bool) -> str {
+    when enabled {
         return "enabled"
     } else {
         return "disabled"
     }
 }
 
-fn find_three(limit: i32) -> i32 {
-    let mut value: i32 = 0
+fun find_three(limit: i32) -> i32 {
+    mut value: i32 = 0
     while value < limit {
-        if value == 3 {
+        when value == 3 {
             return value
         }
         value += 1
@@ -32,22 +32,22 @@ fn find_three(limit: i32) -> i32 {
     -1
 }
 
-fn notify(enabled: bool) {
-    if !enabled {
+fun notify(enabled: bool) {
+    when !enabled {
         return
     }
-    print("notification")
+    echo "notification"
 }
 
-fn main() {
-    print(absolute(-7))
-    print(absolute(4))
-    print(choose(0))
-    print(choose(1))
-    print(label(true))
-    print(label(false))
-    print(find_three(5))
-    print(find_three(2))
+fun main() {
+    echo absolute(-7)
+    echo absolute(4)
+    echo select_value(0)
+    echo select_value(1)
+    echo label(true)
+    echo label(false)
+    echo find_three(5)
+    echo find_three(2)
     notify(false)
     notify(true)
 }
