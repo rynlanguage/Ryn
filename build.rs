@@ -68,9 +68,14 @@ fn build_runtime_shim() -> Result<(), String> {
                 }
             })
             .unwrap_or_else(|| manifest.join("target"));
-        let dependency_dir = target_dir.join(&target).join(profile).join("deps");
-        let libc = std::fs::read_dir(&dependency_dir)
-            .map_err(|error| format!("could not read {}: {error}", dependency_dir.display()))?
+        let dependency_dirs = [
+            target_dir.join(&target).join(&profile).join("deps"),
+            target_dir.join(&profile).join("deps"),
+        ];
+        let libc = dependency_dirs
+            .iter()
+            .filter_map(|directory| std::fs::read_dir(directory).ok())
+            .flatten()
             .flatten()
             .map(|entry| entry.path())
             .find(|path| {
@@ -81,7 +86,13 @@ fn build_runtime_shim() -> Result<(), String> {
                             && (name.ends_with(".rlib") || name.ends_with(".rmeta"))
                     })
             })
-            .ok_or("could not locate compiled libc dependency for Linux runtime shim")?;
+            .ok_or_else(|| {
+                format!(
+                    "could not locate compiled libc dependency in {} or {}",
+                    dependency_dirs[0].display(),
+                    dependency_dirs[1].display()
+                )
+            })?;
         command
             .arg("--extern")
             .arg(format!("libc={}", libc.display()));
