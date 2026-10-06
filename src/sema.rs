@@ -503,6 +503,12 @@ pub enum IrExpression {
         ty: Type,
         span: Span,
     },
+    ValueAddress {
+        value: Box<IrExpression>,
+        ty: Type,
+        pointer_type: Type,
+        span: Span,
+    },
     Call {
         target: IrCallTarget,
         arguments: Vec<IrExpression>,
@@ -5049,8 +5055,55 @@ impl<'a> Analyzer<'a> {
                     }
                     Err(error) => return Err(error),
                 };
-                let (right, right_ty) =
-                    self.expression(*right, if shift { Some(Type::U32) } else { context })?;
+                let operator_parameter_type = match left_ty {
+                    Type::Struct(struct_id) => {
+                        let method_name = match op {
+                            BinaryOp::Add => "add",
+                            BinaryOp::Sub => "sub",
+                            BinaryOp::Mul => "mul",
+                            BinaryOp::Div => "div",
+                            BinaryOp::Rem => "rem",
+                            _ => "",
+                        };
+                        if method_name.is_empty() {
+                            None
+                        } else {
+                            self.operator_method_parameter_type(struct_id, method_name)
+                        }
+                    }
+                    _ => None,
+                };
+                let (right, right_ty) = self.expression(
+                    *right,
+                    if shift {
+                        Some(Type::U32)
+                    } else {
+                        operator_parameter_type.or(context)
+                    },
+                )?;
+                if let Type::Struct(struct_id) = left_ty {
+                    let method_name = match op {
+                        BinaryOp::Add => "add",
+                        BinaryOp::Sub => "sub",
+                        BinaryOp::Mul => "mul",
+                        BinaryOp::Div => "div",
+                        BinaryOp::Rem => "rem",
+                        _ => "",
+                    };
+                    if !method_name.is_empty()
+                        && let Some(operator) = self.lower_operator_method(
+                            left.clone(),
+                            left_ty,
+                            struct_id,
+                            method_name,
+                            right.clone(),
+                            right_ty,
+                            span,
+                        )?
+                    {
+                        return Ok(operator);
+                    }
+                }
                 let result_ty = match op {
                     BinaryOp::Add
                     | BinaryOp::Sub
@@ -5954,6 +6007,92 @@ impl<'a> Analyzer<'a> {
         )?;
         arguments.insert(0, receiver);
         Ok((target, arguments, result))
+    }
+
+    /// The right-operand type of the struct's operator method, if defined.
+    fn operator_method_parameter_type(&self, struct_id: usize, method_name: &str) -> Option<Type> {
+        let definition = self.structs.get(struct_id)?;
+        let mut candidates = vec![format!("{}::{method_name}", definition.name)];
+        if !definition.module_path.is_empty() {
+            candidates.push(format!(
+                "{}::{}::{method_name}",
+                definition.module_path, definition.name
+            ));
+        }
+        for candidate in candidates {
+            let Some(signature) = self.signatures.get(&candidate) else {
+                continue;
+            };
+            return signature.parameters.get(1).copied();
+        }
+        None
+    }
+
+    /// Lowers `left <op> right` through the struct's operator method.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_operator_method(
+        &mut self,
+        left: IrExpression,
+        left_ty: Type,
+        struct_id: usize,
+        method_name: &str,
+        right: IrExpression,
+        right_ty: Type,
+        span: Span,
+    ) -> Result<Option<(IrExpression, Type)>, Diagnostic> {
+        let definition = self.structs[struct_id].clone();
+        let struct_name = definition.name.clone();
+        let mut candidates = vec![format!("{struct_name}::{method_name}")];
+        if !definition.module_path.is_empty() {
+            candidates.push(format!(
+                "{}::{}::{method_name}",
+                definition.module_path, struct_name
+            ));
+        }
+        let mut signature = None;
+        for candidate in candidates {
+            if let Some(found) = self.signatures.get(&candidate) {
+                signature = Some(found.clone());
+                break;
+            }
+        }
+        let Some(signature) = signature else {
+            return Ok(None);
+        };
+        if signature
+            .parameters
+            .get(1)
+            .is_none_or(|parameter| *parameter != right_ty)
+        {
+            return Ok(None);
+        }
+        // Operator methods copy the operands, so owning structs are rejected.
+        if type_has_owned_data_in_sema(Type::Struct(struct_id), self.structs) {
+            return Err(diag(
+                "R0451",
+                format!(
+                    "operator `{method_name}` on `{struct_name}` requires a struct without owned fields"
+                ),
+                span,
+            )
+            .with_help(
+                "operator methods copy their operands; keep owned fields out of operator structs for now",
+            ));
+        }
+        let receiver = IrExpression::ValueAddress {
+            value: Box::new(left),
+            ty: left_ty,
+            pointer_type: Type::Reference(intern_pointer_target(left_ty), false),
+            span,
+        };
+        Ok(Some((
+            IrExpression::Call {
+                target: signature.target,
+                arguments: vec![receiver, right],
+                return_type: signature.return_type.unwrap_or(left_ty),
+            },
+            signature.return_type.unwrap_or(left_ty),
+        )))
     }
 
     /// Lowers one chain link against the current receiver value.
@@ -7629,6 +7768,20 @@ fn name_span(name: &TypeName) -> Span {
         | TypeName::RawPointer(_, span)
         | TypeName::FunctionPointer(_, _, _, span) => *span,
         _ => Span::default(),
+    }
+}
+
+fn type_has_owned_data_in_sema(ty: Type, structs: &[RynStruct]) -> bool {
+    match ty {
+        Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Enum(_) => true,
+        Type::Struct(id) => {
+            structs[id].drop_function.is_some()
+                || structs[id]
+                    .fields
+                    .iter()
+                    .any(|field| type_has_owned_data_in_sema(field.ty, structs))
+        }
+        _ => false,
     }
 }
 

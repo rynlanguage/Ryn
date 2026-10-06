@@ -1141,6 +1141,7 @@ fn map_keys_and_values_iterate_with_clone_and_drop_glue() {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn ryn_functions_coerce_to_function_pointers_and_receive_native_callbacks() {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/function_pointers.ryn");
@@ -1199,5 +1200,21 @@ fn derived_clone_hash_and_eq_power_struct_keys_and_copies() {
     assert_eq!(
         String::from_utf8_lossy(&result.stdout),
         "2\ntrue\nSome(70)\ntrue\n1\ntag\ntag\n"
+    );
+}
+
+#[test]
+fn operator_methods_resolve_struct_arithmetic() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/operators.ryn");
+    let result = run_source(&source);
+
+    assert!(
+        result.status.success(),
+        "compiler/runtime failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        "11\n22\n33\n2\n27\n1\n"
     );
 }

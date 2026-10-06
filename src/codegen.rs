@@ -3362,6 +3362,7 @@ fn collect_strings(ir: &RynIr) -> BTreeSet<String> {
             }
             IrExpression::Dereference { pointer, .. } => expr(pointer, out),
             IrExpression::ReferenceField { pointer, .. } => expr(pointer, out),
+            IrExpression::ValueAddress { value, .. } => expr(value, out),
             IrExpression::StringFindOption { value, .. } | IrExpression::StringAsStr(value) => {
                 expr(value, out)
             }
@@ -4290,6 +4291,30 @@ fn emit_expr(
                 }
             }
             selected.ok_or_else(|| "internal error: field index is out of range".to_string())?
+        }
+        IrExpression::ValueAddress {
+            value,
+            ty,
+            pointer_type,
+            ..
+        } => {
+            let compiled = emit_expr(b, module, value, env, seal_state)?;
+            let flattened = flatten_value(compiled);
+            let bytes = (storage_slot_width(*ty, env.structs) * 8) as u32;
+            let slot = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                bytes.max(8),
+                3,
+            ));
+            let address = b
+                .ins()
+                .stack_addr(module.target_config().pointer_type(), slot, 0);
+            for (index, word) in flattened.iter().enumerate() {
+                b.ins()
+                    .store(MemFlagsData::new(), *word, address, (index * 8) as i32);
+            }
+            let _ = ty;
+            CompiledValue::Integer(address, *pointer_type)
         }
         IrExpression::ReferenceField {
             pointer,
