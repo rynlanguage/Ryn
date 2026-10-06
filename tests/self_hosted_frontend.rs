@@ -2,8 +2,11 @@ use std::{
     fs,
     path::PathBuf,
     process::Command,
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+static SELF_HOSTED_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
 fn run_frontend(source_text: &str, label: &str) -> (String, bool) {
     let unique = SystemTime::now()
@@ -18,6 +21,9 @@ fn run_frontend(source_text: &str, label: &str) -> (String, bool) {
     let source = directory.join("sample.ryn");
     fs::write(&source, source_text).expect("sample source is written");
     let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/self_hosted_project");
+    let _guard = SELF_HOSTED_PROCESS_LOCK
+        .lock()
+        .expect("self-hosted project invocations are serialized");
     let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
         .arg("run")
         .arg(&project)
@@ -45,6 +51,9 @@ fn run_type_checker(source_text: &str, label: &str) -> (String, bool) {
     let source = directory.join("sample.ryn");
     fs::write(&source, source_text).expect("sample source is written");
     let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/self_hosted_project");
+    let _guard = SELF_HOSTED_PROCESS_LOCK
+        .lock()
+        .expect("self-hosted project invocations are serialized");
     let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
         .arg("run")
         .arg(&project)
@@ -74,7 +83,7 @@ fn self_hosted_frontend_accepts_the_samples_the_compiler_accepts() {
         let (stdout, success) = run_frontend(sample, "valid");
         assert!(
             success,
-            "the self-hosted frontend rejected a valid sample: {stdout}"
+            "the self-hosted frontend rejected a valid sample: {sample}\n{stdout}"
         );
         assert_eq!(stdout.trim(), "ok", "valid sample output: {stdout}");
     }
