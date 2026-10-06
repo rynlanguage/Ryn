@@ -42,13 +42,13 @@ pub struct Lexed {
     pub string_values: Vec<String>
 }
 
-struct AstNode {
-    kind: u64,
-    start: u64,
-    end: u64,
-    first_child: u64,
-    child_count: u64,
-    payload: u64
+pub struct AstNode {
+    pub kind: u64,
+    pub start: u64,
+    pub end: u64,
+    pub first_child: u64,
+    pub child_count: u64,
+    pub payload: u64
 }
 
 pub struct ParseState {

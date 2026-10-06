@@ -2,7 +2,7 @@
 
 **Reliable. Fast. Native.**
 
-Ryn is an early native programming language and compiler implemented in Rust. Version `0.0.1` is a small bootstrap milestone: the compiler checks a compact statically typed language subset and emits native machine code with Cranelift.
+Ryn is an early native programming language and compiler implemented in Rust. Version `0.0.4` adds the first self-hosted frontend with an experimental type-checking pass; the Rust compiler checks the broader language and emits native machine code with Cranelift.
 
 ## Why Ryn exists
 
@@ -10,7 +10,7 @@ Ryn explores a language with readable source, strong static types, predictable c
 
 ## Status
 
-The last published milestone is `0.0.1`; the current working tree starts the `0.0.2` language-foundations work. Ryn remains an experimental compiler for small programs and compiler experiments, not yet a general-purpose production language.
+The `0.0.4` milestone adds a Ryn-written lexer, parser, source manager, and a deliberately limited type-checking pass. Ryn remains an experimental compiler for small programs and compiler experiments, not yet a general-purpose production language.
 
 Implemented syntax and behavior include:
 
@@ -99,7 +99,15 @@ Arithmetic operators resolve through `extend` methods: defining `fun add(self, r
 ryn run examples/self_hosted_project -- examples/hello.ryn
 ```
 
-Differential tests (`tests/self_hosted_frontend.rs`) check the frontend against samples the Rust compiler accepts and rejects. This is the first stage of the self-hosting path; the type checker, Ryn Guard, and native code generation remain future stages.
+Pass `--check` before the source path to run the experimental type checker:
+
+```ryn
+ryn run examples/self_hosted_project -- --check examples/hello.ryn
+```
+
+It currently checks primitive value classes (integer, float, boolean, string, and character), `Vec<T>` parameter and return signatures, local declarations and assignments (including immutable-local and value-class mismatches), simple function signatures and calls, and boolean control-flow conditions. Numeric widths and signedness are currently grouped together. It reports the first type error. Container operations, nested generic types, method typing, full borrow checking, and full Rust-compiler parity are not implemented yet.
+
+Differential tests (`tests/self_hosted_frontend.rs`) check the parser against samples the Rust compiler accepts and rejects. Type-checking tests cover the supported subset and verify that unsupported or invalid programs return diagnostics instead of crashing. This is the first stage of the self-hosting path; Ryn Guard and native code generation remain future stages.
 
 ## Ryn example
 

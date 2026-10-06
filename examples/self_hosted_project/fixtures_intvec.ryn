@@ -1,0 +1,16 @@
+fun find(names: Vec<u64>) -> bool {
+    mut existing := false
+    for slot in 0 as u64..names.len() {
+        when names.index(slot) == 7 {
+            existing = true
+        }
+    }
+    existing
+}
+
+fun main() {
+    mut v := Vec<u64>()
+    v.push(7)
+    echo find(v)
+    echo "done"
+}

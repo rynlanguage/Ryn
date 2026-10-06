@@ -1,0 +1,369 @@
+use compiler::lexer
+
+struct FunctionTypeSignature {
+    name: String,
+    parameter_types: Vec<u64>,
+    return_type: u64
+}
+
+struct TypeCheckResult {
+    type_code: u64,
+    error_node: u64,
+    valid: bool,
+    is_mutable: bool
+}
+
+pub struct ProgramTypeCheckResult {
+    pub error_node: u64,
+    pub valid: bool
+}
+
+fun ok_type(type_code: u64) -> TypeCheckResult {
+    TypeCheckResult { type_code: type_code, error_node: 0, valid: true, is_mutable: false }
+}
+
+fun bad_type(error_node: u64) -> TypeCheckResult {
+    TypeCheckResult { type_code: 0, error_node: error_node, valid: false, is_mutable: false }
+}
+
+fun node_name(source: String, nodes: &[lexer::AstNode], node_id: u64) -> String {
+    node := nodes[node_id]
+    source.slice(node.start, node.end)
+}
+
+fun check_expression_type(
+    source: String,
+    nodes: &[lexer::AstNode],
+    children: &[u64],
+    node_id: u64,
+    names: &[String],
+    variable_types: &[u64],
+    functions: &[FunctionTypeSignature]
+) -> TypeCheckResult {
+    node := nodes[node_id]
+    when node.kind == 3 {
+        name := source.slice(node.start, node.end)
+        for slot in 0 as u64..names.len() {
+            when names[slot] == name {
+                stored_type := variable_types[slot]
+                mut result := ok_type(stored_type % 1000)
+                result.is_mutable = stored_type >= 1000
+                return result
+            }
+        }
+        return bad_type(node_id)
+    }
+    when node.kind == 1 { return ok_type(1) }
+    when node.kind == 2 { return ok_type(3) }
+    when node.kind == 6 { return ok_type(2) }
+    when node.kind == 4 {
+        operand := check_expression_type(source.clone(), nodes, children, children[node.first_child], names, variable_types, functions)
+        when !operand.valid { return operand }
+        when node.payload == 123 && operand.type_code == 2 { return ok_type(2) }
+        when (node.payload == 113 || node.payload == 122) && operand.type_code == 1 { return ok_type(1) }
+        return bad_type(node_id)
+    }
+    when node.kind == 5 {
+        left := check_expression_type(source.clone(), nodes, children, children[node.first_child], names, variable_types, functions)
+        when !left.valid { return left }
+        right := check_expression_type(source.clone(), nodes, children, children[node.first_child + 1], names, variable_types, functions)
+        when !right.valid { return right }
+        when left.type_code != right.type_code { return bad_type(node_id) }
+        when node.payload == 210 || node.payload == 212 {
+            when left.type_code == 2 { return ok_type(2) }
+            return bad_type(node_id)
+        }
+        when node.payload == 204 || node.payload == 206 || node.payload == 117 || node.payload == 118 || node.payload == 207 || node.payload == 208 {
+            when left.type_code == 1 || left.type_code == 3 || left.type_code == 5
+                || (left.type_code == 2 && (node.payload == 204 || node.payload == 206)) {
+                return ok_type(2)
+            }
+            return bad_type(node_id)
+        }
+        when node.payload == 112 || node.payload == 113 || node.payload == 114 || node.payload == 115 {
+            when left.type_code == 1 || left.type_code == 3 { return ok_type(left.type_code) }
+        }
+        when node.payload == 116 || node.payload == 119 || node.payload == 120 || node.payload == 121 || node.payload == 215 || node.payload == 217 {
+            when left.type_code == 1 { return ok_type(1) }
+        }
+        return bad_type(node_id)
+    }
+    when node.kind == 8 {
+        condition := check_expression_type(source.clone(), nodes, children, children[node.first_child], names, variable_types, functions)
+        when !condition.valid { return condition }
+        when condition.type_code != 2 { return bad_type(node_id) }
+        then_type := check_expression_type(source.clone(), nodes, children, children[node.first_child + 1], names, variable_types, functions)
+        when !then_type.valid { return then_type }
+        else_type := check_expression_type(source.clone(), nodes, children, children[node.first_child + 2], names, variable_types, functions)
+        when !else_type.valid { return else_type }
+        when then_type.type_code == else_type.type_code { return then_type }
+        return bad_type(node_id)
+    }
+    when node.kind == 19 {
+        name_id := children[node.first_child]
+        function_name := node_name(source.clone(), nodes, name_id)
+        mut signature_index := functions.len()
+        for slot in 0 as u64..functions.len() {
+            when functions[slot].name == function_name {
+                signature_index = slot
+                break
+            }
+        }
+        when signature_index == functions.len() { return bad_type(node_id) }
+        signature := functions[signature_index]
+        when signature.parameter_types.len() != node.payload {
+            return bad_type(node_id)
+        }
+        for argument_offset in 0..node.payload {
+            argument_id := children[node.first_child + 1 + argument_offset]
+            argument_type := check_expression_type(source.clone(), nodes, children, argument_id, names, variable_types, functions)
+            when !argument_type.valid { return argument_type }
+            when argument_type.type_code != signature.parameter_types.index(argument_offset) {
+                return bad_type(argument_id)
+            }
+        }
+        return ok_type(signature.return_type)
+    }
+    bad_type(node_id)
+}
+
+pub fun source_type_code(source: String, type_node: lexer::AstNode) -> u64 {
+    type_name := source.slice(type_node.start, type_node.end)
+    when type_name.starts_with("Vec<") && type_name.ends_with(">") {
+        element_name := type_name.slice(4, type_name.len() - 1)
+        when element_name == String("i8") || element_name == String("i16") || element_name == String("i32")
+            || element_name == String("i64") || element_name == String("u8") || element_name == String("u16")
+            || element_name == String("u32") || element_name == String("u64") { return 11 }
+        when element_name == String("bool") { return 12 }
+        when element_name == String("f32") || element_name == String("f64") { return 13 }
+        when element_name == String("String") || element_name == String("str") { return 14 }
+        when element_name == String("char") { return 15 }
+        return 0
+    }
+    when type_name == String("i8") || type_name == String("i16") || type_name == String("i32")
+        || type_name == String("i64") || type_name == String("u8") || type_name == String("u16")
+        || type_name == String("u32") || type_name == String("u64") { return 1 }
+    when type_name == String("bool") { return 2 }
+    when type_name == String("f32") || type_name == String("f64") { return 3 }
+    when type_name == String("String") || type_name == String("str") { return 4 }
+    when type_name == String("char") { return 5 }
+    0
+}
+
+fun check_block_types(
+    source: String,
+    nodes: &[lexer::AstNode],
+    children: &[u64],
+    root_id: u64,
+    initial_names: Vec<String>,
+    initial_types: Vec<u64>,
+    expected_return_type: u64,
+    functions: &[FunctionTypeSignature]
+) -> ProgramTypeCheckResult {
+    mut names := initial_names
+    mut variable_types := initial_types
+    mut result := ProgramTypeCheckResult { error_node: root_id, valid: false }
+    root := nodes[root_id]
+    when root.kind != 23 && root.kind != 13 { return result }
+    for offset in 0..root.child_count {
+        statement_id := children[root.first_child + offset]
+        statement := nodes[statement_id]
+        when statement.kind == 22 || statement.kind == 24 || statement.kind == 25 || statement.kind == 26 {
+            name_id := children[statement.first_child]
+            is_declaration := statement.payload == 201 || statement.kind == 25 || statement.kind == 26
+            when !is_declaration {
+                expression_id := children[statement.first_child + 1]
+                value_type := check_expression_type(source.clone(), nodes, children, expression_id, names.as_slice(), variable_types.as_slice(), functions)
+                when !value_type.valid {
+                    result.error_node = value_type.error_node
+                    return result
+                }
+                target_type := check_expression_type(source.clone(), nodes, children, name_id, names.as_slice(), variable_types.as_slice(), functions)
+                when !target_type.valid || !target_type.is_mutable || target_type.type_code != value_type.type_code {
+                    result.error_node = statement_id
+                    return result
+                }
+            } else {
+            annotated := statement.kind == 25 || statement.kind == 26
+            value_offset := when annotated { 2 as u64 } else { 1 as u64 }
+            expression_id := children[statement.first_child + value_offset]
+            value_type := check_expression_type(source.clone(), nodes, children, expression_id, names.as_slice(), variable_types.as_slice(), functions)
+            when !value_type.valid {
+                result.error_node = value_type.error_node
+                return result
+            }
+            when annotated {
+                type_id := children[statement.first_child + 1]
+                expected_type := source_type_code(source.clone(), nodes[type_id])
+                when expected_type == 0 || expected_type != value_type.type_code {
+                    result.error_node = statement_id
+                    return result
+                }
+            }
+            name := node_name(source.clone(), nodes, name_id)
+            mut existing := false
+            for slot in 0 as u64..names.len() {
+                when names.index(slot) == name {
+                    existing = true
+                    when variable_types.index(slot) % 1000 != value_type.type_code {
+                        result.error_node = statement_id
+                        return result
+                    }
+                    break
+                }
+            }
+            when !existing {
+                when statement.payload != 201 && !annotated {
+                    result.error_node = statement_id
+                    return result
+                }
+                names.push(name)
+                stored_type := when statement.kind == 24 || statement.kind == 26 { value_type.type_code + 1000 } else { value_type.type_code }
+                variable_types.push(stored_type)
+            }
+            }
+        } else when statement.kind == 20 || statement.kind == 21 {
+            when statement.kind == 21 && statement.child_count == 0 && expected_return_type > 0 {
+                result.error_node = statement_id
+                return result
+            }
+            when statement.child_count > 0 {
+                expression_id := children[statement.first_child]
+                expression_type := check_expression_type(source.clone(), nodes, children, expression_id, names.as_slice(), variable_types.as_slice(), functions)
+                when !expression_type.valid {
+                    result.error_node = expression_type.error_node
+                    return result
+                }
+                when statement.kind == 21 && expected_return_type > 0 && expression_type.type_code != expected_return_type {
+                    result.error_node = statement_id
+                    return result
+                }
+            }
+        } else when statement.kind == 27 {
+            when statement.child_count > 0 {
+                expression_id := children[statement.first_child]
+                expression_type := check_expression_type(source.clone(), nodes, children, expression_id, names.as_slice(), variable_types.as_slice(), functions)
+                when !expression_type.valid {
+                    result.error_node = expression_type.error_node
+                    return result
+                }
+            }
+        } else when statement.kind == 18 {
+            condition_id := children[statement.first_child]
+            condition_type := check_expression_type(source.clone(), nodes, children, condition_id, names.as_slice(), variable_types.as_slice(), functions)
+            when !condition_type.valid || condition_type.type_code != 2 {
+                result.error_node = when !condition_type.valid { condition_type.error_node } else { statement_id }
+                return result
+            }
+            then_id := children[statement.first_child + 1]
+            then_result := check_block_types(source.clone(), nodes, children, then_id, names.clone(), variable_types.clone(), expected_return_type, functions)
+            when !then_result.valid { return then_result }
+            else_id := children[statement.first_child + 2]
+            else_result := check_block_types(source.clone(), nodes, children, else_id, names.clone(), variable_types.clone(), expected_return_type, functions)
+            when !else_result.valid { return else_result }
+        } else when statement.kind == 14 {
+            condition_id := children[statement.first_child]
+            condition_type := check_expression_type(source.clone(), nodes, children, condition_id, names.as_slice(), variable_types.as_slice(), functions)
+            when !condition_type.valid || condition_type.type_code != 2 {
+                result.error_node = when !condition_type.valid { condition_type.error_node } else { statement_id }
+                return result
+            }
+            body_id := children[statement.first_child + 1]
+            body_result := check_block_types(source.clone(), nodes, children, body_id, names.clone(), variable_types.clone(), expected_return_type, functions)
+            when !body_result.valid { return body_result }
+        } else when statement.kind == 17 {
+            start_id := children[statement.first_child + 1]
+            end_id := children[statement.first_child + 2]
+            start_type := check_expression_type(source.clone(), nodes, children, start_id, names.as_slice(), variable_types.as_slice(), functions)
+            end_type := check_expression_type(source.clone(), nodes, children, end_id, names.as_slice(), variable_types.as_slice(), functions)
+            when !start_type.valid || !end_type.valid || start_type.type_code != 1 || end_type.type_code != 1 {
+                result.error_node = statement_id
+                return result
+            }
+            loop_name := node_name(source.clone(), nodes, children[statement.first_child])
+            mut loop_names := names.clone()
+            mut loop_types := variable_types.clone()
+            loop_names.push(loop_name)
+            loop_types.push(1)
+            body_id := children[statement.first_child + 3]
+            body_result := check_block_types(source.clone(), nodes, children, body_id, loop_names, loop_types, expected_return_type, functions)
+            when !body_result.valid { return body_result }
+        } else when statement.kind == 30 {
+            when statement.child_count != 4 {
+                result.error_node = statement_id
+                return result
+            }
+            parameter_list := nodes[children[statement.first_child + 1]]
+            mut parameter_names := Vec<String>()
+            mut parameter_types := Vec<u64>()
+            for parameter_offset in 0..parameter_list.child_count {
+                parameter_id := children[parameter_list.first_child + parameter_offset]
+                parameter := nodes[parameter_id]
+                parameter_name := node_name(source.clone(), nodes, children[parameter.first_child])
+                parameter_type_node := nodes[children[parameter.first_child + 1]]
+                parameter_type := source_type_code(source.clone(), parameter_type_node)
+                when parameter_type == 0 {
+                    result.error_node = statement_id
+                    return result
+                }
+                parameter_names.push(parameter_name)
+                parameter_types.push(parameter_type)
+            }
+            return_node := nodes[children[statement.first_child + 2]]
+            declared_return_type := source_type_code(source.clone(), return_node)
+            body_id := children[statement.first_child + 3]
+            function_result := check_block_types(source.clone(), nodes, children, body_id, parameter_names, parameter_types, declared_return_type, functions)
+            when !function_result.valid { return function_result }
+        } else when statement.kind == 15 || statement.kind == 16 || statement.kind == 37 {
+            // Loop-control placement and type declarations are checked by
+            // later passes.
+        } else {
+            result.error_node = statement_id
+            return result
+        }
+    }
+    ProgramTypeCheckResult { error_node: 0, valid: true }
+}
+
+pub fun check_program_types(
+    source: String,
+    nodes: &[lexer::AstNode],
+    children: &[u64],
+    root_id: u64
+) -> ProgramTypeCheckResult {
+    mut signatures := Vec<FunctionTypeSignature>()
+    root := nodes[root_id]
+    when root.kind != 23 {
+        return ProgramTypeCheckResult { error_node: root_id, valid: false }
+    }
+    for offset in 0..root.child_count {
+        function_id := children[root.first_child + offset]
+        function := nodes[function_id]
+        when function.kind == 30 {
+            when function.child_count != 4 {
+                return ProgramTypeCheckResult { error_node: function_id, valid: false }
+            }
+            function_name := node_name(source.clone(), nodes, children[function.first_child])
+            parameter_list := nodes[children[function.first_child + 1]]
+            mut parameter_types := Vec<u64>()
+            for parameter_offset in 0..parameter_list.child_count {
+                parameter_id := children[parameter_list.first_child + parameter_offset]
+                parameter := nodes[parameter_id]
+                type_node := nodes[children[parameter.first_child + 1]]
+                parameter_type := source_type_code(source.clone(), type_node)
+                when parameter_type == 0 {
+                    return ProgramTypeCheckResult { error_node: function_id, valid: false }
+                }
+                parameter_types.push(parameter_type)
+            }
+            return_node := nodes[children[function.first_child + 2]]
+            return_code := source_type_code(source.clone(), return_node)
+            signatures.push(FunctionTypeSignature {
+                name: function_name,
+                parameter_types: parameter_types,
+                return_type: return_code
+            })
+        }
+    }
+    check_block_types(source, nodes, children, root_id, Vec<String>(), Vec<u64>(), 0, signatures.as_slice())
+}

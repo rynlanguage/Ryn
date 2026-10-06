@@ -1,3 +1,4 @@
+use compiler::checker
 use compiler::lexer
 use compiler::source_manager
 
@@ -18,10 +19,20 @@ fun report_lex_failure(source: source_manager::SourceFile, failure: LexFailure) 
 
 fun main() {
     when arg_count() == 0 {
-        echo "usage: self-hosted <file.ryn>"
+        echo "usage: self-hosted [--check] <file.ryn>"
         exit(1)
     }
-    path := arg(0)
+    mut type_check := false
+    mut path_index := 0 as u32
+    when arg(0) == "--check" {
+        type_check = true
+        path_index = 1
+    }
+    when arg_count() <= path_index {
+        echo "usage: self-hosted [--check] <file.ryn>"
+        exit(1)
+    }
+    path := arg(path_index)
     source_text := read_file(path)
     source := source_manager::index_source(String(path), source_text.clone())
     lexed := lexer::lex(source_text.clone())
@@ -55,6 +66,27 @@ fun main() {
             echo "error: parse failed at {source.name}:{line}:{column} (code {state.error_code})"
         }
         exit(1)
+    }
+    when type_check {
+        result := checker::check_program_types(
+            source.text.clone(),
+            state.nodes.as_slice(),
+            state.children.as_slice(),
+            parsed.node_id
+        )
+        when !result.valid {
+            location := source_manager::locate(
+                source.text.clone(),
+                source.line_starts.clone(),
+                state.nodes.index(result.error_node).start
+            )
+            line := location.index(0)
+            column := location.index(1)
+            echo "error: type check failed at {source.name}:{line}:{column}"
+            exit(1)
+        }
+        echo "ok (types)"
+        exit(0)
     }
     echo "ok"
 }
