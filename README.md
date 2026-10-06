@@ -43,6 +43,33 @@ During semantic recovery, an invalid `for` start bound does not hide errors in t
 
 Function arguments, binary operands, and structure field initializers evaluate from left to right in source order. Structure values are then stored, passed, and printed in field declaration order.
 
+## Object model
+
+Behavior attaches to types with `extend`; data stays in `struct`. Methods take `self` for a shared borrow or `mut self` for a mutable borrow, so Ryn Guard knows whether a method reads or modifies the receiver, and mutations through `mut self` propagate to the caller's local. Associated functions (no `self`) and constants are called through the type name:
+
+```ryn
+struct Player {
+    pub name: String,
+    health: i32,
+}
+
+extend Player {
+    pub fun new(name: str) -> Player {
+        return Player { name: String(name), health: 100 }
+    }
+
+    pub fun health(self) -> i32 => self.health
+
+    pub fun damage(mut self, amount: i32) {
+        self.health -= amount
+    }
+
+    pub const MAX_HEALTH: i32 = 100
+}
+```
+
+Fields are private to their module unless marked `pub`; methods are private unless marked `pub`. See [the objects example](examples/objects.ryn). `shape` contracts, generic constraints, and `#[derive]` are planned for this milestone but not implemented yet.
+
 ## Ryn example
 
 The runnable [quick start](examples/quick_start.ryn) demonstrates a function, inferred and mutable locals, compound assignment, a value-producing conditional, and string interpolation:

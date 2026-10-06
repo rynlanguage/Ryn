@@ -1169,3 +1169,19 @@ fn enums_print_directly_and_inside_interpolation() {
         "Empty\nCircle(7)\ncircle: Circle(7)\nNamed(box, 3)\nlabel: Named(box, 3)\nCircle(9)\nNamed(moved, 8)\n"
     );
 }
+
+#[test]
+fn extend_methods_borrow_receivers_and_associated_items_resolve() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/objects.ryn");
+    let result = run_source(&source);
+
+    assert!(
+        result.status.success(),
+        "compiler/runtime failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        "100\n70\n75\n100\nv3nn7\n"
+    );
+}

@@ -496,6 +496,13 @@ pub enum IrExpression {
         ty: Type,
         span: Span,
     },
+    ReferenceField {
+        pointer: Box<IrExpression>,
+        struct_id: usize,
+        field_index: usize,
+        ty: Type,
+        span: Span,
+    },
     Call {
         target: IrCallTarget,
         arguments: Vec<IrExpression>,
@@ -617,6 +624,13 @@ pub enum IrStatement {
         ty: Type,
         value: IrExpression,
     },
+    ReferenceFieldAssign {
+        pointer: IrExpression,
+        struct_id: usize,
+        field_index: usize,
+        ty: Type,
+        value: IrExpression,
+    },
     Print {
         value: IrExpression,
         ty: Type,
@@ -732,6 +746,7 @@ pub struct RynStruct {
     pub slot_count: usize,
     pub repr_c: bool,
     pub drop_function: Option<usize>,
+    pub module_path: String,
 }
 
 #[derive(Clone, Debug)]
@@ -739,6 +754,7 @@ pub struct RynStructField {
     pub name: String,
     pub ty: Type,
     pub slot_offset: usize,
+    pub public: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2252,7 +2268,7 @@ impl<'a> Analyzer<'a> {
                             .with_help("create the reference with `&mut value`"),
                     );
                 }
-                if !reference_pointee_supported(ty) {
+                if !reference_pointee_supported_in(ty, self.structs) {
                     return Err(diag(
                         "R0206",
                         "assignment through this pointer type is not supported yet",
@@ -2361,6 +2377,24 @@ impl<'a> Analyzer<'a> {
                     self.check_discarded_expression(value);
                     return Err(error);
                 };
+                if let Type::Reference(target, reference_mutable) = binding.ty {
+                    let pointer = IrExpression::Local {
+                        slot: binding.slot,
+                        ty: binding.ty,
+                        span: object_span,
+                    };
+                    return self.reference_field_assign(
+                        pointer,
+                        pointer_target(target),
+                        reference_mutable,
+                        object.clone(),
+                        object_span,
+                        &fields,
+                        op,
+                        value,
+                        span,
+                    );
+                }
                 if !binding.mutable {
                     let error = diag("R0204", format!("`{object}` is immutable"), object_span)
                         .with_help(format!(
@@ -3234,7 +3268,7 @@ impl<'a> Analyzer<'a> {
                     )
                     .with_help("declare the value with `mut` before borrowing it mutably"));
                 }
-                if !reference_pointee_supported(binding.ty) {
+                if !reference_pointee_supported_in(binding.ty, self.structs) {
                     return Err(diag(
                         "R0206",
                         format!(
@@ -3243,7 +3277,9 @@ impl<'a> Analyzer<'a> {
                         ),
                         name_span,
                     )
-                    .with_help("the current backend supports references to scalar values"));
+                    .with_help(
+                        "the current backend supports references to scalars and structures",
+                    ));
                 }
                 self.addressed_slot_types[binding.slot] = Some(binding.ty);
                 let target = intern_pointer_target(binding.ty);
@@ -3354,6 +3390,7 @@ impl<'a> Analyzer<'a> {
                                 name: format!("_{index}"),
                                 ty: *ty,
                                 slot_offset,
+                                public: false,
                             };
                             slot_offset += storage_slot_width(*ty, self.structs);
                             field
@@ -3366,6 +3403,7 @@ impl<'a> Analyzer<'a> {
                         slot_count: slot_offset,
                         repr_c: false,
                         drop_function: None,
+                        module_path: String::new(),
                     });
                     struct_id
                 };
@@ -3588,18 +3626,53 @@ impl<'a> Analyzer<'a> {
                 span,
             } => {
                 let (value, actual) = self.expression(*value, None)?;
-                let Type::Struct(struct_id) = actual else {
-                    return Err(
-                        diag("R0224", "field access requires a structure value", span)
-                            .with_help("access a field on a value declared with a structure type"),
-                    );
+                let referenced = match actual {
+                    Type::Struct(_) => None,
+                    Type::Reference(target, _) => match pointer_target(target) {
+                        Type::Struct(struct_id) => Some(struct_id),
+                        _ => {
+                            return Err(diag(
+                                "R0224",
+                                "field access requires a structure value",
+                                span,
+                            )
+                            .with_help(
+                                "access a field on a value declared with a structure type",
+                            ));
+                        }
+                    },
+                    _ => {
+                        return Err(
+                            diag("R0224", "field access requires a structure value", span)
+                                .with_help(
+                                    "access a field on a value declared with a structure type",
+                                ),
+                        );
+                    }
                 };
+                let struct_id = referenced.unwrap_or_else(|| match actual {
+                    Type::Struct(id) => id,
+                    _ => unreachable!("struct receiver checked above"),
+                });
                 let (field_index, field_info) = self.structs[struct_id]
                     .fields
                     .iter()
                     .enumerate()
                     .find(|(_, field)| field.name == name)
                     .ok_or_else(|| self.unknown_struct_field(struct_id, &name, name_span))?;
+                self.check_field_visibility(struct_id, field_index, name_span)?;
+                if let Some(struct_id) = referenced {
+                    return Ok((
+                        IrExpression::ReferenceField {
+                            pointer: Box::new(value),
+                            struct_id,
+                            field_index,
+                            ty: field_info.ty,
+                            span,
+                        },
+                        field_info.ty,
+                    ));
+                }
                 Ok((
                     IrExpression::Field {
                         value: Box::new(value),
@@ -3758,6 +3831,14 @@ impl<'a> Analyzer<'a> {
                 });
                 let enum_id = self.scoped_enum_id(&enum_name).or(expected_generic_id);
                 let Some(enum_id) = enum_id else {
+                    // `Type::CONSTANT` lowers to a zero-argument function; the
+                    // parser sees the same `Type::Name` path as enum variants.
+                    let constant_name = format!("{enum_name}::{variant}");
+                    if arguments.is_empty()
+                        && let Some(constant) = self.scoped_zero_argument_function(&constant_name)
+                    {
+                        return Ok(constant);
+                    }
                     return Err(diag("R0230", format!("unknown enum `{enum_name}`"), span)
                         .with_help(if matches!(enum_name.as_str(), "Option" | "Result") {
                             "give this generic variant an expected `Option<T>` or `Result<T, E>` type"
@@ -4913,6 +4994,172 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn reference_field_assign(
+        &mut self,
+        pointer: IrExpression,
+        pointee: Type,
+        reference_mutable: bool,
+        object: String,
+        object_span: Span,
+        fields: &[(String, Span)],
+        op: Option<BinaryOp>,
+        value: Expression,
+        span: Span,
+    ) -> Result<IrStatement, Diagnostic> {
+        let Type::Struct(struct_id) = pointee else {
+            return Err(diag(
+                "R0224",
+                "field assignment requires a structure value",
+                span,
+            ));
+        };
+        if !reference_mutable {
+            return Err(
+                diag("R0206", "cannot assign through a shared reference", span)
+                    .with_help("the receiver must be borrowed with `mut self` to mutate fields"),
+            );
+        }
+        let Some(((final_field, final_field_span), parent_fields)) = fields.split_last() else {
+            return Err(diag(
+                "R0900",
+                "internal error: field assignment has no field path",
+                span,
+            ));
+        };
+        if !parent_fields.is_empty() {
+            return Err(diag(
+                "R0224",
+                "assigning through nested field paths on a borrowed receiver is not supported yet",
+                span,
+            )
+            .with_help("assign through a single field level of the borrowed value for now"));
+        }
+        let Some((field_index, field_info)) = self.structs[struct_id]
+            .fields
+            .iter()
+            .enumerate()
+            .find(|(_, candidate)| candidate.name == *final_field)
+            .map(|(index, field)| (index, field.clone()))
+        else {
+            return Err(self.unknown_struct_field(struct_id, final_field, *final_field_span));
+        };
+        self.check_field_visibility(struct_id, field_index, *final_field_span)?;
+        let value_span = value.span();
+        let (value, actual) = if let Some(op) = op {
+            let mut left = Expression::Name(object, object_span);
+            for (field, field_span) in fields {
+                left = Expression::Field {
+                    value: Box::new(left),
+                    name: field.clone(),
+                    name_span: *field_span,
+                    span: Span {
+                        start: object_span.start,
+                        end: field_span.end,
+                    },
+                };
+            }
+            self.expression(
+                Expression::Binary {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(value),
+                    span: Span {
+                        start: object_span.start,
+                        end: value_span.end,
+                    },
+                },
+                Some(field_info.ty),
+            )?
+        } else {
+            self.expression(value, Some(field_info.ty))?
+        };
+        if actual != field_info.ty {
+            return Err(diag(
+                "R0205",
+                format!(
+                    "cannot assign `{}` to field `{final_field}` of type `{}`",
+                    type_name(actual),
+                    type_name(field_info.ty)
+                ),
+                value_span,
+            )
+            .with_help(format!(
+                "assign a `{}` value to `{final_field}`",
+                type_name(field_info.ty)
+            )));
+        }
+        Ok(IrStatement::ReferenceFieldAssign {
+            pointer,
+            struct_id,
+            field_index,
+            ty: field_info.ty,
+            value,
+        })
+    }
+
+    fn scoped_zero_argument_function(&self, name: &str) -> Option<(IrExpression, Type)> {
+        let resolved = if self.signatures.contains_key(name) {
+            name.to_string()
+        } else {
+            let namespace_name = self
+                .function_name
+                .rsplit_once("::")
+                .map(|(namespace, _)| format!("{namespace}::{name}"));
+            namespace_name
+                .filter(|candidate| self.signatures.contains_key(candidate))
+                .or_else(|| {
+                    let local_name = if self.module_path.is_empty() {
+                        name.to_string()
+                    } else {
+                        format!("{}::{name}", self.module_path)
+                    };
+                    self.signatures
+                        .contains_key(&local_name)
+                        .then_some(local_name)
+                })?
+        };
+        let signature = self.signatures.get(&resolved)?;
+        if !signature.parameters.is_empty() {
+            return None;
+        }
+        let IrCallTarget::Function(_) = signature.target else {
+            return None;
+        };
+        Some((
+            IrExpression::Call {
+                target: signature.target,
+                arguments: Vec::new(),
+                return_type: signature.return_type?,
+            },
+            signature.return_type?,
+        ))
+    }
+
+    fn check_field_visibility(
+        &self,
+        struct_id: usize,
+        field_index: usize,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let definition = &self.structs[struct_id];
+        if definition.name.starts_with('$') || definition.module_path == self.module_path {
+            return Ok(());
+        }
+        if definition.fields[field_index].public {
+            return Ok(());
+        }
+        Err(diag(
+            "R0426",
+            format!(
+                "field `{}` of `{}` is private",
+                definition.fields[field_index].name, definition.name
+            ),
+            span,
+        )
+        .with_help("mark the field `pub` to read it outside its module"))
+    }
+
     fn lower_method(
         &mut self,
         value: Expression,
@@ -5007,6 +5254,30 @@ impl<'a> Analyzer<'a> {
         }
         if let Type::Map(map_id) = receiver_ty {
             return self.lower_map_method(receiver, map_id, name.clone(), arguments, span, mutable);
+        }
+        if let Type::Struct(struct_id) = receiver_ty {
+            return self.lower_struct_method(
+                receiver,
+                receiver_ty,
+                struct_id,
+                name,
+                arguments,
+                span,
+                mutable,
+            );
+        }
+        if let Type::Reference(target, reference_mutable) = receiver_ty
+            && let Type::Struct(struct_id) = pointer_target(target)
+        {
+            return self.lower_struct_method_borrowed(
+                receiver,
+                receiver_ty,
+                reference_mutable,
+                struct_id,
+                name,
+                arguments,
+                span,
+            );
         }
         if receiver_ty != Type::OwnedString {
             return Err(diag(
@@ -5298,6 +5569,250 @@ impl<'a> Analyzer<'a> {
         )?;
         arguments.insert(0, receiver);
         Ok((target, arguments, result))
+    }
+
+    fn resolve_method_signature(
+        &self,
+        struct_id: usize,
+        struct_name: &str,
+        method: &str,
+    ) -> Option<FunctionSignature> {
+        let mut candidates = vec![format!("{struct_name}::{method}")];
+        let module = &self.structs[struct_id].module_path;
+        if !module.is_empty() {
+            candidates.push(format!("{module}::{struct_name}::{method}"));
+        }
+        candidates
+            .iter()
+            .find_map(|candidate| self.signatures.get(candidate).cloned())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_struct_method(
+        &mut self,
+        receiver: IrExpression,
+        receiver_ty: Type,
+        struct_id: usize,
+        name: String,
+        arguments: Vec<Expression>,
+        span: Span,
+        mutable: bool,
+    ) -> Result<(IrCallTarget, Vec<IrExpression>, Option<Type>), Diagnostic> {
+        let struct_name = self.structs[struct_id].name.clone();
+        let Some(signature) = self.resolve_method_signature(struct_id, &struct_name, &name) else {
+            return Err(diag(
+                "R0234",
+                format!("type `{}` has no method `{name}`", type_name(receiver_ty)),
+                span,
+            ));
+        };
+        let IrCallTarget::Function(function_index) = signature.target else {
+            return Err(diag(
+                "R0234",
+                format!("type `{}` has no method `{name}`", type_name(receiver_ty)),
+                span,
+            ));
+        };
+        if !self
+            .function_visibility
+            .get(function_index)
+            .copied()
+            .unwrap_or(false)
+            && self
+                .function_module_paths
+                .get(function_index)
+                .map(String::as_str)
+                != Some(self.module_path.as_str())
+        {
+            return Err(diag(
+                "R0425",
+                format!("method `{name}` is private to `{struct_name}`'s module"),
+                span,
+            )
+            .with_help("mark the method `pub` inside its `extend` block"));
+        }
+        let Some(self_binding) = signature.parameters.first().copied() else {
+            return Err(diag(
+                "R0900",
+                "internal error: method has no receiver parameter",
+                span,
+            ));
+        };
+        let Type::Reference(_, self_mutable) = self_binding else {
+            return Err(diag(
+                "R0900",
+                "internal error: method receiver is not a reference",
+                span,
+            ));
+        };
+        if self_mutable && !mutable {
+            return Err(diag(
+                "R0204",
+                format!("method `{name}` requires a mutable receiver"),
+                span,
+            )
+            .with_help("declare the receiver's root binding with `mut`"));
+        }
+        let borrow = self.receiver_borrow(receiver, receiver_ty, self_mutable, span)?;
+        let mut lowered = vec![borrow];
+        for argument in arguments {
+            let argument_span = argument.span();
+            let parameter_type = signature
+                .parameters
+                .get(lowered.len())
+                .copied()
+                .unwrap_or_else(|| signature.parameters.last().copied().unwrap_or(Type::Bool));
+            let (value, actual) = self.expression(argument, Some(parameter_type))?;
+            if actual != parameter_type {
+                return Err(diag(
+                    "R0212",
+                    format!(
+                        "method argument has type `{}` but `{}` is required",
+                        type_name(actual),
+                        type_name(parameter_type)
+                    ),
+                    argument_span,
+                ));
+            }
+            lowered.push(value);
+        }
+        Ok((signature.target, lowered, signature.return_type))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_struct_method_borrowed(
+        &mut self,
+        receiver: IrExpression,
+        receiver_ty: Type,
+        reference_mutable: bool,
+        struct_id: usize,
+        name: String,
+        arguments: Vec<Expression>,
+        span: Span,
+    ) -> Result<(IrCallTarget, Vec<IrExpression>, Option<Type>), Diagnostic> {
+        let struct_name = self.structs[struct_id].name.clone();
+        let Some(signature) = self.resolve_method_signature(struct_id, &struct_name, &name) else {
+            return Err(diag(
+                "R0234",
+                format!("type `{}` has no method `{name}`", type_name(receiver_ty)),
+                span,
+            ));
+        };
+        let IrCallTarget::Function(function_index) = signature.target else {
+            return Err(diag(
+                "R0234",
+                format!("type `{}` has no method `{name}`", type_name(receiver_ty)),
+                span,
+            ));
+        };
+        if !self
+            .function_visibility
+            .get(function_index)
+            .copied()
+            .unwrap_or(false)
+            && self
+                .function_module_paths
+                .get(function_index)
+                .map(String::as_str)
+                != Some(self.module_path.as_str())
+        {
+            return Err(diag(
+                "R0425",
+                format!("method `{name}` is private to `{struct_name}`'s module"),
+                span,
+            )
+            .with_help("mark the method `pub` inside its `extend` block"));
+        }
+        let Some(self_binding) = signature.parameters.first().copied() else {
+            return Err(diag(
+                "R0900",
+                "internal error: method has no receiver parameter",
+                span,
+            ));
+        };
+        let Type::Reference(_, self_mutable) = self_binding else {
+            return Err(diag(
+                "R0900",
+                "internal error: method receiver is not a reference",
+                span,
+            ));
+        };
+        if self_mutable && !reference_mutable {
+            return Err(diag(
+                "R0204",
+                format!("method `{name}` requires a mutable receiver"),
+                span,
+            )
+            .with_help("the receiver borrow must be mutable"));
+        }
+        let mut lowered = vec![receiver];
+        for argument in arguments {
+            let argument_span = argument.span();
+            let parameter_type = signature
+                .parameters
+                .get(lowered.len())
+                .copied()
+                .unwrap_or_else(|| signature.parameters.last().copied().unwrap_or(Type::Bool));
+            let (value, actual) = self.expression(argument, Some(parameter_type))?;
+            if actual != parameter_type {
+                return Err(diag(
+                    "R0212",
+                    format!(
+                        "method argument has type `{}` but `{}` is required",
+                        type_name(actual),
+                        type_name(parameter_type)
+                    ),
+                    argument_span,
+                ));
+            }
+            lowered.push(value);
+        }
+        Ok((signature.target, lowered, signature.return_type))
+    }
+
+    /// Builds the receiver borrow for a method call on a struct-typed local.
+    fn receiver_borrow(
+        &mut self,
+        receiver: IrExpression,
+        receiver_ty: Type,
+        mutable: bool,
+        span: Span,
+    ) -> Result<IrExpression, Diagnostic> {
+        match receiver {
+            IrExpression::Local { slot, ty, span: local_span } => {
+                if let Type::Reference(_, reference_mutable) = ty {
+                    if mutable && !reference_mutable {
+                        return Err(diag(
+                            "R0204",
+                            "cannot borrow an immutable reference as mutable",
+                            span,
+                        ));
+                    }
+                    return Ok(IrExpression::Local {
+                        slot,
+                        ty,
+                        span: local_span,
+                    });
+                }
+                let pointer_type =
+                    Type::Reference(intern_pointer_target(receiver_ty), mutable);
+                self.addressed_slot_types[slot] = Some(receiver_ty);
+                Ok(IrExpression::AddressOf {
+                    slot,
+                    ty: receiver_ty,
+                    pointer_type,
+                    span,
+                })
+            }
+            _ => Err(diag(
+                "R0235",
+                "method receivers must be a local variable for now",
+                span,
+            )
+            .with_help(
+                "assign the value to a local first; chained receivers on expressions are not supported yet",
+            )),
+        }
     }
 
     fn coerce_function_pointer(
@@ -6813,6 +7328,7 @@ fn resolve_struct_layout(
             name: field.name.clone(),
             ty,
             slot_offset: slot_count,
+            public: field.public,
         });
         slot_count = slot_count
             .checked_add(width)
@@ -6827,6 +7343,7 @@ fn resolve_struct_layout(
             })?;
     }
     layouts[struct_id] = Some(RynStruct {
+        module_path: definitions[struct_id].module_path.clone(),
         name: definition.name.clone(),
         fields,
         slot_count,
@@ -7044,7 +7561,11 @@ fn type_name(ty: Type) -> String {
     }
 }
 fn reference_pointee_supported(ty: Type) -> bool {
-    matches!(
+    reference_pointee_supported_in(ty, &[])
+}
+
+fn reference_pointee_supported_in(ty: Type, structs: &[RynStruct]) -> bool {
+    if matches!(
         ty,
         Type::I8
             | Type::I16
@@ -7058,7 +7579,17 @@ fn reference_pointee_supported(ty: Type) -> bool {
             | Type::F64
             | Type::Char
             | Type::Bool
-    )
+    ) {
+        return true;
+    }
+    if let Type::Struct(id) = ty {
+        // Borrowing never duplicates a resource, but move-only custom-destructor
+        // handles keep their whole-value replacement rule for now.
+        return structs
+            .get(id)
+            .is_none_or(|definition| definition.drop_function.is_none());
+    }
+    false
 }
 
 fn is_integer(ty: Type) -> bool {

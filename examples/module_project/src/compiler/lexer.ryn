@@ -1,5 +1,5 @@
 pub struct Token {
-    value: i32
+    pub value: i32
 }
 
 pub type TokenId = i32

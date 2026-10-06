@@ -138,6 +138,7 @@ impl Guard<'_> {
                 .first()
                 .map_or(Span::default(), |value| self.expression_span(value)),
             IrExpression::Dereference { pointer, .. } => self.expression_span(pointer),
+            IrExpression::ReferenceField { pointer, .. } => self.expression_span(pointer),
             _ => Span::default(),
         }
     }
@@ -350,6 +351,9 @@ impl Guard<'_> {
                     Some(Type::Struct(id)) if self.structs[id].drop_function.is_some()
                 );
                 self.expression(value, !custom_owner)?;
+            }
+            IrExpression::ReferenceField { pointer, .. } => {
+                self.expression(pointer, false)?;
             }
             IrExpression::Call {
                 target, arguments, ..
@@ -754,6 +758,33 @@ impl Guard<'_> {
                 IrStatement::DereferenceAssign { pointer, value, .. } => {
                     self.expression(pointer, false)?;
                     self.expression(value, false)?;
+                }
+                IrStatement::ReferenceFieldAssign {
+                    pointer,
+                    struct_id,
+                    field_index,
+                    value,
+                    ..
+                } => {
+                    // Receiver aliasing conflicts are rejected at the call site;
+                    // inside the method, mutating through `mut self` is the point.
+                    self.expression(pointer, false)?;
+                    if matches!(
+                        self.structs
+                            .get(*struct_id)
+                            .and_then(|definition| definition.fields.get(*field_index))
+                            .map(|field| field.ty),
+                        Some(Type::Struct(id)) if self.structs[id].drop_function.is_some()
+                    ) {
+                        let field_span = self.expression_span(pointer);
+                        return Err(Diagnostic {
+                            code: "R0255",
+                            message: "cannot overwrite the resource handle field of a custom-destructor value".into(),
+                            span: field_span,
+                            help: Some("replace the whole value so Ryn Guard can run its destructor first".into()),
+                        });
+                    }
+                    self.expression(value, true)?;
                 }
                 IrStatement::Print { value, .. } => self.expression(value, false)?,
                 IrStatement::PrintTemplate(parts) => {

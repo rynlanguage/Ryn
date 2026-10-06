@@ -1,0 +1,33 @@
+struct Player {
+    pub name: String,
+    health: i32,
+}
+
+extend Player {
+    pub fun new(name: str) -> Player {
+        return Player { name: String(name), health: 100 }
+    }
+
+    pub fun health(self) -> i32 => self.health
+
+    pub fun damage(mut self, amount: i32) {
+        self.health -= amount
+    }
+
+    pub fun heal(mut self, amount: i32) {
+        self.health += amount
+    }
+
+    pub const MAX_HEALTH: i32 = 100
+}
+
+fun main() {
+    mut player := Player::new("v3nn7")
+    echo player.health()
+    player.damage(30)
+    echo player.health()
+    player.heal(5)
+    echo player.health()
+    echo Player::MAX_HEALTH
+    echo player.name
+}

@@ -6,6 +6,7 @@ pub struct Program {
     pub structs: Vec<StructDef>,
     pub enums: Vec<EnumDef>,
     pub type_aliases: Vec<TypeAliasDef>,
+    pub extends: Vec<ExtendDef>,
     pub functions: Vec<Function>,
 }
 #[derive(Debug)]
@@ -52,6 +53,23 @@ pub struct StructDef {
 pub struct StructField {
     pub name: String,
     pub ty: TypeName,
+    pub public: bool,
+    pub span: Span,
+}
+#[derive(Clone, Debug)]
+pub struct ExtendDef {
+    pub type_name: TypeName,
+    pub functions: Vec<Function>,
+    pub constants: Vec<ConstantDef>,
+    pub module_path: String,
+    pub span: Span,
+}
+#[derive(Clone, Debug)]
+pub struct ConstantDef {
+    pub name: String,
+    pub ty: TypeName,
+    pub value: Expression,
+    pub public: bool,
     pub span: Span,
 }
 #[derive(Clone, Debug)]
