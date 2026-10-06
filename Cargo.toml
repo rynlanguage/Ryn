@@ -16,9 +16,6 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 unicode-width = "0.2"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
-
 [[bench]]
 name = "compiler_pipeline"
 harness = false

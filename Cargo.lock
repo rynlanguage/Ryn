@@ -359,7 +359,6 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
- "libc",
  "same-file",
  "serde",
  "serde_yaml",

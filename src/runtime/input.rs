@@ -1,7 +1,7 @@
 //! Non-blocking keyboard state polling. Key IDs are stable across platform backends.
 use std::sync::{Mutex, OnceLock};
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(windows))]
 use std::io::Write;
 #[cfg(any(windows, target_os = "linux"))]
 use std::time::Duration;
@@ -219,20 +219,27 @@ fn refresh_all() {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{KEY_COUNT, KEY_IDS};
+    use super::KEY_IDS;
     use std::{
         fs::{self, File, OpenOptions},
-        mem::MaybeUninit,
+        io::Read,
         os::unix::fs::OpenOptionsExt,
         sync::{Mutex, OnceLock},
-        time::{Duration, Instant},
     };
 
     const EV_KEY: u16 = 0x01;
+    const O_NONBLOCK: i32 = 0x800;
+    const O_CLOEXEC: i32 = 0x80000;
+
+    #[repr(C)]
+    struct TimeVal {
+        seconds: isize,
+        microseconds: isize,
+    }
 
     #[repr(C)]
     struct InputEvent {
-        time: libc::timeval,
+        time: TimeVal,
         kind: u16,
         code: u16,
         value: i32,
@@ -240,7 +247,6 @@ mod linux {
 
     struct Backend {
         devices: Vec<File>,
-        terminal_deadline: [Option<Instant>; KEY_COUNT],
     }
 
     impl Backend {
@@ -253,37 +259,26 @@ mod linux {
                 {
                     if let Ok(device) = OpenOptions::new()
                         .read(true)
-                        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                        .custom_flags(O_NONBLOCK | O_CLOEXEC)
                         .open(entry.path())
                     {
                         devices.push(device);
                     }
                 }
             }
-            Self {
-                devices,
-                terminal_deadline: [None; KEY_COUNT],
-            }
+            Self { devices }
         }
 
         fn drain_evdev(&mut self, samples: &mut Vec<(u32, bool)>) {
             for device in &mut self.devices {
                 loop {
-                    let mut event = MaybeUninit::<InputEvent>::uninit();
-                    // SAFETY: read writes at most one complete input_event into the aligned,
-                    // writable MaybeUninit buffer. The value is read only for a full struct.
-                    let read = unsafe {
-                        libc::read(
-                            std::os::fd::AsRawFd::as_raw_fd(device),
-                            event.as_mut_ptr().cast(),
-                            std::mem::size_of::<InputEvent>(),
-                        )
-                    };
-                    if read != std::mem::size_of::<InputEvent>() as isize {
+                    let mut bytes = [0u8; std::mem::size_of::<InputEvent>()];
+                    if device.read(&mut bytes).ok() != Some(bytes.len()) {
                         break;
                     }
-                    // SAFETY: the exact InputEvent byte count was returned above.
-                    let event = unsafe { event.assume_init() };
+                    // Linux evdev reads return complete input_event records.
+                    let event =
+                        unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<InputEvent>()) };
                     if event.kind == EV_KEY && (event.value == 0 || event.value == 1) {
                         samples.extend(
                             linux_key_ids(event.code)
@@ -291,21 +286,6 @@ mod linux {
                                 .map(|&key| (key, event.value == 1)),
                         );
                     }
-                }
-            }
-        }
-
-        fn drain_terminal(&mut self, samples: &mut Vec<(u32, bool)>) {
-            let keys = read_terminal_keys();
-            let now = Instant::now();
-            for key in keys {
-                samples.push((key, true));
-                self.terminal_deadline[key as usize] = Some(now + Duration::from_millis(100));
-            }
-            for key in KEY_IDS.iter().copied().skip(1) {
-                if self.terminal_deadline[key as usize].is_some_and(|deadline| deadline <= now) {
-                    samples.push((key, false));
-                    self.terminal_deadline[key as usize] = None;
                 }
             }
         }
@@ -323,128 +303,15 @@ mod linux {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         backend.drain_evdev(&mut samples);
-        backend.drain_terminal(&mut samples);
         samples
     }
 
-    fn read_terminal_keys() -> Vec<u32> {
-        let fd = libc::STDIN_FILENO;
-        let mut original = MaybeUninit::<libc::termios>::uninit();
-        // SAFETY: tcgetattr initializes the termios structure for this valid descriptor.
-        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
-            return Vec::new();
-        }
-        // SAFETY: tcgetattr succeeded.
-        let original = unsafe { original.assume_init() };
-        let mut raw = original;
-        // SAFETY: cfmakeraw only mutates the provided termios value.
-        unsafe { libc::cfmakeraw(&mut raw) };
-        raw.c_cc[libc::VMIN] = 0;
-        raw.c_cc[libc::VTIME] = 0;
-        // Keep raw mode active only for the nonblocking read. Line-based stdin remains
-        // canonical between polls, and terminal settings are restored before returning.
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
-            return Vec::new();
-        }
-        let mut bytes = [0u8; 64];
-        // SAFETY: bytes is a writable 64-byte buffer; VMIN/VTIME are zero, so this does not wait.
-        let count = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
-        // SAFETY: original is the exact termios state saved above.
-        let restored = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) } == 0;
-        if !restored || count <= 0 {
-            return Vec::new();
-        }
-        decode_terminal_bytes(&bytes[..count as usize])
-    }
-
-    fn decode_terminal_bytes(bytes: &[u8]) -> Vec<u32> {
-        let mut keys = Vec::new();
-        let mut index = 0;
-        while index < bytes.len() {
-            let byte = bytes[index];
-            if byte == 0x1b {
-                if bytes.get(index + 1) == Some(&b'[') {
-                    let sequence_start = index + 2;
-                    let mut end = sequence_start;
-                    while end < bytes.len()
-                        && !bytes[end].is_ascii_alphabetic()
-                        && bytes[end] != b'~'
-                    {
-                        end += 1;
-                    }
-                    if let Some(&last) = bytes.get(end) {
-                        let key = match last {
-                            b'A' => Some(48),
-                            b'B' => Some(49),
-                            b'C' => Some(51),
-                            b'D' => Some(50),
-                            b'H' => Some(44),
-                            b'F' => Some(45),
-                            b'~' => match &bytes[sequence_start..end] {
-                                b"2" => Some(43),
-                                b"3" => Some(42),
-                                b"5" => Some(46),
-                                b"6" => Some(47),
-                                b"11" => Some(64),
-                                b"12" => Some(65),
-                                b"13" => Some(66),
-                                b"14" => Some(67),
-                                b"15" => Some(68),
-                                b"17" => Some(69),
-                                b"18" => Some(70),
-                                b"19" => Some(71),
-                                b"20" => Some(72),
-                                b"21" => Some(73),
-                                b"23" => Some(74),
-                                b"24" => Some(75),
-                                _ => None,
-                            },
-                            _ => None,
-                        };
-                        if let Some(key) = key {
-                            keys.push(key);
-                        }
-                        index = end + 1;
-                        continue;
-                    }
-                }
-                keys.push(39);
-                index += 1;
-                continue;
-            }
-            if let Some(key) = ascii_key_id(byte) {
-                keys.push(key);
-                if (1..=26).contains(&byte) {
-                    keys.push(55); // Ctrl is reported with control-character input.
-                }
-            }
-            index += 1;
-        }
-        keys
-    }
-
-    fn ascii_key_id(byte: u8) -> Option<u32> {
-        match byte {
-            b'a'..=b'z' | b'A'..=b'Z' => Some(u32::from(byte.to_ascii_uppercase() - b'A' + 1)),
-            b'0'..=b'9' => Some(27 + u32::from(byte - b'0')),
-            b' ' => Some(37),
-            b'\r' | b'\n' => Some(38),
-            b'\t' => Some(40),
-            0x08 | 0x7f => Some(41),
-            b'`' | b'~' => Some(76),
-            b'-' | b'_' => Some(77),
-            b'=' | b'+' => Some(78),
-            b'[' | b'{' => Some(79),
-            b']' | b'}' => Some(80),
-            b'\\' | b'|' => Some(81),
-            b';' | b':' => Some(82),
-            b'\'' | b'"' => Some(83),
-            b',' | b'<' => Some(84),
-            b'.' | b'>' => Some(85),
-            b'/' | b'?' => Some(86),
-            1..=26 => Some(u32::from(byte)),
-            _ => None,
-        }
+    pub(super) fn is_available() -> bool {
+        !backend()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .devices
+            .is_empty()
     }
 
     fn linux_key_ids(code: u16) -> Vec<u32> {
@@ -540,14 +407,7 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
-        use super::{ascii_key_id, decode_terminal_bytes, linux_key_ids};
-
-        #[test]
-        fn terminal_parser_maps_ascii_and_navigation_sequences() {
-            assert_eq!(decode_terminal_bytes(b"w \x1b[A\x1b[3~"), [23, 37, 48, 42]);
-            assert_eq!(ascii_key_id(b'Q'), Some(17));
-            assert_eq!(ascii_key_id(3), Some(3));
-        }
+        use super::linux_key_ids;
 
         #[test]
         fn evdev_mapping_matches_the_public_key_ids() {
@@ -621,6 +481,14 @@ pub extern "C" fn ryn_input_read_key() -> u32 {
         let _ = writeln!(
             std::io::stderr().lock(),
             "Ryn runtime error: realtime keyboard input is not supported on this platform"
+        );
+        std::process::exit(1);
+    }
+    #[cfg(target_os = "linux")]
+    if !linux::is_available() {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "Ryn runtime error: Linux realtime keyboard input requires read access to /dev/input/event*"
         );
         std::process::exit(1);
     }
