@@ -65,6 +65,7 @@ pub struct StructDef {
     pub public: bool,
     pub repr_c: bool,
     pub drop_function: Option<String>,
+    pub derives: Vec<String>,
     pub module_path: String,
     pub span: Span,
 }

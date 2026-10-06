@@ -177,9 +177,13 @@ impl Parser<'_> {
                 self.namespace_decl()?;
                 continue;
             }
+            let mut derives = Vec::new();
             let (repr_c, drop_function) = if matches!(self.peek().kind, TokenKind::Hash) {
                 if self.next_attribute_is_drop() {
                     (false, Some(self.drop_attribute()?))
+                } else if self.next_attribute_is_derive() {
+                    derives = self.derive_attribute()?;
+                    (false, None)
                 } else {
                     (self.repr_c_attribute()?, None)
                 }
@@ -202,7 +206,8 @@ impl Parser<'_> {
                 }
                 uses.push(self.use_decl()?);
             } else if matches!(self.peek().kind, TokenKind::Struct) {
-                let definition = self.struct_def(public, repr_c, drop_function)?;
+                let mut definition = self.struct_def(public, repr_c, drop_function)?;
+                definition.derives = std::mem::take(&mut derives);
                 if definition.type_parameters.is_empty() {
                     structs.push(definition);
                 } else {
@@ -301,9 +306,13 @@ impl Parser<'_> {
                 continue;
             }
             let result = (|| {
+                let mut derives = Vec::new();
                 let (repr_c, drop_function) = if matches!(self.peek().kind, TokenKind::Hash) {
                     if self.next_attribute_is_drop() {
                         (false, Some(self.drop_attribute()?))
+                    } else if self.next_attribute_is_derive() {
+                        derives = self.derive_attribute()?;
+                        (false, None)
                     } else {
                         (self.repr_c_attribute()?, None)
                     }
@@ -325,15 +334,14 @@ impl Parser<'_> {
                     self.use_decl().map(|declaration| uses.push(declaration))
                 } else if matches!(self.peek().kind, TokenKind::Struct) {
                     self.struct_def(public, repr_c, drop_function)
-                        .map(|definition| {
+                        .map(|mut definition| {
+                            definition.derives = std::mem::take(&mut derives);
                             if definition.type_parameters.is_empty() {
                                 structs.push(definition);
-                            } else {
-                                if let Err(diagnostic) =
-                                    self.add_generic_struct_template(definition)
-                                {
-                                    self.recovery_diagnostics.push(diagnostic);
-                                }
+                            } else if let Err(diagnostic) =
+                                self.add_generic_struct_template(definition)
+                            {
+                                self.recovery_diagnostics.push(diagnostic);
                             }
                         })
                 } else if matches!(self.peek().kind, TokenKind::Enum) {
@@ -858,6 +866,63 @@ impl Parser<'_> {
         Ok(true)
     }
 
+    fn next_attribute_is_derive(&self) -> bool {
+        let next = &self.tokens[self.at + 2].kind;
+        matches!(next, TokenKind::Ident(name) if name == "derive")
+    }
+
+    fn derive_attribute(&mut self) -> Result<Vec<String>, Diagnostic> {
+        self.expect(|kind| matches!(kind, TokenKind::Hash), "expected `#`")?;
+        self.expect(
+            |kind| matches!(kind, TokenKind::LBracket),
+            "expected `[` after `#`",
+        )?;
+        let attribute = self.next();
+        if !matches!(attribute.kind, TokenKind::Ident(ref name) if name == "derive") {
+            return Err(Diagnostic {
+                code: "R0014",
+                message: "unsupported attribute".into(),
+                span: attribute.span,
+                help: Some("the supported derivable traits are `Clone`, `Eq`, and `Hash`".into()),
+            });
+        }
+        self.expect(
+            |kind| matches!(kind, TokenKind::LParen),
+            "expected `(` after `derive`",
+        )?;
+        let mut derives = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RParen | TokenKind::Eof) {
+            let (name, span) = self.ident("expected a trait name in `derive`")?;
+            if !matches!(name.as_str(), "Clone" | "Eq" | "Hash") {
+                return Err(Diagnostic {
+                    code: "R0014",
+                    message: format!("unsupported derive `{name}`"),
+                    span,
+                    help: Some(
+                        "the supported derivable traits are `Clone`, `Eq`, and `Hash`".into(),
+                    ),
+                });
+            }
+            if !derives.contains(&name) {
+                derives.push(name);
+            }
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        self.expect(
+            |kind| matches!(kind, TokenKind::RParen),
+            "expected `)` after the derive list",
+        )?;
+        self.expect(
+            |kind| matches!(kind, TokenKind::RBracket),
+            "expected `]` after the attribute",
+        )?;
+        Ok(derives)
+    }
+
     fn next_attribute_is_drop(&self) -> bool {
         matches!(
             self.tokens.get(self.at + 2).map(|token| &token.kind),
@@ -993,6 +1058,7 @@ impl Parser<'_> {
             return Err(self.error("generic structures cannot yet define custom destructors"));
         }
         Ok(StructDef {
+            derives: Vec::new(),
             name,
             type_parameters,
             fields,
@@ -2111,6 +2177,7 @@ impl Parser<'_> {
             let name = format!("$RynTuple#{key}");
             self.tuple_type_names.insert(key, name.clone());
             self.tuple_type_structs.push(StructDef {
+                derives: Vec::new(),
                 name: name.clone(),
                 type_parameters: Vec::new(),
                 fields: fields
@@ -3084,21 +3151,55 @@ impl Parser<'_> {
                     let name_start = open + 1;
                     let name_end = name_start + relative_end;
                     let name = &value[name_start..name_end];
-                    if !is_identifier(name) {
+                    let mut segments = Vec::new();
+                    let mut valid_path = !name.is_empty();
+                    for segment in name.split('.') {
+                        if is_identifier(segment) {
+                            segments.push(segment.to_owned());
+                        } else if !segment.is_empty()
+                            && segment.bytes().all(|byte| byte.is_ascii_digit())
+                            && segment.len() <= 9
+                        {
+                            segments.push(format!("_{segment}"));
+                        } else {
+                            valid_path = false;
+                            break;
+                        }
+                    }
+                    if !valid_path {
                         return Err(Diagnostic {
                             code: "R0014",
-                            message: "echo interpolation must contain a variable name".into(),
+                            message: "echo interpolation must contain a variable name or field path".into(),
                             span: mapped_span(&offsets, raw_end, open, name_end + 1),
-                            help: Some("use a simple variable name, such as `{name}`".into()),
+                            help: Some("use a variable such as `{name}` or a field path such as `{player.health}`".into()),
                         });
                     }
                     if !text.is_empty() {
                         parts.push(PrintPart::Text(std::mem::take(&mut text)));
                     }
-                    parts.push(PrintPart::Value(Expression::Name(
-                        name.to_owned(),
-                        mapped_span(&offsets, raw_end, name_start, name_end),
-                    )));
+                    let mut expression = None;
+                    let mut cursor = name_start;
+                    for (segment_index, segment) in segments.into_iter().enumerate() {
+                        if segment_index > 0 {
+                            cursor += 1;
+                        }
+                        let segment_span =
+                            mapped_span(&offsets, raw_end, cursor, cursor + segment.len());
+                        cursor += segment.len();
+                        expression = Some(match (segment_index, expression) {
+                            (0, _) => Expression::Name(segment, segment_span),
+                            (_, Some(base)) => Expression::Field {
+                                value: Box::new(base),
+                                name: segment,
+                                name_span: segment_span,
+                                span: segment_span,
+                            },
+                            _ => unreachable!("the first segment built the root name"),
+                        });
+                    }
+                    parts.push(PrintPart::Value(
+                        expression.expect("interpolation path has a root"),
+                    ));
                     at = name_end + 1;
                     used_template_syntax = true;
                 }

@@ -204,7 +204,7 @@ pub extern "C" fn ryn_map_new(
 ) -> *mut RynMap {
     let key_stride = usize::try_from(key_stride)
         .ok()
-        .filter(|stride| *stride == 1)
+        .filter(|stride| *stride > 0 && *stride <= isize::MAX as usize / 8)
         .unwrap_or_else(|| fail("unsupported Map key layout"));
     let value_stride = usize::try_from(value_stride)
         .ok()

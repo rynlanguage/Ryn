@@ -48,8 +48,7 @@ use crate::{
     map_ops::MapOp,
     sema::{
         IrCallTarget, IrExpression, IrPrintPart, IrStatement, LocalBinding, LocalType, RynEnum,
-        RynFunction, RynIr, RynStruct, Type, array_info, map_info, slot_width, storage_slot_width,
-        vec_elem,
+        RynFunction, RynIr, RynStruct, Type, array_info, map_info, storage_slot_width, vec_elem,
     },
     string_ops::StringOp,
     system_ops::SystemOp,
@@ -5009,7 +5008,8 @@ fn emit_map_call(
                 _ => 0,
             };
             let mut args = vec![
-                b.ins().iconst(types::I64, slot_width(key) as i64),
+                b.ins()
+                    .iconst(types::I64, storage_slot_width(key, env.structs) as i64),
                 b.ins()
                     .iconst(types::I64, value_width(value, env.structs) as i64),
                 b.ins().iconst(types::I64, key_kind),

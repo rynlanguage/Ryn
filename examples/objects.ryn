@@ -27,5 +27,6 @@ fun main() {
     player.damage(30).heal(5)
     echo player.health()
     echo Player::MAX_HEALTH
-    echo player.name
+    echo "HP: {player.health}"
+    echo "{player.name}"
 }

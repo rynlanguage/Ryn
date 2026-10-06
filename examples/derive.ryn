@@ -1,0 +1,26 @@
+#[derive(Clone, Eq, Hash)]
+struct PlayerId {
+    name: i64,
+    slot: i32,
+}
+
+#[derive(Clone)]
+struct Label {
+    text: String,
+}
+
+fun main() {
+    mut scores := Map<PlayerId, i32>()
+    scores.insert(PlayerId { name: 1, slot: 2 }, 90)
+    scores.insert(PlayerId { name: 3, slot: 4 }, 70)
+    echo scores.len()
+    echo scores.contains_key(PlayerId { name: 1, slot: 2 })
+    echo scores.get(PlayerId { name: 3, slot: 4 })
+    echo scores.remove(PlayerId { name: 1, slot: 2 })
+    echo scores.len()
+
+    mut label := Label { text: String("tag") }
+    copy := label.clone()
+    echo copy.text
+    echo label.text
+}

@@ -1182,6 +1182,22 @@ fn extend_methods_borrow_receivers_and_associated_items_resolve() {
     );
     assert_eq!(
         String::from_utf8_lossy(&result.stdout),
-        "100\n75\n100\nv3nn7\n"
+        "100\n75\n100\nHP: 75\nv3nn7\n"
+    );
+}
+
+#[test]
+fn derived_clone_hash_and_eq_power_struct_keys_and_copies() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/derive.ryn");
+    let result = run_source(&source);
+
+    assert!(
+        result.status.success(),
+        "compiler/runtime failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        "2\ntrue\nSome(70)\ntrue\n1\ntag\ntag\n"
     );
 }

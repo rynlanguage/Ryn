@@ -85,7 +85,9 @@ fun tick<T: Entity>(entity: T) -> T {
 }
 ```
 
-See [the shapes example](examples/shapes.ryn). Built-in types extend the same way — `extend String { fun empty(self) -> bool { ... } }` ([the String extension example](examples/string_extend.ryn)). Associated types, operator contracts, `#[derive]`, and conditional extensions remain future work.
+See [the shapes example](examples/shapes.ryn). Built-in types extend the same way — `extend String { fun empty(self) -> bool { ... } }` ([the String extension example](examples/string_extend.ryn)).
+
+`#[derive(Clone, Eq, Hash)]` generates capabilities for scalar-friendly structs: `Clone` synthesizes a deep `Type::clone()` method, `Hash` (with `Eq`) allows the struct as a `Map` key, and `Eq` documents recursive field equality. String interpolation reads field paths — `echo "HP: {player.health}"` — with per-segment diagnostics. Associated types, operator contracts, and conditional extensions remain future work.
 
 ## Ryn example
 

@@ -746,6 +746,8 @@ pub struct RynStruct {
     pub slot_count: usize,
     pub repr_c: bool,
     pub drop_function: Option<usize>,
+    pub derives_clone: bool,
+    pub derives_hash: bool,
     pub module_path: String,
 }
 
@@ -1482,6 +1484,15 @@ fn analyze_with_recovery(
         &structs,
         &struct_ids,
     );
+    materialize_derived_clones(
+        &mut program.functions,
+        &mut signatures,
+        &mut function_module_paths,
+        &mut function_visibility,
+        &structs,
+        &struct_ids,
+        &enum_ids,
+    );
     let mut functions = Vec::with_capacity(program.functions.len());
     let mut diagnostics = Vec::new();
     for function in program.functions {
@@ -1772,6 +1783,86 @@ fn materialize_shape_defaults(
                 function_visibility.push(true);
             }
         }
+    }
+}
+
+/// Synthesizes `Type::clone` methods for `#[derive(Clone)]` structs. Field
+/// reads through the borrowed receiver already deep-copy owned leaves, so the
+/// body is a plain struct literal of field reads.
+#[allow(clippy::too_many_arguments)]
+fn materialize_derived_clones(
+    functions: &mut Vec<crate::ast::Function>,
+    signatures: &mut HashMap<String, FunctionSignature>,
+    function_module_paths: &mut Vec<String>,
+    function_visibility: &mut Vec<bool>,
+    structs: &[RynStruct],
+    _struct_ids: &HashMap<String, usize>,
+    _enum_ids: &HashMap<String, usize>,
+) {
+    for (struct_index, definition) in structs.iter().enumerate() {
+        if !definition.derives_clone || definition.drop_function.is_some() {
+            continue;
+        }
+        if definition.name.starts_with('$') {
+            continue;
+        }
+        let method_name = format!("{}::clone", definition.name);
+        if signatures.contains_key(&method_name) {
+            continue;
+        }
+        let span = Span::default();
+        let mut fields = Vec::new();
+        for field in &definition.fields {
+            fields.push((
+                field.name.clone(),
+                Expression::Field {
+                    value: Box::new(Expression::Name("self".into(), span)),
+                    name: field.name.clone(),
+                    name_span: span,
+                    span,
+                },
+                span,
+            ));
+        }
+        let index = functions.len();
+        functions.push(crate::ast::Function {
+            name: method_name.clone(),
+            extern_c: false,
+            external_symbol: None,
+            type_parameters: Vec::new(),
+            type_parameter_bounds: Vec::new(),
+            public: true,
+            module_path: definition.module_path.clone(),
+            parameters: vec![crate::ast::Parameter {
+                name: "self".into(),
+                ty: crate::ast::TypeName::Reference(
+                    Box::new(crate::ast::TypeName::Named(definition.name.clone(), span)),
+                    false,
+                    span,
+                ),
+                span,
+            }],
+            return_type: Some(crate::ast::TypeName::Named(definition.name.clone(), span)),
+            body: Vec::new(),
+            return_value: Some(Expression::StructLiteral {
+                name: definition.name.clone(),
+                fields,
+                span,
+            }),
+            span,
+        });
+        let struct_type = Type::Struct(struct_index);
+        signatures.insert(
+            method_name,
+            FunctionSignature {
+                target: IrCallTarget::Function(index),
+                parameters: vec![Type::Reference(intern_pointer_target(struct_type), false)],
+                return_type: Some(struct_type),
+                is_destructor: false,
+            },
+        );
+        function_module_paths.push(definition.module_path.clone());
+        function_visibility.push(true);
     }
 }
 
@@ -3812,6 +3903,8 @@ impl<'a> Analyzer<'a> {
                         slot_count: slot_offset,
                         repr_c: false,
                         drop_function: None,
+                        derives_clone: false,
+                        derives_hash: false,
                         module_path: String::new(),
                     });
                     struct_id
@@ -4137,7 +4230,7 @@ impl<'a> Analyzer<'a> {
                     error.span = span;
                     error
                 })?;
-                validate_map_types(key, value, span)?;
+                validate_map_types_with_structs(key, value, span, self.structs)?;
                 if !map_struct_value_supported(
                     Type::Map(intern_map(key, value)),
                     self.structs,
@@ -7276,7 +7369,8 @@ fn resolve_type_name_scoped(
         TypeName::Map(key, value, span) => {
             let key = resolve_type_name_scoped(key, structs, enums, namespace)?;
             let value = resolve_type_name_scoped(value, structs, enums, namespace)?;
-            validate_map_types(key, value, *span)?;
+            validate_map_key_lenient(key, *span)?;
+            validate_map_value_lenient(value, *span)?;
             Type::Map(intern_map(key, value))
         }
         TypeName::Array(element, length, span) => {
@@ -7538,7 +7632,35 @@ fn name_span(name: &TypeName) -> Span {
     }
 }
 
-fn validate_map_types(key: Type, value: Type, span: Span) -> Result<(), Diagnostic> {
+fn struct_key_hash_supported(ty: Type, structs: &[RynStruct]) -> bool {
+    match ty {
+        Type::I8
+        | Type::I16
+        | Type::I32
+        | Type::I64
+        | Type::U8
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::Bool
+        | Type::Char => true,
+        Type::Struct(id) => {
+            let Some(definition) = structs.get(id) else {
+                return false;
+            };
+            // Hashing flattens the key into words, so every leaf must be a
+            // scalar; handle fields would hash unstable addresses.
+            definition.derives_hash
+                && definition
+                    .fields
+                    .iter()
+                    .all(|field| struct_key_hash_supported(field.ty, structs))
+        }
+        _ => false,
+    }
+}
+
+fn validate_map_key_lenient(key: Type, span: Span) -> Result<(), Diagnostic> {
     let key_supported = matches!(
         key,
         Type::I8
@@ -7552,7 +7674,7 @@ fn validate_map_types(key: Type, value: Type, span: Span) -> Result<(), Diagnost
             | Type::Bool
             | Type::Char
             | Type::OwnedString
-    );
+    ) || matches!(key, Type::Struct(_));
     if !key_supported {
         return Err(diag(
             "R0244",
@@ -7562,7 +7684,66 @@ fn validate_map_types(key: Type, value: Type, span: Span) -> Result<(), Diagnost
             ),
             span,
         )
-        .with_help("Map keys currently support integer types, bool, char, and String"));
+        .with_help(
+            "Map keys currently support integer types, bool, char, String, and `#[derive(Hash)]` structs with scalar fields",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_map_value_lenient(value: Type, _span: Span) -> Result<(), Diagnostic> {
+    let value_supported = matches!(
+        value,
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::F32
+            | Type::F64
+            | Type::Bool
+            | Type::Char
+            | Type::OwnedString
+    );
+    let _ = value_supported;
+    Ok(())
+}
+
+fn validate_map_types_with_structs(
+    key: Type,
+    value: Type,
+    span: Span,
+    structs: &[RynStruct],
+) -> Result<(), Diagnostic> {
+    let key_supported = matches!(
+        key,
+        Type::I8
+            | Type::I16
+            | Type::I32
+            | Type::I64
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::U64
+            | Type::Bool
+            | Type::Char
+            | Type::OwnedString
+    ) || struct_key_hash_supported(key, structs);
+    if !key_supported {
+        return Err(diag(
+            "R0244",
+            format!(
+                "Map key type `{}` does not implement Hash and Eq",
+                type_name(key)
+            ),
+            span,
+        )
+        .with_help(
+            "Map keys currently support integer types, bool, char, String, and `#[derive(Hash)]` structs with scalar fields",
+        ));
     }
     let value_supported = matches!(
         value,
@@ -8002,6 +8183,14 @@ fn resolve_struct_layout(
     }
     layouts[struct_id] = Some(RynStruct {
         module_path: definitions[struct_id].module_path.clone(),
+        derives_clone: definitions[struct_id]
+            .derives
+            .iter()
+            .any(|name| name == "Clone"),
+        derives_hash: definitions[struct_id]
+            .derives
+            .iter()
+            .any(|name| name == "Hash"),
         name: definition.name.clone(),
         fields,
         slot_count,
