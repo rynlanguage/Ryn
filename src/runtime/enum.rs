@@ -40,9 +40,7 @@ fn drop_fn(kind: u64) -> DropFn {
         }
         DROP_VEC => {
             // SAFETY: ABI-compatible transmute of the exported RynVec drop.
-            unsafe {
-                std::mem::transmute::<usize, DropFn>(super::vectors::ryn_vec_drop as usize)
-            }
+            unsafe { std::mem::transmute::<usize, DropFn>(super::vectors::ryn_vec_drop as usize) }
         }
         DROP_ENUM => {
             // SAFETY: Enum payload words store owning RynEnum handles.
@@ -64,9 +62,7 @@ fn clone_fn(kind: u64) -> CloneFn {
         DROP_VEC => unsafe {
             std::mem::transmute::<usize, CloneFn>(super::vectors::ryn_vec_clone as usize)
         },
-        DROP_ENUM => unsafe {
-            std::mem::transmute::<usize, CloneFn>(ryn_enum_clone as usize)
-        },
+        DROP_ENUM => unsafe { std::mem::transmute::<usize, CloneFn>(ryn_enum_clone as usize) },
         DROP_MAP => unsafe {
             std::mem::transmute::<usize, CloneFn>(super::maps::ryn_map_clone as usize)
         },
@@ -145,10 +141,18 @@ pub extern "C" fn ryn_enum_new(
             let variant = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
             let offset = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
             let kind = u64::from_le_bytes(chunk[16..24].try_into().unwrap());
-            drops_list.push(EnumDropEntry { variant, offset, kind });
+            drops_list.push(EnumDropEntry {
+                variant,
+                offset,
+                kind,
+            });
         }
     }
-    Box::into_raw(Box::new(RynEnum { tag, payload, drops: drops_list }))
+    Box::into_raw(Box::new(RynEnum {
+        tag,
+        payload,
+        drops: drops_list,
+    }))
 }
 
 #[unsafe(no_mangle)]

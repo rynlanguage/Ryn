@@ -1,0 +1,34 @@
+pub struct Path {
+    pub raw: String,
+}
+
+pub fun new(value: str) -> Path {
+    return Path { raw: String(value) }
+}
+
+pub fun from(value: str) -> Path {
+    return Path { raw: String(value) }
+}
+
+pub fun exists(value: str) -> bool { return __fs_file_exists(value) }
+pub fun is_file(value: str) -> bool { return __fs_is_file(value) }
+pub fun is_dir(value: str) -> bool { return __fs_is_directory(value) }
+
+extend Path {
+    pub fun new(value: str) -> Path {
+        return Path { raw: String(value) }
+    }
+
+    pub fun exists(self) -> bool { return __fs_file_exists(self.raw) }
+    pub fun is_file(self) -> bool { return __fs_is_file(self.raw) }
+    pub fun is_dir(self) -> bool { return __fs_is_directory(self.raw) }
+    pub fun is_directory(self) -> bool { return __fs_is_directory(self.raw) }
+    pub fun is_absolute(self) -> bool { return __fs_path_is_absolute(self.raw) }
+    pub fun filename(self) -> String { return __fs_path_file_name(self.raw) }
+    pub fun extension(self) -> String { return __fs_path_extension(self.raw) }
+    pub fun parent(self) -> Path { return Path { raw: __fs_path_parent(self.raw) } }
+    pub fun join(self, other: str) -> Path { return Path { raw: __fs_path_join(self.raw, other) } }
+    pub fun absolute(self) -> Path { return Path { raw: __fs_path_absolute(self.raw) } }
+    pub fun canonical(self) -> Path { return Path { raw: __fs_path_canonical(self.raw) } }
+    pub fun to_string(self) -> String { return String(self.raw) }
+}

@@ -1768,9 +1768,7 @@ impl Parser<'_> {
                 )?;
                 let key = self.type_name()?;
                 self.expect_type_greater("expected `>` after the `Set` element type")?;
-                let value = TypeName::Bool;
-                self.ensure_map_option_specialization(&value, span);
-                Ok(TypeName::Map(Box::new(key), Box::new(value), span))
+                Ok(TypeName::Set(Box::new(key), span))
             }
             "Map" | "HashMap" => {
                 self.expect(
@@ -2114,6 +2112,7 @@ impl Parser<'_> {
                     || self.generic_enum_placeholders.contains_key(name)
             }
             TypeName::Vec(element, _)
+            | TypeName::Set(element, _)
             | TypeName::Array(element, _, _)
             | TypeName::Slice(element, _) => self.contains_unresolved_generic_type(element),
             TypeName::Map(key, value, _) => {
@@ -2156,6 +2155,7 @@ impl Parser<'_> {
         }
         match ty {
             TypeName::Vec(element, _)
+            | TypeName::Set(element, _)
             | TypeName::Array(element, _, _)
             | TypeName::Slice(element, _) => {
                 self.resolve_generic_placeholders(element, substitutions)?;
@@ -2511,6 +2511,7 @@ impl Parser<'_> {
                 name,
                 arguments,
                 span,
+                ..
             } => Ok(Statement::MethodCall {
                 value,
                 name,
@@ -3307,15 +3308,32 @@ impl Parser<'_> {
             {
                 self.next();
                 let key = self.type_name()?;
-                let value = if name == "Set" {
-                    TypeName::Bool
-                } else {
+                if name == "Set" {
+                    self.expect_type_greater("expected `>` after Set element type")?;
                     self.expect(
-                        |kind| matches!(kind, TokenKind::Comma),
-                        "expected `,` between Map key and value types",
+                        |kind| matches!(kind, TokenKind::LParen),
+                        "expected `()` after Set<T>",
                     )?;
-                    self.type_name()?
-                };
+                    let end = self
+                        .expect(
+                            |kind| matches!(kind, TokenKind::RParen),
+                            "expected empty `()` after Set<T>",
+                        )?
+                        .span
+                        .end;
+                    return Ok(Expression::SetConstructor {
+                        element: key,
+                        span: Span {
+                            start: span.start,
+                            end,
+                        },
+                    });
+                }
+                self.expect(
+                    |kind| matches!(kind, TokenKind::Comma),
+                    "expected `,` between Map key and value types",
+                )?;
+                let value = self.type_name()?;
                 self.expect_type_greater("expected `>` after Map key and value types")?;
                 self.ensure_map_option_specialization(&value, span);
                 self.expect(
@@ -4017,6 +4035,23 @@ impl Parser<'_> {
                 postfix_depth += 1;
                 self.next();
                 let (name, field_span) = self.field_name_after_dot()?;
+                let mut type_arguments = Vec::new();
+                if matches!(self.peek().kind, TokenKind::ColonColon) {
+                    self.next();
+                    self.expect(
+                        |kind| matches!(kind, TokenKind::Less),
+                        "expected `<` after `::` in generic method call",
+                    )?;
+                    loop {
+                        type_arguments.push(self.type_name()?);
+                        if matches!(self.peek().kind, TokenKind::Comma) {
+                            self.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.expect_type_greater("expected `>` after generic method arguments")?;
+                }
                 let span = Span {
                     start: left.span().start,
                     end: field_span.end,
@@ -4041,6 +4076,7 @@ impl Parser<'_> {
                     Expression::MethodCall {
                         value: Box::new(left),
                         name,
+                        type_arguments,
                         arguments,
                         span: Span {
                             start: span.start,
@@ -4264,6 +4300,7 @@ fn type_key(ty: &TypeName) -> String {
         TypeName::Named(name, _) => name.clone(),
         TypeName::Parameter(name, _) => format!("${name}"),
         TypeName::Vec(element, _) => format!("Vec<{}>", type_key(element)),
+        TypeName::Set(element, _) => format!("Set<{}>", type_key(element)),
         TypeName::Map(key, value, _) => {
             format!("Map<{},{}>", type_key(key), type_key(value))
         }
@@ -4298,6 +4335,7 @@ fn substitute_type_parameters(ty: &mut TypeName, substitutions: &HashMap<String,
             }
         }
         TypeName::Vec(element, _)
+        | TypeName::Set(element, _)
         | TypeName::Array(element, _, _)
         | TypeName::Slice(element, _) => substitute_type_parameters(element, substitutions),
         TypeName::Map(key, value, _) => {

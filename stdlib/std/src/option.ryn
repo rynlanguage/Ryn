@@ -1,0 +1,14 @@
+fun some<U>(item: U) -> Option<U> {
+    return Option::Some(item)
+}
+
+fun none<U>() -> Option<U> {
+    return Option::None
+}
+
+pub fun map<T, U>(value: Option<T>, transform: fun(T) -> U) -> Option<U> {
+    choose value {
+        Option::Some(item) => some::<U>(transform(item)),
+        Option::None => none::<U>()
+    }
+}

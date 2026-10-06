@@ -1,0 +1,49 @@
+pub fun print(value: str) {
+    stdout_write(value)
+}
+
+pub fun println(value: str) {
+    stdout_write(value)
+    stdout_write("\n")
+}
+
+pub fun eprint(value: str) {
+    stderr_write(value)
+}
+
+pub fun eprintln(value: str) {
+    stderr_write(value)
+    stderr_write("\n")
+}
+
+pub fun read_line() -> String {
+    return __io_read_line()
+}
+
+pub fun ask(prompt: str) -> String {
+    return __io_ask(prompt)
+}
+
+pub fun stdin_read() -> String {
+    return __io_stdin_read()
+}
+
+pub fun stdin_read_line() -> String {
+    return __io_read_line()
+}
+
+pub fun stdout_write(value: str) {
+    __io_stdout_write(value)
+}
+
+pub fun stderr_write(value: str) {
+    __io_stderr_write(value)
+}
+
+pub fun stdout_flush() {
+    __io_stdout_flush()
+}
+
+pub fun stderr_flush() {
+    __io_stderr_flush()
+}

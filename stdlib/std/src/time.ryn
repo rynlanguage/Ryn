@@ -1,0 +1,51 @@
+pub fun sleep(duration_ms: u64) {
+    __time_sleep(duration_ms)
+}
+
+pub fun unix() -> f64 {
+    return __time_unix()
+}
+
+pub fun instant_now() -> f64 {
+    return __time_monotonic()
+}
+
+pub fun monotonic() -> f64 {
+    return __time_monotonic()
+}
+
+pub fun instant_elapsed(started_at_monotonic_seconds: f64) -> f64 {
+    return __time_instant_elapsed(started_at_monotonic_seconds)
+}
+
+pub fun yield_thread() {
+    __time_yield_thread()
+}
+
+pub struct Instant {
+    pub started_at_monotonic_seconds: f64,
+}
+
+extend Instant {
+    pub fun now() -> Instant {
+        return Instant { started_at_monotonic_seconds: __time_monotonic() }
+    }
+
+    pub fun elapsed(self) -> f64 {
+        return __time_instant_elapsed(self.started_at_monotonic_seconds)
+    }
+}
+
+pub struct Time {
+    pub unix_seconds: f64,
+}
+
+extend Time {
+    pub fun now() -> Time {
+        return Time { unix_seconds: __time_unix() }
+    }
+
+    pub fun unix() -> f64 {
+        return __time_unix()
+    }
+}

@@ -10,6 +10,7 @@ pub(crate) fn owned_slots(ty: Type, slot: usize, structs: &[RynStruct]) -> Vec<(
         Type::OwnedString => vec![(slot, ty)],
         Type::Vec(_) => vec![(slot, ty)],
         Type::Map(_) => vec![(slot, ty)],
+        Type::Set(_) => vec![(slot, ty)],
         Type::Enum(_) => vec![(slot, ty)],
         Type::Struct(id) if structs[id].drop_function.is_some() => vec![(slot, ty)],
         Type::Struct(id) => structs[id]
@@ -465,6 +466,15 @@ impl Guard<'_> {
         let mut explicit_borrows = Vec::<(BorrowOrigin, bool)>::new();
         for (index, argument) in arguments.iter_mut().enumerate() {
             let consume = consume_all
+                || matches!(
+                    target,
+                    IrCallTarget::IndirectFunctionPointer(signature_id)
+                        if index > 0
+                            && crate::sema::function_pointer_info(signature_id)
+                                .parameters
+                                .get(index - 1)
+                                .is_some_and(|ty| !owned_slots(*ty, 0, self.structs).is_empty())
+                )
                 || matches!(target, IrCallTarget::Vec(op, _) if op.consumes_argument(index))
                 || matches!(target, IrCallTarget::Map(op, _) if op.consumes_argument(index))
                 || matches!(target, IrCallTarget::System(op) if op.consumes_argument(index));

@@ -50,6 +50,10 @@ pub(crate) fn copy_owned(pointer: *const RynString) -> String {
     owned(pointer).clone()
 }
 
+pub(crate) fn compare_owned(left: *const RynString, right: *const RynString) -> std::cmp::Ordering {
+    owned(left).cmp(owned(right))
+}
+
 pub(crate) fn map_hash(pointer: *const RynString) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in owned(pointer).as_bytes() {
@@ -212,8 +216,8 @@ pub extern "C" fn ryn_str_char_at(pointer: *const u8, length: u64, index: u64) -
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ryn_char_from_u32(value: u32) -> u32 {
-    char::from_u32(value)
-        .unwrap_or_else(|| fail("integer is not a valid Unicode scalar value")) as u32
+    char::from_u32(value).unwrap_or_else(|| fail("integer is not a valid Unicode scalar value"))
+        as u32
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn ryn_string_slice(
@@ -249,15 +253,102 @@ pub extern "C" fn ryn_string_slice_chars(
             value.char_indices().nth(index).map(|(offset, _)| offset)
         }
     };
-    let begin = byte_offset(start)
-        .unwrap_or_else(|| fail("String character slice start is out of bounds"));
-    let finish = byte_offset(end)
-        .unwrap_or_else(|| fail("String character slice end is out of bounds"));
+    let begin =
+        byte_offset(start).unwrap_or_else(|| fail("String character slice start is out of bounds"));
+    let finish =
+        byte_offset(end).unwrap_or_else(|| fail("String character slice end is out of bounds"));
     allocate(value[begin..finish].to_owned())
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn ryn_string_trim(pointer: *const RynString) -> *mut RynString {
     allocate(owned(pointer).trim().to_owned())
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_string_is_empty(pointer: *const RynString) -> bool {
+    owned(pointer).is_empty()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_string_trim_start(pointer: *const RynString) -> *mut RynString {
+    allocate(owned(pointer).trim_start().to_owned())
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_string_trim_end(pointer: *const RynString) -> *mut RynString {
+    allocate(owned(pointer).trim_end().to_owned())
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_string_to_lower(pointer: *const RynString) -> *mut RynString {
+    allocate(owned(pointer).to_lowercase())
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_string_to_upper(pointer: *const RynString) -> *mut RynString {
+    allocate(owned(pointer).to_uppercase())
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_string_replace_str(
+    pointer: *const RynString,
+    from: *const u8,
+    from_len: u64,
+    to: *const u8,
+    to_len: u64,
+) -> *mut RynString {
+    allocate(owned(pointer).replace(text(from, from_len), text(to, to_len)))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_string_lines(pointer: *const RynString) -> *mut super::vectors::RynVec {
+    let lines = owned(pointer)
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let result = super::vectors::ryn_vec_new(
+        1,
+        Some(ryn_vec_elem_string_drop),
+        Some(ryn_vec_elem_string_clone),
+    );
+    for line in lines {
+        let item = allocate(line);
+        unsafe { super::vectors::ryn_vec_push(result, (&item as *const *mut RynString).cast()) };
+    }
+    result
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_string_chars(pointer: *const RynString) -> *mut super::vectors::RynVec {
+    let result = super::vectors::ryn_vec_new(1, None, None);
+    for character in owned(pointer).chars() {
+        let word = u64::from(character as u32);
+        unsafe { super::vectors::ryn_vec_push(result, (&word as *const u64).cast()) };
+    }
+    result
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_string_bytes(pointer: *const RynString) -> *mut super::vectors::RynVec {
+    let result = super::vectors::ryn_vec_new(1, None, None);
+    for byte in owned(pointer).bytes() {
+        let word = u64::from(byte);
+        unsafe { super::vectors::ryn_vec_push(result, (&word as *const u64).cast()) };
+    }
+    result
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_string_repeat(pointer: *const RynString, count: u64) -> *mut RynString {
+    let value = owned(pointer);
+    let count = usize::try_from(count)
+        .unwrap_or_else(|_| fail("String repeat count exceeds the host address space"));
+    let capacity = value
+        .len()
+        .checked_mul(count)
+        .unwrap_or_else(|| fail("repeated String is too large"));
+    let mut repeated = String::new();
+    repeated
+        .try_reserve_exact(capacity)
+        .unwrap_or_else(|_| fail("cannot allocate repeated String"));
+    for _ in 0..count {
+        repeated.push_str(value);
+    }
+    allocate(repeated)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_string_reverse(pointer: *const RynString) -> *mut RynString {
+    allocate(owned(pointer).chars().rev().collect())
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn ryn_string_clear(pointer: *mut RynString) {

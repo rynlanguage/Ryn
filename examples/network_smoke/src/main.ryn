@@ -1,0 +1,12 @@
+use std::net
+
+fun main() {
+    mut listener := net::TcpListener::bind("127.0.0.1:45678")
+    mut stream := listener.accept()
+    request := stream.read()
+    assert(request.contains("request"))
+    assert(stream.write("ack"))
+    addresses := net::Dns::resolve("localhost")
+    assert(!addresses.is_empty())
+    echo "accepted"
+}

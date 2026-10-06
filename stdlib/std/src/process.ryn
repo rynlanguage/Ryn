@@ -1,0 +1,82 @@
+#[drop(std::process::release_process)]
+pub struct Process {
+    pub handle: *u8,
+}
+
+pub struct ProcessResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+fun release_process(process: Process) {
+    __process_drop(process.handle)
+}
+
+extend Process {
+    pub fun new(program: str) -> Process {
+        return Process { handle: __process_new(program) }
+    }
+
+    pub fun arg(mut self, value: str) -> bool {
+        return __process_arg(self.handle, value)
+    }
+
+    pub fun args(mut self, values: Vec<String>) -> bool {
+        return __process_args(self.handle, values)
+    }
+
+    pub fun env(mut self, name: str, value: str) -> bool {
+        return __process_env(self.handle, name, value)
+    }
+
+    pub fun cwd(mut self, path: str) -> bool {
+        return __process_cwd(self.handle, path)
+    }
+
+    pub fun spawn(mut self) -> bool {
+        return __process_spawn(self.handle)
+    }
+
+    pub fun wait(mut self) -> i32 {
+        return __process_wait(self.handle)
+    }
+
+    pub fun kill(mut self) -> bool {
+        return __process_kill(self.handle)
+    }
+}
+
+pub fun run(program: str) -> i32 {
+    return run_process(program)
+}
+
+pub fun run_capture(program: str) -> ProcessResult {
+    mut arguments := Vec<String>()
+    return run_capture_args(program, arguments)
+}
+
+pub fun run_capture_args(program: str, arguments: Vec<String>) -> ProcessResult {
+    capture := __process_capture(program, arguments)
+    result := ProcessResult {
+        exit_code: __process_capture_exit_code(capture),
+        stdout: __process_capture_stdout(capture),
+        stderr: __process_capture_stderr(capture),
+    }
+    __process_capture_drop(capture)
+    return result
+}
+
+extend Process {
+    pub fun run(program: str) -> i32 {
+        return std::process::run(program)
+    }
+
+    pub fun run_capture(program: str) -> ProcessResult {
+        return std::process::run_capture(program)
+    }
+
+    pub fun run_capture_args(program: str, arguments: Vec<String>) -> ProcessResult {
+        return std::process::run_capture_args(program, arguments)
+    }
+}

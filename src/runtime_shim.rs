@@ -18,6 +18,9 @@ pub mod maps;
 #[path = "runtime/enum.rs"]
 pub mod enums;
 
+#[path = "runtime/input.rs"]
+pub mod input;
+
 #[repr(C)]
 pub struct RynFfiRecordI32 {
     pub value: i32,
@@ -129,7 +132,9 @@ pub extern "C" fn ryn_ffi_make_mixed_pair(first: u8, second: u16) -> RynFfiMixed
 }
 
 #[cfg(ryn_runtime_debug)]
-pub fn debug_live_vectors() -> usize { vectors::live_vectors() }
+pub fn debug_live_vectors() -> usize {
+    vectors::live_vectors()
+}
 
 #[cfg(ryn_runtime_debug)]
 pub fn debug_live_strings() -> usize {

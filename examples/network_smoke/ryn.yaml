@@ -1,0 +1,10 @@
+name: network-smoke
+version: 0.1.0
+owner: guest
+
+dependencies:
+
+build:
+  optimize: speed
+  debug: none
+  release: speed

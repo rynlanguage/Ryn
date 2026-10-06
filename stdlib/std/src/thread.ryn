@@ -1,0 +1,22 @@
+#[drop(std::thread::release_thread)]
+pub struct Thread {
+    pub handle: *u8,
+}
+
+fun release_thread(thread: Thread) {
+    __thread_drop(thread.handle)
+}
+
+extend Thread {
+    pub fun spawn(worker: extern "C" fun()) -> Thread {
+        return Thread { handle: __thread_spawn(worker) }
+    }
+
+    pub fun join(mut self) -> bool {
+        return __thread_join(self.handle)
+    }
+
+    pub fun id(self) -> u64 {
+        return __thread_id(self.handle)
+    }
+}

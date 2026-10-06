@@ -7,13 +7,14 @@
 use std::collections::HashMap;
 
 use crate::{
-    ast::{BinaryOp, Expression, Function, PrintPart, Program, Statement, TypeName},
+    ast::{BinaryOp, EnumDef, Expression, Function, PrintPart, Program, Statement, TypeName},
     source::{Diagnostic, Span},
 };
 
 const MAX_SPECIALIZATIONS: usize = 256;
 
 pub(crate) fn monomorphize(mut program: Program) -> Result<Program, Diagnostic> {
+    let enum_definitions = program.enums.clone();
     let generic_functions = program
         .functions
         .iter()
@@ -66,6 +67,7 @@ pub(crate) fn monomorphize(mut program: Program) -> Result<Program, Diagnostic> 
             &caller,
             &templates,
             &known_functions,
+            &enum_definitions,
             &mut specializations,
             &mut pending,
         )?;
@@ -76,6 +78,7 @@ pub(crate) fn monomorphize(mut program: Program) -> Result<Program, Diagnostic> 
                 &caller,
                 &templates,
                 &known_functions,
+                &enum_definitions,
                 &mut specializations,
                 &mut pending,
             )?;
@@ -95,6 +98,7 @@ pub(crate) fn monomorphize(mut program: Program) -> Result<Program, Diagnostic> 
             &caller,
             &templates,
             &known_functions,
+            &enum_definitions,
             &mut specializations,
             &mut pending,
         )?;
@@ -105,6 +109,7 @@ pub(crate) fn monomorphize(mut program: Program) -> Result<Program, Diagnostic> 
                 &caller,
                 &templates,
                 &known_functions,
+                &enum_definitions,
                 &mut specializations,
                 &mut pending,
             )?;
@@ -128,6 +133,9 @@ pub(crate) fn monomorphize(mut program: Program) -> Result<Program, Diagnostic> 
     }
     let _ = next_id;
     program.functions = concrete_functions;
+    program
+        .enums
+        .retain(|definition| !enum_has_type_parameters(definition));
     Ok(program)
 }
 
@@ -177,6 +185,7 @@ fn specialize_call(
     caller: &Function,
     templates: &HashMap<String, Function>,
     functions: &HashMap<String, Function>,
+    enum_definitions: &[EnumDef],
     specializations: &mut HashMap<String, String>,
     pending: &mut Vec<Function>,
 ) -> Result<(), Diagnostic> {
@@ -211,7 +220,14 @@ fn specialize_call(
         substitutions.insert(parameter.clone(), ty.clone());
     }
     for (parameter, argument) in template.parameters.iter().zip(arguments) {
-        let Some(actual) = infer_type(argument, environment, functions, templates, caller) else {
+        let Some(actual) = infer_type(
+            argument,
+            environment,
+            functions,
+            templates,
+            enum_definitions,
+            caller,
+        ) else {
             return Err(Diagnostic {
                 code: "R0262",
                 message: format!(
@@ -222,7 +238,63 @@ fn specialize_call(
                 help: Some("pass an expression with a known concrete type".into()),
             });
         };
-        unify(&parameter.ty, &actual, &mut substitutions, span)?;
+        let mut argument_substitutions = HashMap::new();
+        unify(
+            &parameter.ty,
+            &actual,
+            &mut argument_substitutions,
+            enum_definitions,
+            span,
+        )?;
+        merge_substitutions(&mut substitutions, argument_substitutions, span)?;
+    }
+    // Generic Option/Result return signatures get their own parser-created
+    // enum placeholders. Match those layouts to the concrete specialization
+    // selected by the inferred payload types before substituting the function.
+    for definition in enum_definitions {
+        if !enum_has_type_parameters(definition)
+            || !(definition.name.starts_with("$RynOption#")
+                || definition.name.starts_with("$RynResult#"))
+        {
+            continue;
+        }
+        let mut specialized = definition.clone();
+        for variant in &mut specialized.variants {
+            for field in &mut variant.fields {
+                substitute_type(field, &substitutions);
+            }
+        }
+        if enum_has_type_parameters(&specialized) {
+            continue;
+        }
+        let family = if definition.name.starts_with("$RynOption#") {
+            "$RynOption#"
+        } else {
+            "$RynResult#"
+        };
+        if let Some(concrete) = enum_definitions.iter().find(|candidate| {
+            candidate.name != definition.name
+                && candidate.name.starts_with(family)
+                && candidate.variants.len() == specialized.variants.len()
+                && candidate
+                    .variants
+                    .iter()
+                    .zip(&specialized.variants)
+                    .all(|(left, right)| {
+                        left.name == right.name
+                            && left.fields.len() == right.fields.len()
+                            && left
+                                .fields
+                                .iter()
+                                .zip(&right.fields)
+                                .all(|(left, right)| type_key(left) == type_key(right))
+                    })
+        }) {
+            substitutions.insert(
+                definition.name.clone(),
+                TypeName::Named(concrete.name.clone(), definition.span),
+            );
+        }
     }
     for parameter in &template.type_parameters {
         if !substitutions.contains_key(parameter) {
@@ -303,6 +375,7 @@ fn unify(
     pattern: &TypeName,
     actual: &TypeName,
     substitutions: &mut HashMap<String, TypeName>,
+    enum_definitions: &[EnumDef],
     span: Span,
 ) -> Result<(), Diagnostic> {
     match (pattern, actual) {
@@ -326,35 +399,132 @@ fn unify(
         }
         (TypeName::Vec(left, _), TypeName::Vec(right, _))
         | (TypeName::Slice(left, _), TypeName::Slice(right, _)) => {
-            unify(left, right, substitutions, span)?;
+            unify(left, right, substitutions, enum_definitions, span)?;
         }
         (TypeName::Slice(left, _), TypeName::Array(right, _, _)) => {
-            unify(left, right, substitutions, span)?;
+            unify(left, right, substitutions, enum_definitions, span)?;
         }
         (TypeName::Array(left, left_len, _), TypeName::Array(right, right_len, _))
             if left_len == right_len =>
         {
-            unify(left, right, substitutions, span)?;
+            unify(left, right, substitutions, enum_definitions, span)?;
         }
         (TypeName::Map(left_key, left_value, _), TypeName::Map(right_key, right_value, _)) => {
-            unify(left_key, right_key, substitutions, span)?;
-            unify(left_value, right_value, substitutions, span)?;
+            unify(left_key, right_key, substitutions, enum_definitions, span)?;
+            unify(
+                left_value,
+                right_value,
+                substitutions,
+                enum_definitions,
+                span,
+            )?;
+        }
+        (
+            TypeName::FunctionPointer(left_parameters, left_result, left_c_abi, _),
+            TypeName::FunctionPointer(right_parameters, right_result, right_c_abi, _),
+        ) if left_parameters.len() == right_parameters.len() && left_c_abi == right_c_abi => {
+            for (left, right) in left_parameters.iter().zip(right_parameters) {
+                unify(left, right, substitutions, enum_definitions, span)?;
+            }
+            match (left_result, right_result) {
+                (Some(left), Some(right)) => {
+                    unify(left, right, substitutions, enum_definitions, span)?;
+                }
+                (None, None) => {}
+                _ => return Err(generic_type_mismatch(pattern, actual, span)),
+            }
+        }
+        (
+            TypeName::Named(pattern_name, pattern_span),
+            TypeName::Named(actual_name, actual_span),
+        ) if pattern_name != actual_name => {
+            let pattern_enum = enum_definitions
+                .iter()
+                .find(|definition| definition.name == *pattern_name);
+            let actual_enum = enum_definitions
+                .iter()
+                .find(|definition| definition.name == *actual_name);
+            let same_family = |left: &str, right: &str| {
+                ["$RynOption#", "$RynResult#"]
+                    .iter()
+                    .any(|prefix| left.starts_with(prefix) && right.starts_with(prefix))
+            };
+            if let (Some(pattern_enum), Some(actual_enum)) = (pattern_enum, actual_enum)
+                && same_family(&pattern_enum.name, &actual_enum.name)
+                && pattern_enum.variants.len() == actual_enum.variants.len()
+            {
+                for (pattern_variant, actual_variant) in
+                    pattern_enum.variants.iter().zip(&actual_enum.variants)
+                {
+                    if pattern_variant.name != actual_variant.name
+                        || pattern_variant.fields.len() != actual_variant.fields.len()
+                    {
+                        return Err(generic_type_mismatch(pattern, actual, span));
+                    }
+                    for (pattern_field, actual_field) in
+                        pattern_variant.fields.iter().zip(&actual_variant.fields)
+                    {
+                        unify(
+                            pattern_field,
+                            actual_field,
+                            substitutions,
+                            enum_definitions,
+                            span,
+                        )?;
+                    }
+                }
+                substitutions.insert(
+                    pattern_name.clone(),
+                    TypeName::Named(actual_name.clone(), *actual_span),
+                );
+            } else {
+                return Err(generic_type_mismatch(pattern, actual, *pattern_span));
+            }
         }
         _ if type_key(pattern) == type_key(actual) => {}
         _ => {
-            return Err(Diagnostic {
-                code: "R0263",
-                message: format!(
-                    "generic argument has type `{}` but the parameter pattern is `{}`",
-                    type_key(actual),
-                    type_key(pattern)
-                ),
-                span,
-                help: Some("pass a value whose type matches the generic function parameter".into()),
-            });
+            return Err(generic_type_mismatch(pattern, actual, span));
         }
     }
     Ok(())
+}
+
+fn merge_substitutions(
+    substitutions: &mut HashMap<String, TypeName>,
+    new_substitutions: HashMap<String, TypeName>,
+    span: Span,
+) -> Result<(), Diagnostic> {
+    for (parameter, actual) in new_substitutions {
+        if let Some(previous) = substitutions.get(&parameter) {
+            if type_key(previous) != type_key(&actual) {
+                return Err(Diagnostic {
+                    code: "R0263",
+                    message: format!("generic parameter `{parameter}` has conflicting types"),
+                    span,
+                    help: Some(format!(
+                        "this call uses both `{}` and `{}` for `{parameter}`",
+                        type_key(previous),
+                        type_key(&actual)
+                    )),
+                });
+            }
+        } else {
+            substitutions.insert(parameter, actual);
+        }
+    }
+    Ok(())
+}
+fn generic_type_mismatch(pattern: &TypeName, actual: &TypeName, span: Span) -> Diagnostic {
+    Diagnostic {
+        code: "R0263",
+        message: format!(
+            "generic argument has type `{}` but the parameter pattern is `{}`",
+            type_key(actual),
+            type_key(pattern)
+        ),
+        span,
+        help: Some("pass a value whose type matches the generic function parameter".into()),
+    }
 }
 
 fn type_key(ty: &TypeName) -> String {
@@ -376,6 +546,7 @@ fn type_key(ty: &TypeName) -> String {
         TypeName::Named(name, _) => name.clone(),
         TypeName::Parameter(name, _) => format!("${name}"),
         TypeName::Vec(element, _) => format!("Vec<{}>", type_key(element)),
+        TypeName::Set(element, _) => format!("Set<{}>", type_key(element)),
         TypeName::Map(key, value, _) => format!("Map<{},{}>", type_key(key), type_key(value)),
         TypeName::Array(element, length, _) => format!("[{};{length}]", type_key(element)),
         TypeName::Slice(element, _) => format!("&[{}]", type_key(element)),
@@ -402,12 +573,18 @@ fn type_key(ty: &TypeName) -> String {
 
 fn substitute_type(ty: &mut TypeName, substitutions: &HashMap<String, TypeName>) {
     match ty {
+        TypeName::Named(name, _) => {
+            if let Some(replacement) = substitutions.get(name) {
+                *ty = replacement.clone();
+            }
+        }
         TypeName::Parameter(name, _) => {
             if let Some(replacement) = substitutions.get(name) {
                 *ty = replacement.clone();
             }
         }
         TypeName::Vec(element, _)
+        | TypeName::Set(element, _)
         | TypeName::Slice(element, _)
         | TypeName::Reference(element, _, _)
         | TypeName::RawPointer(element, _) => substitute_type(element, substitutions),
@@ -458,7 +635,14 @@ fn substitute_statements(statements: &mut [Statement], substitutions: &HashMap<S
                     }
                 }
             }
-            Statement::Call { arguments, .. } => {
+            Statement::Call {
+                type_arguments,
+                arguments,
+                ..
+            } => {
+                for argument in type_arguments {
+                    substitute_type(argument, substitutions);
+                }
                 for argument in arguments {
                     substitute_expression(argument, substitutions);
                 }
@@ -512,15 +696,28 @@ fn substitute_statements(statements: &mut [Statement], substitutions: &HashMap<S
 
 fn substitute_expression(expression: &mut Expression, substitutions: &HashMap<String, TypeName>) {
     match expression {
-        Expression::Call { arguments, .. } => {
+        Expression::Call {
+            type_arguments,
+            arguments,
+            ..
+        } => {
+            for argument in type_arguments {
+                substitute_type(argument, substitutions);
+            }
             for argument in arguments {
                 substitute_expression(argument, substitutions);
             }
         }
         Expression::MethodCall {
-            value, arguments, ..
+            value,
+            type_arguments,
+            arguments,
+            ..
         } => {
             substitute_expression(value, substitutions);
+            for argument in type_arguments {
+                substitute_type(argument, substitutions);
+            }
             for argument in arguments {
                 substitute_expression(argument, substitutions);
             }
@@ -561,6 +758,7 @@ fn substitute_expression(expression: &mut Expression, substitutions: &HashMap<St
             substitute_type(key, substitutions);
             substitute_type(value, substitutions);
         }
+        Expression::SetConstructor { element, .. } => substitute_type(element, substitutions),
         Expression::ArrayLiteral(values, _) => {
             for value in values {
                 substitute_expression(value, substitutions);
@@ -575,7 +773,14 @@ fn substitute_expression(expression: &mut Expression, substitutions: &HashMap<St
             substitute_expression(value, substitutions);
             substitute_expression(index, substitutions);
         }
-        Expression::EnumConstruct { arguments, .. } => {
+        Expression::EnumConstruct {
+            enum_name,
+            arguments,
+            ..
+        } => {
+            if let Some(TypeName::Named(replacement, _)) = substitutions.get(enum_name) {
+                *enum_name = replacement.clone();
+            }
             for argument in arguments {
                 substitute_expression(argument, substitutions);
             }
@@ -595,12 +800,16 @@ fn substitute_expression(expression: &mut Expression, substitutions: &HashMap<St
     }
 }
 
+// These references are the shared state of one AST rewrite pass; grouping them
+// would add an otherwise opaque context object to every recursive call.
+#[allow(clippy::too_many_arguments)]
 fn rewrite_statements(
     statements: &mut [Statement],
     environment: &mut HashMap<String, TypeName>,
     caller: &Function,
     templates: &HashMap<String, Function>,
     functions: &HashMap<String, Function>,
+    enum_definitions: &[EnumDef],
     specializations: &mut HashMap<String, String>,
     pending: &mut Vec<Function>,
 ) -> Result<(), Diagnostic> {
@@ -618,14 +827,20 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
                 if let Some(ty) = annotation {
                     environment.insert(name.clone(), ty.clone());
-                } else if let Some(ty) =
-                    infer_type(value, environment, functions, templates, caller)
-                {
+                } else if let Some(ty) = infer_type(
+                    value,
+                    environment,
+                    functions,
+                    templates,
+                    enum_definitions,
+                    caller,
+                ) {
                     environment.insert(name.clone(), ty);
                 }
             }
@@ -638,6 +853,7 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -649,6 +865,7 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -658,6 +875,7 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -669,6 +887,7 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -678,6 +897,7 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -689,6 +909,7 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -702,6 +923,7 @@ fn rewrite_statements(
                             caller,
                             templates,
                             functions,
+                            enum_definitions,
                             specializations,
                             pending,
                         )?;
@@ -724,6 +946,7 @@ fn rewrite_statements(
                         caller,
                         templates,
                         functions,
+                        enum_definitions,
                         specializations,
                         pending,
                     )?;
@@ -737,6 +960,7 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -751,6 +975,7 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -761,6 +986,7 @@ fn rewrite_statements(
                         caller,
                         templates,
                         functions,
+                        enum_definitions,
                         specializations,
                         pending,
                     )?;
@@ -778,6 +1004,7 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -789,6 +1016,7 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -798,6 +1026,7 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -811,6 +1040,7 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -821,6 +1051,7 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -838,6 +1069,7 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -847,11 +1079,19 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
                 let mut loop_environment = environment.clone();
-                if let Some(ty) = infer_type(start, environment, functions, templates, caller) {
+                if let Some(ty) = infer_type(
+                    start,
+                    environment,
+                    functions,
+                    templates,
+                    enum_definitions,
+                    caller,
+                ) {
                     loop_environment.insert(name.clone(), ty);
                 }
                 rewrite_statements(
@@ -860,6 +1100,7 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -876,12 +1117,20 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
                 let mut loop_environment = environment.clone();
-                if let Some(ty) = infer_type(collection, environment, functions, templates, caller)
-                    .and_then(collection_element)
+                if let Some(ty) = infer_type(
+                    collection,
+                    environment,
+                    functions,
+                    templates,
+                    enum_definitions,
+                    caller,
+                )
+                .and_then(collection_element)
                 {
                     loop_environment.insert(name.clone(), ty);
                 }
@@ -891,6 +1140,7 @@ fn rewrite_statements(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -903,6 +1153,7 @@ fn rewrite_statements(
                         caller,
                         templates,
                         functions,
+                        enum_definitions,
                         specializations,
                         pending,
                     )?;
@@ -914,12 +1165,14 @@ fn rewrite_statements(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rewrite_expression(
     expression: &mut Expression,
     environment: &HashMap<String, TypeName>,
     caller: &Function,
     templates: &HashMap<String, Function>,
     functions: &HashMap<String, Function>,
+    enum_definitions: &[EnumDef],
     specializations: &mut HashMap<String, String>,
     pending: &mut Vec<Function>,
 ) -> Result<(), Diagnostic> {
@@ -940,6 +1193,7 @@ fn rewrite_expression(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -953,20 +1207,81 @@ fn rewrite_expression(
                 caller,
                 templates,
                 functions,
+                enum_definitions,
                 specializations,
                 pending,
             )?;
             type_arguments.clear();
         }
         Expression::MethodCall {
-            value, arguments, ..
+            value,
+            name,
+            type_arguments,
+            arguments,
+            span,
         } => {
+            let receiver_type = infer_type(
+                value,
+                environment,
+                functions,
+                templates,
+                enum_definitions,
+                caller,
+            );
+            let helper_module = receiver_type.as_ref().and_then(|ty| {
+                let TypeName::Named(enum_name, _) = ty else {
+                    return None;
+                };
+                let family = if enum_name.starts_with("$RynOption#") {
+                    "Option"
+                } else if enum_name.starts_with("$RynResult#") {
+                    "Result"
+                } else {
+                    return None;
+                };
+                match (family, name.as_str()) {
+                    ("Option", "map") => Some(("option", "map")),
+                    ("Result", "map") => Some(("result", "map")),
+                    ("Result", "map_err") => Some(("result", "map_err")),
+                    _ => None,
+                }
+            });
+            if let Some((module, function)) = helper_module {
+                let helper_name = format!("{module}::{function}");
+                if resolve_template(&helper_name, caller, templates).is_some()
+                    && arguments.len() == 1
+                {
+                    let receiver =
+                        std::mem::replace(value, Box::new(Expression::Boolean(false, *span)));
+                    let mapper = arguments.remove(0);
+                    *expression = Expression::Call {
+                        name: helper_name,
+                        type_arguments: Vec::new(),
+                        arguments: vec![*receiver, mapper],
+                        span: *span,
+                    };
+                    return rewrite_expression(
+                        expression,
+                        environment,
+                        caller,
+                        templates,
+                        functions,
+                        enum_definitions,
+                        specializations,
+                        pending,
+                    );
+                }
+            }
+            for argument in type_arguments.iter_mut() {
+                substitute_type(argument, environment);
+            }
             rewrite_expression(
                 value,
                 environment,
                 caller,
                 templates,
                 functions,
+                enum_definitions,
                 specializations,
                 pending,
             )?;
@@ -977,6 +1292,7 @@ fn rewrite_expression(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -990,6 +1306,7 @@ fn rewrite_expression(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -1006,6 +1323,7 @@ fn rewrite_expression(
             caller,
             templates,
             functions,
+            enum_definitions,
             specializations,
             pending,
         )?,
@@ -1015,6 +1333,7 @@ fn rewrite_expression(
             caller,
             templates,
             functions,
+            enum_definitions,
             specializations,
             pending,
         )?,
@@ -1030,6 +1349,7 @@ fn rewrite_expression(
                 caller,
                 templates,
                 functions,
+                enum_definitions,
                 specializations,
                 pending,
             )?;
@@ -1039,6 +1359,7 @@ fn rewrite_expression(
                 caller,
                 templates,
                 functions,
+                enum_definitions,
                 specializations,
                 pending,
             )?;
@@ -1048,6 +1369,7 @@ fn rewrite_expression(
                 caller,
                 templates,
                 functions,
+                enum_definitions,
                 specializations,
                 pending,
             )?;
@@ -1059,6 +1381,7 @@ fn rewrite_expression(
                 caller,
                 templates,
                 functions,
+                enum_definitions,
                 specializations,
                 pending,
             )?;
@@ -1068,6 +1391,7 @@ fn rewrite_expression(
                 caller,
                 templates,
                 functions,
+                enum_definitions,
                 specializations,
                 pending,
             )?;
@@ -1078,6 +1402,7 @@ fn rewrite_expression(
             caller,
             templates,
             functions,
+            enum_definitions,
             specializations,
             pending,
         )?,
@@ -1090,6 +1415,7 @@ fn rewrite_expression(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -1103,6 +1429,7 @@ fn rewrite_expression(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -1115,6 +1442,7 @@ fn rewrite_expression(
                 caller,
                 templates,
                 functions,
+                enum_definitions,
                 specializations,
                 pending,
             )?;
@@ -1124,6 +1452,7 @@ fn rewrite_expression(
                 caller,
                 templates,
                 functions,
+                enum_definitions,
                 specializations,
                 pending,
             )?;
@@ -1136,28 +1465,55 @@ fn rewrite_expression(
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
             }
         }
         Expression::Choose { value, arms, .. } => {
+            let value_type = infer_type(
+                value,
+                environment,
+                functions,
+                templates,
+                enum_definitions,
+                caller,
+            );
             rewrite_expression(
                 value,
                 environment,
                 caller,
                 templates,
                 functions,
+                enum_definitions,
                 specializations,
                 pending,
             )?;
             for arm in arms {
+                let mut arm_environment = environment.clone();
+                if let Some(TypeName::Named(enum_name, _)) = &value_type
+                    && let Some(definition) = enum_definitions
+                        .iter()
+                        .find(|definition| definition.name == *enum_name)
+                    && let Some(variant) = arm.variant.as_ref().and_then(|variant_name| {
+                        definition
+                            .variants
+                            .iter()
+                            .find(|variant| variant.name == *variant_name)
+                    })
+                {
+                    for (binding, field_type) in arm.bindings.iter().zip(&variant.fields) {
+                        arm_environment.insert(binding.clone(), field_type.clone());
+                    }
+                }
                 rewrite_expression(
                     &mut arm.body,
-                    environment,
+                    &arm_environment,
                     caller,
                     templates,
                     functions,
+                    enum_definitions,
                     specializations,
                     pending,
                 )?;
@@ -1170,7 +1526,8 @@ fn rewrite_expression(
         | Expression::Boolean(..)
         | Expression::Name(..)
         | Expression::VecConstructor { .. }
-        | Expression::MapConstructor { .. } => {}
+        | Expression::MapConstructor { .. }
+        | Expression::SetConstructor { .. } => {}
     }
     Ok(())
 }
@@ -1180,6 +1537,7 @@ fn infer_type(
     environment: &HashMap<String, TypeName>,
     functions: &HashMap<String, Function>,
     templates: &HashMap<String, Function>,
+    enum_definitions: &[EnumDef],
     caller: &Function,
 ) -> Option<TypeName> {
     match expression {
@@ -1199,6 +1557,9 @@ fn infer_type(
             Box::new(value.clone()),
             expression.span(),
         )),
+        Expression::SetConstructor { element, .. } => {
+            Some(TypeName::Set(Box::new(element.clone()), expression.span()))
+        }
         Expression::StructLiteral { name, .. } => {
             Some(TypeName::Named(name.clone(), expression.span()))
         }
@@ -1207,6 +1568,9 @@ fn infer_type(
         } => {
             if name == "String" {
                 return Some(TypeName::OwnedString);
+            }
+            if let Some(TypeName::FunctionPointer(_, result, _, _)) = environment.get(name) {
+                return result.as_deref().cloned();
             }
             let function = functions
                 .get(name)
@@ -1217,21 +1581,39 @@ fn infer_type(
             }
             let mut substitutions = HashMap::new();
             for (parameter, argument) in function.parameters.iter().zip(arguments) {
-                let actual = infer_type(argument, environment, functions, templates, caller)?;
+                let actual = infer_type(
+                    argument,
+                    environment,
+                    functions,
+                    templates,
+                    enum_definitions,
+                    caller,
+                )?;
+                let mut call_substitutions = HashMap::new();
                 unify(
                     &parameter.ty,
                     &actual,
-                    &mut substitutions,
+                    &mut call_substitutions,
+                    enum_definitions,
                     expression.span(),
                 )
                 .ok()?;
+                merge_substitutions(&mut substitutions, call_substitutions, expression.span())
+                    .ok()?;
             }
             let mut result = return_type;
             substitute_type(&mut result, &substitutions);
             Some(result)
         }
         Expression::MethodCall { value, name, .. } => {
-            let value_type = infer_type(value, environment, functions, templates, caller)?;
+            let value_type = infer_type(
+                value,
+                environment,
+                functions,
+                templates,
+                enum_definitions,
+                caller,
+            )?;
             match (value_type, name.as_str()) {
                 (TypeName::Vec(element, span), "as_slice" | "slice") => {
                     Some(TypeName::Slice(element, span))
@@ -1248,14 +1630,28 @@ fn infer_type(
             }
         }
         Expression::ArrayLiteral(values, span) => {
-            let element = values
-                .first()
-                .and_then(|value| infer_type(value, environment, functions, templates, caller))?;
+            let element = values.first().and_then(|value| {
+                infer_type(
+                    value,
+                    environment,
+                    functions,
+                    templates,
+                    enum_definitions,
+                    caller,
+                )
+            })?;
             Some(TypeName::Array(Box::new(element), values.len(), *span))
         }
         Expression::Tuple(_, _) => None,
         Expression::Index { value, .. } => {
-            match infer_type(value, environment, functions, templates, caller)? {
+            match infer_type(
+                value,
+                environment,
+                functions,
+                templates,
+                enum_definitions,
+                caller,
+            )? {
                 TypeName::Array(element, _, _)
                 | TypeName::Slice(element, _)
                 | TypeName::Vec(element, _) => Some(*element),
@@ -1280,31 +1676,63 @@ fn infer_type(
             ) {
                 Some(TypeName::Bool)
             } else {
-                infer_type(left, environment, functions, templates, caller)
+                infer_type(
+                    left,
+                    environment,
+                    functions,
+                    templates,
+                    enum_definitions,
+                    caller,
+                )
             }
         }
-        Expression::If { then_value, .. } => {
-            infer_type(then_value, environment, functions, templates, caller)
-        }
-        Expression::Choose { arms, .. } => arms
-            .first()
-            .and_then(|arm| infer_type(&arm.body, environment, functions, templates, caller)),
-        Expression::Negate(inner, _) | Expression::BitNot(inner, _) => {
-            infer_type(inner, environment, functions, templates, caller)
-        }
+        Expression::If { then_value, .. } => infer_type(
+            then_value,
+            environment,
+            functions,
+            templates,
+            enum_definitions,
+            caller,
+        ),
+        Expression::Choose { arms, .. } => arms.first().and_then(|arm| {
+            infer_type(
+                &arm.body,
+                environment,
+                functions,
+                templates,
+                enum_definitions,
+                caller,
+            )
+        }),
+        Expression::Negate(inner, _) | Expression::BitNot(inner, _) => infer_type(
+            inner,
+            environment,
+            functions,
+            templates,
+            enum_definitions,
+            caller,
+        ),
         Expression::AddressOf { mutable, value, .. } => Some(TypeName::Reference(
             Box::new(infer_type(
                 value,
                 environment,
                 functions,
                 templates,
+                enum_definitions,
                 caller,
             )?),
             *mutable,
             expression.span(),
         )),
         Expression::Dereference(value, _) => {
-            match infer_type(value, environment, functions, templates, caller)? {
+            match infer_type(
+                value,
+                environment,
+                functions,
+                templates,
+                enum_definitions,
+                caller,
+            )? {
                 TypeName::Reference(element, _, _) | TypeName::RawPointer(element, _) => {
                     Some(*element)
                 }
@@ -1324,5 +1752,26 @@ fn collection_element(ty: TypeName) -> Option<TypeName> {
         | TypeName::Array(element, _, _) => Some(*element),
         TypeName::Str | TypeName::OwnedString => Some(TypeName::Char),
         _ => None,
+    }
+}
+
+fn enum_has_type_parameters(definition: &EnumDef) -> bool {
+    definition
+        .variants
+        .iter()
+        .flat_map(|variant| &variant.fields)
+        .any(type_has_parameter)
+}
+
+fn type_has_parameter(ty: &TypeName) -> bool {
+    match ty {
+        TypeName::Parameter(..) => true,
+        TypeName::Array(element, _, _)
+        | TypeName::Slice(element, _)
+        | TypeName::Vec(element, _)
+        | TypeName::Reference(element, _, _)
+        | TypeName::RawPointer(element, _) => type_has_parameter(element),
+        TypeName::Map(key, value, _) => type_has_parameter(key) || type_has_parameter(value),
+        _ => false,
     }
 }

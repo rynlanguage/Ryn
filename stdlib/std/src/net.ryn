@@ -1,0 +1,90 @@
+#[drop(std::net::release_tcp_stream)]
+pub struct TcpStream {
+    pub handle: *u8,
+}
+
+fun release_tcp_stream(stream: TcpStream) {
+    __tcp_drop(stream.handle)
+}
+
+#[drop(std::net::release_tcp_listener)]
+pub struct TcpListener {
+    pub handle: *u8,
+}
+
+#[drop(std::net::release_udp_socket)]
+pub struct UdpSocket {
+    pub handle: *u8,
+}
+
+fun release_tcp_listener(listener: TcpListener) {
+    __tcp_listener_drop(listener.handle)
+}
+
+fun release_udp_socket(socket: UdpSocket) {
+    __udp_drop(socket.handle)
+}
+
+extend TcpStream {
+    pub fun connect(address: str) -> TcpStream {
+        return TcpStream { handle: __tcp_connect(address) }
+    }
+
+    pub fun read(mut self) -> String {
+        return __tcp_read(self.handle)
+    }
+
+    pub fun write(mut self, data: str) -> bool {
+        return __tcp_write(self.handle, data)
+    }
+
+    pub fun close(mut self) -> bool {
+        return __tcp_close(self.handle)
+    }
+}
+
+extend TcpListener {
+    pub fun bind(address: str) -> TcpListener {
+        return TcpListener { handle: __tcp_listener_bind(address) }
+    }
+
+    pub fun accept(mut self) -> TcpStream {
+        return TcpStream { handle: __tcp_accept(self.handle) }
+    }
+
+    pub fun close(mut self) -> bool {
+        return __tcp_listener_close(self.handle)
+    }
+}
+
+extend UdpSocket {
+    pub fun bind(address: str) -> UdpSocket {
+        return UdpSocket { handle: __udp_bind(address) }
+    }
+
+    pub fun connect(mut self, address: str) -> bool {
+        return __udp_connect(self.handle, address)
+    }
+
+    pub fun read(mut self) -> String {
+        return __udp_read(self.handle)
+    }
+
+    pub fun write(mut self, data: str) -> bool {
+        return __udp_write(self.handle, data)
+    }
+
+    pub fun close(mut self) -> bool {
+        return __udp_close(self.handle)
+    }
+}
+
+pub struct Dns {
+    marker: bool,
+}
+
+extend Dns {
+    pub fun resolve(host: str) -> Vec<String> {
+        return __dns_resolve(host)
+    }
+}

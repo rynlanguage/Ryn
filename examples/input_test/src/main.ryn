@@ -1,0 +1,10 @@
+fun main() {
+    echo "=== Ryn Input Test ==="
+
+    name := ask("Name: ")
+    language := ask("Favorite language: ")
+
+    echo ""
+    echo "Hello {name}!"
+    echo "Favorite language: {language}"
+}

@@ -7,6 +7,7 @@ pub enum FilesystemOp {
     ReadFile,
     WriteFile,
     CreateDir,
+    CreateDirAll,
     DeleteFile,
     DeleteDir,
     Exists,
@@ -19,13 +20,27 @@ pub enum FilesystemOp {
     PathFileName,
     PathExtension,
     PathIsAbsolute,
+    CopyFile,
+    Rename,
+    PathAbsolute,
+    PathCanonical,
+    FileOpen,
+    FileCreate,
+    FileRead,
+    FileReadLine,
+    FileWrite,
+    FileFlush,
+    FileClose,
+    FileDrop,
+    AppendFile,
 }
 
 impl FilesystemOp {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 29] = [
         Self::ReadFile,
         Self::WriteFile,
         Self::CreateDir,
+        Self::CreateDirAll,
         Self::DeleteFile,
         Self::DeleteDir,
         Self::Exists,
@@ -38,6 +53,19 @@ impl FilesystemOp {
         Self::PathFileName,
         Self::PathExtension,
         Self::PathIsAbsolute,
+        Self::CopyFile,
+        Self::Rename,
+        Self::PathAbsolute,
+        Self::PathCanonical,
+        Self::FileOpen,
+        Self::FileCreate,
+        Self::FileRead,
+        Self::FileReadLine,
+        Self::FileWrite,
+        Self::FileFlush,
+        Self::FileClose,
+        Self::FileDrop,
+        Self::AppendFile,
     ];
 
     pub fn symbol(self) -> &'static str {
@@ -45,6 +73,7 @@ impl FilesystemOp {
             Self::ReadFile => "ryn_fs_read_file",
             Self::WriteFile => "ryn_fs_write_file",
             Self::CreateDir => "ryn_fs_create_dir",
+            Self::CreateDirAll => "ryn_fs_create_dir_all",
             Self::DeleteFile => "ryn_fs_delete_file",
             Self::DeleteDir => "ryn_fs_delete_dir",
             Self::Exists => "ryn_fs_exists",
@@ -57,6 +86,19 @@ impl FilesystemOp {
             Self::PathFileName => "ryn_fs_path_file_name",
             Self::PathExtension => "ryn_fs_path_extension",
             Self::PathIsAbsolute => "ryn_fs_path_is_absolute",
+            Self::CopyFile => "ryn_fs_copy_file",
+            Self::Rename => "ryn_fs_rename",
+            Self::PathAbsolute => "ryn_fs_path_absolute",
+            Self::PathCanonical => "ryn_fs_path_canonical",
+            Self::FileOpen => "ryn_file_open",
+            Self::FileCreate => "ryn_file_create",
+            Self::FileRead => "ryn_file_read",
+            Self::FileReadLine => "ryn_file_read_line",
+            Self::FileWrite => "ryn_file_write",
+            Self::FileFlush => "ryn_file_flush",
+            Self::FileClose => "ryn_file_close",
+            Self::FileDrop => "ryn_file_drop",
+            Self::AppendFile => "ryn_fs_append_file",
         }
     }
 
@@ -64,6 +106,7 @@ impl FilesystemOp {
         match self {
             Self::ReadFile
             | Self::CreateDir
+            | Self::CreateDirAll
             | Self::DeleteFile
             | Self::DeleteDir
             | Self::Exists => vec![Type::Str],
@@ -74,10 +117,28 @@ impl FilesystemOp {
             | Self::PathParent
             | Self::PathFileName
             | Self::PathExtension
-            | Self::PathIsAbsolute => {
+            | Self::PathIsAbsolute
+            | Self::PathAbsolute
+            | Self::PathCanonical => {
                 vec![Type::Str]
             }
-            Self::WriteFile | Self::PathJoin => vec![Type::Str, Type::Str],
+            Self::WriteFile | Self::PathJoin | Self::CopyFile | Self::Rename | Self::AppendFile => {
+                vec![Type::Str, Type::Str]
+            }
+            Self::FileOpen | Self::FileCreate => vec![Type::Str],
+            Self::FileRead
+            | Self::FileReadLine
+            | Self::FileFlush
+            | Self::FileClose
+            | Self::FileDrop => {
+                vec![Type::RawPointer(crate::sema::intern_pointer_target(
+                    Type::U8,
+                ))]
+            }
+            Self::FileWrite => vec![
+                Type::RawPointer(crate::sema::intern_pointer_target(Type::U8)),
+                Type::Str,
+            ],
         }
     }
 
@@ -88,8 +149,14 @@ impl FilesystemOp {
             | Self::PathParent
             | Self::PathFileName
             | Self::PathExtension => Type::OwnedString,
+            Self::PathAbsolute | Self::PathCanonical => Type::OwnedString,
+            Self::FileRead | Self::FileReadLine => Type::OwnedString,
+            Self::FileOpen | Self::FileCreate => {
+                Type::RawPointer(crate::sema::intern_pointer_target(Type::U8))
+            }
             Self::ReadDir => Type::Vec(crate::sema::intern_vec_elem(Type::OwnedString)),
             Self::PathIsAbsolute => Type::Bool,
+            Self::FileDrop => Type::Bool,
             _ => Type::Bool,
         }
     }

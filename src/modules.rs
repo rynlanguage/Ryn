@@ -49,6 +49,12 @@ pub(crate) fn check_project(project: &Path) -> Result<(RynIr, Vec<PathBuf>), Str
         &mut dependency_roots,
         &mut visited_packages,
     )?;
+    // The standard modules are embedded in the compiler so projects can import
+    // `std::...` without a manifest dependency or an installed source tree.
+    dependency_roots.insert(
+        "std".into(),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("stdlib/std/src"),
+    );
     let entry = source_root.join("main.ryn");
     if !entry.is_file() {
         return Err(format!(
@@ -314,12 +320,16 @@ fn load_module(
     discovered: &mut HashMap<PathBuf, String>,
     units: &mut Vec<SourceUnit>,
 ) -> Result<(), String> {
-    let canonical = fs::canonicalize(path).map_err(|error| {
-        format!(
-            "error[R0420]: cannot resolve module file {}: {error}",
-            path.display()
-        )
-    })?;
+    let canonical = if module_path.starts_with("std::") {
+        path.to_path_buf()
+    } else {
+        fs::canonicalize(path).map_err(|error| {
+            format!(
+                "error[R0420]: cannot resolve module file {}: {error}",
+                path.display()
+            )
+        })?
+    };
     if !canonical.starts_with(source_root) {
         return Err(format!(
             "error[R0420]: module source escapes {}: {}",
@@ -339,16 +349,27 @@ fn load_module(
         return Ok(());
     }
     discovered.insert(canonical.clone(), module_path.clone());
-    let source = SourceFile::load(&canonical).map_err(|error| {
-        format!(
-            "error[R0420]: cannot read module {}: {error}",
-            canonical.display()
-        )
-    })?;
-    let parsed = parser::parse_recovering(source.text()).map_err(|errors| {
+    let module_text = if module_path.starts_with("std::") {
+        embedded_std_module(&module_path)
+            .ok_or_else(|| {
+                format!("error[R0420]: standard module `{module_path}` is not available")
+            })?
+            .to_owned()
+    } else {
+        SourceFile::load(&canonical)
+            .map_err(|error| {
+                format!(
+                    "error[R0420]: cannot read module {}: {error}",
+                    canonical.display()
+                )
+            })?
+            .text()
+            .to_owned()
+    };
+    let parsed = parser::parse_recovering(&module_text).map_err(|errors| {
         errors
             .into_iter()
-            .map(|error| render_local_diagnostic(error, &canonical, source.text()))
+            .map(|error| render_local_diagnostic(error, &canonical, &module_text))
             .collect::<Vec<_>>()
             .join("\n\n")
     })?;
@@ -370,7 +391,7 @@ fn load_module(
     units.push(SourceUnit {
         path: canonical,
         module_path,
-        text: source.text().to_owned(),
+        text: module_text,
     });
     Ok(())
 }
@@ -405,6 +426,9 @@ fn resolve_module_file(
         base.push(component);
     }
     let file = base.with_extension("ryn");
+    if components[0] == "std" {
+        return Ok((module_root.to_path_buf(), file));
+    }
     let directory_file = base.join("mod.ryn");
     let selected = if file.is_file() {
         file
@@ -419,6 +443,25 @@ fn resolve_module_file(
         ));
     };
     Ok((module_root.to_path_buf(), selected))
+}
+
+fn embedded_std_module(module_path: &str) -> Option<&'static str> {
+    match module_path {
+        "std::io" => Some(include_str!("../stdlib/std/src/io.ryn")),
+        "std::math" => Some(include_str!("../stdlib/std/src/math.ryn")),
+        "std::time" => Some(include_str!("../stdlib/std/src/time.ryn")),
+        "std::env" => Some(include_str!("../stdlib/std/src/env.ryn")),
+        "std::system" => Some(include_str!("../stdlib/std/src/system.ryn")),
+        "std::fs" => Some(include_str!("../stdlib/std/src/fs.ryn")),
+        "std::path" => Some(include_str!("../stdlib/std/src/path.ryn")),
+        "std::process" => Some(include_str!("../stdlib/std/src/process.ryn")),
+        "std::net" => Some(include_str!("../stdlib/std/src/net.ryn")),
+        "std::thread" => Some(include_str!("../stdlib/std/src/thread.ryn")),
+        "std::keyboard" => Some(include_str!("../stdlib/std/src/keyboard.ryn")),
+        "std::option" => Some(include_str!("../stdlib/std/src/option.ryn")),
+        "std::result" => Some(include_str!("../stdlib/std/src/result.ryn")),
+        _ => None,
+    }
 }
 
 fn render_project_diagnostic(diagnostic: Diagnostic, segments: &[Segment]) -> String {

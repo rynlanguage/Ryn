@@ -59,10 +59,21 @@ pub enum StringOp {
     ToF64,
     TryParse,
     CharFromU32,
+    IsEmpty,
+    TrimStart,
+    TrimEnd,
+    ToLower,
+    ToUpper,
+    ReplaceStr,
+    Lines,
+    Chars,
+    Bytes,
+    Repeat,
+    Reverse,
 }
 
 impl StringOp {
-    pub const ALL: [Self; 54] = [
+    pub const ALL: [Self; 65] = [
         Self::New,
         Self::Clone,
         Self::Drop,
@@ -117,6 +128,17 @@ impl StringOp {
         Self::ToF64,
         Self::TryParse,
         Self::CharFromU32,
+        Self::IsEmpty,
+        Self::TrimStart,
+        Self::TrimEnd,
+        Self::ToLower,
+        Self::ToUpper,
+        Self::ReplaceStr,
+        Self::Lines,
+        Self::Chars,
+        Self::Bytes,
+        Self::Repeat,
+        Self::Reverse,
     ];
 
     pub fn symbol(self) -> &'static str {
@@ -175,6 +197,17 @@ impl StringOp {
             Self::ToF64 => "ryn_string_to_f64",
             Self::TryParse => "ryn_string_try_parse",
             Self::CharFromU32 => "ryn_char_from_u32",
+            Self::IsEmpty => "ryn_string_is_empty",
+            Self::TrimStart => "ryn_string_trim_start",
+            Self::TrimEnd => "ryn_string_trim_end",
+            Self::ToLower => "ryn_string_to_lower",
+            Self::ToUpper => "ryn_string_to_upper",
+            Self::ReplaceStr => "ryn_string_replace_str",
+            Self::Lines => "ryn_string_lines",
+            Self::Chars => "ryn_string_chars",
+            Self::Bytes => "ryn_string_bytes",
+            Self::Repeat => "ryn_string_repeat",
+            Self::Reverse => "ryn_string_reverse",
         }
     }
 
@@ -186,6 +219,8 @@ impl StringOp {
             Self::PrintChar => vec![Char],
             Self::StrCharCount => vec![Str],
             Self::StrCharAt => vec![Str, U64],
+            Self::ReplaceStr => vec![S, Str, Str],
+            Self::Repeat => vec![S, U64],
             Self::Equals
             | Self::AppendString
             | Self::ConcatString
@@ -228,6 +263,13 @@ impl StringOp {
             | Self::SliceChars
             | Self::Data
             | Self::Trim
+            | Self::TrimStart
+            | Self::TrimEnd
+            | Self::ToLower
+            | Self::ToUpper
+            | Self::ReplaceStr
+            | Self::Repeat
+            | Self::Reverse
             | Self::ConcatStr
             | Self::ConcatString => Some(Type::OwnedString),
             Self::Equals
@@ -241,6 +283,10 @@ impl StringOp {
             Self::SplitStr | Self::SplitString => {
                 Some(Type::Vec(intern_vec_elem(Type::OwnedString)))
             }
+            Self::Lines => Some(Type::Vec(intern_vec_elem(Type::OwnedString))),
+            Self::Chars => Some(Type::Vec(intern_vec_elem(Type::Char))),
+            Self::Bytes => Some(Type::Vec(intern_vec_elem(Type::U8))),
+            Self::IsEmpty => Some(Type::Bool),
             Self::Len | Self::CharCount => Some(Type::U64),
             Self::StrCharCount => Some(Type::U64),
             Self::ByteAt => Some(Type::U8),

@@ -1,0 +1,17 @@
+pub fun abs(value: f64) -> f64 { return __math_abs(value) }
+pub fun min(left: f64, right: f64) -> f64 { return __math_min(left, right) }
+pub fun max(left: f64, right: f64) -> f64 { return __math_max(left, right) }
+pub fun clamp(value: f64, min_value: f64, max_value: f64) -> f64 { return __math_clamp(value, min_value, max_value) }
+pub fun sqrt(value: f64) -> f64 { return __math_sqrt(value) }
+pub fun pow(value: f64, exponent: f64) -> f64 { return __math_pow(value, exponent) }
+pub fun floor(value: f64) -> f64 { return __math_floor(value) }
+pub fun ceil(value: f64) -> f64 { return __math_ceil(value) }
+pub fun round(value: f64) -> f64 { return __math_round(value) }
+pub fun sin(value: f64) -> f64 { return __math_sin(value) }
+pub fun cos(value: f64) -> f64 { return __math_cos(value) }
+pub fun tan(value: f64) -> f64 { return __math_tan(value) }
+pub fun log(value: f64) -> f64 { return __math_log(value) }
+pub fun log2(value: f64) -> f64 { return __math_log2(value) }
+pub fun log10(value: f64) -> f64 { return __math_log10(value) }
+pub fun random() -> f64 { return __math_random() }
+pub fun random_range(min_value: f64, max_value: f64) -> f64 { return __math_random_range(min_value, max_value) }

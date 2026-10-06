@@ -47,8 +47,9 @@ use crate::{
     filesystem_ops::FilesystemOp,
     map_ops::MapOp,
     sema::{
-        IrCallTarget, IrExpression, IrPrintPart, IrStatement, LocalBinding, LocalType, RynEnum,
-        RynFunction, RynIr, RynStruct, Type, array_info, map_info, storage_slot_width, vec_elem,
+        EnumPredicate, IrCallTarget, IrExpression, IrPrintPart, IrStatement, LocalBinding,
+        LocalType, RynEnum, RynFunction, RynIr, RynStruct, Type, array_info, map_info,
+        storage_slot_width, vec_elem,
     },
     string_ops::StringOp,
     system_ops::SystemOp,
@@ -558,12 +559,47 @@ fn declare_print_functions(
                 signature.params.push(AbiParam::new(pointer_type));
                 signature.returns.push(AbiParam::new(pointer_type));
             }
-            VecOp::Drop | VecOp::Clear | VecOp::Len | VecOp::Capacity => {
+            VecOp::Drop | VecOp::Clear | VecOp::Len | VecOp::Capacity | VecOp::Reverse => {
                 signature.call_conv = call_conv;
                 signature.params.push(AbiParam::new(pointer_type));
                 if matches!(operation, VecOp::Len | VecOp::Capacity) {
                     signature.returns.push(AbiParam::new(types::I64));
                 }
+            }
+            VecOp::IsEmpty => {
+                signature.call_conv = call_conv;
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.returns.push(AbiParam::new(types::I8));
+            }
+            VecOp::Sort => {
+                signature.call_conv = call_conv;
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.params.push(AbiParam::new(types::I64));
+            }
+            VecOp::Contains => {
+                signature.call_conv = call_conv;
+                signature.params.extend([
+                    AbiParam::new(pointer_type),
+                    AbiParam::new(pointer_type),
+                    AbiParam::new(types::I64),
+                ]);
+                signature.returns.push(AbiParam::new(types::I8));
+            }
+            VecOp::GetOption => {
+                signature.call_conv = call_conv;
+                signature.params.extend([
+                    AbiParam::new(pointer_type),
+                    AbiParam::new(types::I64),
+                    AbiParam::new(pointer_type),
+                ]);
+                signature.returns.push(AbiParam::new(types::I8));
+            }
+            VecOp::PopOption => {
+                signature.call_conv = call_conv;
+                signature
+                    .params
+                    .extend([AbiParam::new(pointer_type), AbiParam::new(pointer_type)]);
+                signature.returns.push(AbiParam::new(types::I8));
             }
             VecOp::Reserve => {
                 signature.call_conv = call_conv;
@@ -588,6 +624,12 @@ fn declare_print_functions(
                 signature.returns.push(AbiParam::new(pointer_type));
             }
             VecOp::Set => {
+                signature.call_conv = call_conv;
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.params.push(AbiParam::new(types::I64));
+                signature.params.push(AbiParam::new(pointer_type));
+            }
+            VecOp::Insert => {
                 signature.call_conv = call_conv;
                 signature.params.push(AbiParam::new(pointer_type));
                 signature.params.push(AbiParam::new(types::I64));
@@ -639,6 +681,10 @@ fn declare_print_functions(
                 signature.params.push(AbiParam::new(pointer_type));
                 signature.returns.push(AbiParam::new(types::I64));
             }
+            MapOp::IsEmpty => {
+                signature.params.push(AbiParam::new(pointer_type));
+                signature.returns.push(AbiParam::new(types::I8));
+            }
             MapOp::ContainsKey | MapOp::Remove => {
                 signature
                     .params
@@ -668,9 +714,9 @@ fn declare_print_functions(
                 .map_err(|error| error.to_string())?,
         );
     }
-    let maps: [FuncId; 11] = maps
+    let maps: [FuncId; 12] = maps
         .try_into()
-        .map_err(|_| "internal error: expected eleven Map runtime functions")?;
+        .map_err(|_| "internal error: expected twelve Map runtime functions")?;
     let mut vec_string_element_signature = module.make_signature();
     vec_string_element_signature.call_conv = call_conv;
     vec_string_element_signature
@@ -902,7 +948,7 @@ fn type_clone_supported(ty: Type, structs: &[RynStruct]) -> bool {
 
 fn type_has_owned_data(ty: Type, structs: &[RynStruct]) -> bool {
     match ty {
-        Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Enum(_) => true,
+        Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Set(_) | Type::Enum(_) => true,
         Type::Struct(id) => {
             structs[id].drop_function.is_some()
                 || structs[id]
@@ -927,6 +973,7 @@ fn type_has_custom_drop(ty: Type, structs: &[RynStruct]) -> bool {
         Type::Array(id) => type_has_custom_drop(array_info(id).0, structs),
         Type::Vec(id) => type_has_custom_drop(vec_elem(id), structs),
         Type::Map(id) => type_has_custom_drop(map_info(id).1, structs),
+        Type::Set(id) => type_has_custom_drop(map_info(id).0, structs),
         _ => false,
     }
 }
@@ -1059,6 +1106,7 @@ fn emit_vec_struct_field_callback(
         Type::OwnedString
         | Type::Vec(_)
         | Type::Map(_)
+        | Type::Set(_)
         | Type::Enum(_)
         | Type::Reference(_, _)
         | Type::RawPointer(_)
@@ -1398,6 +1446,7 @@ fn append_type(
         Type::OwnedString
         | Type::Vec(_)
         | Type::Map(_)
+        | Type::Set(_)
         | Type::Enum(_)
         | Type::Reference(_, _)
         | Type::RawPointer(_)
@@ -1653,7 +1702,7 @@ fn define_function(
     }
     module
         .define_function(function_id, &mut context)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{e:?}"))?;
     module.clear_context(&mut context);
     Ok(())
 }
@@ -1692,7 +1741,7 @@ fn reference_storage_layout(ty: Type, structs: &[RynStruct]) -> (u32, u32) {
             ((slot_count * 8) as u32, 8)
         }
         // Owning handles are pointer-sized stack homes.
-        Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Enum(_) => (8, 8),
+        Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Set(_) | Type::Enum(_) => (8, 8),
         _ => unreachable!("reference target was validated as scalar or structure"),
     }
 }
@@ -1830,6 +1879,7 @@ fn bind_parameter_value(
         | Type::OwnedString
         | Type::Vec(_)
         | Type::Map(_)
+        | Type::Set(_)
         | Type::Enum(_) => {
             b.def_var(Variable::from_u32(slot as u32), values[*offset]);
             *offset += 1;
@@ -1878,12 +1928,12 @@ fn bind_parameter_value(
 
 #[derive(Clone, Copy)]
 struct PrintFunctionIds {
-    owned_strings: [FuncId; 54],
-    filesystem: [FuncId; 15],
-    system: [FuncId; 18],
-    owned_vecs: [FuncId; 12],
+    owned_strings: [FuncId; 65],
+    filesystem: [FuncId; 29],
+    system: [FuncId; 95],
+    owned_vecs: [FuncId; 19],
     vec_slice: FuncId,
-    maps: [FuncId; 11],
+    maps: [FuncId; 12],
     enum_drop: FuncId,
     enum_clone: FuncId,
     enum_new: FuncId,
@@ -1923,12 +1973,12 @@ struct FunctionCodegenEnv<'a> {
 
 #[derive(Clone, Copy)]
 struct PrintFunctions {
-    owned_strings: [FuncRef; 54],
-    filesystem: [FuncRef; 15],
-    system: [FuncRef; 18],
-    owned_vecs: [FuncRef; 12],
+    owned_strings: [FuncRef; 65],
+    filesystem: [FuncRef; 29],
+    system: [FuncRef; 95],
+    owned_vecs: [FuncRef; 19],
     vec_slice: FuncRef,
-    maps: [FuncRef; 11],
+    maps: [FuncRef; 12],
     enum_drop: FuncRef,
     enum_clone: FuncRef,
     enum_new: FuncRef,
@@ -2000,6 +2050,10 @@ fn drop_slots(
                 );
             }
             Type::Map(_) => {
+                b.ins()
+                    .call(env.print_functions.maps[MapOp::Drop as usize], &[pointer]);
+            }
+            Type::Set(_) => {
                 b.ins()
                     .call(env.print_functions.maps[MapOp::Drop as usize], &[pointer]);
             }
@@ -2131,9 +2185,21 @@ fn call_result(target: IrCallTarget, env: &ExprEnv<'_>) -> Option<Type> {
                 op.result(key, value)
             }
         }
+        IrCallTarget::Set(op, map_id) => {
+            let (key, _) = map_info(map_id);
+            match op {
+                MapOp::New | MapOp::Clone => Some(Type::Set(map_id)),
+                MapOp::Insert | MapOp::Remove => Some(Type::Bool),
+                _ => op.result(key, Type::Bool),
+            }
+        }
         IrCallTarget::Argument => Some(Type::Str),
         IrCallTarget::ArgumentCount => Some(Type::U32),
         IrCallTarget::EnumNew { enum_id, .. } => Some(Type::Enum(enum_id)),
+        IrCallTarget::EnumPredicate(_, _) => Some(Type::Bool),
+        IrCallTarget::EnumUnwrapOr { value_type, .. } => Some(value_type),
+        IrCallTarget::EnumUnwrap { value_type, .. } => Some(value_type),
+        IrCallTarget::VecGetOption { option_id, .. } => Some(Type::Enum(option_id)),
     }
 }
 
@@ -2215,7 +2281,7 @@ fn emit_statements(
                 // Release the previous field owner before overwriting the handle.
                 if matches!(
                     field.ty,
-                    Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Enum(_)
+                    Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Set(_) | Type::Enum(_)
                 ) {
                     let previous = load_reference_field(
                         b,
@@ -2235,7 +2301,7 @@ fn emit_statements(
                             ptr: flatten_value(previous)[0],
                             temporary: true,
                         },
-                        Type::Map(_) => CompiledValue::Map {
+                        Type::Map(_) | Type::Set(_) => CompiledValue::Map {
                             ptr: flatten_value(previous)[0],
                             temporary: true,
                         },
@@ -2350,6 +2416,7 @@ fn emit_statements(
                                 }
                                 Type::Enum(_) => env.print_functions.enum_drop,
                                 Type::Map(_) => env.print_functions.maps[MapOp::Drop as usize],
+                                Type::Set(_) => env.print_functions.maps[MapOp::Drop as usize],
                                 _ => env.print_functions.owned_strings[StringOp::Drop as usize],
                             };
                             b.ins().call(drop_op, &[old_if_selected]);
@@ -3064,6 +3131,13 @@ fn load_reference_field(
                 ty,
             ))
         }
+        Type::Reference(_, _) | Type::RawPointer(_) | Type::FunctionPointer(_) => {
+            Ok(CompiledValue::Integer(
+                b.ins()
+                    .load(pointer_type, MemFlagsData::new(), pointer, offset),
+                Type::U64,
+            ))
+        }
         Type::F32 => Ok(CompiledValue::F32(b.ins().load(
             types::F32,
             MemFlagsData::new(),
@@ -3176,7 +3250,7 @@ fn store_local(
         (Type::Vec(_), CompiledValue::Vec { ptr, .. }) => {
             b.def_var(Variable::from_u32(slot as u32), ptr)
         }
-        (Type::Map(_), CompiledValue::Map { ptr, .. }) => {
+        (Type::Map(_) | Type::Set(_), CompiledValue::Map { ptr, .. }) => {
             b.def_var(Variable::from_u32(slot as u32), ptr)
         }
         (Type::Enum(_), CompiledValue::Enum { ptr, .. }) => {
@@ -3256,7 +3330,7 @@ fn load_local(
             ptr: first,
             temporary: false,
         },
-        Type::Map(_) => CompiledValue::Map {
+        Type::Map(_) | Type::Set(_) => CompiledValue::Map {
             ptr: first,
             temporary: false,
         },
@@ -3673,7 +3747,7 @@ fn emit_expr(
             // ownership, so the view must never be stored or consumed.
             if matches!(
                 ty,
-                Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Enum(_)
+                Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Set(_) | Type::Enum(_)
             ) {
                 let handle = b.ins().load(
                     module.target_config().pointer_type(),
@@ -3690,7 +3764,7 @@ fn emit_expr(
                         ptr: handle,
                         temporary: false,
                     },
-                    Type::Map(_) => CompiledValue::Map {
+                    Type::Map(_) | Type::Set(_) => CompiledValue::Map {
                         ptr: handle,
                         temporary: false,
                     },
@@ -3843,6 +3917,14 @@ fn emit_expr(
         IrExpression::Local {
             slot,
             ty: Type::Map(_),
+            ..
+        } => CompiledValue::Map {
+            ptr: b.use_var(Variable::from_u32(*slot as u32)),
+            temporary: false,
+        },
+        IrExpression::Local {
+            slot,
+            ty: Type::Set(_),
             ..
         } => CompiledValue::Map {
             ptr: b.use_var(Variable::from_u32(*slot as u32)),
@@ -4374,7 +4456,7 @@ fn emit_expr(
                     ptr: values[0],
                     temporary: true,
                 },
-                Type::Map(_) => CompiledValue::Map {
+                Type::Map(_) | Type::Set(_) => CompiledValue::Map {
                     ptr: values[0],
                     temporary: true,
                 },
@@ -4922,7 +5004,13 @@ fn emit_vec_call(
             );
             Ok(b.func.dfg.inst_results(call).to_vec())
         }
-        VecOp::Len | VecOp::Capacity | VecOp::Clear | VecOp::Clone | VecOp::Drop => {
+        VecOp::Len
+        | VecOp::Capacity
+        | VecOp::Clear
+        | VecOp::Clone
+        | VecOp::Drop
+        | VecOp::IsEmpty
+        | VecOp::Reverse => {
             let [argument] = arguments else {
                 return Err("internal error: `Vec` operation expects the receiver".into());
             };
@@ -4943,6 +5031,61 @@ fn emit_vec_call(
                 .ins()
                 .call(env.print_functions.owned_vecs[operation as usize], &args);
             Ok(b.func.dfg.inst_results(call).to_vec())
+        }
+        VecOp::Sort => {
+            let receiver = emit_expr(b, module, &arguments[0], env, seal_state)?;
+            let receiver_values = flatten_value(receiver);
+            let kind = match elem {
+                Type::I8 => 0,
+                Type::U8 => 1,
+                Type::I16 => 2,
+                Type::U16 => 3,
+                Type::I32 => 4,
+                Type::U32 => 5,
+                Type::I64 => 6,
+                Type::U64 => 7,
+                Type::F32 => 8,
+                Type::F64 => 9,
+                Type::Char => 11,
+                Type::OwnedString => 12,
+                _ => return Err("internal error: unsupported Vec.sort element type".into()),
+            };
+            let kind = b.ins().iconst(types::I64, kind);
+            b.ins().call(
+                env.print_functions.owned_vecs[VecOp::Sort as usize],
+                &[receiver_values[0], kind],
+            );
+            Ok(Vec::new())
+        }
+        VecOp::Contains => {
+            let receiver = emit_expr(b, module, &arguments[0], env, seal_state)?;
+            let element = emit_expr(b, module, &arguments[1], env, seal_state)?;
+            let elem_addr = emit_elem_slot(b, element.clone(), elem, pointer_type, env.structs)?;
+            let kind = match elem {
+                Type::I8 => 0,
+                Type::U8 => 1,
+                Type::I16 => 2,
+                Type::U16 => 3,
+                Type::I32 => 4,
+                Type::U32 => 5,
+                Type::I64 => 6,
+                Type::U64 => 7,
+                Type::F32 => 8,
+                Type::F64 => 9,
+                Type::Bool => 10,
+                Type::Char => 11,
+                Type::OwnedString => 12,
+                _ => return Err("internal error: unsupported Vec.contains element type".into()),
+            };
+            let kind = b.ins().iconst(types::I64, kind);
+            let vector = flatten_value(receiver);
+            let call = b.ins().call(
+                env.print_functions.owned_vecs[VecOp::Contains as usize],
+                &[vector[0], elem_addr, kind],
+            );
+            let result = b.func.dfg.inst_results(call).to_vec();
+            drop_temporary(b, env.print_functions, element);
+            Ok(result)
         }
         VecOp::Push => {
             let receiver = eval_arg(b, module, &arguments[0], env, seal_state)?;
@@ -4965,6 +5108,19 @@ fn emit_vec_call(
             let index_values = flatten_value(index);
             b.ins().call(
                 env.print_functions.owned_vecs[VecOp::Set as usize],
+                &[receiver_values[0], index_values[0], elem_addr],
+            );
+            Ok(Vec::new())
+        }
+        VecOp::Insert => {
+            let receiver = eval_arg(b, module, &arguments[0], env, seal_state)?;
+            let index = eval_arg(b, module, &arguments[1], env, seal_state)?;
+            let element = eval_arg(b, module, &arguments[2], env, seal_state)?;
+            let elem_addr = emit_elem_slot(b, element, elem, pointer_type, env.structs)?;
+            let receiver_values = flatten_value(receiver);
+            let index_values = flatten_value(index);
+            b.ins().call(
+                env.print_functions.owned_vecs[VecOp::Insert as usize],
                 &[receiver_values[0], index_values[0], elem_addr],
             );
             Ok(Vec::new())
@@ -5005,6 +5161,12 @@ fn emit_vec_call(
             let result = emit_elem_load(b, out_addr, elem, pointer_type, env.structs)?;
             Ok(flatten_value(result))
         }
+        VecOp::GetOption => {
+            Err("internal error: Vec.get Option must use its specialized lowering".into())
+        }
+        VecOp::PopOption => {
+            Err("internal error: Vec.pop Option must use its specialized lowering".into())
+        }
     }
 }
 
@@ -5026,7 +5188,7 @@ fn emit_map_call(
             let value_kind = match value {
                 Type::OwnedString => 1,
                 Type::Vec(_) => 2,
-                Type::Map(_) => 3,
+                Type::Map(_) | Type::Set(_) => 3,
                 Type::Struct(id) if env.structs[id].drop_function.is_some() => 4,
                 Type::Struct(_) if type_has_custom_drop(value, env.structs) => 6,
                 Type::Struct(_) => 5,
@@ -5055,7 +5217,7 @@ fn emit_map_call(
             let call = b.ins().call(runtime, &args);
             Ok(b.func.dfg.inst_results(call).to_vec())
         }
-        MapOp::Drop | MapOp::Len | MapOp::Clear => {
+        MapOp::Drop | MapOp::Len | MapOp::Clear | MapOp::IsEmpty => {
             let receiver = emit_expr(b, module, &arguments[0], env, seal_state)?;
             let receiver = flatten_value(receiver);
             let call = b.ins().call(runtime, &receiver);
@@ -5233,7 +5395,7 @@ fn emit_elem_slot(
         (Type::Vec(_), CompiledValue::Vec { ptr: v, .. }) => {
             b.ins().store(MemFlagsData::new(), v, addr, 0);
         }
-        (Type::Map(_), CompiledValue::Map { ptr: v, .. }) => {
+        (Type::Map(_) | Type::Set(_), CompiledValue::Map { ptr: v, .. }) => {
             b.ins().store(MemFlagsData::new(), v, addr, 0);
         }
         (
@@ -5302,7 +5464,7 @@ fn emit_elem_load(
             ptr: b.ins().load(pointer_type, MemFlagsData::new(), ptr, 0),
             temporary: true,
         },
-        Type::Map(_) => CompiledValue::Map {
+        Type::Map(_) | Type::Set(_) => CompiledValue::Map {
             ptr: b.ins().load(pointer_type, MemFlagsData::new(), ptr, 0),
             temporary: true,
         },
@@ -5390,7 +5552,7 @@ fn emit_vec_struct_field_load(
                 .load(pointer_type, MemFlagsData::new(), pointer, 0),
             temporary: true,
         },
-        Type::Map(_) => CompiledValue::Map {
+        Type::Map(_) | Type::Set(_) => CompiledValue::Map {
             ptr: builder
                 .ins()
                 .load(pointer_type, MemFlagsData::new(), pointer, 0),
@@ -5491,7 +5653,7 @@ fn append_enum_drop_entries(
         Type::OwnedString => Some(0),
         Type::Vec(_) => Some(1),
         Type::Enum(_) => Some(2),
-        Type::Map(_) => Some(3),
+        Type::Map(_) | Type::Set(_) => Some(3),
         Type::Struct(id) => {
             for field in &structs[id].fields {
                 append_enum_drop_entries(
@@ -5658,6 +5820,9 @@ fn emit_call(
         IrCallTarget::Map(operation, map_id) => {
             emit_map_call(b, module, operation, map_id, arguments, env, seal_state)
         }
+        IrCallTarget::Set(operation, map_id) => {
+            emit_map_call(b, module, operation, map_id, arguments, env, seal_state)
+        }
         IrCallTarget::EnumNew { enum_id, tag } => {
             let definition = env
                 .enums
@@ -5728,6 +5893,330 @@ fn emit_call(
                 &[tag_value, payload_ptr, payload_length, drop_ptr, drop_len],
             );
             Ok(b.func.dfg.inst_results(call).to_vec())
+        }
+        IrCallTarget::EnumPredicate(predicate, enum_id) => {
+            let argument = arguments
+                .first()
+                .ok_or("internal error: enum predicate receiver missing")?;
+            let value = emit_expr(b, module, argument, env, seal_state)?;
+            let values = flatten_value(value.clone());
+            let definition = env
+                .enums
+                .get(enum_id)
+                .ok_or("internal error: enum predicate type is out of range")?;
+            let variant = match predicate {
+                EnumPredicate::IsSome => "Some",
+                EnumPredicate::IsOk => "Ok",
+                EnumPredicate::IsNone => "None",
+                EnumPredicate::IsErr => "Err",
+            };
+            let tag = definition
+                .variants
+                .iter()
+                .position(|item| item.name == variant)
+                .ok_or("internal error: enum predicate variant is missing")?;
+            let call = b.ins().call(env.print_functions.enum_tag, &[values[0]]);
+            let actual = b.func.dfg.inst_results(call)[0];
+            let expected = b.ins().iconst(types::I64, tag as i64);
+            let result = b.ins().icmp(IntCC::Equal, actual, expected);
+            drop_temporary(b, env.print_functions, value);
+            Ok(vec![result])
+        }
+        IrCallTarget::EnumUnwrapOr {
+            enum_id,
+            value_type,
+        } => {
+            let receiver_expr = arguments
+                .first()
+                .ok_or("internal error: Option receiver missing")?;
+            let default_expr = arguments
+                .get(1)
+                .ok_or("internal error: Option default missing")?;
+            let receiver = emit_expr(b, module, receiver_expr, env, seal_state)?;
+            let default = emit_expr(b, module, default_expr, env, seal_state)?;
+            let pointer_type = module.target_config().pointer_type();
+            let receiver_values = flatten_value(receiver.clone());
+            let tag_call = b
+                .ins()
+                .call(env.print_functions.enum_tag, &[receiver_values[0]]);
+            let tag_value = b.func.dfg.inst_results(tag_call)[0];
+            let success_variant = if env
+                .enums
+                .get(enum_id)
+                .is_some_and(|definition| definition.name.starts_with("$RynResult#"))
+            {
+                "Ok"
+            } else {
+                "Some"
+            };
+            let success_tag = env
+                .enums
+                .get(enum_id)
+                .and_then(|definition| {
+                    definition
+                        .variants
+                        .iter()
+                        .position(|variant| variant.name == success_variant)
+                })
+                .ok_or("internal error: Option/Result success variant is missing")?;
+            let expected_tag = b.ins().iconst(types::I64, success_tag as i64);
+            let is_success = b.ins().icmp(IntCC::Equal, tag_value, expected_tag);
+            let success_block = b.create_block();
+            let fallback_block = b.create_block();
+            let merge_block = b.create_block();
+            for ty in clif_types(value_type, pointer_type, env.structs) {
+                b.append_block_param(merge_block, ty);
+            }
+            let from = b
+                .current_block()
+                .ok_or("internal error: Option/Result.unwrap_or has no source block")?;
+            b.ins()
+                .brif(is_success, success_block, &[], fallback_block, &[]);
+            seal_ready(b, from, seal_state);
+
+            b.switch_to_block(success_block);
+            let value = decode_enum_value_payload(
+                b,
+                receiver_values[0],
+                0,
+                value_type,
+                pointer_type,
+                env.structs,
+                env.print_functions,
+                false,
+            )?;
+            let value = clone_enum_payload(b, env.print_functions, value_type, value)?;
+            drop_temporary(b, env.print_functions, default.clone());
+            drop_temporary(b, env.print_functions, receiver.clone());
+            let from = b
+                .current_block()
+                .ok_or("internal error: Option/Result.unwrap_or success block missing")?;
+            let args = flatten_value(value)
+                .into_iter()
+                .map(BlockArg::Value)
+                .collect::<Vec<_>>();
+            b.ins().jump(merge_block, &args);
+            seal_ready(b, from, seal_state);
+
+            b.switch_to_block(fallback_block);
+            drop_temporary(b, env.print_functions, receiver);
+            let args = flatten_value(default)
+                .into_iter()
+                .map(BlockArg::Value)
+                .collect::<Vec<_>>();
+            b.ins().jump(merge_block, &args);
+            let from = b
+                .current_block()
+                .ok_or("internal error: Option/Result.unwrap_or fallback block missing")?;
+            seal_ready(b, from, seal_state);
+
+            b.switch_to_block(merge_block);
+            seal_ready(b, merge_block, seal_state);
+            let mut offset = 0;
+            let result = compiled_value_from_type(
+                value_type,
+                b.block_params(merge_block),
+                &mut offset,
+                env.structs,
+            )?;
+            Ok(flatten_value(result))
+        }
+        IrCallTarget::EnumUnwrap {
+            enum_id: _,
+            value_type,
+            message,
+            success_tag,
+            failure,
+        } => {
+            let receiver_expr = arguments
+                .first()
+                .ok_or("internal error: Option receiver missing")?;
+            let receiver = emit_expr(b, module, receiver_expr, env, seal_state)?;
+            let expect_message = if message {
+                Some(emit_expr(b, module, &arguments[1], env, seal_state)?)
+            } else {
+                None
+            };
+            let pointer_type = module.target_config().pointer_type();
+            let receiver_values = flatten_value(receiver.clone());
+            let tag_call = b
+                .ins()
+                .call(env.print_functions.enum_tag, &[receiver_values[0]]);
+            let tag_value = b.func.dfg.inst_results(tag_call)[0];
+            let expected_tag = b.ins().iconst(types::I64, success_tag as i64);
+            let is_some = b.ins().icmp(IntCC::Equal, tag_value, expected_tag);
+            let some_block = b.create_block();
+            let none_block = b.create_block();
+            let merge_block = b.create_block();
+            for ty in clif_types(value_type, pointer_type, env.structs) {
+                b.append_block_param(merge_block, ty);
+            }
+            let from = b
+                .current_block()
+                .ok_or("internal error: Option.unwrap has no source block")?;
+            b.ins().brif(is_some, some_block, &[], none_block, &[]);
+            seal_ready(b, from, seal_state);
+
+            b.switch_to_block(some_block);
+            let value = decode_enum_value_payload(
+                b,
+                receiver_values[0],
+                0,
+                value_type,
+                pointer_type,
+                env.structs,
+                env.print_functions,
+                false,
+            )?;
+            let value = clone_enum_payload(b, env.print_functions, value_type, value)?;
+            drop_temporary(b, env.print_functions, receiver.clone());
+            if let Some(message) = expect_message.clone() {
+                drop_temporary(b, env.print_functions, message);
+            }
+            let args = flatten_value(value)
+                .into_iter()
+                .map(BlockArg::Value)
+                .collect::<Vec<_>>();
+            b.ins().jump(merge_block, &args);
+            let from = b
+                .current_block()
+                .ok_or("internal error: Option.unwrap Some block missing")?;
+            seal_ready(b, from, seal_state);
+
+            b.switch_to_block(none_block);
+            if let Some(message) = expect_message {
+                let values = flatten_value(message);
+                b.ins()
+                    .call(env.print_functions.system[failure as usize], &values);
+            } else {
+                b.ins()
+                    .call(env.print_functions.system[failure as usize], &[]);
+            }
+            b.ins().trap(TrapCode::unwrap_user(1));
+            let from = b
+                .current_block()
+                .ok_or("internal error: Option.unwrap None block missing")?;
+            seal_ready(b, from, seal_state);
+
+            b.switch_to_block(merge_block);
+            seal_ready(b, merge_block, seal_state);
+            let mut offset = 0;
+            let result = compiled_value_from_type(
+                value_type,
+                b.block_params(merge_block),
+                &mut offset,
+                env.structs,
+            )?;
+            Ok(flatten_value(result))
+        }
+        IrCallTarget::VecGetOption {
+            elem_id,
+            option_id,
+            pop,
+        } => {
+            let elem = vec_elem(elem_id);
+            let pointer_type = module.target_config().pointer_type();
+            let receiver = emit_expr(b, module, &arguments[0], env, seal_state)?;
+            let receiver_values = flatten_value(receiver.clone());
+            let output = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                (value_width(elem, env.structs) * 8) as u32,
+                3,
+            ));
+            let output_ptr = b.ins().stack_addr(pointer_type, output, 0);
+            let get = if pop {
+                b.ins().call(
+                    env.print_functions.owned_vecs[VecOp::PopOption as usize],
+                    &[receiver_values[0], output_ptr],
+                )
+            } else {
+                let index = emit_expr(b, module, &arguments[1], env, seal_state)?;
+                let index_values = flatten_value(index);
+                b.ins().call(
+                    env.print_functions.owned_vecs[VecOp::GetOption as usize],
+                    &[receiver_values[0], index_values[0], output_ptr],
+                )
+            };
+            let found = b.func.dfg.inst_results(get)[0];
+            drop_temporary(b, env.print_functions, receiver);
+            let option = env
+                .enums
+                .get(option_id)
+                .ok_or("internal error: Vec Option type is out of range")?;
+            let some_tag = option
+                .variants
+                .iter()
+                .position(|variant| variant.name == "Some")
+                .ok_or("internal error: Vec Option lacks Some")?;
+            let none_tag = option
+                .variants
+                .iter()
+                .position(|variant| variant.name == "None")
+                .ok_or("internal error: Vec Option lacks None")?;
+            let some_block = b.create_block();
+            let none_block = b.create_block();
+            let merge_block = b.create_block();
+            b.append_block_param(merge_block, pointer_type);
+            let one = b.ins().iconst(types::I8, 1);
+            let is_found = b.ins().icmp(IntCC::Equal, found, one);
+            let from = b
+                .current_block()
+                .ok_or("internal error: Vec.get has no source block")?;
+            b.ins().brif(is_found, some_block, &[], none_block, &[]);
+            seal_ready(b, from, seal_state);
+
+            b.switch_to_block(some_block);
+            let tag = b.ins().iconst(types::I64, some_tag as i64);
+            let payload_len = b
+                .ins()
+                .iconst(types::I64, (value_width(elem, env.structs) * 8) as i64);
+            let drop_plan = if let Some(data_id) = env.enum_drop_plans[option_id] {
+                let data = module.declare_data_in_func(data_id, b.func);
+                b.ins().symbol_value(pointer_type, data)
+            } else {
+                b.ins().iconst(pointer_type, 0)
+            };
+            let drop_len = b
+                .ins()
+                .iconst(types::I64, enum_drop_plan_len(option, env.structs) as i64);
+            let some = b.ins().call(
+                env.print_functions.enum_new,
+                &[tag, output_ptr, payload_len, drop_plan, drop_len],
+            );
+            let some_value = b.func.dfg.inst_results(some)[0];
+            b.ins().jump(merge_block, &[BlockArg::Value(some_value)]);
+            let from = b
+                .current_block()
+                .ok_or("internal error: Vec.get Some block missing")?;
+            seal_ready(b, from, seal_state);
+
+            b.switch_to_block(none_block);
+            let tag = b.ins().iconst(types::I64, none_tag as i64);
+            let null = b.ins().iconst(pointer_type, 0);
+            let zero = b.ins().iconst(types::I64, 0);
+            let none_drop_plan = if let Some(data_id) = env.enum_drop_plans[option_id] {
+                let data = module.declare_data_in_func(data_id, b.func);
+                b.ins().symbol_value(pointer_type, data)
+            } else {
+                b.ins().iconst(pointer_type, 0)
+            };
+            let none_drop_len = b
+                .ins()
+                .iconst(types::I64, enum_drop_plan_len(option, env.structs) as i64);
+            let none = b.ins().call(
+                env.print_functions.enum_new,
+                &[tag, null, zero, none_drop_plan, none_drop_len],
+            );
+            let none_value = b.func.dfg.inst_results(none)[0];
+            b.ins().jump(merge_block, &[BlockArg::Value(none_value)]);
+            let from = b
+                .current_block()
+                .ok_or("internal error: Vec.get None block missing")?;
+            seal_ready(b, from, seal_state);
+
+            b.switch_to_block(merge_block);
+            seal_ready(b, merge_block, seal_state);
+            Ok(vec![b.block_params(merge_block)[0]])
         }
         IrCallTarget::Argument => {
             let [argument] = arguments else {
@@ -5948,6 +6437,7 @@ fn clif_scalar_type(ty: Type, pointer_type: types::Type) -> Result<types::Type, 
         | Type::OwnedString
         | Type::Vec(_)
         | Type::Map(_)
+        | Type::Set(_)
         | Type::Enum(_)
         | Type::Reference(_, _)
         | Type::RawPointer(_)
@@ -6262,7 +6752,11 @@ fn emit_enum_match(
                 }
                 let word_index = b.ins().iconst(types::I64, payload_word_offset as i64);
                 let local_value = match field_type {
-                    Type::OwnedString | Type::Vec(_) | Type::Enum(_) | Type::Map(_) => {
+                    Type::OwnedString
+                    | Type::Vec(_)
+                    | Type::Enum(_)
+                    | Type::Map(_)
+                    | Type::Set(_) => {
                         let get = b
                             .ins()
                             .call(env.print_functions.enum_word, &[ptr, word_index]);
@@ -6542,7 +7036,7 @@ fn decode_enum_payload(
     pointer_type: types::Type,
 ) -> Result<CompiledValue, String> {
     Ok(match ty {
-        Type::OwnedString | Type::Vec(_) | Type::Enum(_) | Type::Map(_) => {
+        Type::OwnedString | Type::Vec(_) | Type::Enum(_) | Type::Map(_) | Type::Set(_) => {
             let pointer = if pointer_type == types::I64 {
                 raw
             } else {
@@ -6561,7 +7055,7 @@ fn decode_enum_payload(
                     ptr: pointer,
                     temporary: true,
                 },
-                Type::Map(_) => CompiledValue::Map {
+                Type::Map(_) | Type::Set(_) => CompiledValue::Map {
                     ptr: pointer,
                     temporary: true,
                 },
@@ -6598,6 +7092,52 @@ fn decode_enum_payload(
         }
         Type::I64 | Type::U64 => CompiledValue::Integer(raw, ty),
         _ => return Err("internal error: unsupported `?` payload layout".into()),
+    })
+}
+
+fn clone_enum_payload(
+    b: &mut FunctionBuilder<'_>,
+    functions: PrintFunctions,
+    ty: Type,
+    value: CompiledValue,
+) -> Result<CompiledValue, String> {
+    if matches!(ty, Type::Struct(_) | Type::Array(_)) {
+        return clone_array_element(b, functions, value);
+    }
+    let (pointer, clone_function) = match (ty, value) {
+        (Type::OwnedString, CompiledValue::OwnedString { ptr, .. }) => {
+            (ptr, functions.owned_strings[StringOp::Clone as usize])
+        }
+        (Type::Vec(_), CompiledValue::Vec { ptr, .. }) => {
+            (ptr, functions.owned_vecs[VecOp::Clone as usize])
+        }
+        (Type::Map(_), CompiledValue::Map { ptr, .. })
+        | (Type::Set(_), CompiledValue::Map { ptr, .. }) => {
+            (ptr, functions.maps[MapOp::Clone as usize])
+        }
+        (Type::Enum(_), CompiledValue::Enum { ptr, .. }) => (ptr, functions.enum_clone),
+        (_, value) => return Ok(value),
+    };
+    let clone = b.ins().call(clone_function, &[pointer]);
+    let pointer = b.func.dfg.inst_results(clone)[0];
+    Ok(match ty {
+        Type::OwnedString => CompiledValue::OwnedString {
+            ptr: pointer,
+            temporary: true,
+        },
+        Type::Vec(_) => CompiledValue::Vec {
+            ptr: pointer,
+            temporary: true,
+        },
+        Type::Map(_) | Type::Set(_) => CompiledValue::Map {
+            ptr: pointer,
+            temporary: true,
+        },
+        Type::Enum(_) => CompiledValue::Enum {
+            ptr: pointer,
+            temporary: true,
+        },
+        _ => unreachable!("only pointer-backed enum payloads are cloned"),
     })
 }
 
@@ -6732,7 +7272,7 @@ fn compiled_value_matches_type(value: &CompiledValue, ty: Type) -> bool {
         | (CompiledValue::OwnedString { .. }, Type::OwnedString)
         | (CompiledValue::Vec { .. }, Type::Vec(_))
         | (CompiledValue::Enum { .. }, Type::Enum(_))
-        | (CompiledValue::Map { .. }, Type::Map(_))
+        | (CompiledValue::Map { .. }, Type::Map(_) | Type::Set(_))
         | (CompiledValue::Bool(_), Type::Bool) => true,
         (CompiledValue::Struct { struct_id, fields }, Type::Struct(expected)) => {
             *struct_id == expected && !fields.is_empty()
@@ -6832,7 +7372,7 @@ fn compiled_value_from_type(
                 temporary: true,
             }
         }
-        Type::Map(_) => {
+        Type::Map(_) | Type::Set(_) => {
             let pointer = *params
                 .get(*offset)
                 .ok_or("internal error: missing Map handle")?;
@@ -6919,7 +7459,7 @@ fn encode_enum_word(
             let bits = b.ins().bitcast(types::I32, MemFlagsData::new(), value);
             b.ins().uextend(types::I64, bits)
         }
-        Type::OwnedString | Type::Vec(_) | Type::Enum(_) | Type::Map(_) => {
+        Type::OwnedString | Type::Vec(_) | Type::Enum(_) | Type::Map(_) | Type::Set(_) => {
             if pointer_type == types::I64 {
                 value
             } else {
@@ -6957,6 +7497,7 @@ fn clif_types(ty: Type, pointer_type: types::Type, structs: &[RynStruct]) -> Vec
         Type::OwnedString
         | Type::Vec(_)
         | Type::Map(_)
+        | Type::Set(_)
         | Type::Enum(_)
         | Type::Reference(_, _)
         | Type::RawPointer(_)
@@ -7202,6 +7743,14 @@ fn write_linker_wrapper(wrapper: &Path, use_precompiled_shim: bool) -> Result<()
             .replace(
                 "#[path = \"runtime/system.rs\"]\r\npub mod system;",
                 &format!("pub mod system {{ {} }}", include_str!("runtime/system.rs")),
+            )
+            .replace(
+                "#[path = \"runtime/input.rs\"]\npub mod input;",
+                &format!("pub mod input {{ {} }}", include_str!("runtime/input.rs")),
+            )
+            .replace(
+                "#[path = \"runtime/input.rs\"]\r\npub mod input;",
+                &format!("pub mod input {{ {} }}", include_str!("runtime/input.rs")),
             );
         format!(
             "#![allow(unused_unsafe, function_casts_as_integer)]\n{shim}\n{LINKER_ENTRY_SOURCE}"

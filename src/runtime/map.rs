@@ -1,8 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    io::Write,
-    ptr,
-};
+use std::{collections::BTreeMap, io::Write, ptr};
 
 const KEY_STRING: u64 = 1;
 const VALUE_STRING: u64 = 1;
@@ -103,7 +99,8 @@ fn drop_word(value: &mut [u64], kind: u64, custom_drop: Option<MapDropValue>) {
         return;
     }
     if kind == VALUE_MOVE_ONLY_STRUCT {
-        let callback = custom_drop.unwrap_or_else(|| fail("missing move-only Map struct drop callback"));
+        let callback =
+            custom_drop.unwrap_or_else(|| fail("missing move-only Map struct drop callback"));
         unsafe { callback(value.as_mut_ptr().cast()) };
         value.fill(0);
         return;
@@ -121,11 +118,7 @@ fn drop_word(value: &mut [u64], kind: u64, custom_drop: Option<MapDropValue>) {
     value[0] = 0;
 }
 
-fn clone_value(
-    value: &[u64],
-    kind: u64,
-    custom_clone: Option<MapCloneValue>,
-) -> Vec<u64> {
+fn clone_value(value: &[u64], kind: u64, custom_clone: Option<MapCloneValue>) -> Vec<u64> {
     let mut cloned = value.to_vec();
     match kind {
         VALUE_STRING => {
@@ -141,7 +134,8 @@ fn clone_value(
             cloned[0] = ryn_map_clone(pointer) as usize as u64;
         }
         VALUE_CUSTOM => {
-            let callback = custom_clone.unwrap_or_else(|| fail("missing custom Map clone callback"));
+            let callback =
+                custom_clone.unwrap_or_else(|| fail("missing custom Map clone callback"));
             unsafe { callback(value.as_ptr().cast(), cloned.as_mut_ptr().cast()) };
         }
         VALUE_MOVE_ONLY_STRUCT => fail("move-only custom Map structs cannot be cloned"),
@@ -241,11 +235,7 @@ fn clone_map(value: &RynMap) -> RynMap {
                 .iter()
                 .map(|entry| Entry {
                     key: clone_value(&entry.key, value.key_kind, None),
-                    value: clone_value(
-                        &entry.value,
-                        value.value_kind,
-                        value.clone_custom_value,
-                    ),
+                    value: clone_value(&entry.value, value.value_kind, value.clone_custom_value),
                 })
                 .collect();
             (*hash, entries)
@@ -308,6 +298,11 @@ pub extern "C" fn ryn_map_len(pointer: *const RynMap) -> u64 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn ryn_map_is_empty(pointer: *const RynMap) -> bool {
+    ryn_map_len(pointer) == 0
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn ryn_map_clear(pointer: *mut RynMap) {
     map_mut(pointer).clear();
 }
@@ -318,7 +313,11 @@ pub extern "C" fn ryn_map_contains_key(pointer: *const RynMap, key: *const u8) -
     let key = read_words(key, map.key_stride);
     map.buckets
         .get(&key_hash(&key, map.key_kind))
-        .is_some_and(|bucket| bucket.iter().any(|entry| keys_equal(&entry.key, &key, map.key_kind)))
+        .is_some_and(|bucket| {
+            bucket
+                .iter()
+                .any(|entry| keys_equal(&entry.key, &key, map.key_kind))
+        })
         .into()
 }
 
@@ -359,18 +358,14 @@ pub extern "C" fn ryn_map_get(pointer: *const RynMap, key: *const u8, output: *m
     }
     let key = read_words(key, map.key_stride);
     let hash = key_hash(&key, map.key_kind);
-    let Some(entry) = map
-        .buckets
-        .get(&hash)
-        .and_then(|bucket| bucket.iter().find(|entry| keys_equal(&entry.key, &key, map.key_kind)))
-    else {
+    let Some(entry) = map.buckets.get(&hash).and_then(|bucket| {
+        bucket
+            .iter()
+            .find(|entry| keys_equal(&entry.key, &key, map.key_kind))
+    }) else {
         return 0;
     };
-    let value = clone_value(
-        &entry.value,
-        map.value_kind,
-        map.clone_custom_value,
-    );
+    let value = clone_value(&entry.value, map.value_kind, map.clone_custom_value);
     // SAFETY: Output points to the compiler-allocated slot for this Map's value type.
     unsafe { ptr::copy_nonoverlapping(value.as_ptr().cast(), output, map.value_stride * 8) };
     1
@@ -403,7 +398,10 @@ pub extern "C" fn ryn_map_remove(pointer: *mut RynMap, key: *const u8) -> i8 {
     1
 }
 
-fn owned_element_callbacks(kind: u64, custom: Option<(MapDropValue, MapCloneValue)>) -> (
+fn owned_element_callbacks(
+    kind: u64,
+    custom: Option<(MapDropValue, MapCloneValue)>,
+) -> (
     Option<super::vectors::DropElement>,
     Option<super::vectors::CloneElement>,
 ) {
@@ -434,14 +432,10 @@ fn owned_element_callbacks(kind: u64, custom: Option<(MapDropValue, MapCloneValu
         ),
         VALUE_MAP => (
             Some(unsafe {
-                std::mem::transmute::<usize, super::vectors::DropElement>(
-                    ryn_map_drop as usize,
-                )
+                std::mem::transmute::<usize, super::vectors::DropElement>(ryn_map_drop as usize)
             }),
             Some(unsafe {
-                std::mem::transmute::<usize, super::vectors::CloneElement>(
-                    ryn_map_clone as usize,
-                )
+                std::mem::transmute::<usize, super::vectors::CloneElement>(ryn_map_clone as usize)
             }),
         ),
         VALUE_STRUCT => match custom {
@@ -489,18 +483,12 @@ pub extern "C" fn ryn_map_values(pointer: *const RynMap) -> *mut super::vectors:
     if matches!(map.value_kind, VALUE_CUSTOM | VALUE_MOVE_ONLY_STRUCT) {
         fail("Map.values cannot clone a move-only custom value");
     }
-    let custom = map
-        .drop_custom_value
-        .zip(map.clone_custom_value);
+    let custom = map.drop_custom_value.zip(map.clone_custom_value);
     let (drop_element, clone_element) = owned_element_callbacks(map.value_kind, custom);
     let mut result = super::vectors::build_vec(map.value_stride, drop_element, clone_element);
     for bucket in map.buckets.values() {
         for entry in bucket {
-            let mut value = clone_value(
-                &entry.value,
-                map.value_kind,
-                map.clone_custom_value,
-            );
+            let mut value = clone_value(&entry.value, map.value_kind, map.clone_custom_value);
             result.push_words(&value);
             value.fill(0);
         }

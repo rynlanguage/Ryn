@@ -134,6 +134,7 @@ pub enum TypeName {
     Parameter(String, Span),
     Vec(Box<TypeName>, Span),
     Map(Box<TypeName>, Box<TypeName>, Span),
+    Set(Box<TypeName>, Span),
     Array(Box<TypeName>, usize, Span),
     Slice(Box<TypeName>, Span),
     Reference(Box<TypeName>, bool, Span),
@@ -180,6 +181,7 @@ pub enum Expression {
     MethodCall {
         value: Box<Expression>,
         name: String,
+        type_arguments: Vec<TypeName>,
         arguments: Vec<Expression>,
         span: Span,
     },
@@ -229,6 +231,10 @@ pub enum Expression {
     MapConstructor {
         key: TypeName,
         value: TypeName,
+        span: Span,
+    },
+    SetConstructor {
+        element: TypeName,
         span: Span,
     },
     Tuple(Vec<Expression>, Span),
@@ -284,6 +290,7 @@ impl Expression {
             Self::StructLiteral { span, .. } | Self::Field { span, .. } => *span,
             Self::VecConstructor { span, .. } => *span,
             Self::MapConstructor { span, .. } => *span,
+            Self::SetConstructor { span, .. } => *span,
             Self::Tuple(_, span) => *span,
             Self::ArrayLiteral(_, span) => *span,
             Self::Index { span, .. } => *span,

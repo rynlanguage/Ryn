@@ -580,7 +580,7 @@ fn lex_all(text: &str, recovering: bool) -> (Vec<Token>, Vec<Diagnostic>) {
                         }
                         TokenKind::Float(value)
                     } else {
-                        let value = match normalized.parse::<u64>() {
+                        let mut value = match normalized.parse::<u64>() {
                             Ok(value) => value,
                             Err(_) => {
                                 diagnostics.push(Diagnostic {
@@ -596,6 +596,44 @@ fn lex_all(text: &str, recovering: bool) -> (Vec<Token>, Vec<Diagnostic>) {
                                 continue;
                             }
                         };
+                        let unit_start = i;
+                        let mut unit_end = i;
+                        while bytes.get(unit_end).is_some_and(u8::is_ascii_alphabetic) {
+                            unit_end += 1;
+                        }
+                        let multiplier = match &text[unit_start..unit_end] {
+                            "ms" => Some(1),
+                            "s" => Some(1_000),
+                            "min" => Some(60_000),
+                            "h" => Some(3_600_000),
+                            _ => None,
+                        };
+                        if let Some(multiplier) = multiplier {
+                            let Some(milliseconds) = value.checked_mul(multiplier) else {
+                                diagnostics.push(Diagnostic {
+                                    code: "R0006",
+                                    message:
+                                        "duration literal exceeds the supported millisecond range"
+                                            .into(),
+                                    span: Span {
+                                        start,
+                                        end: unit_end,
+                                    },
+                                    help: Some("use a shorter duration".into()),
+                                });
+                                if !recovering {
+                                    break 'tokens;
+                                }
+                                continue;
+                            };
+                            value = milliseconds;
+                            i = unit_end;
+                            out.push(Token {
+                                kind: TokenKind::Integer(value),
+                                span: Span { start, end: i },
+                            });
+                            continue;
+                        }
                         TokenKind::Integer(value)
                     }
                 }

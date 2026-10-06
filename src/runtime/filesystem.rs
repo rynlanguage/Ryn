@@ -1,7 +1,11 @@
-use std::{fs, io::Write, path::PathBuf};
+use std::{
+    fs,
+    io::{BufRead, Read, Write},
+    path::PathBuf,
+};
 
 use super::{
-    enums::{self, EnumDropEntry, DROP_STRING},
+    enums::{self, DROP_STRING, EnumDropEntry},
     strings::{self, RynString},
 };
 
@@ -17,16 +21,15 @@ fn fail(message: &str) -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn ryn_fs_read_file(pointer: *const u8, length: u64) -> *mut RynString {
     let path = path(pointer, length);
-    let bytes = fs::read(&path).unwrap_or_else(|error| fail(&format!("could not read `{}`: {error}", path.display())));
-    let contents = String::from_utf8(bytes).unwrap_or_else(|_| fail("file contents are not valid UTF-8"));
+    let bytes = fs::read(&path)
+        .unwrap_or_else(|error| fail(&format!("could not read `{}`: {error}", path.display())));
+    let contents =
+        String::from_utf8(bytes).unwrap_or_else(|_| fail("file contents are not valid UTF-8"));
     strings::ryn_string_new(contents.as_ptr(), contents.len() as u64)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ryn_fs_try_read_file(
-    pointer: *const u8,
-    length: u64,
-) -> *mut enums::RynEnum {
+pub extern "C" fn ryn_fs_try_read_file(pointer: *const u8, length: u64) -> *mut enums::RynEnum {
     let path = path(pointer, length);
     let Ok(contents) = fs::read_to_string(path) else {
         return enums::ryn_enum_new(1, std::ptr::null(), 0, std::ptr::null(), 0);
@@ -51,10 +54,7 @@ pub extern "C" fn ryn_fs_try_read_file(
 /// Error codes are 1 for not found, 2 for permission denied, 3 for invalid UTF-8,
 /// 4 for invalid input, and 5 for other I/O errors.
 #[unsafe(no_mangle)]
-pub extern "C" fn ryn_fs_read_file_result(
-    pointer: *const u8,
-    length: u64,
-) -> *mut enums::RynEnum {
+pub extern "C" fn ryn_fs_read_file_result(pointer: *const u8, length: u64) -> *mut enums::RynEnum {
     let path = path(pointer, length);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
@@ -93,13 +93,61 @@ pub extern "C" fn ryn_fs_read_file_result(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ryn_fs_write_file(path_ptr: *const u8, path_len: u64, data_ptr: *const u8, data_len: u64) -> bool {
+pub extern "C" fn ryn_fs_write_file(
+    path_ptr: *const u8,
+    path_len: u64,
+    data_ptr: *const u8,
+    data_len: u64,
+) -> bool {
     fs::write(path(path_ptr, path_len), strings::text(data_ptr, data_len)).is_ok()
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn ryn_fs_append_file(
+    path_ptr: *const u8,
+    path_len: u64,
+    data_ptr: *const u8,
+    data_len: u64,
+) -> bool {
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path(path_ptr, path_len))
+    else {
+        return false;
+    };
+    file.write_all(strings::text(data_ptr, data_len).as_bytes())
+        .is_ok()
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn ryn_fs_create_dir(pointer: *const u8, length: u64) -> bool {
+    fs::create_dir(path(pointer, length)).is_ok()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_fs_create_dir_all(pointer: *const u8, length: u64) -> bool {
     fs::create_dir_all(path(pointer, length)).is_ok()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_fs_copy_file(
+    from_ptr: *const u8,
+    from_len: u64,
+    to_ptr: *const u8,
+    to_len: u64,
+) -> bool {
+    fs::copy(path(from_ptr, from_len), path(to_ptr, to_len)).is_ok()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_fs_rename(
+    from_ptr: *const u8,
+    from_len: u64,
+    to_ptr: *const u8,
+    to_len: u64,
+) -> bool {
+    fs::rename(path(from_ptr, from_len), path(to_ptr, to_len)).is_ok()
 }
 
 #[unsafe(no_mangle)]
@@ -174,13 +222,161 @@ pub extern "C" fn ryn_fs_path_is_absolute(pointer: *const u8, length: u64) -> bo
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn ryn_fs_path_absolute(pointer: *const u8, length: u64) -> *mut RynString {
+    let value = path(pointer, length);
+    let absolute = if value.is_absolute() {
+        value
+    } else {
+        std::env::current_dir().unwrap_or_default().join(value)
+    };
+    let text = absolute.to_string_lossy();
+    strings::ryn_string_new(text.as_ptr(), text.len() as u64)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_fs_path_canonical(pointer: *const u8, length: u64) -> *mut RynString {
+    let text = fs::canonicalize(path(pointer, length))
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    strings::ryn_string_new(text.as_ptr(), text.len() as u64)
+}
+
+struct RynFile {
+    file: Option<std::io::BufReader<fs::File>>,
+}
+
+unsafe fn file_mut<'a>(pointer: *mut std::ffi::c_void) -> Option<&'a mut RynFile> {
+    if pointer.is_null() {
+        return None;
+    }
+    // SAFETY: Handles are allocated by ryn_file_open/create and freed once by ryn_file_drop.
+    Some(unsafe { &mut *pointer.cast::<RynFile>() })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_file_open(pointer: *const u8, length: u64) -> *mut std::ffi::c_void {
+    let requested_path = path(pointer, length);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .open(&requested_path)
+        .unwrap_or_else(|error| {
+            fail(&format!(
+                "could not open `{}`: {error}",
+                requested_path.display()
+            ))
+        });
+    Box::into_raw(Box::new(RynFile {
+        file: Some(std::io::BufReader::new(file)),
+    }))
+    .cast()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_file_create(pointer: *const u8, length: u64) -> *mut std::ffi::c_void {
+    let requested_path = path(pointer, length);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&requested_path)
+        .unwrap_or_else(|error| {
+            fail(&format!(
+                "could not create `{}`: {error}",
+                requested_path.display()
+            ))
+        });
+    Box::into_raw(Box::new(RynFile {
+        file: Some(std::io::BufReader::new(file)),
+    }))
+    .cast()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_file_read(pointer: *mut std::ffi::c_void) -> *mut RynString {
+    let mut contents = String::new();
+    if let Some(file) = unsafe { file_mut(pointer) }.and_then(|handle| handle.file.as_mut()) {
+        if file.read_to_string(&mut contents).is_err() {
+            contents.clear();
+        }
+    }
+    strings::ryn_string_new(contents.as_ptr(), contents.len() as u64)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_file_read_line(pointer: *mut std::ffi::c_void) -> *mut RynString {
+    let mut line = String::new();
+    if let Some(file) = unsafe { file_mut(pointer) }.and_then(|handle| handle.file.as_mut()) {
+        if file.read_line(&mut line).is_err() {
+            line.clear();
+        }
+    }
+    if line.ends_with('\n') {
+        line.pop();
+        if line.ends_with('\r') {
+            line.pop();
+        }
+    }
+    strings::ryn_string_new(line.as_ptr(), line.len() as u64)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_file_write(
+    pointer: *mut std::ffi::c_void,
+    data: *const u8,
+    length: u64,
+) -> bool {
+    unsafe { file_mut(pointer) }
+        .and_then(|handle| handle.file.as_mut())
+        .is_some_and(|file| {
+            file.get_mut()
+                .write_all(strings::text(data, length).as_bytes())
+                .is_ok()
+        })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_file_flush(pointer: *mut std::ffi::c_void) -> bool {
+    unsafe { file_mut(pointer) }
+        .and_then(|handle| handle.file.as_mut())
+        .is_some_and(|file| file.get_mut().flush().is_ok())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_file_close(pointer: *mut std::ffi::c_void) -> bool {
+    unsafe { file_mut(pointer) }
+        .and_then(|handle| handle.file.take())
+        .is_some()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_file_drop(pointer: *mut std::ffi::c_void) -> bool {
+    if pointer.is_null() {
+        return false;
+    }
+    // SAFETY: Ryn's custom destructor calls this once for each File owner.
+    drop(unsafe { Box::from_raw(pointer.cast::<RynFile>()) });
+    true
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn ryn_fs_read_dir(pointer: *const u8, length: u64) -> *mut super::vectors::RynVec {
     let directory = path(pointer, length);
     let entries = fs::read_dir(&directory)
-        .unwrap_or_else(|error| fail(&format!("could not read directory `{}`: {error}", directory.display())))
+        .unwrap_or_else(|error| {
+            fail(&format!(
+                "could not read directory `{}`: {error}",
+                directory.display()
+            ))
+        })
         .map(|entry| {
             entry
-                .unwrap_or_else(|error| fail(&format!("could not read an entry in `{}`: {error}", directory.display())))
+                .unwrap_or_else(|error| {
+                    fail(&format!(
+                        "could not read an entry in `{}`: {error}",
+                        directory.display()
+                    ))
+                })
                 .path()
                 .to_string_lossy()
                 .into_owned()
@@ -200,4 +396,3 @@ pub extern "C" fn ryn_fs_read_dir(pointer: *const u8, length: u64) -> *mut super
     }
     vector
 }
-

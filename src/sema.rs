@@ -34,6 +34,7 @@ pub enum Type {
     Struct(usize),
     Vec(usize),
     Map(usize),
+    Set(usize),
     Enum(usize),
     Array(usize),
     Slice(usize),
@@ -284,6 +285,14 @@ fn contains_custom_drop(
             contains_custom_drop(key, structs, enums, seen_structs, seen_enums, depth + 1)
                 || contains_custom_drop(value, structs, enums, seen_structs, seen_enums, depth + 1)
         }
+        Type::Set(id) => contains_custom_drop(
+            map_info(id).0,
+            structs,
+            enums,
+            seen_structs,
+            seen_enums,
+            depth + 1,
+        ),
         Type::Enum(id) => {
             seen_enums.insert(id)
                 && enums[id].variants.iter().any(|variant| {
@@ -410,6 +419,7 @@ fn map_payload_type_supported(ty: Type, structs: &[RynStruct], depth: usize) -> 
             map_payload_type_supported(key, structs, depth + 1)
                 && map_payload_type_supported(value, structs, depth + 1)
         }
+        Type::Set(id) => map_payload_type_supported(map_info(id).0, structs, depth + 1),
         _ => true,
     }
 }
@@ -434,6 +444,7 @@ fn enum_payload_struct_supported(ty: Type, structs: &[RynStruct], depth: usize) 
             enum_payload_struct_supported(key, structs, depth + 1)
                 && enum_payload_struct_supported(value, structs, depth + 1)
         }
+        Type::Set(id) => enum_payload_struct_supported(map_info(id).0, structs, depth + 1),
         _ => true,
     }
 }
@@ -685,7 +696,36 @@ pub enum IrCallTarget {
     VecSlice(usize),
     SliceLen,
     Map(MapOp, usize),
-    EnumNew { enum_id: usize, tag: usize },
+    Set(MapOp, usize),
+    EnumNew {
+        enum_id: usize,
+        tag: usize,
+    },
+    EnumPredicate(EnumPredicate, usize),
+    EnumUnwrapOr {
+        enum_id: usize,
+        value_type: Type,
+    },
+    EnumUnwrap {
+        enum_id: usize,
+        value_type: Type,
+        message: bool,
+        success_tag: usize,
+        failure: SystemOp,
+    },
+    VecGetOption {
+        elem_id: usize,
+        option_id: usize,
+        pop: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnumPredicate {
+    IsSome,
+    IsNone,
+    IsOk,
+    IsErr,
 }
 
 #[derive(Clone, Debug)]
@@ -731,6 +771,7 @@ pub struct RynIr {
     pub main_index: usize,
     pub structs: Vec<RynStruct>,
     pub enums: Vec<RynEnum>,
+    pub instant_drop: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -780,6 +821,52 @@ struct FunctionSignature {
     parameters: Vec<Type>,
     return_type: Option<Type>,
     is_destructor: bool,
+}
+
+// Associated functions and instance methods share the source name inside an
+// `extend` block, but are called through different syntactic forms. Keep the
+// static function at the ordinary key (`Type::name`) and index receiver
+// methods separately so both can coexist without introducing overload
+// resolution for ordinary functions.
+fn function_signature_key(function: &crate::ast::Function) -> String {
+    if function
+        .parameters
+        .first()
+        .is_some_and(|parameter| parameter.name == "self")
+        && !function.name.starts_with("String::")
+    {
+        format!("{}#method", function.name)
+    } else {
+        function.name.clone()
+    }
+}
+
+fn enum_extract_payload_supported(ty: Type, structs: &[RynStruct], enums: &[RynEnum]) -> bool {
+    match ty {
+        Type::I8
+        | Type::I16
+        | Type::I32
+        | Type::I64
+        | Type::U8
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::F32
+        | Type::F64
+        | Type::Bool
+        | Type::Char
+        | Type::OwnedString
+        | Type::Vec(_)
+        | Type::Map(_)
+        | Type::Set(_)
+        | Type::Enum(_) => true,
+        Type::Struct(_) | Type::Array(_) => {
+            let mut seen_structs = HashSet::new();
+            let mut seen_enums = HashSet::new();
+            !contains_custom_drop(ty, structs, enums, &mut seen_structs, &mut seen_enums, 0)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Clone)]
@@ -873,6 +960,8 @@ fn analyze_with_recovery(
         ("U64", TypeName::U64),
         ("F32", TypeName::F32),
         ("F64", TypeName::F64),
+        ("Bool", TypeName::Bool),
+        ("Char", TypeName::Char),
     ] {
         if !program
             .enums
@@ -899,6 +988,94 @@ fn analyze_with_recovery(
                 span: Span::default(),
             });
         }
+    }
+    let primitive_types = [
+        TypeName::I8,
+        TypeName::I16,
+        TypeName::I32,
+        TypeName::I64,
+        TypeName::U8,
+        TypeName::U16,
+        TypeName::U32,
+        TypeName::U64,
+        TypeName::F32,
+        TypeName::F64,
+        TypeName::OwnedString,
+    ];
+    for (result_index, result_type) in primitive_types.iter().enumerate() {
+        for (error_index, error_type) in primitive_types.iter().enumerate() {
+            let name = format!("$RynResult#{result_index}#{error_index}");
+            if program
+                .enums
+                .iter()
+                .any(|definition| definition.name == name)
+            {
+                continue;
+            }
+            program.enums.push(EnumDef {
+                name,
+                type_parameters: Vec::new(),
+                variants: vec![
+                    VariantDef {
+                        name: "Ok".into(),
+                        fields: vec![result_type.clone()],
+                        span: Span::default(),
+                    },
+                    VariantDef {
+                        name: "Err".into(),
+                        fields: vec![error_type.clone()],
+                        span: Span::default(),
+                    },
+                ],
+                public: false,
+                module_path: String::new(),
+                span: Span::default(),
+            });
+        }
+    }
+    // Result specializations for parsing carry an owned error message.
+    for (result_index, result_type) in [
+        TypeName::I8,
+        TypeName::I16,
+        TypeName::I32,
+        TypeName::I64,
+        TypeName::U8,
+        TypeName::U16,
+        TypeName::U32,
+        TypeName::U64,
+        TypeName::F32,
+        TypeName::F64,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let name = format!("$RynResult#Parse{result_index}String");
+        if program
+            .enums
+            .iter()
+            .any(|definition| definition.name == name)
+        {
+            continue;
+        }
+        program.enums.push(EnumDef {
+            name,
+            type_parameters: Vec::new(),
+            variants: vec![
+                VariantDef {
+                    name: "Ok".into(),
+                    fields: vec![result_type.clone()],
+                    span: Span::default(),
+                },
+                VariantDef {
+                    name: "Err".into(),
+                    fields: vec![TypeName::OwnedString],
+                    span: Span::default(),
+                },
+            ],
+            public: false,
+            module_path: String::new(),
+            span: Span::default(),
+        });
     }
     let mut struct_ids = HashMap::new();
     let mut enum_ids = HashMap::new();
@@ -1071,7 +1248,7 @@ fn analyze_with_recovery(
     if recover_errors {
         let mut function_names = HashSet::new();
         for function in &program.functions {
-            if !function_names.insert(function.name.as_str()) {
+            if !function_names.insert(function_signature_key(function)) {
                 declaration_errors.push(
                     diag(
                         "R0201",
@@ -1153,7 +1330,8 @@ fn analyze_with_recovery(
         .map(|function| function.public)
         .collect::<Vec<_>>();
     for (index, function) in program.functions.iter().enumerate() {
-        if signatures.contains_key(&function.name) {
+        let signature_key = function_signature_key(function);
+        if signatures.contains_key(&signature_key) {
             return Err(vec![
                 diag(
                     "R0201",
@@ -1238,7 +1416,7 @@ fn analyze_with_recovery(
         if function.name == "main" {
             main_index = Some(index);
         }
-        signatures.insert(function.name.clone(), signature);
+        signatures.insert(signature_key, signature);
     }
     for import in &program.uses {
         let module_path = import.path.join("::");
@@ -1255,8 +1433,14 @@ fn analyze_with_recovery(
                 continue;
             };
             let alias_name = format!("{alias}::{suffix}");
-            let signature = signatures[&function.name].clone();
-            if let Some(existing) = signatures.get(&alias_name) {
+            let function_key = function_signature_key(function);
+            let signature = signatures[&function_key].clone();
+            let alias_key = if function_key.ends_with("#method") {
+                format!("{alias_name}#method")
+            } else {
+                alias_name.clone()
+            };
+            if let Some(existing) = signatures.get(&alias_key) {
                 if !matches!(
                     (existing.target, signature.target),
                     (IrCallTarget::Function(left), IrCallTarget::Function(right)) if left == right
@@ -1268,7 +1452,7 @@ fn analyze_with_recovery(
                     )]);
                 }
             } else {
-                signatures.insert(alias_name, signature);
+                signatures.insert(alias_key, signature);
             }
         }
     }
@@ -1325,6 +1509,7 @@ fn analyze_with_recovery(
                         | Type::F64
                         | Type::Bool
                         | Type::Char
+                        | Type::OwnedString
                         | Type::RawPointer(_)
                 )
             })
@@ -1416,7 +1601,7 @@ fn analyze_with_recovery(
         }
     }
     for function in &program.functions {
-        let Some(signature) = signatures.get(&function.name) else {
+        let Some(signature) = signatures.get(&function_signature_key(function)) else {
             continue;
         };
         for ty in signature
@@ -1540,6 +1725,7 @@ fn analyze_with_recovery(
         main_index,
         structs,
         enums,
+        instant_drop: None,
     };
     crate::guard::check(&mut ir).map_err(|error| vec![error])?;
     Ok(ir)
@@ -1602,10 +1788,10 @@ fn build_shape_table(
 }
 
 fn method_signature_candidates(definition: &RynStruct, method: &str) -> Vec<String> {
-    let mut candidates = vec![format!("{}::{method}", definition.name)];
+    let mut candidates = vec![format!("{}::{method}#method", definition.name)];
     if !definition.module_path.is_empty() {
         candidates.push(format!(
-            "{}::{}::{method}",
+            "{}::{}::{method}#method",
             definition.module_path, definition.name
         ));
     }
@@ -1777,7 +1963,7 @@ fn materialize_shape_defaults(
                     span: method.span,
                 });
                 signatures.insert(
-                    qualified,
+                    format!("{qualified}#method"),
                     FunctionSignature {
                         target: IrCallTarget::Function(index),
                         parameters: vec![self_type],
@@ -1813,7 +1999,7 @@ fn materialize_derived_clones(
             continue;
         }
         let method_name = format!("{}::clone", definition.name);
-        if signatures.contains_key(&method_name) {
+        if signatures.contains_key(&format!("{method_name}#method")) {
             continue;
         }
         let span = Span::default();
@@ -1859,7 +2045,7 @@ fn materialize_derived_clones(
         });
         let struct_type = Type::Struct(struct_index);
         signatures.insert(
-            method_name,
+            format!("{method_name}#method"),
             FunctionSignature {
                 target: IrCallTarget::Function(index),
                 parameters: vec![Type::Reference(intern_pointer_target(struct_type), false)],
@@ -2050,7 +2236,7 @@ impl<'a> Analyzer<'a> {
 
     fn function(mut self, mut function: Function) -> Result<RynFunction, Diagnostic> {
         if function.extern_c {
-            let signature = &self.signatures[&function.name];
+            let signature = &self.signatures[&function_signature_key(&function)];
             return Ok(RynFunction {
                 parameters: signature
                     .parameters
@@ -2113,7 +2299,8 @@ impl<'a> Analyzer<'a> {
     ) -> Result<(Vec<LocalBinding>, bool), Diagnostic> {
         self.function_name.clone_from(&function.name);
         self.module_path.clone_from(&function.module_path);
-        self.return_type = self.signatures[&function.name].return_type;
+        let signature_key = function_signature_key(function);
+        self.return_type = self.signatures[&signature_key].return_type;
         if matches!(self.return_type, Some(Type::Slice(_))) {
             return Err(diag(
                 "R0240",
@@ -2127,7 +2314,7 @@ impl<'a> Analyzer<'a> {
         for (parameter, ty) in function
             .parameters
             .iter()
-            .zip(&self.signatures[&function.name].parameters)
+            .zip(&self.signatures[&signature_key].parameters)
         {
             if self.names.contains_key(&parameter.name) {
                 return Err(diag(
@@ -2349,7 +2536,7 @@ impl<'a> Analyzer<'a> {
                 self.local_types.push(LocalType::OwnedPtr);
                 self.owned_slot_types.push(Some(Type::OwnedString));
             }
-            Type::Vec(_) | Type::Map(_) => {
+            Type::Vec(_) | Type::Map(_) | Type::Set(_) => {
                 self.local_types.push(LocalType::OwnedPtr);
                 self.owned_slot_types.push(Some(ty));
             }
@@ -3062,6 +3249,7 @@ impl<'a> Analyzer<'a> {
                     name,
                     arguments,
                     span,
+                    ..
                 } = root_expression
                 {
                     links.push((name, arguments, span));
@@ -4259,6 +4447,23 @@ impl<'a> Analyzer<'a> {
                     ty,
                 ))
             }
+            Expression::SetConstructor { element, span } => {
+                let element = self.resolve_type_name(&element).map_err(|mut error| {
+                    error.span = span;
+                    error
+                })?;
+                validate_map_key_lenient(element, span)?;
+                let map_id = intern_map(element, Type::Bool);
+                let ty = Type::Set(map_id);
+                Ok((
+                    IrExpression::Call {
+                        target: IrCallTarget::Set(MapOp::New, map_id),
+                        arguments: Vec::new(),
+                        return_type: ty,
+                    },
+                    ty,
+                ))
+            }
             Expression::Call {
                 name,
                 arguments,
@@ -4737,11 +4942,12 @@ impl<'a> Analyzer<'a> {
             Expression::MethodCall {
                 value,
                 name,
+                type_arguments,
                 arguments,
                 span,
             } => {
                 let (target, arguments, result) =
-                    self.lower_method(*value, name.clone(), arguments, span)?;
+                    self.lower_method(*value, name.clone(), type_arguments, arguments, span)?;
                 if matches!(
                     target,
                     IrCallTarget::String(StringOp::FindStr | StringOp::FindString)
@@ -5490,9 +5696,13 @@ impl<'a> Analyzer<'a> {
                 };
                 match receiver_hint {
                     Some(Type::OwnedString) => match name.as_str() {
-                        "clone" | "concat" | "slice" | "slice_chars" | "trim" => {
-                            Some(Type::OwnedString)
-                        }
+                        "clone" | "to_string" | "concat" | "slice" | "slice_chars"
+                        | "substring" | "trim" | "trim_start" | "trim_end" | "to_lower"
+                        | "to_upper" | "replace" | "repeat" | "reverse" => Some(Type::OwnedString),
+                        "lines" => Some(Type::Vec(intern_vec_elem(Type::OwnedString))),
+                        "chars" => Some(Type::Vec(intern_vec_elem(Type::Char))),
+                        "bytes" => Some(Type::Vec(intern_vec_elem(Type::U8))),
+                        "is_empty" => Some(Type::Bool),
                         "to_i8" => Some(Type::I8),
                         "to_i16" => Some(Type::I16),
                         "to_i32" => Some(Type::I32),
@@ -5514,9 +5724,11 @@ impl<'a> Analyzer<'a> {
                     Some(Type::Vec(id)) => match name.as_str() {
                         "clone" => Some(Type::Vec(id)),
                         "len" | "capacity" => Some(Type::U64),
+                        "is_empty" => Some(Type::Bool),
                         "take" | "extract" | "index" => Some(vec_elem(id)),
                         _ => None,
                     },
+                    Some(ty) if is_numeric(ty) && name == "to_string" => Some(Type::OwnedString),
                     _ => None,
                 }
             }
@@ -5741,6 +5953,7 @@ impl<'a> Analyzer<'a> {
         &mut self,
         value: Expression,
         name: String,
+        type_arguments: Vec<TypeName>,
         arguments: Vec<Expression>,
         span: Span,
     ) -> Result<(IrCallTarget, Vec<IrExpression>, Option<Type>), Diagnostic> {
@@ -5755,6 +5968,87 @@ impl<'a> Analyzer<'a> {
             .and_then(|name| self.names.get(name))
             .is_none_or(|binding| binding.mutable || self.parameter_slots.contains(&binding.slot));
         let (mut receiver, receiver_ty) = self.expression(value, None)?;
+        if matches!(name.as_str(), "parse" | "try_parse") {
+            if type_arguments.len() != 1 {
+                return Err(diag(
+                    "R0211",
+                    format!("method `{name}` expects one type argument"),
+                    span,
+                ));
+            }
+            if !arguments.is_empty() {
+                return Err(diag(
+                    "R0211",
+                    format!("method `{name}` expects no value arguments"),
+                    span,
+                ));
+            }
+            if receiver_ty != Type::OwnedString {
+                return Err(diag(
+                    "R0234",
+                    format!("`{name}` is only available on String"),
+                    span,
+                ));
+            }
+            let target_name = match (&type_arguments[0], name.as_str()) {
+                (TypeName::I8, "parse") => "to_i8",
+                (TypeName::I16, "parse") => "to_i16",
+                (TypeName::I32, "parse") => "to_i32",
+                (TypeName::I64, "parse") => "to_i64",
+                (TypeName::U8, "parse") => "to_u8",
+                (TypeName::U16, "parse") => "to_u16",
+                (TypeName::U32, "parse") => "to_u32",
+                (TypeName::U64, "parse") => "to_u64",
+                (TypeName::F32, "parse") => "to_f32",
+                (TypeName::F64, "parse") => "to_f64",
+                (TypeName::I8, "try_parse") => "try_to_i8",
+                (TypeName::I16, "try_parse") => "try_to_i16",
+                (TypeName::I32, "try_parse") => "try_to_i32",
+                (TypeName::I64, "try_parse") => "try_to_i64",
+                (TypeName::U8, "try_parse") => "try_to_u8",
+                (TypeName::U16, "try_parse") => "try_to_u16",
+                (TypeName::U32, "try_parse") => "try_to_u32",
+                (TypeName::U64, "try_parse") => "try_to_u64",
+                (TypeName::F32, "try_parse") => "try_to_f32",
+                (TypeName::F64, "try_parse") => "try_to_f64",
+                _ => {
+                    return Err(diag(
+                        "R0234",
+                        "String parsing supports numeric target types",
+                        span,
+                    ));
+                }
+            };
+            return self.lower_string_method_receiver(
+                receiver,
+                target_name.to_owned(),
+                Vec::new(),
+                span,
+                mutable,
+            );
+        } else if !type_arguments.is_empty() {
+            return Err(diag(
+                "R0234",
+                "this method does not accept type arguments",
+                span,
+            ));
+        }
+        if name == "to_string" && arguments.is_empty() {
+            if receiver_ty == Type::OwnedString {
+                return Ok((
+                    IrCallTarget::String(StringOp::Clone),
+                    vec![receiver],
+                    Some(Type::OwnedString),
+                ));
+            }
+            if let Some(operation) = StringOp::from_numeric_type(receiver_ty) {
+                return Ok((
+                    IrCallTarget::String(operation),
+                    vec![receiver],
+                    Some(Type::OwnedString),
+                ));
+            }
+        }
         if let Type::Vec(elem_id) = receiver_ty {
             if matches!(name.as_str(), "as_slice" | "slice") {
                 if custom_drop_vec_only(Type::Vec(elem_id), self.structs, self.enums) {
@@ -5829,8 +6123,209 @@ impl<'a> Analyzer<'a> {
                 span,
             ));
         }
+        if let Type::Set(map_id) = receiver_ty {
+            return self.lower_set_method(receiver, map_id, name.clone(), arguments, span, mutable);
+        }
         if let Type::Map(map_id) = receiver_ty {
             return self.lower_map_method(receiver, map_id, name.clone(), arguments, span, mutable);
+        }
+        if let Type::Enum(enum_id) = receiver_ty {
+            let definition = &self.enums[enum_id];
+            let is_option = definition
+                .variants
+                .iter()
+                .any(|variant| variant.name == "Some")
+                && definition
+                    .variants
+                    .iter()
+                    .any(|variant| variant.name == "None");
+            let is_result = definition
+                .variants
+                .iter()
+                .any(|variant| variant.name == "Ok")
+                && definition
+                    .variants
+                    .iter()
+                    .any(|variant| variant.name == "Err");
+            let predicate = match (is_option, is_result, name.as_str()) {
+                (true, _, "is_some") => Some(EnumPredicate::IsSome),
+                (true, _, "is_none") => Some(EnumPredicate::IsNone),
+                (_, true, "is_ok") => Some(EnumPredicate::IsOk),
+                (_, true, "is_err") => Some(EnumPredicate::IsErr),
+                _ => None,
+            };
+            if let Some(predicate) = predicate {
+                if !arguments.is_empty() {
+                    return Err(diag(
+                        "R0211",
+                        format!(
+                            "method `{name}` expects no arguments but got {}",
+                            arguments.len()
+                        ),
+                        span,
+                    ));
+                }
+                let variants = &definition.variants;
+                let expected = match predicate {
+                    EnumPredicate::IsSome => "Some",
+                    EnumPredicate::IsOk => "Ok",
+                    EnumPredicate::IsNone => "None",
+                    EnumPredicate::IsErr => "Err",
+                };
+                if !variants.iter().any(|variant| variant.name == expected) {
+                    return Err(diag(
+                        "R0900",
+                        "malformed Option/Result specialization",
+                        span,
+                    ));
+                }
+                return Ok((
+                    IrCallTarget::EnumPredicate(predicate, enum_id),
+                    vec![receiver],
+                    Some(Type::Bool),
+                ));
+            }
+            if (definition.name.starts_with("$RynOption#")
+                || definition.name.starts_with("$RynResult#"))
+                && name == "unwrap_or"
+            {
+                if arguments.len() != 1 {
+                    return Err(diag(
+                        "R0211",
+                        format!(
+                            "method `unwrap_or` expects 1 argument but got {}",
+                            arguments.len()
+                        ),
+                        span,
+                    ));
+                }
+                let success_name = if definition.name.starts_with("$RynResult#") {
+                    "Ok"
+                } else {
+                    "Some"
+                };
+                let Some(value_type) = definition.variants.iter().find_map(|variant| {
+                    (variant.name == success_name)
+                        .then(|| variant.fields.first().copied())
+                        .flatten()
+                }) else {
+                    return Err(diag(
+                        "R0900",
+                        "malformed Option/Result specialization",
+                        span,
+                    ));
+                };
+                if !enum_extract_payload_supported(value_type, self.structs, self.enums) {
+                    return Err(diag(
+                        "R0234",
+                        "Option/Result.unwrap_or supports scalar, owned pointer-backed, and non-resource aggregate payloads",
+                        span,
+                    ));
+                }
+                let argument_span = arguments[0].span();
+                let (mut default, actual) =
+                    self.expression(arguments.into_iter().next().unwrap(), Some(value_type))?;
+                if actual != value_type {
+                    return Err(diag(
+                        "R0212",
+                        format!(
+                            "unwrap_or default has type `{}` but `{}` is required",
+                            type_name(actual),
+                            type_name(value_type)
+                        ),
+                        argument_span,
+                    ));
+                }
+                if value_type == Type::OwnedString {
+                    default = IrExpression::Call {
+                        target: IrCallTarget::String(StringOp::Clone),
+                        arguments: vec![default],
+                        return_type: Type::OwnedString,
+                    };
+                }
+                return Ok((
+                    IrCallTarget::EnumUnwrapOr {
+                        enum_id,
+                        value_type,
+                    },
+                    vec![receiver, default],
+                    Some(value_type),
+                ));
+            }
+            if (is_option && matches!(name.as_str(), "unwrap" | "expect"))
+                || (is_result && matches!(name.as_str(), "unwrap" | "expect" | "unwrap_err"))
+            {
+                let takes_message = name == "expect";
+                let success_name = if name == "unwrap_err" {
+                    "Err"
+                } else if is_result {
+                    "Ok"
+                } else {
+                    "Some"
+                };
+                let failure_op = if takes_message {
+                    SystemOp::OptionExpectFailed
+                } else if is_result {
+                    SystemOp::ResultUnwrapFailed
+                } else {
+                    SystemOp::OptionUnwrapFailed
+                };
+                if arguments.len() != usize::from(takes_message) {
+                    return Err(diag(
+                        "R0211",
+                        format!(
+                            "method `{name}` expects {} argument(s) but got {}",
+                            usize::from(takes_message),
+                            arguments.len()
+                        ),
+                        span,
+                    ));
+                }
+                let Some((success_tag, value_type)) = definition
+                    .variants
+                    .iter()
+                    .enumerate()
+                    .find_map(|(tag, variant)| {
+                        (variant.name == success_name)
+                            .then(|| variant.fields.first().copied().map(|ty| (tag, ty)))
+                            .flatten()
+                    })
+                else {
+                    return Err(diag("R0900", "malformed Option specialization", span));
+                };
+                if !enum_extract_payload_supported(value_type, self.structs, self.enums) {
+                    return Err(diag(
+                        "R0234",
+                        "Option/Result extraction supports scalar, owned pointer-backed, and non-resource aggregate payloads",
+                        span,
+                    ));
+                }
+                let mut lowered = vec![receiver];
+                if takes_message {
+                    let message_span = arguments[0].span();
+                    let (message, actual) =
+                        self.expression(arguments.into_iter().next().unwrap(), Some(Type::Str))?;
+                    if actual != Type::Str {
+                        return Err(diag(
+                            "R0212",
+                            "Option.expect message must be `str`",
+                            message_span,
+                        ));
+                    }
+                    lowered.push(message);
+                }
+                return Ok((
+                    IrCallTarget::EnumUnwrap {
+                        enum_id,
+                        value_type,
+                        message: takes_message,
+                        success_tag,
+                        failure: failure_op,
+                    },
+                    lowered,
+                    Some(value_type),
+                ));
+            }
         }
         if let Type::Struct(struct_id) = receiver_ty {
             return self.lower_struct_method(
@@ -5936,7 +6431,19 @@ impl<'a> Analyzer<'a> {
             "char_at" => StringOp::CharAt,
             "slice" => StringOp::Slice,
             "slice_chars" => StringOp::SliceChars,
+            "substring" => StringOp::SliceChars,
             "trim" => StringOp::Trim,
+            "trim_start" => StringOp::TrimStart,
+            "trim_end" => StringOp::TrimEnd,
+            "is_empty" => StringOp::IsEmpty,
+            "to_lower" => StringOp::ToLower,
+            "to_upper" => StringOp::ToUpper,
+            "replace" => StringOp::ReplaceStr,
+            "lines" => StringOp::Lines,
+            "chars" => StringOp::Chars,
+            "bytes" => StringOp::Bytes,
+            "repeat" => StringOp::Repeat,
+            "reverse" => StringOp::Reverse,
             "clear" => StringOp::Clear,
             "push" => StringOp::Push,
             "append" if owned_argument => StringOp::AppendString,
@@ -6016,10 +6523,10 @@ impl<'a> Analyzer<'a> {
     /// The right-operand type of the struct's operator method, if defined.
     fn operator_method_parameter_type(&self, struct_id: usize, method_name: &str) -> Option<Type> {
         let definition = self.structs.get(struct_id)?;
-        let mut candidates = vec![format!("{}::{method_name}", definition.name)];
+        let mut candidates = vec![format!("{}::{method_name}#method", definition.name)];
         if !definition.module_path.is_empty() {
             candidates.push(format!(
-                "{}::{}::{method_name}",
+                "{}::{}::{method_name}#method",
                 definition.module_path, definition.name
             ));
         }
@@ -6046,10 +6553,10 @@ impl<'a> Analyzer<'a> {
     ) -> Result<Option<(IrExpression, Type)>, Diagnostic> {
         let definition = self.structs[struct_id].clone();
         let struct_name = definition.name.clone();
-        let mut candidates = vec![format!("{struct_name}::{method_name}")];
+        let mut candidates = vec![format!("{struct_name}::{method_name}#method")];
         if !definition.module_path.is_empty() {
             candidates.push(format!(
-                "{}::{}::{method_name}",
+                "{}::{}::{method_name}#method",
                 definition.module_path, struct_name
             ));
         }
@@ -6125,6 +6632,9 @@ impl<'a> Analyzer<'a> {
             }
             Type::Map(map_id) => {
                 self.lower_map_method(receiver, map_id, name, arguments, span, mutable)
+            }
+            Type::Set(map_id) => {
+                self.lower_set_method(receiver, map_id, name, arguments, span, mutable)
             }
             Type::Reference(target, reference_mutable) => {
                 if let Type::Struct(struct_id) = pointer_target(target) {
@@ -6308,7 +6818,7 @@ impl<'a> Analyzer<'a> {
             | Type::F64
             | Type::Bool
             | Type::Char => true,
-            Type::OwnedString | Type::Vec(_) | Type::Map(_) => true,
+            Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Set(_) => true,
             Type::Struct(id) => {
                 self.structs[id].drop_function.is_none()
                     && !contains_custom_drop(
@@ -6323,6 +6833,106 @@ impl<'a> Analyzer<'a> {
             }
             _ => false,
         };
+        if matches!(name.as_str(), "get" | "first" | "last") {
+            let expected_arity = usize::from(name == "get");
+            if arguments.len() != expected_arity {
+                return Err(diag(
+                    "R0211",
+                    format!(
+                        "method `{name}` expects {expected_arity} argument(s) but got {}",
+                        arguments.len()
+                    ),
+                    span,
+                ));
+            }
+            if !elem_copyable {
+                return Err(diag(
+                    "R0234",
+                    format!(
+                        "`Vec<{}>::{name}` requires cloneable elements",
+                        type_name(elem)
+                    ),
+                    span,
+                ));
+            }
+            let option_id = self
+                .enums
+                .iter()
+                .position(|definition| is_option_of(definition, elem))
+                .ok_or_else(|| {
+                    diag(
+                        "R0234",
+                        format!(
+                            "`Option<{}>` is not available for this Vec element type",
+                            type_name(elem)
+                        ),
+                        span,
+                    )
+                })?;
+            let index = if name == "get" {
+                let argument = arguments.into_iter().next().unwrap();
+                let arg_span = argument.span();
+                let (value, actual) = self.expression(argument, Some(Type::U64))?;
+                if actual != Type::U64 {
+                    return Err(diag("R0212", "Vec.get index must be u64", arg_span));
+                }
+                value
+            } else if name == "first" {
+                IrExpression::Integer(0, Type::U64)
+            } else {
+                // The runtime recognizes the maximum u64 sentinel as "last" and
+                // checks for an empty vector before choosing an element.
+                IrExpression::Integer(u64::MAX.into(), Type::U64)
+            };
+            return Ok((
+                IrCallTarget::VecGetOption {
+                    elem_id,
+                    option_id,
+                    pop: false,
+                },
+                vec![receiver, index],
+                Some(Type::Enum(option_id)),
+            ));
+        }
+        if name == "pop" {
+            if !arguments.is_empty() {
+                return Err(diag(
+                    "R0211",
+                    format!(
+                        "method `pop` expects no arguments but got {}",
+                        arguments.len()
+                    ),
+                    span,
+                ));
+            }
+            if !mutable {
+                return Err(diag("R0204", "method `pop` requires a mutable Vec", span)
+                    .with_help("declare the receiver's root binding with `mut`"));
+            }
+            let option_id = self
+                .enums
+                .iter()
+                .position(|definition| is_option_of(definition, elem))
+                .ok_or_else(|| {
+                    diag(
+                        "R0234",
+                        format!(
+                            "`Option<{}>` is not available for this Vec element type",
+                            type_name(elem)
+                        ),
+                        span,
+                    )
+                })?;
+            return Ok((
+                IrCallTarget::VecGetOption {
+                    elem_id,
+                    option_id,
+                    pop: true,
+                },
+                vec![receiver],
+                Some(Type::Enum(option_id)),
+            ));
+        }
         let op = match name.as_str() {
             "clone" if elem_copyable => VecOp::Clone,
             "clone" => {
@@ -6336,10 +6946,69 @@ impl<'a> Analyzer<'a> {
                 ));
             }
             "len" => VecOp::Len,
+            "is_empty" => VecOp::IsEmpty,
             "capacity" => VecOp::Capacity,
             "reserve" => VecOp::Reserve,
             "clear" => VecOp::Clear,
             "push" => VecOp::Push,
+            "insert" => VecOp::Insert,
+            "reverse" => VecOp::Reverse,
+            "sort" => {
+                if !matches!(
+                    elem,
+                    Type::I8
+                        | Type::I16
+                        | Type::I32
+                        | Type::I64
+                        | Type::U8
+                        | Type::U16
+                        | Type::U32
+                        | Type::U64
+                        | Type::F32
+                        | Type::F64
+                        | Type::Char
+                        | Type::OwnedString
+                ) {
+                    return Err(diag(
+                        "R0234",
+                        format!(
+                            "`Vec<{}>::sort` currently supports numeric, char, and String elements",
+                            type_name(elem)
+                        ),
+                        span,
+                    ));
+                }
+                VecOp::Sort
+            }
+            "contains" => {
+                if !matches!(
+                    elem,
+                    Type::I8
+                        | Type::I16
+                        | Type::I32
+                        | Type::I64
+                        | Type::U8
+                        | Type::U16
+                        | Type::U32
+                        | Type::U64
+                        | Type::F32
+                        | Type::F64
+                        | Type::Bool
+                        | Type::Char
+                        | Type::OwnedString
+                ) {
+                    return Err(diag(
+                        "R0234",
+                        format!(
+                            "`Vec<{}>::contains` currently supports scalar and String elements",
+                            type_name(elem)
+                        ),
+                        span,
+                    ));
+                }
+                VecOp::Contains
+            }
+            "remove" => VecOp::Take,
             "set" => VecOp::Set,
             "take" => VecOp::Take,
             "extract" if elem_copyable => VecOp::Extract,
@@ -6401,6 +7070,7 @@ impl<'a> Analyzer<'a> {
         let (key, value) = map_info(map_id);
         let op = match name.as_str() {
             "len" => MapOp::Len,
+            "is_empty" => MapOp::IsEmpty,
             "clone" => MapOp::Clone,
             "clear" => MapOp::Clear,
             "contains_key" | "contains" => MapOp::ContainsKey,
@@ -6465,16 +7135,88 @@ impl<'a> Analyzer<'a> {
         Ok((target, arguments, result))
     }
 
+    fn lower_set_method(
+        &mut self,
+        receiver: IrExpression,
+        map_id: usize,
+        name: String,
+        arguments: Vec<Expression>,
+        span: Span,
+        mutable: bool,
+    ) -> Result<(IrCallTarget, Vec<IrExpression>, Option<Type>), Diagnostic> {
+        let (element, _) = map_info(map_id);
+        // Set<T> exposes membership operations that take a single element,
+        // while the backing Map<T, bool> insert takes a key/value pair.
+        // Do not route insert through Map's public method signature: lower it
+        // directly and supply the set's marker value internally.
+        if name == "insert" {
+            if arguments.len() != 1 {
+                return Err(diag(
+                    "R0211",
+                    format!(
+                        "function `insert` expects 1 argument but got {}",
+                        arguments.len()
+                    ),
+                    span,
+                ));
+            }
+            let (value, actual) =
+                self.expression(arguments.into_iter().next().unwrap(), Some(element))?;
+            if actual != element {
+                return Err(diag(
+                    "R0212",
+                    format!(
+                        "argument to `insert` has type `{}` but `{}` is required",
+                        type_name(actual),
+                        type_name(element)
+                    ),
+                    span,
+                ));
+            }
+            return Ok((
+                IrCallTarget::Set(MapOp::Insert, map_id),
+                vec![receiver, value, IrExpression::Boolean(true)],
+                Some(Type::Bool),
+            ));
+        }
+        let (target, arguments, result) =
+            self.lower_map_method(receiver, map_id, name.clone(), arguments, span, mutable)?;
+        let operation = match target {
+            IrCallTarget::Map(operation, _) => operation,
+            _ => return Err(diag("R0900", "internal Set method dispatch mismatch", span)),
+        };
+        if !matches!(
+            operation,
+            MapOp::Len
+                | MapOp::IsEmpty
+                | MapOp::Clear
+                | MapOp::ContainsKey
+                | MapOp::Insert
+                | MapOp::Remove
+                | MapOp::New
+                | MapOp::Clone
+        ) {
+            return Err(diag("R0234", format!("Set has no method `{name}`"), span));
+        }
+        let result = if operation == MapOp::Insert {
+            Some(Type::Bool)
+        } else {
+            result
+        };
+        let _ = element;
+        Ok((IrCallTarget::Set(operation, map_id), arguments, result))
+    }
+
     fn resolve_method_signature(
         &self,
         struct_id: usize,
         struct_name: &str,
         method: &str,
     ) -> Option<FunctionSignature> {
-        let mut candidates = vec![format!("{struct_name}::{method}")];
+        let mut candidates = vec![format!("{struct_name}::{method}#method")];
         let module = &self.structs[struct_id].module_path;
         if !module.is_empty() {
-            candidates.push(format!("{module}::{struct_name}::{method}"));
+            candidates.push(format!("{module}::{struct_name}::{method}#method"));
         }
         candidates
             .iter()
@@ -6915,7 +7657,7 @@ impl<'a> Analyzer<'a> {
             )),
             "arg_count" => Some((IrCallTarget::ArgumentCount, Vec::new(), Some(Type::U32))),
             "arg" => Some((IrCallTarget::Argument, vec![Type::U32], Some(Type::Str))),
-            "read_file" => Some((
+            "read_file" | "__fs_read_file" => Some((
                 IrCallTarget::Filesystem(FilesystemOp::ReadFile),
                 vec![Type::Str],
                 Some(Type::OwnedString),
@@ -6952,9 +7694,19 @@ impl<'a> Analyzer<'a> {
                     Some(Type::Enum(result_id)),
                 ))
             }
-            "write_file" => Some((
+            "write_file" | "__fs_write_file" => Some((
                 IrCallTarget::Filesystem(FilesystemOp::WriteFile),
                 vec![Type::Str, Type::Str],
+                Some(Type::Bool),
+            )),
+            "append_file" | "__fs_append_file" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::AppendFile),
+                vec![Type::Str, Type::Str],
+                Some(Type::Bool),
+            )),
+            "__fs_create_dir" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::CreateDir),
+                vec![Type::Str],
                 Some(Type::Bool),
             )),
             "create_dir" => Some((
@@ -6962,64 +7714,129 @@ impl<'a> Analyzer<'a> {
                 vec![Type::Str],
                 Some(Type::Bool),
             )),
-            "delete_file" => Some((
+            "create_dir_all" | "__fs_create_dir_all" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::CreateDirAll),
+                vec![Type::Str],
+                Some(Type::Bool),
+            )),
+            "delete_file" | "remove_file" | "__fs_remove_file" => Some((
                 IrCallTarget::Filesystem(FilesystemOp::DeleteFile),
                 vec![Type::Str],
                 Some(Type::Bool),
             )),
-            "delete_dir" => Some((
+            "delete_dir" | "remove_dir" | "__fs_remove_dir" => Some((
                 IrCallTarget::Filesystem(FilesystemOp::DeleteDir),
                 vec![Type::Str],
                 Some(Type::Bool),
             )),
-            "file_exists" => Some((
+            "file_exists" | "__fs_file_exists" => Some((
                 IrCallTarget::Filesystem(FilesystemOp::Exists),
                 vec![Type::Str],
                 Some(Type::Bool),
             )),
-            "is_file" => Some((
+            "is_file" | "__fs_is_file" => Some((
                 IrCallTarget::Filesystem(FilesystemOp::IsFile),
                 vec![Type::Str],
                 Some(Type::Bool),
             )),
-            "is_directory" => Some((
+            "is_directory" | "__fs_is_directory" => Some((
                 IrCallTarget::Filesystem(FilesystemOp::IsDirectory),
                 vec![Type::Str],
                 Some(Type::Bool),
             )),
-            "delete_dir_all" => Some((
+            "delete_dir_all" | "remove_dir_all" | "__fs_remove_dir_all" => Some((
                 IrCallTarget::Filesystem(FilesystemOp::DeleteDirAll),
                 vec![Type::Str],
                 Some(Type::Bool),
             )),
-            "read_dir" => Some((
+            "read_dir" | "__fs_read_dir" => Some((
                 IrCallTarget::Filesystem(FilesystemOp::ReadDir),
                 vec![Type::Str],
                 Some(Type::Vec(intern_vec_elem(Type::OwnedString))),
             )),
-            "path_join" => Some((
+            "path_join" | "__fs_path_join" => Some((
                 IrCallTarget::Filesystem(FilesystemOp::PathJoin),
                 vec![Type::Str, Type::Str],
                 Some(Type::OwnedString),
             )),
-            "path_parent" => Some((
+            "path_parent" | "__fs_path_parent" => Some((
                 IrCallTarget::Filesystem(FilesystemOp::PathParent),
                 vec![Type::Str],
                 Some(Type::OwnedString),
             )),
-            "path_file_name" => Some((
+            "path_file_name" | "__fs_path_file_name" => Some((
                 IrCallTarget::Filesystem(FilesystemOp::PathFileName),
                 vec![Type::Str],
                 Some(Type::OwnedString),
             )),
-            "path_extension" => Some((
+            "path_extension" | "__fs_path_extension" => Some((
                 IrCallTarget::Filesystem(FilesystemOp::PathExtension),
                 vec![Type::Str],
                 Some(Type::OwnedString),
             )),
-            "path_is_absolute" => Some((
+            "path_is_absolute" | "__fs_path_is_absolute" => Some((
                 IrCallTarget::Filesystem(FilesystemOp::PathIsAbsolute),
                 vec![Type::Str],
+                Some(Type::Bool),
+            )),
+            "path_absolute" | "__fs_path_absolute" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::PathAbsolute),
+                vec![Type::Str],
+                Some(Type::OwnedString),
+            )),
+            "path_canonical" | "__fs_path_canonical" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::PathCanonical),
+                vec![Type::Str],
+                Some(Type::OwnedString),
+            )),
+            "copy_file" | "__fs_copy_file" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::CopyFile),
+                vec![Type::Str, Type::Str],
+                Some(Type::Bool),
+            )),
+            "move_file" | "rename" | "__fs_rename" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::Rename),
+                vec![Type::Str, Type::Str],
+                Some(Type::Bool),
+            )),
+            "__file_open" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::FileOpen),
+                vec![Type::Str],
+                Some(raw_pointer),
+            )),
+            "__file_create" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::FileCreate),
+                vec![Type::Str],
+                Some(raw_pointer),
+            )),
+            "__file_read" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::FileRead),
+                vec![raw_pointer],
+                Some(Type::OwnedString),
+            )),
+            "__file_read_line" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::FileReadLine),
+                vec![raw_pointer],
+                Some(Type::OwnedString),
+            )),
+            "__file_write" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::FileWrite),
+                vec![raw_pointer, Type::Str],
+                Some(Type::Bool),
+            )),
+            "__file_flush" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::FileFlush),
+                vec![raw_pointer],
+                Some(Type::Bool),
+            )),
+            "__file_close" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::FileClose),
+                vec![raw_pointer],
+                Some(Type::Bool),
+            )),
+            "__file_drop" => Some((
+                IrCallTarget::Filesystem(FilesystemOp::FileDrop),
+                vec![raw_pointer],
                 Some(Type::Bool),
             )),
             "env_exists" => Some((
@@ -7031,6 +7848,11 @@ impl<'a> Analyzer<'a> {
                 IrCallTarget::System(SystemOp::EnvOr),
                 vec![Type::Str, Type::Str],
                 Some(Type::OwnedString),
+            )),
+            "__env_set" => Some((
+                IrCallTarget::System(SystemOp::SetEnv),
+                vec![Type::Str, Type::Str],
+                Some(Type::Bool),
             )),
             "set_env" => Some((
                 IrCallTarget::System(SystemOp::SetEnv),
@@ -7047,15 +7869,234 @@ impl<'a> Analyzer<'a> {
                 vec![],
                 Some(Type::OwnedString),
             )),
+            "stdin_read_line" | "read_line" => Some((
+                IrCallTarget::System(SystemOp::ReadStdinLine),
+                vec![],
+                Some(Type::OwnedString),
+            )),
+            "ask" => Some((
+                IrCallTarget::System(SystemOp::Ask),
+                vec![Type::Str],
+                Some(Type::OwnedString),
+            )),
             "stdout_write" => Some((
                 IrCallTarget::System(SystemOp::WriteStdout),
                 vec![Type::Str],
                 None,
             )),
+            "stdout_flush" => Some((IrCallTarget::System(SystemOp::FlushStdout), vec![], None)),
             "stderr_write" => Some((
                 IrCallTarget::System(SystemOp::WriteStderr),
                 vec![Type::Str],
                 None,
+            )),
+            "stderr_flush" => Some((IrCallTarget::System(SystemOp::FlushStderr), vec![], None)),
+            "__io_read_line" => Some((
+                IrCallTarget::System(SystemOp::ReadStdinLine),
+                vec![],
+                Some(Type::OwnedString),
+            )),
+            "__io_ask" => Some((
+                IrCallTarget::System(SystemOp::Ask),
+                vec![Type::Str],
+                Some(Type::OwnedString),
+            )),
+            "__io_stdin_read" => Some((
+                IrCallTarget::System(SystemOp::ReadStdin),
+                vec![],
+                Some(Type::OwnedString),
+            )),
+            "__io_stdout_write" => Some((
+                IrCallTarget::System(SystemOp::WriteStdout),
+                vec![Type::Str],
+                None,
+            )),
+            "__io_stderr_write" => Some((
+                IrCallTarget::System(SystemOp::WriteStderr),
+                vec![Type::Str],
+                None,
+            )),
+            "__io_stdout_flush" => {
+                Some((IrCallTarget::System(SystemOp::FlushStdout), vec![], None))
+            }
+            "__io_stderr_flush" => {
+                Some((IrCallTarget::System(SystemOp::FlushStderr), vec![], None))
+            }
+            "__input_key_down" => Some((
+                IrCallTarget::System(SystemOp::KeyDown),
+                vec![Type::U32],
+                Some(Type::Bool),
+            )),
+            "__input_key_pressed" => Some((
+                IrCallTarget::System(SystemOp::KeyPressed),
+                vec![Type::U32],
+                Some(Type::Bool),
+            )),
+            "__input_key_released" => Some((
+                IrCallTarget::System(SystemOp::KeyReleased),
+                vec![Type::U32],
+                Some(Type::Bool),
+            )),
+            "__input_read_key" => Some((
+                IrCallTarget::System(SystemOp::ReadKey),
+                vec![],
+                Some(Type::U32),
+            )),
+            "abs" | "__math_abs" => Some((
+                IrCallTarget::System(SystemOp::MathAbs),
+                vec![Type::F64],
+                Some(Type::F64),
+            )),
+            "min" | "__math_min" => Some((
+                IrCallTarget::System(SystemOp::MathMin),
+                vec![Type::F64, Type::F64],
+                Some(Type::F64),
+            )),
+            "max" | "__math_max" => Some((
+                IrCallTarget::System(SystemOp::MathMax),
+                vec![Type::F64, Type::F64],
+                Some(Type::F64),
+            )),
+            "clamp" | "__math_clamp" => Some((
+                IrCallTarget::System(SystemOp::MathClamp),
+                vec![Type::F64, Type::F64, Type::F64],
+                Some(Type::F64),
+            )),
+            "sqrt" | "__math_sqrt" => Some((
+                IrCallTarget::System(SystemOp::MathSqrt),
+                vec![Type::F64],
+                Some(Type::F64),
+            )),
+            "pow" | "__math_pow" => Some((
+                IrCallTarget::System(SystemOp::MathPow),
+                vec![Type::F64, Type::F64],
+                Some(Type::F64),
+            )),
+            "floor" | "__math_floor" => Some((
+                IrCallTarget::System(SystemOp::MathFloor),
+                vec![Type::F64],
+                Some(Type::F64),
+            )),
+            "ceil" | "__math_ceil" => Some((
+                IrCallTarget::System(SystemOp::MathCeil),
+                vec![Type::F64],
+                Some(Type::F64),
+            )),
+            "round" | "__math_round" => Some((
+                IrCallTarget::System(SystemOp::MathRound),
+                vec![Type::F64],
+                Some(Type::F64),
+            )),
+            "sin" | "__math_sin" => Some((
+                IrCallTarget::System(SystemOp::MathSin),
+                vec![Type::F64],
+                Some(Type::F64),
+            )),
+            "cos" | "__math_cos" => Some((
+                IrCallTarget::System(SystemOp::MathCos),
+                vec![Type::F64],
+                Some(Type::F64),
+            )),
+            "tan" | "__math_tan" => Some((
+                IrCallTarget::System(SystemOp::MathTan),
+                vec![Type::F64],
+                Some(Type::F64),
+            )),
+            "log" | "__math_log" => Some((
+                IrCallTarget::System(SystemOp::MathLog),
+                vec![Type::F64],
+                Some(Type::F64),
+            )),
+            "log2" | "__math_log2" => Some((
+                IrCallTarget::System(SystemOp::MathLog2),
+                vec![Type::F64],
+                Some(Type::F64),
+            )),
+            "log10" | "__math_log10" => Some((
+                IrCallTarget::System(SystemOp::MathLog10),
+                vec![Type::F64],
+                Some(Type::F64),
+            )),
+            "random" | "__math_random" => Some((
+                IrCallTarget::System(SystemOp::Random),
+                vec![],
+                Some(Type::F64),
+            )),
+            "random_range" | "__math_random_range" => Some((
+                IrCallTarget::System(SystemOp::RandomRange),
+                vec![Type::F64, Type::F64],
+                Some(Type::F64),
+            )),
+            "sleep" | "__time_sleep" => {
+                Some((IrCallTarget::System(SystemOp::Sleep), vec![Type::U64], None))
+            }
+            "yield_thread" | "__time_yield_thread" => {
+                Some((IrCallTarget::System(SystemOp::YieldThread), vec![], None))
+            }
+            "env" | "__env_get" => Some((
+                IrCallTarget::System(SystemOp::EnvGet),
+                vec![Type::Str],
+                Some(Type::OwnedString),
+            )),
+            "current_dir" | "__current_dir" => Some((
+                IrCallTarget::System(SystemOp::CurrentDir),
+                vec![],
+                Some(Type::OwnedString),
+            )),
+            "set_current_dir" | "__set_current_dir" => Some((
+                IrCallTarget::System(SystemOp::SetCurrentDir),
+                vec![Type::Str],
+                Some(Type::Bool),
+            )),
+            "home_dir" | "__home_dir" => Some((
+                IrCallTarget::System(SystemOp::HomeDir),
+                vec![],
+                Some(Type::OwnedString),
+            )),
+            "temp_dir" | "__temp_dir" => Some((
+                IrCallTarget::System(SystemOp::TempDir),
+                vec![],
+                Some(Type::OwnedString),
+            )),
+            "executable_path" | "__executable_path" => Some((
+                IrCallTarget::System(SystemOp::ExecutablePath),
+                vec![],
+                Some(Type::OwnedString),
+            )),
+            "os" | "__os" => Some((
+                IrCallTarget::System(SystemOp::Os),
+                vec![],
+                Some(Type::OwnedString),
+            )),
+            "arch" | "__arch" => Some((
+                IrCallTarget::System(SystemOp::Arch),
+                vec![],
+                Some(Type::OwnedString),
+            )),
+            "cpu_count" | "__cpu_count" => Some((
+                IrCallTarget::System(SystemOp::CpuCount),
+                vec![],
+                Some(Type::U32),
+            )),
+            "hostname" | "__hostname" => Some((
+                IrCallTarget::System(SystemOp::Hostname),
+                vec![],
+                Some(Type::OwnedString),
+            )),
+            "__time_unix" => Some((
+                IrCallTarget::System(SystemOp::TimeUnix),
+                vec![],
+                Some(Type::F64),
+            )),
+            "__time_monotonic" => Some((
+                IrCallTarget::System(SystemOp::TimeMonotonic),
+                vec![],
+                Some(Type::F64),
+            )),
+            "__time_instant_elapsed" => Some((
+                IrCallTarget::System(SystemOp::TimeElapsed),
+                vec![Type::F64],
+                Some(Type::F64),
             )),
             "run_process" => Some((
                 IrCallTarget::System(SystemOp::RunProcess),
@@ -7067,14 +8108,194 @@ impl<'a> Analyzer<'a> {
                 vec![Type::Str, Type::Vec(intern_vec_elem(Type::OwnedString))],
                 Some(Type::I32),
             )),
-            "panic" => Some((IrCallTarget::System(SystemOp::Panic), vec![Type::Str], None)),
-            "exit" => Some((IrCallTarget::System(SystemOp::Exit), vec![Type::I32], None)),
-            "assert" => Some((
+            "__process_capture" => Some((
+                IrCallTarget::System(SystemOp::ProcessCapture),
+                vec![Type::Str, Type::Vec(intern_vec_elem(Type::OwnedString))],
+                Some(raw_pointer),
+            )),
+            "__process_capture_exit_code" => Some((
+                IrCallTarget::System(SystemOp::ProcessCaptureExitCode),
+                vec![raw_pointer],
+                Some(Type::I32),
+            )),
+            "__process_capture_stdout" => Some((
+                IrCallTarget::System(SystemOp::ProcessCaptureStdout),
+                vec![raw_pointer],
+                Some(Type::OwnedString),
+            )),
+            "__process_capture_stderr" => Some((
+                IrCallTarget::System(SystemOp::ProcessCaptureStderr),
+                vec![raw_pointer],
+                Some(Type::OwnedString),
+            )),
+            "__process_capture_drop" => Some((
+                IrCallTarget::System(SystemOp::ProcessCaptureDrop),
+                vec![raw_pointer],
+                None,
+            )),
+            "__tcp_connect" => Some((
+                IrCallTarget::System(SystemOp::TcpConnect),
+                vec![Type::Str],
+                Some(raw_pointer),
+            )),
+            "__tcp_read" => Some((
+                IrCallTarget::System(SystemOp::TcpRead),
+                vec![raw_pointer],
+                Some(Type::OwnedString),
+            )),
+            "__tcp_write" => Some((
+                IrCallTarget::System(SystemOp::TcpWrite),
+                vec![raw_pointer, Type::Str],
+                Some(Type::Bool),
+            )),
+            "__tcp_close" => Some((
+                IrCallTarget::System(SystemOp::TcpClose),
+                vec![raw_pointer],
+                Some(Type::Bool),
+            )),
+            "__tcp_drop" => Some((
+                IrCallTarget::System(SystemOp::TcpDrop),
+                vec![raw_pointer],
+                None,
+            )),
+            "__tcp_listener_bind" => Some((
+                IrCallTarget::System(SystemOp::TcpListenerBind),
+                vec![Type::Str],
+                Some(raw_pointer),
+            )),
+            "__tcp_accept" => Some((
+                IrCallTarget::System(SystemOp::TcpAccept),
+                vec![raw_pointer],
+                Some(raw_pointer),
+            )),
+            "__tcp_listener_close" => Some((
+                IrCallTarget::System(SystemOp::TcpListenerClose),
+                vec![raw_pointer],
+                Some(Type::Bool),
+            )),
+            "__tcp_listener_drop" => Some((
+                IrCallTarget::System(SystemOp::TcpListenerDrop),
+                vec![raw_pointer],
+                None,
+            )),
+            "__dns_resolve" => Some((
+                IrCallTarget::System(SystemOp::DnsResolve),
+                vec![Type::Str],
+                Some(Type::Vec(intern_vec_elem(Type::OwnedString))),
+            )),
+            "__udp_bind" => Some((
+                IrCallTarget::System(SystemOp::UdpBind),
+                vec![Type::Str],
+                Some(raw_pointer),
+            )),
+            "__udp_connect" => Some((
+                IrCallTarget::System(SystemOp::UdpConnect),
+                vec![raw_pointer, Type::Str],
+                Some(Type::Bool),
+            )),
+            "__udp_read" => Some((
+                IrCallTarget::System(SystemOp::UdpRead),
+                vec![raw_pointer],
+                Some(Type::OwnedString),
+            )),
+            "__udp_write" => Some((
+                IrCallTarget::System(SystemOp::UdpWrite),
+                vec![raw_pointer, Type::Str],
+                Some(Type::Bool),
+            )),
+            "__udp_close" => Some((
+                IrCallTarget::System(SystemOp::UdpClose),
+                vec![raw_pointer],
+                Some(Type::Bool),
+            )),
+            "__udp_drop" => Some((
+                IrCallTarget::System(SystemOp::UdpDrop),
+                vec![raw_pointer],
+                None,
+            )),
+            "__thread_spawn" => Some((
+                IrCallTarget::System(SystemOp::ThreadSpawn),
+                vec![Type::FunctionPointer(intern_function_pointer(
+                    FunctionPointerSignature {
+                        parameters: vec![],
+                        result: None,
+                        extern_c: true,
+                    },
+                ))],
+                Some(raw_pointer),
+            )),
+            "__thread_join" => Some((
+                IrCallTarget::System(SystemOp::ThreadJoin),
+                vec![raw_pointer],
+                Some(Type::Bool),
+            )),
+            "__thread_id" => Some((
+                IrCallTarget::System(SystemOp::ThreadId),
+                vec![raw_pointer],
+                Some(Type::U64),
+            )),
+            "__thread_drop" => Some((
+                IrCallTarget::System(SystemOp::ThreadDrop),
+                vec![raw_pointer],
+                None,
+            )),
+            "__process_new" => Some((
+                IrCallTarget::System(SystemOp::ProcessNew),
+                vec![Type::Str],
+                Some(raw_pointer),
+            )),
+            "__process_arg" => Some((
+                IrCallTarget::System(SystemOp::ProcessArg),
+                vec![raw_pointer, Type::Str],
+                Some(Type::Bool),
+            )),
+            "__process_args" => Some((
+                IrCallTarget::System(SystemOp::ProcessArgs),
+                vec![raw_pointer, Type::Vec(intern_vec_elem(Type::OwnedString))],
+                Some(Type::Bool),
+            )),
+            "__process_env" => Some((
+                IrCallTarget::System(SystemOp::ProcessEnv),
+                vec![raw_pointer, Type::Str, Type::Str],
+                Some(Type::Bool),
+            )),
+            "__process_cwd" => Some((
+                IrCallTarget::System(SystemOp::ProcessCwd),
+                vec![raw_pointer, Type::Str],
+                Some(Type::Bool),
+            )),
+            "__process_spawn" => Some((
+                IrCallTarget::System(SystemOp::ProcessSpawn),
+                vec![raw_pointer],
+                Some(Type::Bool),
+            )),
+            "__process_wait" => Some((
+                IrCallTarget::System(SystemOp::ProcessWait),
+                vec![raw_pointer],
+                Some(Type::I32),
+            )),
+            "__process_kill" => Some((
+                IrCallTarget::System(SystemOp::ProcessKill),
+                vec![raw_pointer],
+                Some(Type::Bool),
+            )),
+            "__process_drop" => Some((
+                IrCallTarget::System(SystemOp::ProcessDrop),
+                vec![raw_pointer],
+                None,
+            )),
+            "panic" | "__sys_panic" => {
+                Some((IrCallTarget::System(SystemOp::Panic), vec![Type::Str], None))
+            }
+            "exit" | "__sys_exit" => {
+                Some((IrCallTarget::System(SystemOp::Exit), vec![Type::I32], None))
+            }
+            "assert" | "__sys_assert" => Some((
                 IrCallTarget::System(SystemOp::Assert),
                 vec![Type::Bool],
                 None,
             )),
-            "assert_message" => Some((
+            "assert_message" | "__sys_assert_message" => Some((
                 IrCallTarget::System(SystemOp::AssertMessage),
                 vec![Type::Bool, Type::Str],
                 None,
@@ -7509,6 +8730,11 @@ fn resolve_type_name_scoped(
             validate_vec_elem(&elem, *span)?;
             Type::Vec(intern_vec_elem(elem))
         }
+        TypeName::Set(element, span) => {
+            let element = resolve_type_name_scoped(element, structs, enums, namespace)?;
+            validate_map_key_lenient(element, *span)?;
+            Type::Set(intern_map(element, Type::Bool))
+        }
         TypeName::Map(key, value, span) => {
             let key = resolve_type_name_scoped(key, structs, enums, namespace)?;
             let value = resolve_type_name_scoped(value, structs, enums, namespace)?;
@@ -7556,6 +8782,15 @@ fn resolve_type_name_scoped(
                         ty,
                         Type::Char | Type::RawPointer(_) | Type::FunctionPointer(_)
                     )
+                    || (!*extern_c
+                        && matches!(
+                            ty,
+                            Type::OwnedString
+                                | Type::Vec(_)
+                                | Type::Map(_)
+                                | Type::Set(_)
+                                | Type::Enum(_)
+                        ))
                     || (*extern_c && matches!(ty, Type::Struct(_)))
             };
             if parameters.iter().any(|ty| !supported(*ty))
@@ -7563,7 +8798,7 @@ fn resolve_type_name_scoped(
             {
                 return Err(diag(
                     "R0247",
-                    "function pointer types support scalar and pointer values; C-ABI records must fit the supported packed 1, 2, 4, or 8 byte layout",
+                    "Ryn function pointers support scalar and owned pointer values; C-ABI records must fit the supported packed 1, 2, 4, or 8 byte layout",
                     *span,
                 ));
             }
@@ -7614,6 +8849,7 @@ fn validate_array_elem(elem: Type, span: Span) -> Result<(), Diagnostic> {
             | Type::OwnedString
             | Type::Vec(_)
             | Type::Map(_)
+            | Type::Set(_)
             | Type::Struct(_)
             | Type::Enum(_)
             | Type::Str
@@ -7647,7 +8883,7 @@ fn validate_array_literal_elem(
             ),
             span,
         )
-        .with_help("array elements support recursively nested structures and arrays containing scalar, str, String, Vec, Map, or enum fields; borrowed slices cannot be stored in array elements"))
+        .with_help("array elements support recursively nested structures and arrays containing scalar, str, String, Vec, Map, Set, or enum fields; borrowed slices cannot be stored in array elements"))
     } else {
         validate_array_elem(elem, span)
     }
@@ -7670,6 +8906,7 @@ fn array_element_clone_supported(ty: Type, structs: &[RynStruct]) -> bool {
         | Type::Str
         | Type::OwnedString
         | Type::Map(_)
+        | Type::Set(_)
         | Type::Enum(_)
         | Type::Reference(_, _)
         | Type::RawPointer(_)
@@ -7766,6 +9003,7 @@ fn name_span(name: &TypeName) -> Span {
         | TypeName::Parameter(_, span)
         | TypeName::Vec(_, span)
         | TypeName::Map(_, _, span)
+        | TypeName::Set(_, span)
         | TypeName::Array(_, _, span)
         | TypeName::Slice(_, span)
         | TypeName::Reference(_, _, span)
@@ -7777,7 +9015,7 @@ fn name_span(name: &TypeName) -> Span {
 
 fn type_has_owned_data_in_sema(ty: Type, structs: &[RynStruct]) -> bool {
     match ty {
-        Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Enum(_) => true,
+        Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Set(_) | Type::Enum(_) => true,
         Type::Struct(id) => {
             structs[id].drop_function.is_some()
                 || structs[id]
@@ -8093,12 +9331,9 @@ fn resolve_enum_layouts(
                     | Type::OwnedString => {}
                     Type::Enum(_) | Type::Map(_) => {}
                     Type::Struct(struct_id)
-                        if definition.name.starts_with("$RynOption#")
-                            && enum_payload_struct_supported(
-                                Type::Struct(struct_id),
-                                structs,
-                                0,
-                            ) => {}
+                        if enum_payload_struct_supported(Type::Struct(struct_id), structs, 0) => {}
+                    Type::Array(array_id)
+                        if enum_payload_struct_supported(Type::Array(array_id), structs, 0) => {}
                     Type::Vec(id) => match vec_elem(id) {
                         Type::I8
                         | Type::I16
@@ -8134,7 +9369,7 @@ fn resolve_enum_layouts(
                             variant.span,
                         )
                         .with_help(
-                            "currently allowed field types are integers, floats, `bool`, `char`, `String`, `Vec`, and enums",
+                            "currently allowed field types are scalars, `String`, `Vec`, `Map`, arrays, structures without custom destructors, and enums",
                         ));
                     }
                 }
@@ -8456,6 +9691,7 @@ fn type_layout(ty: Type, structs: &[RynStruct]) -> (usize, usize) {
         | Type::OwnedString
         | Type::Vec(_)
         | Type::Map(_)
+        | Type::Set(_)
         | Type::Enum(_)
         | Type::Reference(_, _)
         | Type::RawPointer(_)
@@ -8532,6 +9768,7 @@ fn type_name(ty: Type) -> String {
             let (key, value) = map_info(id);
             format!("Map<{}, {}>", type_name(key), type_name(value))
         }
+        Type::Set(id) => format!("Set<{}>", type_name(map_info(id).0)),
         Type::Enum(_) => "enum".into(),
         Type::Array(id) => {
             let (element, length) = array_info(id);
@@ -8596,7 +9833,7 @@ fn reference_pointee_supported_in(ty: Type, structs: &[RynStruct]) -> bool {
     // Owning handles live behind their stack home; dereference reads clone.
     matches!(
         ty,
-        Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Enum(_)
+        Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Set(_) | Type::Enum(_)
     )
 }
 

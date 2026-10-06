@@ -1,0 +1,27 @@
+use std::keyboard
+
+fun main() {
+    echo "Press a key to start, then use W and Space. Escape exits."
+    first := keyboard::read_key()
+    echo "First key: {first}"
+
+    while true {
+        when keyboard::key_down(Key::W) {
+            echo "Moving forward"
+        }
+
+        when keyboard::key_pressed(Key::Space) {
+            echo "Jump!"
+        }
+
+        when keyboard::key_released(Key::W) {
+            echo "Stopped"
+        }
+
+        when keyboard::key_pressed(Key::Escape) {
+            break
+        }
+
+        sleep(16ms)
+    }
+}

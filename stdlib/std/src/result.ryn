@@ -1,0 +1,21 @@
+fun ok<T, E>(item: T) -> Result<T, E> {
+    return Result::Ok(item)
+}
+
+fun err<T, E>(item: E) -> Result<T, E> {
+    return Result::Err(item)
+}
+
+pub fun map<T, E, U>(value: Result<T, E>, transform: fun(T) -> U) -> Result<U, E> {
+    choose value {
+        Result::Ok(item) => ok::<U, E>(transform(item)),
+        Result::Err(error) => err::<U, E>(error)
+    }
+}
+
+pub fun map_err<T, E, F>(value: Result<T, E>, transform: fun(E) -> F) -> Result<T, F> {
+    choose value {
+        Result::Ok(item) => ok::<T, F>(item),
+        Result::Err(error) => err::<T, F>(transform(error))
+    }
+}

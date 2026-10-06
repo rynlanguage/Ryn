@@ -1,0 +1,350 @@
+pub enum Key {
+    Unknown,
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    V,
+    W,
+    X,
+    Y,
+    Z,
+    Digit0,
+    Digit1,
+    Digit2,
+    Digit3,
+    Digit4,
+    Digit5,
+    Digit6,
+    Digit7,
+    Digit8,
+    Digit9,
+    Space,
+    Enter,
+    Escape,
+    Tab,
+    Backspace,
+    Delete,
+    Insert,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    Shift,
+    LeftShift,
+    RightShift,
+    Ctrl,
+    LeftCtrl,
+    RightCtrl,
+    Alt,
+    LeftAlt,
+    RightAlt,
+    CapsLock,
+    NumLock,
+    ScrollLock,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+    Backtick,
+    Minus,
+    Equal,
+    LeftBracket,
+    RightBracket,
+    Backslash,
+    Semicolon,
+    Quote,
+    Comma,
+    Period,
+    Slash,
+    Numpad0,
+    Numpad1,
+    Numpad2,
+    Numpad3,
+    Numpad4,
+    Numpad5,
+    Numpad6,
+    Numpad7,
+    Numpad8,
+    Numpad9,
+    NumpadAdd,
+    NumpadSubtract,
+    NumpadMultiply,
+    NumpadDivide,
+    NumpadDecimal,
+    NumpadEnter,
+    PrintScreen,
+    Pause,
+    Menu,
+    LeftSuper,
+    RightSuper,
+}
+
+fun key_code(key: Key) -> u32 {
+    choose key {
+        Key::Unknown => 0 as u32,
+        Key::A => 1 as u32,
+        Key::B => 2 as u32,
+        Key::C => 3 as u32,
+        Key::D => 4 as u32,
+        Key::E => 5 as u32,
+        Key::F => 6 as u32,
+        Key::G => 7 as u32,
+        Key::H => 8 as u32,
+        Key::I => 9 as u32,
+        Key::J => 10 as u32,
+        Key::K => 11 as u32,
+        Key::L => 12 as u32,
+        Key::M => 13 as u32,
+        Key::N => 14 as u32,
+        Key::O => 15 as u32,
+        Key::P => 16 as u32,
+        Key::Q => 17 as u32,
+        Key::R => 18 as u32,
+        Key::S => 19 as u32,
+        Key::T => 20 as u32,
+        Key::U => 21 as u32,
+        Key::V => 22 as u32,
+        Key::W => 23 as u32,
+        Key::X => 24 as u32,
+        Key::Y => 25 as u32,
+        Key::Z => 26 as u32,
+        Key::Digit0 => 27 as u32,
+        Key::Digit1 => 28 as u32,
+        Key::Digit2 => 29 as u32,
+        Key::Digit3 => 30 as u32,
+        Key::Digit4 => 31 as u32,
+        Key::Digit5 => 32 as u32,
+        Key::Digit6 => 33 as u32,
+        Key::Digit7 => 34 as u32,
+        Key::Digit8 => 35 as u32,
+        Key::Digit9 => 36 as u32,
+        Key::Space => 37 as u32,
+        Key::Enter => 38 as u32,
+        Key::Escape => 39 as u32,
+        Key::Tab => 40 as u32,
+        Key::Backspace => 41 as u32,
+        Key::Delete => 42 as u32,
+        Key::Insert => 43 as u32,
+        Key::Home => 44 as u32,
+        Key::End => 45 as u32,
+        Key::PageUp => 46 as u32,
+        Key::PageDown => 47 as u32,
+        Key::ArrowUp => 48 as u32,
+        Key::ArrowDown => 49 as u32,
+        Key::ArrowLeft => 50 as u32,
+        Key::ArrowRight => 51 as u32,
+        Key::Shift => 52 as u32,
+        Key::LeftShift => 53 as u32,
+        Key::RightShift => 54 as u32,
+        Key::Ctrl => 55 as u32,
+        Key::LeftCtrl => 56 as u32,
+        Key::RightCtrl => 57 as u32,
+        Key::Alt => 58 as u32,
+        Key::LeftAlt => 59 as u32,
+        Key::RightAlt => 60 as u32,
+        Key::CapsLock => 61 as u32,
+        Key::NumLock => 62 as u32,
+        Key::ScrollLock => 63 as u32,
+        Key::F1 => 64 as u32,
+        Key::F2 => 65 as u32,
+        Key::F3 => 66 as u32,
+        Key::F4 => 67 as u32,
+        Key::F5 => 68 as u32,
+        Key::F6 => 69 as u32,
+        Key::F7 => 70 as u32,
+        Key::F8 => 71 as u32,
+        Key::F9 => 72 as u32,
+        Key::F10 => 73 as u32,
+        Key::F11 => 74 as u32,
+        Key::F12 => 75 as u32,
+        Key::Backtick => 76 as u32,
+        Key::Minus => 77 as u32,
+        Key::Equal => 78 as u32,
+        Key::LeftBracket => 79 as u32,
+        Key::RightBracket => 80 as u32,
+        Key::Backslash => 81 as u32,
+        Key::Semicolon => 82 as u32,
+        Key::Quote => 83 as u32,
+        Key::Comma => 84 as u32,
+        Key::Period => 85 as u32,
+        Key::Slash => 86 as u32,
+        Key::Numpad0 => 87 as u32,
+        Key::Numpad1 => 88 as u32,
+        Key::Numpad2 => 89 as u32,
+        Key::Numpad3 => 90 as u32,
+        Key::Numpad4 => 91 as u32,
+        Key::Numpad5 => 92 as u32,
+        Key::Numpad6 => 93 as u32,
+        Key::Numpad7 => 94 as u32,
+        Key::Numpad8 => 95 as u32,
+        Key::Numpad9 => 96 as u32,
+        Key::NumpadAdd => 97 as u32,
+        Key::NumpadSubtract => 98 as u32,
+        Key::NumpadMultiply => 99 as u32,
+        Key::NumpadDivide => 100 as u32,
+        Key::NumpadDecimal => 101 as u32,
+        Key::NumpadEnter => 102 as u32,
+        Key::PrintScreen => 103 as u32,
+        Key::Pause => 104 as u32,
+        Key::Menu => 105 as u32,
+        Key::LeftSuper => 106 as u32,
+        Key::RightSuper => 107 as u32
+    }
+}
+
+pub fun key_down(key: Key) -> bool {
+    return __input_key_down(key_code(key))
+}
+
+pub fun key_pressed(key: Key) -> bool {
+    return __input_key_pressed(key_code(key))
+}
+
+pub fun key_released(key: Key) -> bool {
+    return __input_key_released(key_code(key))
+}
+
+pub fun read_key() -> Key {
+    code := __input_read_key()
+    when code == 1 { return Key::A }
+    when code == 2 { return Key::B }
+    when code == 3 { return Key::C }
+    when code == 4 { return Key::D }
+    when code == 5 { return Key::E }
+    when code == 6 { return Key::F }
+    when code == 7 { return Key::G }
+    when code == 8 { return Key::H }
+    when code == 9 { return Key::I }
+    when code == 10 { return Key::J }
+    when code == 11 { return Key::K }
+    when code == 12 { return Key::L }
+    when code == 13 { return Key::M }
+    when code == 14 { return Key::N }
+    when code == 15 { return Key::O }
+    when code == 16 { return Key::P }
+    when code == 17 { return Key::Q }
+    when code == 18 { return Key::R }
+    when code == 19 { return Key::S }
+    when code == 20 { return Key::T }
+    when code == 21 { return Key::U }
+    when code == 22 { return Key::V }
+    when code == 23 { return Key::W }
+    when code == 24 { return Key::X }
+    when code == 25 { return Key::Y }
+    when code == 26 { return Key::Z }
+    when code == 27 { return Key::Digit0 }
+    when code == 28 { return Key::Digit1 }
+    when code == 29 { return Key::Digit2 }
+    when code == 30 { return Key::Digit3 }
+    when code == 31 { return Key::Digit4 }
+    when code == 32 { return Key::Digit5 }
+    when code == 33 { return Key::Digit6 }
+    when code == 34 { return Key::Digit7 }
+    when code == 35 { return Key::Digit8 }
+    when code == 36 { return Key::Digit9 }
+    when code == 37 { return Key::Space }
+    when code == 38 { return Key::Enter }
+    when code == 39 { return Key::Escape }
+    when code == 40 { return Key::Tab }
+    when code == 41 { return Key::Backspace }
+    when code == 42 { return Key::Delete }
+    when code == 43 { return Key::Insert }
+    when code == 44 { return Key::Home }
+    when code == 45 { return Key::End }
+    when code == 46 { return Key::PageUp }
+    when code == 47 { return Key::PageDown }
+    when code == 48 { return Key::ArrowUp }
+    when code == 49 { return Key::ArrowDown }
+    when code == 50 { return Key::ArrowLeft }
+    when code == 51 { return Key::ArrowRight }
+    when code == 52 { return Key::Shift }
+    when code == 53 { return Key::LeftShift }
+    when code == 54 { return Key::RightShift }
+    when code == 55 { return Key::Ctrl }
+    when code == 56 { return Key::LeftCtrl }
+    when code == 57 { return Key::RightCtrl }
+    when code == 58 { return Key::Alt }
+    when code == 59 { return Key::LeftAlt }
+    when code == 60 { return Key::RightAlt }
+    when code == 61 { return Key::CapsLock }
+    when code == 62 { return Key::NumLock }
+    when code == 63 { return Key::ScrollLock }
+    when code == 64 { return Key::F1 }
+    when code == 65 { return Key::F2 }
+    when code == 66 { return Key::F3 }
+    when code == 67 { return Key::F4 }
+    when code == 68 { return Key::F5 }
+    when code == 69 { return Key::F6 }
+    when code == 70 { return Key::F7 }
+    when code == 71 { return Key::F8 }
+    when code == 72 { return Key::F9 }
+    when code == 73 { return Key::F10 }
+    when code == 74 { return Key::F11 }
+    when code == 75 { return Key::F12 }
+    when code == 76 { return Key::Backtick }
+    when code == 77 { return Key::Minus }
+    when code == 78 { return Key::Equal }
+    when code == 79 { return Key::LeftBracket }
+    when code == 80 { return Key::RightBracket }
+    when code == 81 { return Key::Backslash }
+    when code == 82 { return Key::Semicolon }
+    when code == 83 { return Key::Quote }
+    when code == 84 { return Key::Comma }
+    when code == 85 { return Key::Period }
+    when code == 86 { return Key::Slash }
+    when code == 87 { return Key::Numpad0 }
+    when code == 88 { return Key::Numpad1 }
+    when code == 89 { return Key::Numpad2 }
+    when code == 90 { return Key::Numpad3 }
+    when code == 91 { return Key::Numpad4 }
+    when code == 92 { return Key::Numpad5 }
+    when code == 93 { return Key::Numpad6 }
+    when code == 94 { return Key::Numpad7 }
+    when code == 95 { return Key::Numpad8 }
+    when code == 96 { return Key::Numpad9 }
+    when code == 97 { return Key::NumpadAdd }
+    when code == 98 { return Key::NumpadSubtract }
+    when code == 99 { return Key::NumpadMultiply }
+    when code == 100 { return Key::NumpadDivide }
+    when code == 101 { return Key::NumpadDecimal }
+    when code == 102 { return Key::NumpadEnter }
+    when code == 103 { return Key::PrintScreen }
+    when code == 104 { return Key::Pause }
+    when code == 105 { return Key::Menu }
+    when code == 106 { return Key::LeftSuper }
+    when code == 107 { return Key::RightSuper }
+    return Key::Unknown
+}
+
+// Edge queries consume one latched transition per key; call them once per loop iteration.
+// The Windows backend samples virtual-key state without changing console mode.

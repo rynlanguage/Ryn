@@ -1,0 +1,8 @@
+pub fun os() -> String { return __os() }
+pub fun arch() -> String { return __arch() }
+pub fun cpu_count() -> u32 { return __cpu_count() }
+pub fun hostname() -> String { return __hostname() }
+pub fun exit(code: i32) { __sys_exit(code) }
+pub fun panic(message: str) { __sys_panic(message) }
+pub fun assert(condition: bool) { __sys_assert(condition) }
+pub fun assert_message(condition: bool, message: str) { __sys_assert_message(condition, message) }

@@ -14,10 +14,11 @@ pub enum MapOp {
     Remove,
     Keys,
     Values,
+    IsEmpty,
 }
 
 impl MapOp {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::New,
         Self::Drop,
         Self::Clone,
@@ -29,13 +30,14 @@ impl MapOp {
         Self::Remove,
         Self::Keys,
         Self::Values,
+        Self::IsEmpty,
     ];
 
     pub fn parameters(self, key: Type, value: Type) -> Vec<Type> {
         let map = Type::Map(crate::sema::intern_map(key, value));
         match self {
             Self::New => Vec::new(),
-            Self::Drop | Self::Clone | Self::Len | Self::Clear => vec![map],
+            Self::Drop | Self::Clone | Self::Len | Self::Clear | Self::IsEmpty => vec![map],
             Self::ContainsKey | Self::Remove => vec![map, key],
             Self::Insert => vec![map, key, value],
             Self::Get => vec![map, key],
@@ -47,6 +49,7 @@ impl MapOp {
         match self {
             Self::New | Self::Clone => Some(Type::Map(crate::sema::intern_map(key, value))),
             Self::Len => Some(Type::U64),
+            Self::IsEmpty => Some(Type::Bool),
             Self::ContainsKey | Self::Insert | Self::Remove => Some(Type::Bool),
             Self::Get => None,
             Self::Drop | Self::Clear => None,
@@ -68,6 +71,7 @@ impl MapOp {
             Self::Remove => "ryn_map_remove",
             Self::Keys => "ryn_map_keys",
             Self::Values => "ryn_map_values",
+            Self::IsEmpty => "ryn_map_is_empty",
         }
     }
 

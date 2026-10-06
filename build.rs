@@ -26,6 +26,7 @@ fn build_runtime_shim() -> Result<(), String> {
     println!("cargo:rerun-if-changed=src/runtime/enum.rs");
     println!("cargo:rerun-if-changed=src/runtime/filesystem.rs");
     println!("cargo:rerun-if-changed=src/runtime/system.rs");
+    println!("cargo:rerun-if-changed=src/runtime/input.rs");
 
     let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let target = env::var("TARGET").map_err(|error| error.to_string())?;
@@ -36,7 +37,8 @@ fn build_runtime_shim() -> Result<(), String> {
         "ryn_runtime_shim.o"
     });
 
-    let status = Command::new(&rustc)
+    let mut command = Command::new(&rustc);
+    command
         .args([
             "--edition=2024",
             "--crate-name",
@@ -50,7 +52,41 @@ fn build_runtime_shim() -> Result<(), String> {
             &target,
             "-o",
         ])
-        .arg(&object_path)
+        .arg(&object_path);
+    if target.contains("linux") {
+        let manifest = PathBuf::from(
+            env::var_os("CARGO_MANIFEST_DIR").ok_or("CARGO_MANIFEST_DIR is not set")?,
+        );
+        let profile = env::var("PROFILE").map_err(|error| error.to_string())?;
+        let target_dir = env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    manifest.join(path)
+                }
+            })
+            .unwrap_or_else(|| manifest.join("target"));
+        let dependency_dir = target_dir.join(&target).join(profile).join("deps");
+        let libc = std::fs::read_dir(&dependency_dir)
+            .map_err(|error| format!("could not read {}: {error}", dependency_dir.display()))?
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("liblibc-")
+                            && (name.ends_with(".rlib") || name.ends_with(".rmeta"))
+                    })
+            })
+            .ok_or("could not locate compiled libc dependency for Linux runtime shim")?;
+        command
+            .arg("--extern")
+            .arg(format!("libc={}", libc.display()));
+    }
+    let status = command
         .status()
         .map_err(|error| format!("could not compile runtime shim with rustc: {error}"))?;
     if !status.success() {

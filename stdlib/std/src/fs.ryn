@@ -1,0 +1,59 @@
+pub fun read(path: str) -> String { return __fs_read_file(path) }
+pub fun read_text(path: str) -> String { return __fs_read_file(path) }
+pub fun read_file(path: str) -> String { return __fs_read_file(path) }
+pub fun write(path: str, data: str) -> bool { return __fs_write_file(path, data) }
+pub fun append(path: str, data: str) -> bool { return __fs_append_file(path, data) }
+pub fun create_dir(path: str) -> bool { return __fs_create_dir(path) }
+pub fun create_dir_all(path: str) -> bool { return __fs_create_dir_all(path) }
+pub fun remove_file(path: str) -> bool { return __fs_remove_file(path) }
+pub fun remove_dir(path: str) -> bool { return __fs_remove_dir(path) }
+pub fun remove_dir_all(path: str) -> bool { return __fs_remove_dir_all(path) }
+pub fun copy_file(from: str, to: str) -> bool { return __fs_copy_file(from, to) }
+pub fun move_file(from: str, to: str) -> bool { return __fs_rename(from, to) }
+pub fun rename(from: str, to: str) -> bool { return __fs_rename(from, to) }
+pub fun read_dir(path: str) -> Vec<String> { return __fs_read_dir(path) }
+pub fun exists(path: str) -> bool { return __fs_file_exists(path) }
+pub fun is_file(path: str) -> bool { return __fs_is_file(path) }
+pub fun is_dir(path: str) -> bool { return __fs_is_directory(path) }
+
+#[drop(std::fs::release_file)]
+pub struct File {
+    pub handle: *u8,
+}
+
+fun release_file(file: File) {
+    __file_drop(file.handle)
+}
+
+extend File {
+    pub fun open(path: str) -> File {
+        return File { handle: __file_open(path) }
+    }
+
+    pub fun create(path: str) -> File {
+        return File { handle: __file_create(path) }
+    }
+
+    pub fun append(path: str, data: str) -> bool {
+        return __fs_append_file(path, data)
+    }
+
+    pub fun read(path: str) -> String {
+        return __fs_read_file(path)
+    }
+
+    pub fun read_text(path: str) -> String {
+        return __fs_read_file(path)
+    }
+
+    pub fun write(path: str, data: str) -> bool {
+        return __fs_write_file(path, data)
+    }
+
+    pub fun read(mut self) -> String { return __file_read(self.handle) }
+    pub fun read_line(mut self) -> String { return __file_read_line(self.handle) }
+    pub fun read_text(mut self) -> String { return __file_read(self.handle) }
+    pub fun write(mut self, data: str) -> bool { return __file_write(self.handle, data) }
+    pub fun flush(mut self) -> bool { return __file_flush(self.handle) }
+    pub fun close(mut self) -> bool { return __file_close(self.handle) }
+}
