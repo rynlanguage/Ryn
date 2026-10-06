@@ -55,7 +55,7 @@ pub fun remove_file(value: Path) -> bool {
 }
 
 pub fun create_directories(value: Path) -> bool {
-    return create_dir(value.raw)
+    return create_dir_all(value.raw)
 }
 
 pub fun remove_directory(value: Path) -> bool {
