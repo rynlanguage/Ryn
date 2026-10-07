@@ -336,6 +336,7 @@ impl Guard<'_> {
                     self.expression(value, true)?;
                 }
             }
+            IrExpression::ArrayRepeat { value, .. } => self.expression(value, true)?,
             IrExpression::ArrayIndex { array, index, .. } => {
                 self.expression(array, false)?;
                 self.expression(index, false)?;
@@ -662,6 +663,18 @@ impl Guard<'_> {
         statements: Vec<IrStatement>,
         nested: bool,
     ) -> Result<(Vec<IrStatement>, bool), Diagnostic> {
+        self.block_ending(statements, nested, true)
+    }
+
+    /// `ending` inserts the scope drop when control falls out of the block.
+    /// A `while` condition's temporaries are not a scope: dropping there would
+    /// release the surrounding locals before the condition and on every iteration.
+    fn block_ending(
+        &mut self,
+        statements: Vec<IrStatement>,
+        nested: bool,
+        ending: bool,
+    ) -> Result<(Vec<IrStatement>, bool), Diagnostic> {
         if nested {
             self.scopes.push(Vec::new());
             self.reference_scopes.push(Vec::new());
@@ -857,8 +870,15 @@ impl Guard<'_> {
                     }
                     falls_through = then_falls || else_falls;
                 }
-                IrStatement::While { condition, body } => {
+                IrStatement::While {
+                    setup,
+                    condition,
+                    body,
+                } => {
                     let before = self.available.clone();
+                    let (setup_statements, _) =
+                        self.block_ending(std::mem::take(setup), false, false)?;
+                    *setup = setup_statements;
                     self.expression(condition, false)?;
                     *body = self.loop_body(std::mem::take(body), before)?;
                 }
@@ -893,7 +913,7 @@ impl Guard<'_> {
             }
             output.push(statement);
         }
-        if falls_through {
+        if falls_through && ending {
             output.push(self.drops(self.scopes.len() - 1));
         }
         if nested {

@@ -1,0 +1,405 @@
+
+// ---------------------------------------------------------------------------
+// Writing the text format.
+
+extend Tree {
+    fun encode_type(self, ty: u64) -> String {
+        node := self.types[ty]
+        kind := node.kind
+        when kind == TypeKind::I8 { return word("i8") }
+        when kind == TypeKind::I16 { return word("i16") }
+        when kind == TypeKind::I32 { return word("i32") }
+        when kind == TypeKind::I64 { return word("i64") }
+        when kind == TypeKind::U8 { return word("u8") }
+        when kind == TypeKind::U16 { return word("u16") }
+        when kind == TypeKind::U32 { return word("u32") }
+        when kind == TypeKind::U64 { return word("u64") }
+        when kind == TypeKind::F32 { return word("f32") }
+        when kind == TypeKind::F64 { return word("f64") }
+        when kind == TypeKind::STR { return word("str") }
+        when kind == TypeKind::STRING { return word("String") }
+        when kind == TypeKind::CHAR { return word("char") }
+        when kind == TypeKind::BOOL { return word("bool") }
+        mut out := String()
+        when kind == TypeKind::NAMED {
+            out = word("Named")
+            out.append(enc_str(node.name))
+        } else when kind == TypeKind::PARAM {
+            out = word("Param")
+            out.append(enc_str(node.name))
+        } else when kind == TypeKind::VEC {
+            out = word("Vec")
+            out.append(self.encode_type(node.first))
+        } else when kind == TypeKind::SET {
+            out = word("Set")
+            out.append(self.encode_type(node.first))
+        } else when kind == TypeKind::SLICE {
+            out = word("Slice")
+            out.append(self.encode_type(node.first))
+        } else when kind == TypeKind::RAW {
+            out = word("Raw")
+            out.append(self.encode_type(node.first))
+        } else when kind == TypeKind::MAP {
+            out = word("Map")
+            out.append(self.encode_type(node.first))
+            out.append(self.encode_type(node.second))
+        } else when kind == TypeKind::ARRAY {
+            out = word("Array")
+            out.append(self.encode_type(node.first))
+            out.append(enc_uint(node.length))
+        } else when kind == TypeKind::REF {
+            out = word("Ref")
+            out.append(self.encode_type(node.first))
+            out.append(enc_bool(node.flag))
+        } else {
+            out = word("FnPtr")
+            out.append(self.encode_types(node.params.clone()))
+            when node.has_result {
+                out.append(word("+"))
+                out.append(self.encode_type(node.first))
+            } else {
+                out.append(word("-"))
+            }
+            out.append(enc_bool(node.flag))
+        }
+        out.append(enc_span(node.start, node.end))
+        return out
+    }
+
+    fun encode_types(self, types: Vec<u64>) -> String {
+        mut out := enc_uint(types.len())
+        for ty in types {
+            out.append(self.encode_type(ty))
+        }
+        return out
+    }
+
+    fun encode_exprs(self, expressions: Vec<u64>) -> String {
+        mut out := enc_uint(expressions.len())
+        for expression in expressions {
+            out.append(self.encode_expr(expression))
+        }
+        return out
+    }
+
+    fun encode_expr(self, index: u64) -> String {
+        node := self.exprs[index]
+        kind := node.kind
+        mut out := String()
+        when kind == Ex::INT {
+            out = word("Int")
+            out.append(enc_uint(node.value))
+        } else when kind == Ex::FLOAT {
+            out = word("Float")
+            out.append(word(""))
+            out.append(node.text.clone())
+        } else when kind == Ex::STR {
+            out = word("Str")
+            out.append(enc_str(node.text.clone()))
+        } else when kind == Ex::CHAR {
+            out = word("Char")
+            out.append(enc_uint(node.value))
+        } else when kind == Ex::BOOL {
+            out = word("Bool")
+            out.append(enc_bool(node.flag))
+        } else when kind == Ex::NAME {
+            out = word("Name")
+            out.append(enc_str(node.text.clone()))
+        } else when kind == Ex::CALL {
+            out = word("Call")
+            out.append(enc_str(node.text.clone()))
+            out.append(self.encode_types(node.types.clone()))
+            out.append(self.encode_exprs(node.list.clone()))
+        } else when kind == Ex::METHOD_CALL {
+            out = word("MethodCall")
+            out.append(self.encode_expr(node.a))
+            out.append(enc_str(node.text.clone()))
+            out.append(self.encode_types(node.types.clone()))
+            out.append(self.encode_exprs(node.list.clone()))
+        } else when kind == Ex::STRUCT {
+            out = word("Struct")
+            out.append(enc_str(node.text.clone()))
+            out.append(enc_uint(node.list.len()))
+            mut field: u64 = 0
+            while field < node.list.len() {
+                out.append(enc_str(node.names[field]))
+                out.append(self.encode_expr(node.list[field]))
+                out.append(enc_span(node.spans[field * 2], node.spans[field * 2 + 1]))
+                field += 1
+            }
+        } else when kind == Ex::FIELD {
+            out = word("Field")
+            out.append(self.encode_expr(node.a))
+            out.append(enc_str(node.text.clone()))
+            out.append(enc_span(node.name_start, node.name_end))
+        } else when kind == Ex::IF {
+            out = word("If")
+            out.append(self.encode_expr(node.a))
+            out.append(self.encode_expr(node.b))
+            out.append(self.encode_expr(node.c))
+        } else when kind == Ex::BINARY {
+            out = word("Binary")
+            out.append(word(""))
+            out.append(node.text.clone())
+            out.append(self.encode_expr(node.a))
+            out.append(self.encode_expr(node.b))
+        } else when kind == Ex::NEGATE || kind == Ex::NOT || kind == Ex::BIT_NOT || kind == Ex::DEREF || kind == Ex::PROPAGATE {
+            out = when kind == Ex::NEGATE {
+                word("Negate")
+            } else when kind == Ex::NOT {
+                word("Not")
+            } else when kind == Ex::BIT_NOT {
+                word("BitNot")
+            } else when kind == Ex::DEREF {
+                word("Deref")
+            } else {
+                word("Propagate")
+            }
+            out.append(self.encode_expr(node.a))
+        } else when kind == Ex::ADDRESS_OF {
+            out = word("AddressOf")
+            out.append(enc_bool(node.flag))
+            out.append(enc_bool(node.flag2))
+            out.append(self.encode_expr(node.a))
+        } else when kind == Ex::CAST {
+            out = word("Cast")
+            out.append(self.encode_expr(node.a))
+            out.append(self.encode_type(node.ty))
+        } else when kind == Ex::LAYOUT {
+            out = word("Layout")
+            out.append(self.encode_type(node.ty))
+            out.append(enc_bool(node.flag))
+        } else when kind == Ex::NEW_VEC {
+            out = word("NewVec")
+            out.append(self.encode_type(node.ty))
+        } else when kind == Ex::NEW_SET {
+            out = word("NewSet")
+            out.append(self.encode_type(node.ty))
+        } else when kind == Ex::NEW_MAP {
+            out = word("NewMap")
+            out.append(self.encode_type(node.ty))
+            out.append(self.encode_type(node.ty2))
+        } else when kind == Ex::TUPLE {
+            out = word("Tuple")
+            out.append(self.encode_exprs(node.list.clone()))
+        } else when kind == Ex::ARRAY {
+            out = word("Array")
+            out.append(self.encode_exprs(node.list.clone()))
+        } else when kind == Ex::REPEAT {
+            out = word("Repeat")
+            out.append(self.encode_expr(node.a))
+            out.append(enc_uint(node.value))
+        } else when kind == Ex::INDEX {
+            out = word("Index")
+            out.append(self.encode_expr(node.a))
+            out.append(self.encode_expr(node.b))
+        } else when kind == Ex::ENUM {
+            out = word("Enum")
+            out.append(enc_str(node.text.clone()))
+            out.append(enc_str(node.text2.clone()))
+            out.append(self.encode_exprs(node.list.clone()))
+        } else {
+            out = word("Choose")
+            out.append(self.encode_expr(node.a))
+            out.append(enc_uint(node.list.len()))
+            for arm_index in node.list.clone() {
+                out.append(self.encode_arm(arm_index))
+            }
+        }
+        out.append(enc_span(node.start, node.end))
+        return out
+    }
+
+    fun encode_arm(self, index: u64) -> String {
+        arm := self.arms[index]
+        mut out := String()
+        when arm.has_enum {
+            out.append(word("+"))
+            out.append(enc_str(arm.enum_name.clone()))
+        } else {
+            out.append(word("-"))
+        }
+        when arm.has_variant {
+            out.append(word("+"))
+            out.append(enc_str(arm.variant.clone()))
+        } else {
+            out.append(word("-"))
+        }
+        out.append(enc_strings(arm.bindings.clone()))
+        out.append(self.encode_expr(arm.body))
+        out.append(enc_span(arm.start, arm.end))
+        return out
+    }
+
+    fun encode_stmts(self, statements: Vec<u64>) -> String {
+        mut out := enc_uint(statements.len())
+        for statement in statements {
+            out.append(self.encode_stmt(statement))
+        }
+        return out
+    }
+
+    fun encode_stmt(self, index: u64) -> String {
+        node := self.stmts[index]
+        kind := node.kind
+        mut out := String("\n")
+        when kind == St::LET {
+            out.append(word("Let"))
+            out.append(enc_str(node.text.clone()))
+            out.append(enc_bool(node.flag))
+            when node.has {
+                out.append(word("+"))
+                out.append(self.encode_type(node.ty))
+            } else {
+                out.append(word("-"))
+            }
+            out.append(self.encode_expr(node.a))
+        } else when kind == St::ASSIGN {
+            out.append(word("Assign"))
+            out.append(enc_str(node.text.clone()))
+            out.append(self.encode_expr(node.a))
+        } else when kind == St::INDEX_ASSIGN {
+            out.append(word("IndexAssign"))
+            out.append(enc_str(node.text.clone()))
+            out.append(self.encode_expr(node.a))
+            out.append(self.encode_expr(node.b))
+        } else when kind == St::DEREF_ASSIGN {
+            out.append(word("DerefAssign"))
+            out.append(self.encode_expr(node.a))
+            out.append(self.encode_expr(node.b))
+        } else when kind == St::FIELD_ASSIGN {
+            out.append(word("FieldAssign"))
+            out.append(enc_str(node.text.clone()))
+            out.append(enc_uint(node.names.len()))
+            mut field: u64 = 0
+            while field < node.names.len() {
+                out.append(enc_str(node.names[field]))
+                out.append(enc_span(node.spans[field * 2], node.spans[field * 2 + 1]))
+                field += 1
+            }
+            when node.has {
+                out.append(word("+"))
+                out.append(word(""))
+                out.append(node.op.clone())
+            } else {
+                out.append(word("-"))
+            }
+            out.append(self.encode_expr(node.a))
+        } else when kind == St::COMPOUND {
+            out.append(word("Compound"))
+            out.append(enc_str(node.text.clone()))
+            out.append(word(""))
+            out.append(node.op.clone())
+            out.append(self.encode_expr(node.a))
+        } else when kind == St::PRINT {
+            out.append(word("Print"))
+            out.append(self.encode_expr(node.a))
+        } else when kind == St::TEMPLATE {
+            out.append(word("Template"))
+            out.append(enc_uint(node.parts.len()))
+            mut part: u64 = 0
+            while part < node.parts.len() {
+                when node.part_kinds[part] == 1 {
+                    out.append(word("T"))
+                    out.append(enc_str(node.names[part]))
+                } else {
+                    out.append(word("V"))
+                    out.append(self.encode_expr(node.parts[part]))
+                }
+                part += 1
+            }
+        } else when kind == St::CALL {
+            out.append(word("Call"))
+            out.append(enc_str(node.text.clone()))
+            out.append(self.encode_types(node.types.clone()))
+            out.append(self.encode_exprs(node.list.clone()))
+        } else when kind == St::METHOD_CALL {
+            out.append(word("MethodCall"))
+            out.append(self.encode_expr(node.a))
+            out.append(enc_str(node.text.clone()))
+            out.append(self.encode_exprs(node.list.clone()))
+        } else when kind == St::IF {
+            out.append(word("If"))
+            out.append(self.encode_expr(node.a))
+            out.append(self.encode_stmts(node.body.clone()))
+            out.append(self.encode_stmts(node.body2.clone()))
+        } else when kind == St::WHILE {
+            out.append(word("While"))
+            out.append(self.encode_expr(node.a))
+            out.append(self.encode_stmts(node.body.clone()))
+        } else when kind == St::FOR {
+            out.append(word("For"))
+            out.append(enc_str(node.text.clone()))
+            out.append(enc_span(node.name_start, node.name_end))
+            out.append(self.encode_expr(node.a))
+            out.append(self.encode_expr(node.b))
+            out.append(self.encode_stmts(node.body.clone()))
+        } else when kind == St::FOR_EACH {
+            out.append(word("ForEach"))
+            out.append(enc_str(node.text.clone()))
+            out.append(enc_span(node.name_start, node.name_end))
+            out.append(self.encode_expr(node.a))
+            out.append(self.encode_stmts(node.body.clone()))
+        } else when kind == St::BREAK {
+            out.append(word("Break"))
+        } else when kind == St::CONTINUE {
+            out.append(word("Continue"))
+        } else {
+            out.append(word("Return"))
+            when node.has {
+                out.append(word("+"))
+                out.append(self.encode_expr(node.a))
+            } else {
+                out.append(word("-"))
+            }
+        }
+        out.append(enc_span(node.start, node.end))
+        return out
+    }
+
+    fun encode_function(self, index: u64) -> String {
+        function := self.functions[index]
+        mut out := String("\n")
+        out.append(enc_str(function.name.clone()))
+        out.append(enc_bool(function.extern_c))
+        when function.has_symbol {
+            out.append(word("+"))
+            out.append(enc_str(function.symbol.clone()))
+        } else {
+            out.append(word("-"))
+        }
+        out.append(enc_strings(function.type_params.clone()))
+        out.append(enc_uint(function.bound_params.len()))
+        mut bound: u64 = 0
+        while bound < function.bound_params.len() {
+            out.append(enc_str(function.bound_params[bound]))
+            out.append(function.bound_lists[bound])
+            bound += 1
+        }
+        out.append(enc_bool(function.public))
+        out.append(enc_str(function.module_path.clone()))
+        out.append(enc_uint(function.param_names.len()))
+        mut parameter: u64 = 0
+        while parameter < function.param_names.len() {
+            out.append(enc_str(function.param_names[parameter]))
+            out.append(self.encode_type(function.param_types[parameter]))
+            out.append(enc_span(function.param_spans[parameter * 2], function.param_spans[parameter * 2 + 1]))
+            parameter += 1
+        }
+        when function.has_return {
+            out.append(word("+"))
+            out.append(self.encode_type(function.return_type))
+        } else {
+            out.append(word("-"))
+        }
+        out.append(self.encode_stmts(function.body.clone()))
+        when function.has_value {
+            out.append(word("+"))
+            out.append(self.encode_expr(function.value))
+        } else {
+            out.append(word("-"))
+        }
+        out.append(enc_span(function.start, function.end))
+        return out
+    }
+}

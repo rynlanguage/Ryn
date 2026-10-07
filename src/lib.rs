@@ -5,9 +5,11 @@ use std::{
 };
 
 pub mod ast;
+pub mod ast_codec;
 pub mod codegen;
 pub mod filesystem_ops;
-mod generics;
+pub mod frontend;
+pub mod generics;
 mod guard;
 pub mod lexer;
 pub mod lockfile;
@@ -74,7 +76,30 @@ pub fn check_recovering(source: &str) -> Result<sema::RynIr, Vec<source::Diagnos
 /// Loads and checks a project rooted at a directory containing `src/main.ryn`.
 /// Module imports use paths relative to `src/`, such as `use compiler::lexer`.
 pub fn check_project(project: impl AsRef<Path>) -> Result<sema::RynIr, String> {
-    modules::check_project(project.as_ref()).map(|(ir, _)| ir)
+    check_project_with_frontend(project, &frontend::Frontend::Bootstrap)
+}
+
+/// Loads and checks a project, parsing its modules with `frontend`.
+pub fn check_project_with_frontend(
+    project: impl AsRef<Path>,
+    frontend: &frontend::Frontend,
+) -> Result<sema::RynIr, String> {
+    modules::check_project(project.as_ref(), frontend).map(|(ir, _)| ir)
+}
+
+/// Checks a source file, parsing it with `frontend`.
+///
+/// The bootstrap parser gathers independent syntax errors; the self-hosted
+/// frontend reports the first one.
+pub fn check_source_with_frontend(
+    source: &source::SourceFile,
+    frontend: &frontend::Frontend,
+) -> Result<sema::RynIr, Vec<source::Diagnostic>> {
+    let program = frontend.parse_recovering(source.text())?;
+    let program = frontend
+        .monomorphize(program)
+        .map_err(|error| vec![error])?;
+    sema::analyze_recovering(program)
 }
 
 /// Compiles a project and its imported Ryn modules into a native executable.
@@ -83,8 +108,18 @@ pub fn compile_project_with_optimize(
     output: impl AsRef<Path>,
     optimize: manifest::Optimize,
 ) -> Result<(), String> {
+    compile_project_with_frontend(project, output, optimize, &frontend::Frontend::Bootstrap)
+}
+
+/// Compiles a project into a native executable, parsing its modules with `frontend`.
+pub fn compile_project_with_frontend(
+    project: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    optimize: manifest::Optimize,
+    frontend: &frontend::Frontend,
+) -> Result<(), String> {
     let output = output.as_ref();
-    let (ir, source_paths) = modules::check_project(project.as_ref())?;
+    let (ir, source_paths) = modules::check_project(project.as_ref(), frontend)?;
     for source in source_paths {
         if paths_refer_to_same_file(&source, output) {
             return Err(format!(
@@ -189,6 +224,16 @@ pub fn compile_source_with_optimize(
     output: impl AsRef<Path>,
     optimize: manifest::Optimize,
 ) -> Result<(), CompileError> {
+    compile_source_with_frontend(source, output, optimize, &frontend::Frontend::Bootstrap)
+}
+
+/// Compiles a source file into a native executable, parsing it with `frontend`.
+pub fn compile_source_with_frontend(
+    source: &source::SourceFile,
+    output: impl AsRef<Path>,
+    optimize: manifest::Optimize,
+    frontend: &frontend::Frontend,
+) -> Result<(), CompileError> {
     let output = output.as_ref();
     if paths_refer_to_same_file(source.path(), output) {
         return Err(CompileError::OutputWouldOverwriteSource {
@@ -196,7 +241,13 @@ pub fn compile_source_with_optimize(
             output: output.to_path_buf(),
         });
     }
-    let ir = check(source.text()).map_err(CompileError::Source)?;
+    let program = frontend
+        .parse(source.text())
+        .map_err(CompileError::Source)?;
+    let program = frontend
+        .monomorphize(program)
+        .map_err(CompileError::Source)?;
+    let ir = sema::analyze(program).map_err(CompileError::Source)?;
     codegen::build_native_with_optimize(&ir, output, optimize.codegen_value())
         .map_err(CompileError::Native)
 }

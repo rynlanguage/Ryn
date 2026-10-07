@@ -1,0 +1,53 @@
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fun marker() -> i32 {
+    echo 1
+    7
+}
+
+fun take(value: String) -> i32 {
+    echo value
+    3
+}
+
+fun sum(values: &[i32]) -> i32 {
+    mut total := 0 as i32
+    for value in values {
+        total += value
+    }
+    total
+}
+
+fun main() {
+    mut cells: [u16; 4] = [65; 4]
+    echo cells[0]
+    echo cells[3]
+
+    row := [0; 3]
+    echo row[2]
+
+    grid := [[1; 2]; 2]
+    echo grid[1][0]
+
+    words := ["ryn"; 2]
+    echo words[1]
+
+    origin := [Point { x: 4, y: 5 }; 2]
+    echo origin[1].x
+
+    echo sum([7; 3])
+
+    values := [marker(); 3]
+    echo values[0]
+    echo values[2]
+
+    empty: [i32; 0] = [marker(); 0]
+    echo 0
+
+    text := String("owned")
+    codes := [take(text); 2]
+    echo codes[1]
+}

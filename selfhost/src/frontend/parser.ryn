@@ -1,0 +1,4260 @@
+// Ryn parser, written in Ryn.
+//
+// A faithful port of the Rust bootstrap parser (`src/parser.rs`). It parses
+// a whole source text, specializes generic structures and enums, resolves
+// type aliases, and registers tuple, Option, and Result types exactly like
+// the bootstrap parser, then prints the syntax tree in the text format that
+// `src/ast_codec.rs` decodes.
+//
+// Expressions and statements are built bottom-up directly as encoded text.
+// Types live in an arena because generic specialization needs to inspect and
+// rewrite them before they are encoded.
+
+use frontend::lexer
+
+// Nesting limits shared with the bootstrap parser.
+struct Limits {
+    unused: u8
+}
+
+extend Limits {
+    pub const EXPRESSION_DEPTH: u64 = 24
+    pub const BLOCK_DEPTH: u64 = 128
+    pub const IF_DEPTH: u64 = 128
+}
+
+// Type node kinds.
+struct Ty {
+    unused: u8
+}
+
+extend Ty {
+    pub const I8: u32 = 1
+    pub const I16: u32 = 2
+    pub const I32: u32 = 3
+    pub const I64: u32 = 4
+    pub const U8: u32 = 5
+    pub const U16: u32 = 6
+    pub const U32: u32 = 7
+    pub const U64: u32 = 8
+    pub const F32: u32 = 9
+    pub const F64: u32 = 10
+    pub const STR: u32 = 11
+    pub const STRING: u32 = 12
+    pub const CHAR: u32 = 13
+    pub const BOOL: u32 = 14
+    pub const NAMED: u32 = 20
+    pub const PARAM: u32 = 21
+    pub const VEC: u32 = 22
+    pub const MAP: u32 = 23
+    pub const SET: u32 = 24
+    pub const ARRAY: u32 = 25
+    pub const SLICE: u32 = 26
+    pub const REF: u32 = 27
+    pub const RAW: u32 = 28
+    pub const FNPTR: u32 = 29
+}
+
+// Expression kinds that later stages of the parser inspect.
+struct Ek {
+    unused: u8
+}
+
+extend Ek {
+    pub const OTHER: u32 = 0
+    pub const CALL: u32 = 1
+    pub const METHOD_CALL: u32 = 2
+    pub const DEREF: u32 = 3
+    // `call()?` and `call()??`, which may stand alone as statements.
+    pub const PROPAGATE_CALL: u32 = 4
+    pub const PROPAGATE_NESTED: u32 = 5
+}
+
+// One type in the arena. `first` is the element, key, or function result;
+// `second` is a Map value; `length` is an array length; `flag` is reference
+// mutability or the `extern "C"` marker of a function pointer.
+struct TypeNode {
+    kind: u32,
+    name: String,
+    first: u64,
+    second: u64,
+    length: u64,
+    flag: bool,
+    has_result: bool,
+    params: Vec<u64>,
+    start: u64,
+    end: u64
+}
+
+// An encoded expression with the parts that statements reuse: a call's
+// encoding is shared by `Statement::Call`, a method call keeps its receiver
+// and name (`head`) and arguments (`tail`), and a dereference keeps its
+// pointer (`head`).
+struct Expr {
+    code: String,
+    kind: u32,
+    start: u64,
+    end: u64,
+    head: String,
+    tail: String
+}
+
+struct Name {
+    text: String,
+    start: u64,
+    end: u64
+}
+
+struct FieldTemplate {
+    name: String,
+    ty: u64,
+    public: bool,
+    start: u64,
+    end: u64
+}
+
+struct VariantTemplate {
+    name: String,
+    fields: Vec<u64>,
+    start: u64,
+    end: u64
+}
+
+// A generic structure or enum awaiting specialization. Its fields or
+// variants live in `Parser.template_fields` / `Parser.template_variants`.
+struct Template {
+    name: String,
+    is_struct: bool,
+    params: Vec<String>,
+    first_item: u64,
+    item_count: u64,
+    public: bool,
+    repr_c: bool,
+    has_drop: bool,
+    drop_function: String,
+    derives: Vec<String>,
+    start: u64,
+    end: u64
+}
+
+struct AliasTemplate {
+    params: Vec<String>,
+    ty: u64
+}
+
+struct Placeholder {
+    template: String,
+    arguments: Vec<u64>
+}
+
+struct Parser {
+    src: String,
+    tokens: Vec<lexer::Token>,
+    texts: Vec<String>,
+    at: u64,
+    expression_depth: u64,
+    block_depth: u64,
+    if_depth: u64,
+    types: Vec<TypeNode>,
+    type_aliases: Map<String, u64>,
+    generic_type_aliases: Map<String, u64>,
+    alias_templates: Vec<AliasTemplate>,
+    tuple_type_names: Map<String, String>,
+    tuple_type_structs: Vec<String>,
+    templates: Vec<Template>,
+    template_fields: Vec<FieldTemplate>,
+    template_variants: Vec<VariantTemplate>,
+    generic_struct_templates: Map<String, u64>,
+    generic_struct_keys: Map<String, String>,
+    generic_struct_placeholder_keys: Map<String, String>,
+    generic_struct_placeholders: Map<String, u64>,
+    generic_structs: Vec<String>,
+    generic_enum_keys: Map<String, String>,
+    generic_enum_placeholder_keys: Map<String, String>,
+    generic_enum_placeholders: Map<String, u64>,
+    generic_enums: Vec<String>,
+    generic_enum_templates: Map<String, u64>,
+    placeholders: Vec<Placeholder>,
+    namespace_path: Vec<String>,
+    generic_type_parameters: Set<String>,
+    custom_drop_types: Set<String>,
+    // Functions produced by the most recent `extend` block.
+    pending_methods: String,
+    pending_method_count: u64,
+    // Error recovery, used by `ryn check` to report independent errors.
+    recovering: bool,
+    speculative: bool,
+    recovery_diagnostics: Vec<lexer::Diag>,
+    // Positions of consumed `when` (1), `else` (2), and `{` (3) tokens, which
+    // let recovery skip the remains of a malformed control-flow header.
+    control_indices: Vec<u64>,
+    control_markers: Vec<u32>,
+    // Scratch results of `declaration`, `drain_recovery`, and `program`.
+    declared: String,
+    drained: Vec<lexer::Diag>,
+    diagnostics: Vec<lexer::Diag>,
+    brace_consumed: bool,
+    closing_consumed: bool,
+    closing_end: u64
+}
+
+// ---------------------------------------------------------------------------
+// Encoding helpers. Every word is preceded by one space, matching
+// `src/ast_codec.rs`.
+
+fun word(text: str) -> String {
+    mut out := String(" ")
+    out.append(text)
+    return out
+}
+
+fun enc_uint(value: u64) -> String {
+    mut out := String(" ")
+    out.append(String(value))
+    return out
+}
+
+fun enc_bool(value: bool) -> String {
+    when value {
+        return String(" 1")
+    }
+    return String(" 0")
+}
+
+fun enc_str(value: String) -> String {
+    mut out := String(" ")
+    out.append(String(value.len()))
+    out.push(':')
+    out.append(value)
+    return out
+}
+
+fun enc_text(value: str) -> String {
+    return enc_str(String(value))
+}
+
+fun enc_span(start: u64, end: u64) -> String {
+    mut out := String(" ")
+    out.append(String(start))
+    out.push(' ')
+    out.append(String(end))
+    return out
+}
+
+fun enc_none() -> String {
+    return String(" -")
+}
+
+fun enc_some(code: String) -> String {
+    mut out := String(" +")
+    out.append(code)
+    return out
+}
+
+fun enc_list(count: u64, items: String) -> String {
+    mut out := enc_uint(count)
+    out.append(items)
+    return out
+}
+
+fun enc_strings(values: Vec<String>) -> String {
+    mut out := enc_uint(values.len())
+    for value in values {
+        out.append(enc_str(value))
+    }
+    return out
+}
+
+fun join(values: Vec<String>, separator: str) -> String {
+    mut out := String()
+    mut first := true
+    for value in values {
+        when !first {
+            out.append(separator)
+        }
+        first = false
+        out.append(value)
+    }
+    return out
+}
+
+fun contains_text(values: Vec<String>, needle: String) -> bool {
+    for value in values {
+        when value == needle {
+            return true
+        }
+    }
+    return false
+}
+
+fun leaf_name(name: String) -> String {
+    // The last `::` segment of a path.
+    mut start: u64 = 0
+    mut index: u64 = 0
+    length := name.len()
+    while index + 1 < length {
+        when name.byte_at(index) == 58 && name.byte_at(index + 1) == 58 {
+            start = index + 2
+            index += 2
+        } else {
+            index += 1
+        }
+    }
+    return name.slice(start, length)
+}
+
+fun has_path_separator(name: String) -> bool {
+    return name.contains("::")
+}
+
+fun is_builtin_type_name(name: String) -> bool {
+    return name == "i8" || name == "i16" || name == "i32" || name == "i64"
+        || name == "u8" || name == "u16" || name == "u32" || name == "u64"
+        || name == "f32" || name == "f64" || name == "str" || name == "String"
+        || name == "char" || name == "bool" || name == "Vec" || name == "Map"
+        || name == "HashMap" || name == "Set" || name == "Option" || name == "Result"
+}
+
+fun is_identifier(name: String) -> bool {
+    length := name.len()
+    when length == 0 {
+        return false
+    }
+    first := name.byte_at(0) as u32
+    when !(lexer::is_alpha(first) || first == 95) {
+        return false
+    }
+    mut index: u64 = 1
+    while index < length {
+        current := name.byte_at(index) as u32
+        when !(lexer::is_alnum(current) || current == 95) {
+            return false
+        }
+        index += 1
+    }
+    return true
+}
+
+fun is_digits(name: String) -> bool {
+    length := name.len()
+    when length == 0 {
+        return false
+    }
+    mut index: u64 = 0
+    while index < length {
+        when !lexer::is_digit(name.byte_at(index) as u32) {
+            return false
+        }
+        index += 1
+    }
+    return true
+}
+
+fun binary_op_name(kind: u32) -> str {
+    when kind == lexer::Tk::OR_OR { return "Or" }
+    when kind == lexer::Tk::AND_AND { return "And" }
+    when kind == lexer::Tk::EQUAL_EQUAL { return "Eq" }
+    when kind == lexer::Tk::BANG_EQUAL { return "Ne" }
+    when kind == lexer::Tk::LESS { return "Lt" }
+    when kind == lexer::Tk::LESS_EQUAL { return "Le" }
+    when kind == lexer::Tk::GREATER { return "Gt" }
+    when kind == lexer::Tk::GREATER_EQUAL { return "Ge" }
+    when kind == lexer::Tk::BIT_OR { return "BitOr" }
+    when kind == lexer::Tk::CARET { return "BitXor" }
+    when kind == lexer::Tk::BIT_AND { return "BitAnd" }
+    when kind == lexer::Tk::SHIFT_LEFT { return "Shl" }
+    when kind == lexer::Tk::SHIFT_RIGHT { return "Shr" }
+    when kind == lexer::Tk::PLUS { return "Add" }
+    when kind == lexer::Tk::MINUS { return "Sub" }
+    when kind == lexer::Tk::STAR { return "Mul" }
+    when kind == lexer::Tk::SLASH { return "Div" }
+    return "Rem"
+}
+
+fun binary_precedence(kind: u32) -> u64 {
+    when kind == lexer::Tk::OR_OR { return 1 }
+    when kind == lexer::Tk::AND_AND { return 2 }
+    when kind == lexer::Tk::EQUAL_EQUAL || kind == lexer::Tk::BANG_EQUAL
+        || kind == lexer::Tk::LESS || kind == lexer::Tk::LESS_EQUAL
+        || kind == lexer::Tk::GREATER || kind == lexer::Tk::GREATER_EQUAL {
+        return 3
+    }
+    when kind == lexer::Tk::BIT_OR { return 4 }
+    when kind == lexer::Tk::CARET { return 5 }
+    when kind == lexer::Tk::BIT_AND { return 6 }
+    when kind == lexer::Tk::SHIFT_LEFT || kind == lexer::Tk::SHIFT_RIGHT { return 7 }
+    when kind == lexer::Tk::PLUS || kind == lexer::Tk::MINUS { return 8 }
+    when kind == lexer::Tk::STAR || kind == lexer::Tk::SLASH || kind == lexer::Tk::PERCENT {
+        return 9
+    }
+    return 0
+}
+
+// Operator name of a compound assignment token, or "" for other tokens.
+fun compound_op_name(kind: u32) -> str {
+    when kind == lexer::Tk::PLUS_EQUAL { return "Add" }
+    when kind == lexer::Tk::MINUS_EQUAL { return "Sub" }
+    when kind == lexer::Tk::STAR_EQUAL { return "Mul" }
+    when kind == lexer::Tk::SLASH_EQUAL { return "Div" }
+    when kind == lexer::Tk::PERCENT_EQUAL { return "Rem" }
+    when kind == lexer::Tk::BIT_AND_EQUAL { return "BitAnd" }
+    when kind == lexer::Tk::BIT_OR_EQUAL { return "BitOr" }
+    when kind == lexer::Tk::CARET_EQUAL { return "BitXor" }
+    when kind == lexer::Tk::SHIFT_LEFT_EQUAL { return "Shl" }
+    when kind == lexer::Tk::SHIFT_RIGHT_EQUAL { return "Shr" }
+    return ""
+}
+
+fun is_assignment_kind(kind: u32) -> bool {
+    return kind == lexer::Tk::EQUAL || kind == lexer::Tk::PLUS_EQUAL
+        || kind == lexer::Tk::MINUS_EQUAL || kind == lexer::Tk::STAR_EQUAL
+        || kind == lexer::Tk::SLASH_EQUAL || kind == lexer::Tk::PERCENT_EQUAL
+        || kind == lexer::Tk::BIT_AND_EQUAL || kind == lexer::Tk::BIT_OR_EQUAL
+        || kind == lexer::Tk::CARET_EQUAL || kind == lexer::Tk::SHIFT_LEFT_EQUAL
+        || kind == lexer::Tk::SHIFT_RIGHT_EQUAL
+}
+
+fun plain_expr(code: String, start: u64, end: u64) -> Expr {
+    return Expr {
+        code: code,
+        kind: Ek::OTHER,
+        start: start,
+        end: end,
+        head: String(),
+        tail: String()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Token access and diagnostics.
+
+extend Parser {
+    fun kind_at(self, index: u64) -> u32 {
+        when index >= self.tokens.len() {
+            return lexer::Tk::EOF
+        }
+        return self.tokens[index].kind
+    }
+
+    fun peek(self) -> lexer::Token {
+        return self.tokens[self.at]
+    }
+
+    fun peek_kind(self) -> u32 {
+        return self.tokens[self.at].kind
+    }
+
+    fun ident_at(self, index: u64, text: str) -> bool {
+        when self.kind_at(index) != lexer::Tk::IDENT {
+            return false
+        }
+        token := self.tokens[index]
+        return self.texts[token.text] == text
+    }
+
+    fun peek_is_ident(self, text: str) -> bool {
+        return self.ident_at(self.at, text)
+    }
+
+    fun prev_end(self) -> u64 {
+        return self.tokens[self.at - 1].end
+    }
+
+    fun next(mut self) -> lexer::Token {
+        token := self.tokens[self.at]
+        when token.kind == lexer::Tk::EOF {
+            return token
+        }
+        when self.recovering && !self.speculative {
+            mut marker: u32 = 0
+            when token.kind == lexer::Tk::WHEN {
+                marker = 1
+            } else when token.kind == lexer::Tk::ELSE {
+                marker = 2
+            } else when token.kind == lexer::Tk::LBRACE {
+                marker = 3
+            }
+            when marker != 0 {
+                self.control_indices.push(self.at)
+                self.control_markers.push(marker)
+            }
+        }
+        self.at += 1
+        return token
+    }
+    fun skip(mut self) {
+        _ := self.next()
+    }
+
+    fun push_recovery(mut self, error: lexer::Diag) {
+        self.recovery_diagnostics.push(error)
+    }
+
+    // Whether the token that produced `error` was consumed after `start`.
+    fun diagnostic_token_was_consumed(self, start: u64, error_start: u64, error_end: u64) -> bool {
+        when self.at <= start {
+            return false
+        }
+        previous := self.tokens[self.at - 1]
+        return previous.start == error_start && previous.end == error_end
+    }
+
+    fun source_text(self, start: u64, end: u64) -> String {
+        when start > end || end > self.src.len() {
+            return String()
+        }
+        return self.src.slice(start, end)
+    }
+
+    fun starts_expression(self) -> bool {
+        kind := self.peek_kind()
+        return kind == lexer::Tk::INTEGER || kind == lexer::Tk::FLOAT || kind == lexer::Tk::STRING
+            || kind == lexer::Tk::CHARACTER || kind == lexer::Tk::TRUE || kind == lexer::Tk::FALSE
+            || kind == lexer::Tk::WHEN || kind == lexer::Tk::IDENT || kind == lexer::Tk::MINUS
+            || kind == lexer::Tk::BANG || kind == lexer::Tk::LPAREN
+    }
+
+    fun synchronize_top_level(mut self) {
+        while true {
+            kind := self.peek_kind()
+            when kind == lexer::Tk::EOF || kind == lexer::Tk::FUN || kind == lexer::Tk::STRUCT
+                || kind == lexer::Tk::ENUM || kind == lexer::Tk::TYPE || kind == lexer::Tk::USE
+                || kind == lexer::Tk::NAMESPACE || kind == lexer::Tk::PUB {
+                return
+            }
+            self.skip()
+        }
+    }
+
+    fun synchronize_statement(mut self, start: u64, allow_call: bool) {
+        mut brace_depth: u64 = 0
+        mut paren_depth: u64 = 0
+        while self.peek_kind() != lexer::Tk::EOF {
+            kind := self.peek_kind()
+            when self.at > start && brace_depth == 0 && paren_depth == 0
+                && (kind == lexer::Tk::RBRACE || self.starts_statement(allow_call)) {
+                return
+            }
+            when kind == lexer::Tk::LBRACE {
+                brace_depth += 1
+            } else when kind == lexer::Tk::RBRACE {
+                when brace_depth == 0 {
+                    return
+                }
+                brace_depth -= 1
+            } else when kind == lexer::Tk::LPAREN {
+                paren_depth += 1
+            } else when kind == lexer::Tk::RPAREN && paren_depth > 0 {
+                paren_depth -= 1
+            }
+            self.skip()
+        }
+    }
+
+    // Skips to the next `name:` entry or past a comma inside `{ ... }` or
+    // `( ... )` lists of fields and parameters.
+    fun synchronize_list_entry(mut self, start: u64, closing: u32) {
+        while self.peek_kind() != closing && self.peek_kind() != lexer::Tk::EOF {
+            when self.at > start && self.peek_kind() == lexer::Tk::IDENT && self.kind_at(self.at + 1) == lexer::Tk::COLON {
+                return
+            }
+            when self.peek_kind() == lexer::Tk::COMMA {
+                self.skip()
+                return
+            }
+            self.skip()
+        }
+    }
+
+    fun synchronize_expression_list(mut self, closing: u32) {
+        mut paren_depth: u64 = 0
+        mut brace_depth: u64 = 0
+        while self.peek_kind() != lexer::Tk::EOF {
+            kind := self.peek_kind()
+            when paren_depth == 0 && brace_depth == 0 {
+                when kind == closing || kind == lexer::Tk::RBRACE {
+                    return
+                }
+                when kind == lexer::Tk::COMMA {
+                    self.skip()
+                    return
+                }
+            }
+            when kind == lexer::Tk::LPAREN {
+                paren_depth += 1
+            } else when kind == lexer::Tk::RPAREN && paren_depth > 0 {
+                paren_depth -= 1
+            } else when kind == lexer::Tk::LBRACE {
+                brace_depth += 1
+            } else when kind == lexer::Tk::RBRACE && brace_depth > 0 {
+                brace_depth -= 1
+            }
+            self.skip()
+        }
+    }
+
+    // After a malformed `when`, `while`, or `for` header, skips the rest of
+    // the header, including an `else` chain left over from a `when`
+    // expression, and stops before the body's `{`.
+    fun synchronize_control_body(mut self, header_start: u64) {
+        mut pending_if_body := false
+        mut index: u64 = 0
+        count := self.control_indices.len()
+        while index < count && self.control_indices[index] < header_start {
+            index += 1
+        }
+        while index < count && self.control_indices[index] < self.at {
+            marker := self.control_markers[index]
+            when marker == 1 {
+                pending_if_body = true
+            } else {
+                pending_if_body = false
+            }
+            index += 1
+        }
+        while self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
+            when self.peek_kind() == lexer::Tk::ELSE {
+                self.skip()
+                when self.peek_kind() == lexer::Tk::WHEN {
+                    self.skip()
+                    pending_if_body = true
+                    continue
+                }
+                when self.peek_kind() == lexer::Tk::LBRACE {
+                    self.skip_balanced_block()
+                }
+                pending_if_body = false
+                continue
+            }
+            when self.peek_kind() == lexer::Tk::LBRACE {
+                when pending_if_body {
+                    self.skip_balanced_block()
+                    pending_if_body = false
+                    continue
+                }
+                break
+            }
+            when self.peek_kind() == lexer::Tk::WHEN {
+                self.skip()
+                pending_if_body = true
+                continue
+            }
+            self.skip()
+        }
+    }
+
+    fun skip_balanced_block(mut self) {
+        mut depth: u64 = 0
+        while self.peek_kind() != lexer::Tk::EOF {
+            kind := self.next().kind
+            when kind == lexer::Tk::LBRACE {
+                depth += 1
+            } else when kind == lexer::Tk::RBRACE {
+                depth -= 1
+                when depth == 0 {
+                    break
+                }
+            }
+        }
+    }
+    fun error(self, message: str) -> lexer::Diag {
+        token := self.peek()
+        return lexer::diag("R0010", String(message), token.start, token.end)
+    }
+
+    fun expect(mut self, kind: u32, message: str) -> Result<lexer::Token, lexer::Diag> {
+        when self.peek_kind() == kind {
+            return Result::Ok(self.next())
+        }
+        return Result::Err(self.error(message))
+    }
+
+    fun consume_if(mut self, kind: u32) -> bool {
+        when self.peek_kind() == kind {
+            self.skip()
+            return true
+        }
+        return false
+    }
+
+    fun ident(mut self, message: str) -> Result<Name, lexer::Diag> {
+        token := self.peek()
+        when token.kind == lexer::Tk::IDENT {
+            self.skip()
+            return Result::Ok(Name { text: self.texts[token.text], start: token.start, end: token.end })
+        }
+        return Result::Err(self.error(message))
+    }
+
+    fun nesting_error(self, kind: str) -> lexer::Diag {
+        token := self.peek()
+        mut message := String("maximum parser nesting depth exceeded in ")
+        message.append(kind)
+        mut help := String("reduce the amount of nesting in ")
+        help.append(kind)
+        help.push('s')
+        return lexer::diag_help("R0015", message, token.start, token.end, help)
+    }
+
+    fun qualified_declaration_name(self, name: String) -> String {
+        when self.namespace_path.is_empty() {
+            return name
+        }
+        mut qualified := join(self.namespace_path.clone(), "::")
+        qualified.append("::")
+        qualified.append(name)
+        return qualified
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The type arena, generic specialization, and type encoding.
+
+extend Parser {
+    fun new_type(mut self, kind: u32, name: String, first: u64, second: u64, length: u64, flag: bool, has_result: bool, params: Vec<u64>, start: u64, end: u64) -> u64 {
+        index := self.types.len()
+        self.types.push(TypeNode {
+            kind: kind,
+            name: name,
+            first: first,
+            second: second,
+            length: length,
+            flag: flag,
+            has_result: has_result,
+            params: params,
+            start: start,
+            end: end
+        })
+        return index
+    }
+
+    fun named_type(mut self, kind: u32, name: String, start: u64, end: u64) -> u64 {
+        return self.new_type(kind, name, 0, 0, 0, false, false, Vec<u64>(), start, end)
+    }
+
+    fun wrapper_type(mut self, kind: u32, first: u64, start: u64, end: u64) -> u64 {
+        return self.new_type(kind, String(), first, 0, 0, false, false, Vec<u64>(), start, end)
+    }
+
+    fun type_key(self, ty: u64) -> String {
+        node := self.types[ty]
+        kind := node.kind
+        when kind == Ty::I8 { return String("i8") }
+        when kind == Ty::I16 { return String("i16") }
+        when kind == Ty::I32 { return String("i32") }
+        when kind == Ty::I64 { return String("i64") }
+        when kind == Ty::U8 { return String("u8") }
+        when kind == Ty::U16 { return String("u16") }
+        when kind == Ty::U32 { return String("u32") }
+        when kind == Ty::U64 { return String("u64") }
+        when kind == Ty::F32 { return String("f32") }
+        when kind == Ty::F64 { return String("f64") }
+        when kind == Ty::STR { return String("str") }
+        when kind == Ty::STRING { return String("String") }
+        when kind == Ty::CHAR { return String("char") }
+        when kind == Ty::BOOL { return String("bool") }
+        when kind == Ty::NAMED { return node.name }
+        when kind == Ty::PARAM {
+            mut key := String("$")
+            key.append(node.name)
+            return key
+        }
+        when kind == Ty::VEC || kind == Ty::SET {
+            mut key := when kind == Ty::VEC { String("Vec<") } else { String("Set<") }
+            key.append(self.type_key(node.first))
+            key.push('>')
+            return key
+        }
+        when kind == Ty::MAP {
+            mut key := String("Map<")
+            key.append(self.type_key(node.first))
+            key.push(',')
+            key.append(self.type_key(node.second))
+            key.push('>')
+            return key
+        }
+        when kind == Ty::ARRAY {
+            mut key := String("[")
+            key.append(self.type_key(node.first))
+            key.push(';')
+            key.append(String(node.length))
+            key.push(']')
+            return key
+        }
+        when kind == Ty::SLICE {
+            mut key := String("&[")
+            key.append(self.type_key(node.first))
+            key.push(']')
+            return key
+        }
+        when kind == Ty::REF {
+            mut key := String("&")
+            when node.flag {
+                key.append("mut ")
+            }
+            key.append(self.type_key(node.first))
+            return key
+        }
+        when kind == Ty::RAW {
+            mut key := String("*")
+            key.append(self.type_key(node.first))
+            return key
+        }
+        mut key := String()
+        when node.flag {
+            key.append("extern \"C\" ")
+        }
+        key.append("fun(")
+        key.append(self.type_keys(node.params.clone()))
+        key.push(')')
+        when node.has_result {
+            key.append("->")
+            key.append(self.type_key(node.first))
+        }
+        return key
+    }
+
+    fun type_keys(self, types: Vec<u64>) -> String {
+        mut keys := Vec<String>()
+        for ty in types {
+            keys.push(self.type_key(ty))
+        }
+        return join(keys, ",")
+    }
+
+    fun encode_type(self, ty: u64) -> String {
+        node := self.types[ty]
+        kind := node.kind
+        when kind == Ty::I8 { return word("i8") }
+        when kind == Ty::I16 { return word("i16") }
+        when kind == Ty::I32 { return word("i32") }
+        when kind == Ty::I64 { return word("i64") }
+        when kind == Ty::U8 { return word("u8") }
+        when kind == Ty::U16 { return word("u16") }
+        when kind == Ty::U32 { return word("u32") }
+        when kind == Ty::U64 { return word("u64") }
+        when kind == Ty::F32 { return word("f32") }
+        when kind == Ty::F64 { return word("f64") }
+        when kind == Ty::STR { return word("str") }
+        when kind == Ty::STRING { return word("String") }
+        when kind == Ty::CHAR { return word("char") }
+        when kind == Ty::BOOL { return word("bool") }
+        mut out := String()
+        when kind == Ty::NAMED {
+            out = word("Named")
+            out.append(enc_str(node.name))
+        } else when kind == Ty::PARAM {
+            out = word("Param")
+            out.append(enc_str(node.name))
+        } else when kind == Ty::VEC {
+            out = word("Vec")
+            out.append(self.encode_type(node.first))
+        } else when kind == Ty::SET {
+            out = word("Set")
+            out.append(self.encode_type(node.first))
+        } else when kind == Ty::SLICE {
+            out = word("Slice")
+            out.append(self.encode_type(node.first))
+        } else when kind == Ty::RAW {
+            out = word("Raw")
+            out.append(self.encode_type(node.first))
+        } else when kind == Ty::MAP {
+            out = word("Map")
+            out.append(self.encode_type(node.first))
+            out.append(self.encode_type(node.second))
+        } else when kind == Ty::ARRAY {
+            out = word("Array")
+            out.append(self.encode_type(node.first))
+            out.append(enc_uint(node.length))
+        } else when kind == Ty::REF {
+            out = word("Ref")
+            out.append(self.encode_type(node.first))
+            out.append(enc_bool(node.flag))
+        } else {
+            out = word("FnPtr")
+            out.append(self.encode_types(node.params.clone()))
+            when node.has_result {
+                out.append(enc_some(self.encode_type(node.first)))
+            } else {
+                out.append(enc_none())
+            }
+            out.append(enc_bool(node.flag))
+        }
+        out.append(enc_span(node.start, node.end))
+        return out
+    }
+
+    fun encode_types(self, types: Vec<u64>) -> String {
+        mut out := enc_uint(types.len())
+        for ty in types {
+            out.append(self.encode_type(ty))
+        }
+        return out
+    }
+
+    // Mirrors `substitute_type_parameters`, which only looks inside
+    // collections, arrays, and slices.
+    fun substitute(mut self, ty: u64, params: Vec<String>, arguments: Vec<u64>) -> u64 {
+        node := self.types[ty]
+        when node.kind == Ty::PARAM {
+            mut index: u64 = 0
+            for param in params {
+                when param == node.name {
+                    return arguments[index]
+                }
+                index += 1
+            }
+            return ty
+        }
+        when node.kind == Ty::VEC || node.kind == Ty::SET || node.kind == Ty::ARRAY || node.kind == Ty::SLICE {
+            element := self.substitute(node.first, params, arguments)
+            return self.new_type(node.kind, String(), element, 0, node.length, false, false, Vec<u64>(), node.start, node.end)
+        }
+        when node.kind == Ty::MAP {
+            key := self.substitute(node.first, params.clone(), arguments.clone())
+            value := self.substitute(node.second, params, arguments)
+            return self.new_type(Ty::MAP, String(), key, value, 0, false, false, Vec<u64>(), node.start, node.end)
+        }
+        return ty
+    }
+
+    fun contains_unresolved_generic_type(self, ty: u64) -> bool {
+        node := self.types[ty]
+        when node.kind == Ty::PARAM {
+            return true
+        }
+        when node.kind == Ty::NAMED {
+            return self.generic_struct_placeholders.contains_key(node.name.clone())
+                || self.generic_enum_placeholders.contains_key(node.name)
+        }
+        when node.kind == Ty::VEC || node.kind == Ty::SET || node.kind == Ty::ARRAY || node.kind == Ty::SLICE {
+            return self.contains_unresolved_generic_type(node.first)
+        }
+        when node.kind == Ty::MAP {
+            return self.contains_unresolved_generic_type(node.first)
+                || self.contains_unresolved_generic_type(node.second)
+        }
+        return false
+    }
+
+    fun any_unresolved(self, types: Vec<u64>) -> bool {
+        for ty in types {
+            when self.contains_unresolved_generic_type(ty) {
+                return true
+            }
+        }
+        return false
+    }
+
+    fun resolve_generic_placeholders(mut self, ty: u64, params: Vec<String>, arguments: Vec<u64>) -> Result<u64, lexer::Diag> {
+        node := self.types[ty]
+        when node.kind == Ty::NAMED {
+            mut is_struct := true
+            mut placeholder: u64 = 0
+            mut found := false
+            when self.generic_struct_placeholders.contains_key(node.name.clone()) {
+                placeholder = self.generic_struct_placeholders.get(node.name.clone()).unwrap()
+                found = true
+            } else when self.generic_enum_placeholders.contains_key(node.name.clone()) {
+                placeholder = self.generic_enum_placeholders.get(node.name.clone()).unwrap()
+                is_struct = false
+                found = true
+            }
+            when found {
+                record := self.placeholders[placeholder]
+                mut resolved := Vec<u64>()
+                for argument in record.arguments {
+                    substituted := self.substitute(argument, params.clone(), arguments.clone())
+                    resolved.push(self.resolve_generic_placeholders(substituted, params.clone(), arguments.clone())?)
+                }
+                mut specialized := String()
+                when is_struct {
+                    specialized = self.specialize_generic_struct(record.template, resolved, node.start, node.end)?
+                } else {
+                    specialized = self.specialize_generic_enum(record.template, resolved, node.start, node.end)?
+                }
+                return Result::Ok(self.named_type(Ty::NAMED, specialized, node.start, node.end))
+            }
+        }
+        when node.kind == Ty::VEC || node.kind == Ty::SET || node.kind == Ty::ARRAY || node.kind == Ty::SLICE {
+            element := self.resolve_generic_placeholders(node.first, params, arguments)?
+            return Result::Ok(self.new_type(node.kind, String(), element, 0, node.length, false, false, Vec<u64>(), node.start, node.end))
+        }
+        when node.kind == Ty::MAP {
+            key := self.resolve_generic_placeholders(node.first, params.clone(), arguments.clone())?
+            value := self.resolve_generic_placeholders(node.second, params, arguments)?
+            return Result::Ok(self.new_type(Ty::MAP, String(), key, value, 0, false, false, Vec<u64>(), node.start, node.end))
+        }
+        return Result::Ok(ty)
+    }
+
+    fun arity_message(self, kind: str, name: String, expected: u64, found: u64) -> String {
+        mut message := String("generic ")
+        message.append(kind)
+        message.append(" `")
+        message.append(name)
+        message.append("` expects ")
+        message.append(String(expected))
+        message.append(" type argument(s), found ")
+        message.append(String(found))
+        return message
+    }
+
+    fun specialize_generic_struct(mut self, template_name: String, arguments: Vec<u64>, start: u64, end: u64) -> Result<String, lexer::Diag> {
+        when !self.generic_struct_templates.contains_key(template_name.clone()) {
+            return Result::Err(self.error("unknown generic structure"))
+        }
+        template := self.templates[self.generic_struct_templates.get(template_name.clone()).unwrap()]
+        when template.params.len() != arguments.len() {
+            message := self.arity_message("structure", template.name.clone(), template.params.len(), arguments.len())
+            return Result::Err(lexer::diag("R0243", message, start, end))
+        }
+        mut key := template_name.clone()
+        key.push('<')
+        key.append(self.type_keys(arguments.clone()))
+        key.push('>')
+        when self.any_unresolved(arguments.clone()) {
+            when self.generic_struct_placeholder_keys.contains_key(key.clone()) {
+                return Result::Ok(self.generic_struct_placeholder_keys.get(key).unwrap())
+            }
+            mut name := String("$RynStructParam#")
+            name.append(String(self.generic_struct_placeholders.len()))
+            index := self.placeholders.len()
+            self.placeholders.push(Placeholder { template: template_name, arguments: arguments })
+            self.generic_struct_placeholders.insert(name.clone(), index)
+            self.generic_struct_placeholder_keys.insert(key, name.clone())
+            return Result::Ok(name)
+        }
+        when self.generic_struct_keys.contains_key(key.clone()) {
+            return Result::Ok(self.generic_struct_keys.get(key).unwrap())
+        }
+        mut internal := String("$RynStruct#")
+        internal.append(String(self.generic_struct_keys.len() + self.generic_struct_placeholders.len()))
+        self.generic_struct_keys.insert(key, internal.clone())
+        mut fields := String()
+        mut item := template.first_item
+        while item < template.first_item + template.item_count {
+            field := self.template_fields[item]
+            substituted := self.substitute(field.ty, template.params.clone(), arguments.clone())
+            resolved := self.resolve_generic_placeholders(substituted, template.params.clone(), arguments.clone())?
+            fields.append(enc_str(field.name))
+            fields.append(self.encode_type(resolved))
+            fields.append(enc_bool(field.public))
+            fields.append(enc_span(field.start, field.end))
+            item += 1
+        }
+        mut out := String("\n")
+        out.append(enc_str(internal.clone()))
+        out.append(enc_uint(0))
+        out.append(enc_list(template.item_count, fields))
+        out.append(enc_bool(false))
+        out.append(enc_bool(template.repr_c))
+        when template.has_drop {
+            out.append(enc_some(enc_str(template.drop_function)))
+        } else {
+            out.append(enc_none())
+        }
+        out.append(enc_strings(template.derives))
+        out.append(enc_text(""))
+        out.append(enc_span(template.start, template.end))
+        self.generic_structs.push(out)
+        return Result::Ok(internal)
+    }
+
+    fun specialize_generic_enum(mut self, template_name: String, arguments: Vec<u64>, start: u64, end: u64) -> Result<String, lexer::Diag> {
+        when !self.generic_enum_templates.contains_key(template_name.clone()) {
+            return Result::Err(self.error("unknown generic enum"))
+        }
+        template := self.templates[self.generic_enum_templates.get(template_name.clone()).unwrap()]
+        when template.params.len() != arguments.len() {
+            message := self.arity_message("enum", template.name.clone(), template.params.len(), arguments.len())
+            return Result::Err(lexer::diag("R0244", message, start, end))
+        }
+        mut key := template_name.clone()
+        key.push('<')
+        key.append(self.type_keys(arguments.clone()))
+        key.push('>')
+        when self.any_unresolved(arguments.clone()) {
+            when self.generic_enum_placeholder_keys.contains_key(key.clone()) {
+                return Result::Ok(self.generic_enum_placeholder_keys.get(key).unwrap())
+            }
+            mut name := String("$RynEnumParam#")
+            name.append(String(self.generic_enum_placeholders.len()))
+            index := self.placeholders.len()
+            self.placeholders.push(Placeholder { template: template_name, arguments: arguments })
+            self.generic_enum_placeholders.insert(name.clone(), index)
+            self.generic_enum_placeholder_keys.insert(key, name.clone())
+            return Result::Ok(name)
+        }
+        when self.generic_enum_keys.contains_key(key.clone()) {
+            return Result::Ok(self.generic_enum_keys.get(key).unwrap())
+        }
+        mut internal := String("$RynEnum#")
+        internal.append(template_name.clone())
+        internal.push('#')
+        internal.append(String(self.generic_enum_keys.len() + self.generic_enum_placeholders.len()))
+        self.generic_enum_keys.insert(key, internal.clone())
+        mut variants := String()
+        mut item := template.first_item
+        while item < template.first_item + template.item_count {
+            variant := self.template_variants[item]
+            mut fields := String()
+            for field in variant.fields.clone() {
+                substituted := self.substitute(field, template.params.clone(), arguments.clone())
+                resolved := self.resolve_generic_placeholders(substituted, template.params.clone(), arguments.clone())?
+                fields.append(self.encode_type(resolved))
+            }
+            variants.append(enc_str(variant.name))
+            variants.append(enc_list(variant.fields.len(), fields))
+            variants.append(enc_span(variant.start, variant.end))
+            item += 1
+        }
+        mut out := String("\n")
+        out.append(enc_str(internal.clone()))
+        out.append(enc_uint(0))
+        out.append(enc_list(template.item_count, variants))
+        out.append(enc_bool(false))
+        out.append(enc_text(""))
+        out.append(enc_span(template.start, template.end))
+        self.generic_enums.push(out)
+        return Result::Ok(internal)
+    }
+
+    // Registers `Option<value>` and returns its internal enum name.
+    fun option_specialization(mut self, value: u64, start: u64, end: u64) -> String {
+        mut key := String("Option<")
+        key.append(self.type_key(value))
+        key.push('>')
+        when self.generic_enum_keys.contains_key(key.clone()) {
+            return self.generic_enum_keys.get(key).unwrap()
+        }
+        mut internal := String("$RynOption#")
+        internal.append(String(self.generic_enum_keys.len()))
+        self.generic_enum_keys.insert(key, internal.clone())
+        mut variants := enc_text("Some")
+        variants.append(enc_list(1, self.encode_type(value)))
+        variants.append(enc_span(start, end))
+        variants.append(enc_text("None"))
+        variants.append(enc_uint(0))
+        variants.append(enc_span(start, end))
+        self.push_generic_enum(internal.clone(), variants, start, end)
+        return internal
+    }
+
+    fun result_specialization(mut self, value: u64, error: u64, start: u64, end: u64) -> String {
+        mut key := String("Result<")
+        key.append(self.type_key(value))
+        key.push(',')
+        key.append(self.type_key(error))
+        key.push('>')
+        when self.generic_enum_keys.contains_key(key.clone()) {
+            return self.generic_enum_keys.get(key).unwrap()
+        }
+        mut internal := String("$RynResult#")
+        internal.append(String(self.generic_enum_keys.len()))
+        self.generic_enum_keys.insert(key, internal.clone())
+        mut variants := enc_text("Ok")
+        variants.append(enc_list(1, self.encode_type(value)))
+        variants.append(enc_span(start, end))
+        variants.append(enc_text("Err"))
+        variants.append(enc_list(1, self.encode_type(error)))
+        variants.append(enc_span(start, end))
+        self.push_generic_enum(internal.clone(), variants, start, end)
+        return internal
+    }
+
+    fun push_generic_enum(mut self, name: String, variants: String, start: u64, end: u64) {
+        mut out := String("\n")
+        out.append(enc_str(name))
+        out.append(enc_uint(0))
+        out.append(enc_list(2, variants))
+        out.append(enc_bool(false))
+        out.append(enc_text(""))
+        out.append(enc_span(start, end))
+        self.generic_enums.push(out)
+    }
+
+    fun is_custom_drop_type(self, ty: u64) -> bool {
+        mut current := ty
+        mut seen := Set<String>()
+        while true {
+            node := self.types[current]
+            when node.kind != Ty::NAMED {
+                return false
+            }
+            name := node.name
+            leaf := leaf_name(name.clone())
+            when self.custom_drop_types.contains(name.clone()) || self.custom_drop_types.contains(leaf.clone()) {
+                return true
+            }
+            when seen.contains(name.clone()) {
+                return false
+            }
+            seen.insert(name.clone())
+            when self.type_aliases.contains_key(name.clone()) {
+                current = self.type_aliases.get(name).unwrap()
+            } else when self.type_aliases.contains_key(leaf.clone()) {
+                current = self.type_aliases.get(leaf).unwrap()
+            } else {
+                return false
+            }
+        }
+        return false
+    }
+
+    fun ensure_map_option_specialization(mut self, value: u64, start: u64, end: u64) {
+        when !self.is_custom_drop_type(value) {
+            self.option_specialization(value, start, end)
+        }
+    }
+
+    fun register_tuple_type(mut self, fields: Vec<u64>, start: u64, end: u64) -> u64 {
+        key := self.type_keys(fields.clone())
+        mut name := String()
+        when self.tuple_type_names.contains_key(key.clone()) {
+            name = self.tuple_type_names.get(key).unwrap()
+        } else {
+            name = String("$RynTuple#")
+            name.append(key.clone())
+            self.tuple_type_names.insert(key, name.clone())
+            mut encoded := String()
+            mut index: u64 = 0
+            count := fields.len()
+            for field in fields {
+                mut field_name := String("_")
+                field_name.append(String(index))
+                encoded.append(enc_str(field_name))
+                encoded.append(self.encode_type(field))
+                encoded.append(enc_bool(false))
+                encoded.append(enc_span(start, end))
+                index += 1
+            }
+            mut out := String("\n")
+            out.append(enc_str(name.clone()))
+            out.append(enc_uint(0))
+            out.append(enc_list(count, encoded))
+            out.append(enc_bool(false))
+            out.append(enc_bool(false))
+            out.append(enc_none())
+            out.append(enc_uint(0))
+            out.append(enc_text(""))
+            out.append(enc_span(start, end))
+            self.tuple_type_structs.push(out)
+        }
+        return self.named_type(Ty::NAMED, name, start, end)
+    }
+
+    fun expect_type_greater(mut self, message: str) -> Result<lexer::Token, lexer::Diag> {
+        token := self.peek()
+        when token.kind == lexer::Tk::GREATER {
+            return Result::Ok(self.next())
+        }
+        when token.kind == lexer::Tk::SHIFT_RIGHT {
+            // Split `>>` closing two generic lists; the second half stays in
+            // the token stream.
+            self.skip()
+            self.tokens.insert(self.at, lexer::Token {
+                kind: lexer::Tk::GREATER,
+                start: token.start + 1,
+                end: token.end,
+                text: 0,
+                value: 0
+            })
+            return Result::Ok(lexer::Token {
+                kind: lexer::Tk::GREATER,
+                start: token.start,
+                end: token.start + 1,
+                text: 0,
+                value: 0
+            })
+        }
+        return Result::Err(self.error(message))
+    }
+
+    // Parses `T, U, ...` and the closing `>`.
+    fun type_arguments(mut self, message: str) -> Result<Vec<u64>, lexer::Diag> {
+        mut arguments := Vec<u64>()
+        while true {
+            arguments.push(self.type_name()?)
+            when self.peek_kind() == lexer::Tk::COMMA {
+                self.skip()
+            } else {
+                break
+            }
+        }
+        self.expect_type_greater(message)?
+        return Result::Ok(arguments)
+    }
+
+    fun type_name(mut self) -> Result<u64, lexer::Diag> {
+        when self.peek_is_ident("extern") || self.peek_kind() == lexer::Tk::FUN {
+            start := self.peek().start
+            mut extern_c := false
+            when self.peek_is_ident("extern") {
+                self.skip()
+                abi := self.next()
+                when abi.kind != lexer::Tk::STRING || self.texts[abi.text] != "C" {
+                    return Result::Err(lexer::diag_help(
+                        "R0012",
+                        String("function pointer ABI must be `\"C\"`"),
+                        abi.start,
+                        abi.end,
+                        String("use `extern \"C\" fun(...) -> ...`")
+                    ))
+                }
+                extern_c = true
+            }
+            self.expect(lexer::Tk::FUN, "expected `fun` in function pointer type")?
+            self.expect(lexer::Tk::LPAREN, "expected `(` after function pointer `fun`")?
+            mut parameters := Vec<u64>()
+            while self.peek_kind() != lexer::Tk::RPAREN && self.peek_kind() != lexer::Tk::EOF {
+                parameters.push(self.type_name()?)
+                when self.peek_kind() != lexer::Tk::COMMA {
+                    break
+                }
+                self.skip()
+            }
+            self.expect(lexer::Tk::RPAREN, "expected `)` after function pointer parameters")?
+            mut result: u64 = 0
+            mut has_result := false
+            when self.peek_kind() == lexer::Tk::ARROW {
+                self.skip()
+                result = self.type_name()?
+                has_result = true
+            }
+            end := self.prev_end()
+            return Result::Ok(self.new_type(Ty::FNPTR, String(), result, 0, 0, extern_c, has_result, parameters, start, end))
+        }
+        when self.peek_kind() == lexer::Tk::LPAREN {
+            start := self.next().start
+            first := self.type_name()?
+            when self.peek_kind() != lexer::Tk::COMMA {
+                self.expect(lexer::Tk::RPAREN, "expected `)` after parenthesized type")?
+                return Result::Ok(first)
+            }
+            mut fields := Vec<u64>()
+            fields.push(first)
+            while self.peek_kind() == lexer::Tk::COMMA {
+                self.skip()
+                when self.peek_kind() == lexer::Tk::RPAREN {
+                    break
+                }
+                fields.push(self.type_name()?)
+            }
+            closing := self.expect(lexer::Tk::RPAREN, "expected `)` after tuple type")?
+            return Result::Ok(self.register_tuple_type(fields, start, closing.end))
+        }
+        when self.peek_kind() == lexer::Tk::BIT_AND {
+            start := self.next().start
+            when self.consume_if(lexer::Tk::LBRACKET) {
+                element := self.type_name()?
+                closing := self.expect(lexer::Tk::RBRACKET, "expected `]` after slice element type")?
+                return Result::Ok(self.wrapper_type(Ty::SLICE, element, start, closing.end))
+            }
+            mutable := self.consume_if(lexer::Tk::MUT)
+            element := self.type_name()?
+            end := self.prev_end()
+            return Result::Ok(self.new_type(Ty::REF, String(), element, 0, 0, mutable, false, Vec<u64>(), start, end))
+        }
+        when self.peek_kind() == lexer::Tk::STAR {
+            start := self.next().start
+            element := self.type_name()?
+            end := self.prev_end()
+            return Result::Ok(self.wrapper_type(Ty::RAW, element, start, end))
+        }
+        when self.peek_kind() == lexer::Tk::LBRACKET {
+            start := self.next().start
+            element := self.type_name()?
+            self.expect(lexer::Tk::SEMICOLON, "expected `;` between the array element type and length")?
+            length_token := self.next()
+            when length_token.kind != lexer::Tk::INTEGER {
+                return Result::Err(lexer::diag_help(
+                    "R0012",
+                    String("expected a non-negative integer array length"),
+                    length_token.start,
+                    length_token.end,
+                    String("array lengths must be integer literals")
+                ))
+            }
+            closing := self.expect(lexer::Tk::RBRACKET, "expected `]` after array type")?
+            return Result::Ok(self.new_type(Ty::ARRAY, String(), element, 0, length_token.value, false, false, Vec<u64>(), start, closing.end))
+        }
+        first := self.ident("expected type name")?
+        mut name := first.text.clone()
+        start := first.start
+        end := first.end
+        while self.peek_kind() == lexer::Tk::COLON_COLON {
+            self.skip()
+            segment := self.ident("expected type path segment after `::`")?
+            name.append("::")
+            name.append(segment.text)
+        }
+        when name == "i8" { return Result::Ok(Ty::I8 as u64) }
+        when name == "i16" { return Result::Ok(Ty::I16 as u64) }
+        when name == "i32" { return Result::Ok(Ty::I32 as u64) }
+        when name == "i64" { return Result::Ok(Ty::I64 as u64) }
+        when name == "u8" { return Result::Ok(Ty::U8 as u64) }
+        when name == "u16" { return Result::Ok(Ty::U16 as u64) }
+        when name == "u32" { return Result::Ok(Ty::U32 as u64) }
+        when name == "u64" { return Result::Ok(Ty::U64 as u64) }
+        when name == "f32" { return Result::Ok(Ty::F32 as u64) }
+        when name == "f64" { return Result::Ok(Ty::F64 as u64) }
+        when name == "str" { return Result::Ok(Ty::STR as u64) }
+        when name == "String" { return Result::Ok(Ty::STRING as u64) }
+        when name == "char" { return Result::Ok(Ty::CHAR as u64) }
+        when name == "bool" { return Result::Ok(Ty::BOOL as u64) }
+        when name == "Vec" {
+            self.expect(lexer::Tk::LESS, "expected `<` after `Vec`")?
+            element := self.type_name()?
+            self.expect_type_greater("expected `>` after the `Vec` element type")?
+            return Result::Ok(self.wrapper_type(Ty::VEC, element, start, end))
+        }
+        when name == "Set" {
+            self.expect(lexer::Tk::LESS, "expected `<` after `Set`")?
+            key := self.type_name()?
+            self.expect_type_greater("expected `>` after the `Set` element type")?
+            return Result::Ok(self.wrapper_type(Ty::SET, key, start, end))
+        }
+        when name == "Map" || name == "HashMap" {
+            self.expect(lexer::Tk::LESS, "expected `<` after `Map`")?
+            key := self.type_name()?
+            self.expect(lexer::Tk::COMMA, "expected `,` between Map key and value types")?
+            value := self.type_name()?
+            self.expect_type_greater("expected `>` after Map key and value types")?
+            self.ensure_map_option_specialization(value, start, end)
+            return Result::Ok(self.new_type(Ty::MAP, String(), key, value, 0, false, false, Vec<u64>(), start, end))
+        }
+        when name == "Option" || name == "Result" {
+            self.expect(lexer::Tk::LESS, "expected `<` after `Option` or `Result`")?
+            value := self.type_name()?
+            mut error: u64 = 0
+            when name == "Result" {
+                self.expect(lexer::Tk::COMMA, "expected `,` between the `Result` value and error types")?
+                error = self.type_name()?
+            }
+            self.expect_type_greater("expected `>` after generic type arguments")?
+            mut internal := String()
+            when name == "Option" {
+                internal = self.option_specialization(value, start, end)
+            } else {
+                internal = self.result_specialization(value, error, start, end)
+            }
+            return Result::Ok(self.named_type(Ty::NAMED, internal, start, end))
+        }
+        when self.generic_type_parameters.contains(name.clone()) {
+            return Result::Ok(self.named_type(Ty::PARAM, name, start, end))
+        }
+        mut template_name := name.clone()
+        when !has_path_separator(name.clone()) && !self.namespace_path.is_empty() {
+            template_name = self.qualified_declaration_name(name.clone())
+        }
+        when self.generic_type_aliases.contains_key(template_name.clone()) && self.peek_kind() == lexer::Tk::LESS {
+            alias := self.alias_templates[self.generic_type_aliases.get(template_name.clone()).unwrap()]
+            self.skip()
+            arguments := self.type_arguments("expected `>` after generic type alias arguments")?
+            when alias.params.len() != arguments.len() {
+                message := self.arity_message("type alias", template_name, alias.params.len(), arguments.len())
+                return Result::Err(lexer::diag("R0245", message, start, end))
+            }
+            substituted := self.substitute(alias.ty, alias.params.clone(), arguments.clone())
+            return Result::Ok(self.resolve_generic_placeholders(substituted, alias.params, arguments)?)
+        }
+        when self.generic_struct_templates.contains_key(template_name.clone()) && self.peek_kind() == lexer::Tk::LESS {
+            self.skip()
+            arguments := self.type_arguments("expected `>` after generic structure arguments")?
+            specialized := self.specialize_generic_struct(template_name, arguments, start, end)?
+            return Result::Ok(self.named_type(Ty::NAMED, specialized, start, end))
+        }
+        when self.generic_enum_templates.contains_key(template_name.clone()) && self.peek_kind() == lexer::Tk::LESS {
+            self.skip()
+            arguments := self.type_arguments("expected `>` after generic enum arguments")?
+            specialized := self.specialize_generic_enum(template_name, arguments, start, end)?
+            return Result::Ok(self.named_type(Ty::NAMED, specialized, start, end))
+        }
+        when self.peek_kind() == lexer::Tk::LESS {
+            // Imported generic aliases are unknown while modules are being
+            // discovered; keep the application spelled out until the combined
+            // project parse resolves it.
+            self.skip()
+            arguments := self.type_arguments("expected `>` after generic type arguments")?
+            mut spelled := template_name.clone()
+            spelled.push('<')
+            spelled.append(self.type_keys(arguments))
+            spelled.push('>')
+            return Result::Ok(self.named_type(Ty::NAMED, spelled, start, end))
+        }
+        when !self.namespace_path.is_empty() && !has_path_separator(name.clone()) {
+            qualified := self.qualified_declaration_name(name.clone())
+            when self.type_aliases.contains_key(qualified.clone()) {
+                return Result::Ok(self.type_aliases.get(qualified).unwrap())
+            }
+        }
+        when self.type_aliases.contains_key(name.clone()) {
+            return Result::Ok(self.type_aliases.get(name).unwrap())
+        }
+        return Result::Ok(self.named_type(Ty::NAMED, name, start, end))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Declarations.
+
+// The pieces of a parsed function that `extend` constants and statements
+// assemble; `code` is the complete encoded `Function`.
+struct Encoded {
+    code: String,
+    count: u64
+}
+
+extend Parser {
+    fun program(mut self) -> Result<String, lexer::Diag> {
+        mut uses := String()
+        mut use_count: u64 = 0
+        mut structs := String()
+        mut struct_count: u64 = 0
+        mut enums := String()
+        mut enum_count: u64 = 0
+        mut aliases := String()
+        mut alias_count: u64 = 0
+        mut extends := String()
+        mut extend_count: u64 = 0
+        mut shapes := String()
+        mut shape_count: u64 = 0
+        mut functions := String()
+        mut function_count: u64 = 0
+        mut diagnostics := Vec<lexer::Diag>()
+        while self.peek_kind() != lexer::Tk::EOF {
+            declaration_start := self.at
+            when self.peek_kind() == lexer::Tk::NAMESPACE {
+                switched := self.namespace_decl()
+                when switched.is_err() {
+                    when !self.recovering {
+                        return Result::Err(switched.unwrap_err())
+                    }
+                    diagnostics.push(switched.unwrap_err())
+                    self.synchronize_top_level()
+                }
+                self.drain_recovery(diagnostics)
+                diagnostics = self.drained
+                continue
+            }
+            // One top-level declaration; `self.declared` receives its code.
+            declared := self.declaration()
+            when self.recovering {
+                for diagnostic in self.recovery_diagnostics.clone() {
+                    diagnostics.push(diagnostic)
+                }
+                self.recovery_diagnostics.clear()
+            }
+            when declared.is_err() {
+                when !self.recovering {
+                    return Result::Err(declared.unwrap_err())
+                }
+                self.generic_type_parameters.clear()
+                diagnostics.push(declared.unwrap_err())
+                when self.at == declaration_start {
+                    self.skip()
+                }
+                self.synchronize_top_level()
+                continue
+            }
+            kind := declared.unwrap()
+            code := self.declared.clone()
+            when kind == 1 {
+                uses.append(code)
+                use_count += 1
+            } else when kind == 2 {
+                structs.append(code)
+                struct_count += 1
+            } else when kind == 3 {
+                enums.append(code)
+                enum_count += 1
+            } else when kind == 4 {
+                aliases.append(code)
+                alias_count += 1
+            } else when kind == 5 {
+                extends.append(code)
+                extend_count += 1
+                functions.append(self.pending_methods.clone())
+                function_count += self.pending_method_count
+            } else when kind == 6 {
+                shapes.append(code)
+                shape_count += 1
+            } else when kind == 7 {
+                functions.append(code)
+                function_count += 1
+            }
+        }
+        when !diagnostics.is_empty() {
+            self.diagnostics = diagnostics
+            return Result::Err(self.diagnostics[0])
+        }
+        for code in self.generic_enums.clone() {
+            enums.append(code)
+            enum_count += 1
+        }
+        for code in self.generic_structs.clone() {
+            structs.append(code)
+            struct_count += 1
+        }
+        for code in self.tuple_type_structs.clone() {
+            structs.append(code)
+            struct_count += 1
+        }
+        mut out := word("Ok")
+        out.push('\n')
+        out.append(enc_list(use_count, uses))
+        out.push('\n')
+        out.append(enc_list(struct_count, structs))
+        out.push('\n')
+        out.append(enc_list(enum_count, enums))
+        out.push('\n')
+        out.append(enc_list(alias_count, aliases))
+        out.push('\n')
+        out.append(enc_list(extend_count, extends))
+        out.push('\n')
+        out.append(enc_list(shape_count, shapes))
+        out.push('\n')
+        out.append(enc_list(function_count, functions))
+        out.push('\n')
+        return Result::Ok(out)
+    }
+
+    fun drain_recovery(mut self, diagnostics: Vec<lexer::Diag>) {
+        mut all := diagnostics
+        for diagnostic in self.recovery_diagnostics.clone() {
+            all.push(diagnostic)
+        }
+        self.recovery_diagnostics.clear()
+        self.drained = all
+    }
+
+    // Parses one top-level declaration other than `namespace`. Returns its
+    // kind (1 use, 2 struct, 3 enum, 4 alias, 5 extend, 6 shape, 7 function,
+    // 0 when nothing is emitted) and leaves its code in `self.declared`.
+    fun declaration(mut self) -> Result<u32, lexer::Diag> {
+        self.declared = String()
+        mut derives := Vec<String>()
+        mut repr_c := false
+        mut has_drop := false
+        mut drop_function := String()
+        when self.peek_kind() == lexer::Tk::HASH {
+            when self.ident_at(self.at + 2, "drop") {
+                drop_function = self.drop_attribute()?
+                has_drop = true
+            } else when self.ident_at(self.at + 2, "derive") {
+                derives = self.derive_attribute()?
+            } else {
+                repr_c = self.repr_c_attribute()?
+            }
+        }
+        public := self.consume_if(lexer::Tk::PUB)
+        kind := self.peek_kind()
+        when (repr_c || has_drop) && kind != lexer::Tk::STRUCT {
+            return Result::Err(self.error("`#[repr(C)]` applies only to structs"))
+        }
+        when kind == lexer::Tk::USE && !public {
+            self.declared = self.use_decl()?
+            return Result::Ok(1)
+        }
+        when kind == lexer::Tk::USE && !self.recovering {
+            return Result::Err(self.error("`pub use` is not supported"))
+        }
+        when kind == lexer::Tk::STRUCT {
+            encoded := self.struct_def(public, repr_c, has_drop, drop_function, derives)?
+            when encoded.count == 1 {
+                self.declared = encoded.code
+                return Result::Ok(2)
+            }
+            return Result::Ok(0)
+        }
+        when kind == lexer::Tk::ENUM {
+            encoded := self.enum_def(public)?
+            when encoded.count == 1 {
+                self.declared = encoded.code
+                return Result::Ok(3)
+            }
+            return Result::Ok(0)
+        }
+        when kind == lexer::Tk::TYPE {
+            self.declared = self.type_alias(public)?
+            return Result::Ok(4)
+        }
+        when kind == lexer::Tk::EXTEND {
+            when public && !self.recovering {
+                return Result::Err(self.error("`pub extend` is not supported; mark members `pub` instead"))
+            }
+            self.declared = self.extend_def()?
+            return Result::Ok(5)
+        }
+        when kind == lexer::Tk::SHAPE {
+            self.declared = self.shape_def()?
+            return Result::Ok(6)
+        }
+        when self.peek_is_ident("extern") {
+            self.skip()
+            abi := self.next()
+            when abi.kind != lexer::Tk::STRING || self.texts[abi.text] != "C" {
+                return Result::Err(self.error("expected `\"C\"` after `extern`"))
+            }
+            self.declared = self.function(public, true, false, 0, false, String())?
+            return Result::Ok(7)
+        }
+        self.declared = self.function(public, false, false, 0, false, String())?
+        return Result::Ok(7)
+    }
+    fun namespace_decl(mut self) -> Result<bool, lexer::Diag> {
+        self.expect(lexer::Tk::NAMESPACE, "expected `namespace`")?
+        when self.peek_kind() == lexer::Tk::SEMICOLON {
+            self.skip()
+            self.namespace_path.clear()
+            return Result::Ok(true)
+        }
+        first := self.ident("expected a namespace name or `;` to reset it")?
+        mut path := Vec<String>()
+        path.push(first.text)
+        while self.peek_kind() == lexer::Tk::COLON_COLON {
+            self.skip()
+            segment := self.ident("expected namespace segment after `::`")?
+            path.push(segment.text)
+        }
+        when self.peek_kind() == lexer::Tk::SEMICOLON {
+            self.skip()
+        }
+        self.namespace_path = path
+        return Result::Ok(true)
+    }
+
+    fun encode_parameter(self, name: String, ty: u64, start: u64, end: u64) -> String {
+        mut out := enc_str(name)
+        out.append(self.encode_type(ty))
+        out.append(enc_span(start, end))
+        return out
+    }
+
+    fun shape_parameter(mut self) -> Result<String, lexer::Diag> {
+        mutable := self.consume_if(lexer::Tk::MUT)
+        parameter := self.ident("expected parameter name")?
+        when parameter.text == "self" && self.peek_kind() != lexer::Tk::COLON {
+            // The receiver type is only known at conformance time; `Self`
+            // stands in for it.
+            receiver := self.named_type(Ty::NAMED, String("Self"), parameter.start, parameter.end)
+            reference := self.new_type(Ty::REF, String(), receiver, 0, 0, mutable, false, Vec<u64>(), parameter.start, parameter.end)
+            return Result::Ok(self.encode_parameter(parameter.text, reference, parameter.start, parameter.end))
+        }
+        self.expect(lexer::Tk::COLON, "expected `:` after parameter name")?
+        ty := self.type_name()?
+        return Result::Ok(self.encode_parameter(parameter.text, ty, parameter.start, parameter.end))
+    }
+
+    fun shape_def(mut self) -> Result<String, lexer::Diag> {
+        start := self.expect(lexer::Tk::SHAPE, "expected `shape`")?.start
+        shape_name := self.ident("expected shape name")?
+        name := self.qualified_declaration_name(shape_name.text)
+        self.expect(lexer::Tk::LBRACE, "expected `{` after shape name")?
+        mut methods := String()
+        mut method_count: u64 = 0
+        while self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
+            fun_start := self.expect(lexer::Tk::FUN, "expected `fun` in shape")?.start
+            method_name := self.ident("expected method name")?
+            self.expect(lexer::Tk::LPAREN, "expected `(` after method name")?
+            mut parameters := String()
+            mut parameter_count: u64 = 0
+            when self.peek_kind() != lexer::Tk::RPAREN {
+                while true {
+                    parameter_start := self.at
+                    parameter := self.shape_parameter()
+                    when parameter.is_ok() {
+                        parameters.append(parameter.unwrap())
+                        parameter_count += 1
+                    } else {
+                        when !self.recovering {
+                            return Result::Err(parameter.unwrap_err())
+                        }
+                        self.push_recovery(parameter.unwrap_err())
+                        self.synchronize_list_entry(parameter_start, lexer::Tk::RPAREN)
+                    }
+                    when self.peek_kind() == lexer::Tk::COMMA {
+                        self.skip()
+                    } else {
+                        break
+                    }
+                }
+            }
+            self.expect(lexer::Tk::RPAREN, "expected `)` after shape method parameters")?
+            mut return_type := enc_none()
+            when self.peek_kind() == lexer::Tk::ARROW {
+                self.skip()
+                return_type = enc_some(self.encode_type(self.type_name()?))
+            }
+            mut default_body := enc_none()
+            mut default_value := enc_none()
+            when self.peek_kind() == lexer::Tk::FAT_ARROW {
+                self.skip()
+                value := self.expression(0)?
+                default_value = enc_some(value.code)
+            } else when self.peek_kind() == lexer::Tk::LBRACE {
+                self.skip()
+                mut body := String()
+                mut body_count: u64 = 0
+                while self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
+                    statement_start := self.at
+                    statement := self.statement()
+                    when statement.is_ok() {
+                        body.append(statement.unwrap())
+                        body_count += 1
+                    } else {
+                        when !self.recovering {
+                            return Result::Err(statement.unwrap_err())
+                        }
+                        self.push_recovery(statement.unwrap_err())
+                        self.synchronize_statement(statement_start, true)
+                    }
+                }
+                self.expect(lexer::Tk::RBRACE, "expected `}` after the default method body")?
+                default_body = enc_some(enc_list(body_count, body))
+            } else when self.peek_kind() == lexer::Tk::SEMICOLON {
+                self.skip()
+            }
+            methods.append(enc_str(method_name.text))
+            methods.append(enc_list(parameter_count, parameters))
+            methods.append(return_type)
+            methods.append(default_body)
+            methods.append(default_value)
+            methods.append(enc_span(fun_start, self.peek().start))
+            method_count += 1
+        }
+        end := self.expect(lexer::Tk::RBRACE, "expected `}` after shape methods")?.end
+        mut out := String("\n")
+        out.append(enc_str(name))
+        out.append(enc_list(method_count, methods))
+        out.append(enc_text(""))
+        out.append(enc_span(start, end))
+        return Result::Ok(out)
+    }
+
+    // Parses an `extend` block. Its methods and constants become functions
+    // that the program loop collects from `pending_methods`.
+    fun extend_def(mut self) -> Result<String, lexer::Diag> {
+        start := self.expect(lexer::Tk::EXTEND, "expected `extend`")?.start
+        when self.peek_kind() == lexer::Tk::LESS {
+            return Result::Err(self.error("generic `extend` blocks are not supported yet"))
+        }
+        receiver := self.type_name()?
+        node := self.types[receiver]
+        mut type_name := String()
+        when node.kind == Ty::NAMED {
+            type_name = node.name
+        } else when node.kind == Ty::STRING {
+            type_name = String("String")
+        } else {
+            return Result::Err(self.error("`extend` currently supports named structures and `String`"))
+        }
+        mut as_shape := enc_none()
+        when self.peek_kind() == lexer::Tk::AS {
+            self.skip()
+            shape_ident := self.ident("expected shape name after `as`")?
+            as_shape = enc_some(enc_str(self.qualified_declaration_name(shape_ident.text)))
+        }
+        self.expect(lexer::Tk::LBRACE, "expected `{` after the extend type")?
+        mut methods := String()
+        mut method_count: u64 = 0
+        mut constants := String()
+        mut constant_count: u64 = 0
+        while self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
+            member_public := self.consume_if(lexer::Tk::PUB)
+            when self.peek_kind() == lexer::Tk::FUN {
+                methods.append(self.function(member_public, false, true, receiver, true, type_name.clone())?)
+                method_count += 1
+            } else when self.peek_kind() == lexer::Tk::CONST {
+                constants.append(self.constant_def(member_public, type_name.clone())?)
+                constant_count += 1
+            } else {
+                return Result::Err(self.error("expected `fun` or `const` inside `extend`"))
+            }
+        }
+        end := self.expect(lexer::Tk::RBRACE, "expected `}` after extend members")?.end
+        methods.append(constants)
+        self.pending_methods = methods
+        self.pending_method_count = method_count + constant_count
+        mut out := String("\n")
+        out.append(self.encode_type(receiver))
+        out.append(as_shape)
+        out.append(enc_uint(0))
+        out.append(enc_uint(0))
+        out.append(enc_text(""))
+        out.append(enc_span(start, end))
+        return Result::Ok(out)
+    }
+
+    // A constant inside `extend` becomes a parameterless function that
+    // returns its value.
+    fun constant_def(mut self, public: bool, type_name: String) -> Result<String, lexer::Diag> {
+        start := self.expect(lexer::Tk::CONST, "expected `const`")?.start
+        name := self.ident("expected constant name")?
+        self.expect(lexer::Tk::COLON, "expected `:` after constant name")?
+        ty := self.type_name()?
+        self.expect(lexer::Tk::EQUAL, "expected `=` after constant type")?
+        value := self.expression(0)?
+        mut span_start := start
+        when name.start < start {
+            span_start = name.start
+        }
+        mut qualified := type_name
+        qualified.append("::")
+        qualified.append(name.text)
+        mut out := String("\n")
+        out.append(enc_str(self.qualified_declaration_name(qualified)))
+        out.append(enc_bool(false))
+        out.append(enc_none())
+        out.append(enc_uint(0))
+        out.append(enc_uint(0))
+        out.append(enc_bool(public))
+        out.append(enc_text(""))
+        out.append(enc_uint(0))
+        out.append(enc_some(self.encode_type(ty)))
+        out.append(enc_uint(0))
+        out.append(enc_some(value.code))
+        out.append(enc_span(span_start, value.end))
+        return Result::Ok(out)
+    }
+
+    fun use_decl(mut self) -> Result<String, lexer::Diag> {
+        start := self.expect(lexer::Tk::USE, "expected `use`")?.start
+        first := self.ident("expected module path after `use`")?
+        mut path := Vec<String>()
+        path.push(first.text)
+        mut end := first.end
+        while self.peek_kind() == lexer::Tk::COLON_COLON {
+            self.skip()
+            segment := self.ident("expected module path segment after `::`")?
+            path.push(segment.text)
+            end = segment.end
+        }
+        mut out := String("\n")
+        out.append(enc_strings(path))
+        out.append(enc_span(start, end))
+        return Result::Ok(out)
+    }
+
+    fun repr_c_attribute(mut self) -> Result<bool, lexer::Diag> {
+        self.expect(lexer::Tk::HASH, "expected `#`")?
+        self.expect(lexer::Tk::LBRACKET, "expected `[` after `#`")?
+        attribute := self.next()
+        when attribute.kind != lexer::Tk::IDENT || self.texts[attribute.text] != "repr" {
+            return Result::Err(lexer::diag_help(
+                "R0014",
+                String("unsupported attribute"),
+                attribute.start,
+                attribute.end,
+                String("the supported representation attribute is `#[repr(C)]`")
+            ))
+        }
+        self.expect(lexer::Tk::LPAREN, "expected `(` after `repr`")?
+        representation := self.next()
+        when representation.kind != lexer::Tk::IDENT || self.texts[representation.text] != "C" {
+            return Result::Err(lexer::diag_help(
+                "R0014",
+                String("unsupported structure representation"),
+                representation.start,
+                representation.end,
+                String("the supported representation is `C`")
+            ))
+        }
+        self.expect(lexer::Tk::RPAREN, "expected `)` after representation")?
+        self.expect(lexer::Tk::RBRACKET, "expected `]` after attribute")?
+        return Result::Ok(true)
+    }
+
+    fun derive_attribute(mut self) -> Result<Vec<String>, lexer::Diag> {
+        self.expect(lexer::Tk::HASH, "expected `#`")?
+        self.expect(lexer::Tk::LBRACKET, "expected `[` after `#`")?
+        attribute := self.next()
+        when attribute.kind != lexer::Tk::IDENT || self.texts[attribute.text] != "derive" {
+            return Result::Err(lexer::diag_help(
+                "R0014",
+                String("unsupported attribute"),
+                attribute.start,
+                attribute.end,
+                String("the supported derivable traits are `Clone`, `Eq`, and `Hash`")
+            ))
+        }
+        self.expect(lexer::Tk::LPAREN, "expected `(` after `derive`")?
+        mut derives := Vec<String>()
+        while self.peek_kind() != lexer::Tk::RPAREN && self.peek_kind() != lexer::Tk::EOF {
+            name := self.ident("expected a trait name in `derive`")?
+            when name.text != "Clone" && name.text != "Eq" && name.text != "Hash" {
+                mut message := String("unsupported derive `")
+                message.append(name.text)
+                message.push('`')
+                return Result::Err(lexer::diag_help(
+                    "R0014",
+                    message,
+                    name.start,
+                    name.end,
+                    String("the supported derivable traits are `Clone`, `Eq`, and `Hash`")
+                ))
+            }
+            when !contains_text(derives.clone(), name.text.clone()) {
+                derives.push(name.text)
+            }
+            when self.peek_kind() == lexer::Tk::COMMA {
+                self.skip()
+            } else {
+                break
+            }
+        }
+        self.expect(lexer::Tk::RPAREN, "expected `)` after the derive list")?
+        self.expect(lexer::Tk::RBRACKET, "expected `]` after the attribute")?
+        return Result::Ok(derives)
+    }
+
+    fun drop_attribute(mut self) -> Result<String, lexer::Diag> {
+        self.expect(lexer::Tk::HASH, "expected `#`")?
+        self.expect(lexer::Tk::LBRACKET, "expected `[` after `#`")?
+        attribute := self.next()
+        when attribute.kind != lexer::Tk::IDENT || self.texts[attribute.text] != "drop" {
+            return Result::Err(self.error("expected `drop` in destructor attribute"))
+        }
+        self.expect(lexer::Tk::LPAREN, "expected `(` after `drop`")?
+        mut function := self.ident("expected destructor function name")?.text
+        while self.peek_kind() == lexer::Tk::COLON_COLON {
+            self.skip()
+            segment := self.ident("expected destructor path segment after `::`")?
+            function.append("::")
+            function.append(segment.text)
+        }
+        self.expect(lexer::Tk::RPAREN, "expected `)` after destructor function name")?
+        self.expect(lexer::Tk::RBRACKET, "expected `]` after destructor attribute")?
+        when has_path_separator(function.clone()) {
+            return Result::Ok(function)
+        }
+        return Result::Ok(self.qualified_declaration_name(function))
+    }
+
+    // Parses `<T, U>` after a structure, enum, or alias name and registers
+    // the parameters; `code` names the duplicate-parameter diagnostic.
+    fun declaration_type_parameters(mut self) -> Result<Vec<String>, lexer::Diag> {
+        mut parameters := Vec<String>()
+        when self.peek_kind() != lexer::Tk::LESS {
+            return Result::Ok(parameters)
+        }
+        self.skip()
+        while true {
+            parameter := self.ident("expected generic type parameter")?
+            when contains_text(parameters.clone(), parameter.text.clone()) || self.generic_type_parameters.contains(parameter.text.clone()) {
+                mut message := String("duplicate generic type parameter `")
+                message.append(parameter.text)
+                message.push('`')
+                return Result::Err(lexer::diag("R0242", message, parameter.start, parameter.end))
+            }
+            self.generic_type_parameters.insert(parameter.text.clone())
+            parameters.push(parameter.text)
+            when self.peek_kind() == lexer::Tk::COMMA {
+                self.skip()
+            } else {
+                break
+            }
+        }
+        self.expect_type_greater("expected `>` after generic type parameters")?
+        return Result::Ok(parameters)
+    }
+
+    fun forget_type_parameters(mut self, parameters: Vec<String>) {
+        for parameter in parameters {
+            self.generic_type_parameters.remove(parameter)
+        }
+    }
+
+    // Parses `pub? name: Type` into `template_fields`.
+    fun struct_field(mut self) -> Result<bool, lexer::Diag> {
+        field_public := self.consume_if(lexer::Tk::PUB)
+        field_name := self.ident("expected field name")?
+        self.expect(lexer::Tk::COLON, "expected `:` after field name")?
+        ty := self.type_name()?
+        self.template_fields.push(FieldTemplate {
+            name: field_name.text,
+            ty: ty,
+            public: field_public,
+            start: field_name.start,
+            end: field_name.end
+        })
+        return Result::Ok(true)
+    }
+
+    // Returns the encoded structure with `count == 1`, or `count == 0` after
+    // storing a generic structure as a template.
+    fun struct_def(mut self, public: bool, repr_c: bool, has_drop: bool, drop_function: String, derives: Vec<String>) -> Result<Encoded, lexer::Diag> {
+        start := self.next().start
+        struct_name := self.ident("expected structure name")?
+        name := self.qualified_declaration_name(struct_name.text)
+        when repr_c && self.peek_kind() == lexer::Tk::LESS {
+            return Result::Err(self.error("generic `#[repr(C)]` structs are not supported"))
+        }
+        type_parameters := self.declaration_type_parameters()?
+        self.expect(lexer::Tk::LBRACE, "expected `{` after structure name")?
+        first_field := self.template_fields.len()
+        mut field_count: u64 = 0
+        while self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
+            field_start := self.at
+            field := self.struct_field()
+            when field.is_ok() {
+                field_count += 1
+            } else {
+                when !self.recovering {
+                    return Result::Err(field.unwrap_err())
+                }
+                self.push_recovery(field.unwrap_err())
+                self.synchronize_list_entry(field_start, lexer::Tk::RBRACE)
+            }
+            when self.peek_kind() == lexer::Tk::COMMA {
+                self.skip()
+            } else when self.peek_kind() != lexer::Tk::IDENT {
+                break
+            }
+        }
+        end := self.expect(lexer::Tk::RBRACE, "expected `}` after structure fields")?.end
+        self.forget_type_parameters(type_parameters.clone())
+        when has_drop && !type_parameters.is_empty() {
+            return Result::Err(self.error("generic structures cannot yet define custom destructors"))
+        }
+        when !type_parameters.is_empty() {
+            when self.generic_struct_templates.contains_key(name.clone()) {
+                mut message := String("duplicate structure `")
+                message.append(name)
+                message.push('`')
+                duplicate := lexer::diag_help("R0220", message, start, end, String("give each structure a unique name"))
+                when !self.recovering {
+                    return Result::Err(duplicate)
+                }
+                self.push_recovery(duplicate)
+                return Result::Ok(Encoded { code: String(), count: 0 })
+            }
+            index := self.templates.len()
+            self.templates.push(Template {
+                name: name.clone(),
+                is_struct: true,
+                params: type_parameters,
+                first_item: first_field,
+                item_count: field_count,
+                public: public,
+                repr_c: repr_c,
+                has_drop: has_drop,
+                drop_function: drop_function,
+                derives: derives,
+                start: start,
+                end: end
+            })
+            self.generic_struct_templates.insert(name, index)
+            return Result::Ok(Encoded { code: String(), count: 0 })
+        }
+        mut fields := String()
+        mut item := first_field
+        while item < first_field + field_count {
+            field := self.template_fields[item]
+            fields.append(enc_str(field.name))
+            fields.append(self.encode_type(field.ty))
+            fields.append(enc_bool(field.public))
+            fields.append(enc_span(field.start, field.end))
+            item += 1
+        }
+        mut out := String("\n")
+        out.append(enc_str(name))
+        out.append(enc_uint(0))
+        out.append(enc_list(field_count, fields))
+        out.append(enc_bool(public))
+        out.append(enc_bool(repr_c))
+        when has_drop {
+            out.append(enc_some(enc_str(drop_function)))
+        } else {
+            out.append(enc_none())
+        }
+        out.append(enc_strings(derives))
+        out.append(enc_text(""))
+        out.append(enc_span(start, end))
+        return Result::Ok(Encoded { code: out, count: 1 })
+    }
+
+    // Parses `Name` or `Name(T, ...)` into `template_variants`.
+    fun enum_variant(mut self) -> Result<bool, lexer::Diag> {
+        variant_name := self.ident("expected variant name")?
+        mut fields := Vec<u64>()
+        when self.peek_kind() == lexer::Tk::LPAREN {
+            self.skip()
+            when self.peek_kind() != lexer::Tk::RPAREN {
+                while true {
+                    fields.push(self.type_name()?)
+                    when self.peek_kind() == lexer::Tk::COMMA {
+                        self.skip()
+                    } else {
+                        break
+                    }
+                }
+            }
+            self.expect(lexer::Tk::RPAREN, "expected `)` after variant fields")?
+        }
+        self.template_variants.push(VariantTemplate {
+            name: variant_name.text,
+            fields: fields,
+            start: variant_name.start,
+            end: variant_name.end
+        })
+        return Result::Ok(true)
+    }
+
+    fun enum_def(mut self, public: bool) -> Result<Encoded, lexer::Diag> {
+        start := self.next().start
+        enum_name := self.ident("expected enum name")?
+        name := self.qualified_declaration_name(enum_name.text)
+        type_parameters := self.declaration_type_parameters()?
+        self.expect(lexer::Tk::LBRACE, "expected `{` after enum name")?
+        first_variant := self.template_variants.len()
+        mut variant_count: u64 = 0
+        while self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
+            variant_start := self.at
+            variant := self.enum_variant()
+            when variant.is_ok() {
+                variant_count += 1
+            } else {
+                when !self.recovering {
+                    return Result::Err(variant.unwrap_err())
+                }
+                self.push_recovery(variant.unwrap_err())
+                when self.at == variant_start {
+                    self.skip()
+                }
+                while self.peek_kind() != lexer::Tk::COMMA && self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
+                    self.skip()
+                }
+            }
+            when self.peek_kind() == lexer::Tk::COMMA {
+                self.skip()
+            } else when self.peek_kind() != lexer::Tk::RBRACE {
+                break
+            }
+        }
+        end := self.expect(lexer::Tk::RBRACE, "expected `}` after enum variants")?.end
+        self.forget_type_parameters(type_parameters.clone())
+        when !type_parameters.is_empty() {
+            when !self.recovering && self.generic_enum_templates.contains_key(name.clone()) {
+                mut message := String("duplicate enum `")
+                message.append(name)
+                message.push('`')
+                return Result::Err(lexer::diag_help("R0221", message, start, end, String("give each enum a unique name")))
+            }
+            index := self.templates.len()
+            self.templates.push(Template {
+                name: name.clone(),
+                is_struct: false,
+                params: type_parameters,
+                first_item: first_variant,
+                item_count: variant_count,
+                public: public,
+                repr_c: false,
+                has_drop: false,
+                drop_function: String(),
+                derives: Vec<String>(),
+                start: start,
+                end: end
+            })
+            self.generic_enum_templates.insert(name, index)
+            return Result::Ok(Encoded { code: String(), count: 0 })
+        }
+        mut variants := String()
+        mut item := first_variant
+        while item < first_variant + variant_count {
+            variant := self.template_variants[item]
+            variants.append(enc_str(variant.name))
+            variants.append(self.encode_types(variant.fields))
+            variants.append(enc_span(variant.start, variant.end))
+            item += 1
+        }
+        mut out := String("\n")
+        out.append(enc_str(name))
+        out.append(enc_uint(0))
+        out.append(enc_list(variant_count, variants))
+        out.append(enc_bool(public))
+        out.append(enc_text(""))
+        out.append(enc_span(start, end))
+        return Result::Ok(Encoded { code: out, count: 1 })
+    }
+
+    fun type_alias(mut self, public: bool) -> Result<String, lexer::Diag> {
+        start := self.next().start
+        alias_name := self.ident("expected a type alias name")?
+        name := self.qualified_declaration_name(alias_name.text)
+        type_parameters := self.declaration_type_parameters()?
+        self.expect(lexer::Tk::EQUAL, "expected `=` after type alias name")?
+        ty := self.type_name()?
+        end := self.prev_end()
+        self.forget_type_parameters(type_parameters.clone())
+        when self.type_aliases.contains_key(name.clone()) || self.generic_type_aliases.contains_key(name.clone()) {
+            mut message := String("duplicate type alias `")
+            message.append(name)
+            message.push('`')
+            return Result::Err(lexer::diag_help("R0241", message, alias_name.start, alias_name.end, String("give each type alias a unique name")))
+        }
+        when type_parameters.is_empty() {
+            self.type_aliases.insert(name.clone(), ty)
+        } else {
+            index := self.alias_templates.len()
+            self.alias_templates.push(AliasTemplate { params: type_parameters.clone(), ty: ty })
+            self.generic_type_aliases.insert(name.clone(), index)
+        }
+        mut out := String("\n")
+        out.append(enc_str(name))
+        out.append(enc_strings(type_parameters))
+        out.append(self.encode_type(ty))
+        out.append(enc_bool(public))
+        out.append(enc_text(""))
+        out.append(enc_span(start, end))
+        return Result::Ok(out)
+    }
+
+    fun parameter_with_type(mut self) -> Result<String, lexer::Diag> {
+        name := self.ident("expected parameter name")?
+        self.expect(lexer::Tk::COLON, "expected `:` after parameter name")?
+        ty := self.type_name()?
+        return Result::Ok(self.encode_parameter(name.text, ty, name.start, name.end))
+    }
+
+    // One parameter; inside `extend`, `self` or `mut self` is the receiver.
+    fun function_parameter(mut self, has_self: bool, receiver: u64) -> Result<String, lexer::Diag> {
+        when has_self {
+            mut is_receiver := false
+            mut mutable := false
+            when self.peek_kind() == lexer::Tk::MUT && self.ident_at(self.at + 1, "self") {
+                self.skip()
+                is_receiver = true
+                mutable = true
+            } else when self.peek_is_ident("self") {
+                is_receiver = true
+            }
+            when is_receiver {
+                self_token := self.next()
+                when self.peek_kind() != lexer::Tk::COMMA && self.peek_kind() != lexer::Tk::RPAREN {
+                    return Result::Err(self.error("expected `,` or `)` after `self`"))
+                }
+                reference := self.new_type(Ty::REF, String(), receiver, 0, 0, mutable, false, Vec<u64>(), self_token.start, self_token.end)
+                return Result::Ok(self.encode_parameter(String("self"), reference, self_token.start, self_token.end))
+            }
+        }
+        return self.parameter_with_type()
+    }
+
+    // `has_self` marks an `extend` method whose receiver has type `receiver`;
+    // `prefix` qualifies its name with the extended type.
+    fun function(mut self, public: bool, extern_c: bool, has_self: bool, receiver: u64, has_prefix: bool, prefix: String) -> Result<String, lexer::Diag> {
+        start := self.expect(lexer::Tk::FUN, "expected `fun`")?.start
+        name_token := self.next()
+        when name_token.kind != lexer::Tk::IDENT {
+            return Result::Err(self.error("expected function name"))
+        }
+        mut name := self.texts[name_token.text]
+        when has_prefix {
+            mut prefixed := prefix
+            prefixed.append("::")
+            prefixed.append(name)
+            name = prefixed
+        }
+        external_symbol := name.clone()
+        name = self.qualified_declaration_name(name)
+        mut type_parameters := Vec<String>()
+        mut bounds := String()
+        when self.peek_kind() == lexer::Tk::LESS {
+            self.skip()
+            while true {
+                parameter := self.ident("expected generic type parameter")?
+                when self.generic_type_parameters.contains(parameter.text.clone())
+                    || contains_text(type_parameters.clone(), parameter.text.clone())
+                    || is_builtin_type_name(parameter.text.clone()) {
+                    mut message := String("invalid or duplicate generic parameter `")
+                    message.append(parameter.text)
+                    message.push('`')
+                    return Result::Err(lexer::diag_help(
+                        "R0260",
+                        message,
+                        parameter.start,
+                        parameter.end,
+                        String("choose a unique non-builtin type parameter name")
+                    ))
+                }
+                self.generic_type_parameters.insert(parameter.text.clone())
+                type_parameters.push(parameter.text.clone())
+                mut parameter_bounds := Vec<String>()
+                when self.peek_kind() == lexer::Tk::COLON {
+                    self.skip()
+                    while true {
+                        bound := self.ident("expected a shape name after `:`")?
+                        parameter_bounds.push(self.qualified_declaration_name(bound.text))
+                        when self.peek_kind() == lexer::Tk::PLUS {
+                            self.skip()
+                            continue
+                        }
+                        break
+                    }
+                }
+                bounds.append(enc_str(parameter.text))
+                bounds.append(enc_strings(parameter_bounds))
+                when self.peek_kind() == lexer::Tk::COMMA {
+                    self.skip()
+                    continue
+                }
+                self.expect_type_greater("expected `>` after generic type parameters")?
+                break
+            }
+        }
+        self.expect(lexer::Tk::LPAREN, "expected `(` after function name")?
+        mut parameters := String()
+        mut parameter_count: u64 = 0
+        when self.peek_kind() != lexer::Tk::RPAREN {
+            while self.peek_kind() != lexer::Tk::RPAREN && self.peek_kind() != lexer::Tk::EOF {
+                parameter_start := self.at
+                parameter := self.function_parameter(has_self, receiver)
+                when parameter.is_err() {
+                    when !self.recovering {
+                        return Result::Err(parameter.unwrap_err())
+                    }
+                    self.push_recovery(parameter.unwrap_err())
+                    self.synchronize_list_entry(parameter_start, lexer::Tk::RPAREN)
+                    continue
+                }
+                parameters.append(parameter.unwrap())
+                parameter_count += 1
+                when self.peek_kind() == lexer::Tk::COMMA {
+                    self.skip()
+                    when self.peek_kind() == lexer::Tk::RPAREN {
+                        missing := self.error("expected parameter name")
+                        when self.recovering {
+                            self.push_recovery(missing)
+                            break
+                        }
+                        return Result::Err(missing)
+                    }
+                } else when self.peek_kind() == lexer::Tk::RPAREN || self.peek_kind() == lexer::Tk::EOF {
+                    break
+                } else when self.recovering {
+                    self.push_recovery(self.error("expected `,` between function parameters"))
+                    self.synchronize_list_entry(parameter_start, lexer::Tk::RPAREN)
+                } else {
+                    break
+                }
+            }
+        }
+        self.expect(lexer::Tk::RPAREN, "expected `)` after parameters")?
+        mut has_return := false
+        mut return_type := enc_none()
+        when self.peek_kind() == lexer::Tk::ARROW {
+            self.skip()
+            return_type = enc_some(self.encode_type(self.type_name()?))
+            has_return = true
+        }
+        mut head := String("\n")
+        head.append(enc_str(name))
+        head.append(enc_bool(extern_c))
+        when self.peek_kind() == lexer::Tk::FAT_ARROW {
+            when extern_c {
+                return Result::Err(self.error("`extern \"C\"` functions cannot have a body"))
+            }
+            self.skip()
+            value := self.expression(0)?
+            self.forget_type_parameters(type_parameters.clone())
+            head.append(enc_none())
+            head.append(enc_strings(type_parameters.clone()))
+            head.append(enc_list(type_parameters.len(), bounds))
+            head.append(enc_bool(public))
+            head.append(enc_text(""))
+            head.append(enc_list(parameter_count, parameters))
+            head.append(return_type)
+            head.append(enc_uint(0))
+            head.append(enc_some(value.code))
+            head.append(enc_span(start, value.end))
+            return Result::Ok(head)
+        }
+        when extern_c {
+            when !type_parameters.is_empty() {
+                return Result::Err(self.error("generic `extern \"C\"` functions are not supported"))
+            }
+            end := self.expect(lexer::Tk::SEMICOLON, "expected `;` after the external function signature")?.end
+            head.append(enc_some(enc_str(external_symbol)))
+            head.append(enc_uint(0))
+            head.append(enc_uint(0))
+            head.append(enc_bool(public))
+            head.append(enc_text(""))
+            head.append(enc_list(parameter_count, parameters))
+            head.append(return_type)
+            head.append(enc_uint(0))
+            head.append(enc_none())
+            head.append(enc_span(start, end))
+            return Result::Ok(head)
+        }
+        self.expect(lexer::Tk::LBRACE, "expected function body")?
+        mut body := String()
+        mut body_count: u64 = 0
+        mut tail := enc_none()
+        while self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
+            statement_start := self.at
+            starts := self.starts_statement(!has_return) || self.call_is_statement_before_result(has_return)
+            mut is_tail_when := false
+            when has_return && self.peek_kind() == lexer::Tk::WHEN {
+                is_tail_when = self.if_expression_reaches_function_end()
+            }
+            when starts && !is_tail_when {
+                statement := self.statement()
+                when statement.is_ok() {
+                    body.append(statement.unwrap())
+                    body_count += 1
+                } else {
+                    when !self.recovering {
+                        return Result::Err(statement.unwrap_err())
+                    }
+                    self.push_recovery(statement.unwrap_err())
+                    self.synchronize_statement(statement_start, !has_return)
+                }
+            } else {
+                parsed := self.expression(0)
+                when parsed.is_err() {
+                    when !self.recovering {
+                        return Result::Err(parsed.unwrap_err())
+                    }
+                    self.push_recovery(parsed.unwrap_err())
+                    self.synchronize_statement(statement_start, !has_return)
+                    continue
+                }
+                expression := parsed.unwrap()
+                is_call := expression.kind == Ek::CALL || expression.kind == Ek::METHOD_CALL
+                    || expression.kind == Ek::PROPAGATE_CALL
+                when (!has_return || self.peek_kind() != lexer::Tk::RBRACE) && is_call {
+                    body.append(self.expression_statement(expression)?)
+                    body_count += 1
+                    continue
+                }
+                tail = enc_some(expression.code)
+                break
+            }
+        }
+        end := self.expect(lexer::Tk::RBRACE, "expected `}` to close function")?.end
+        self.forget_type_parameters(type_parameters.clone())
+        when extern_c {
+            head.append(enc_some(enc_str(external_symbol)))
+        } else {
+            head.append(enc_none())
+        }
+        head.append(enc_strings(type_parameters.clone()))
+        head.append(enc_list(type_parameters.len(), bounds))
+        head.append(enc_bool(public))
+        head.append(enc_text(""))
+        head.append(enc_list(parameter_count, parameters))
+        head.append(return_type)
+        head.append(enc_list(body_count, body))
+        head.append(tail)
+        head.append(enc_span(start, end))
+        return Result::Ok(head)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Statements. Each encoded statement starts on a new line.
+
+extend Parser {
+    fun starts_statement(self, allow_call: bool) -> bool {
+        kind := self.peek_kind()
+        when kind == lexer::Tk::MUT || kind == lexer::Tk::ECHO || kind == lexer::Tk::WHEN
+            || kind == lexer::Tk::WHILE || kind == lexer::Tk::FOR || kind == lexer::Tk::BREAK
+            || kind == lexer::Tk::CONTINUE || kind == lexer::Tk::RETURN || kind == lexer::Tk::STAR {
+            return true
+        }
+        when self.field_assignment_start() || self.short_declaration_start() || self.index_assignment_start() {
+            return true
+        }
+        next := self.kind_at(self.at + 1)
+        when kind == lexer::Tk::IDENT && (next == lexer::Tk::DEFINE || is_assignment_kind(next)) {
+            return true
+        }
+        return allow_call && kind == lexer::Tk::IDENT && (next == lexer::Tk::LPAREN || next == lexer::Tk::DOT)
+    }
+
+    fun field_assignment_start(self) -> bool {
+        when self.peek_kind() != lexer::Tk::IDENT {
+            return false
+        }
+        mut index := self.at + 1
+        mut has_field := false
+        while self.kind_at(index) == lexer::Tk::DOT {
+            has_field = true
+            member := self.kind_at(index + 1)
+            when member != lexer::Tk::IDENT && member != lexer::Tk::INTEGER {
+                return false
+            }
+            index += 2
+        }
+        return has_field && is_assignment_kind(self.kind_at(index))
+    }
+
+    fun call_is_statement_before_result(self, has_return_type: bool) -> bool {
+        when self.peek_kind() != lexer::Tk::IDENT || self.kind_at(self.at + 1) != lexer::Tk::LPAREN {
+            return false
+        }
+        mut depth: u64 = 0
+        mut index := self.at + 1
+        count := self.tokens.len()
+        while index < count {
+            kind := self.tokens[index].kind
+            when kind == lexer::Tk::LPAREN {
+                depth += 1
+            } else when kind == lexer::Tk::RPAREN {
+                depth -= 1
+                when depth == 0 {
+                    next := self.kind_at(index + 1)
+                    when next == lexer::Tk::RBRACE {
+                        return !has_return_type
+                    }
+                    when next == lexer::Tk::DOT || next == lexer::Tk::AS
+                        || binary_precedence(next) > 2 || next == lexer::Tk::AND_AND || next == lexer::Tk::OR_OR {
+                        return false
+                    }
+                    return true
+                }
+            } else when kind == lexer::Tk::EOF {
+                return false
+            }
+            index += 1
+        }
+        return false
+    }
+
+    fun short_declaration_start(self) -> bool {
+        when self.peek_kind() != lexer::Tk::IDENT {
+            return false
+        }
+        next := self.kind_at(self.at + 1)
+        when next == lexer::Tk::DEFINE {
+            return true
+        }
+        when next != lexer::Tk::COLON {
+            return false
+        }
+        mut square: u64 = 0
+        mut generic: u64 = 0
+        mut paren: u64 = 0
+        mut index := self.at + 2
+        count := self.tokens.len()
+        while index < count {
+            kind := self.tokens[index].kind
+            when kind == lexer::Tk::LPAREN {
+                paren += 1
+            } else when kind == lexer::Tk::RPAREN && paren > 0 {
+                paren -= 1
+            } else when kind == lexer::Tk::LBRACKET {
+                square += 1
+            } else when kind == lexer::Tk::RBRACKET && square > 0 {
+                square -= 1
+            } else when kind == lexer::Tk::LESS {
+                generic += 1
+            } else when kind == lexer::Tk::GREATER && generic > 0 {
+                generic -= 1
+            } else when kind == lexer::Tk::SHIFT_RIGHT && generic >= 2 {
+                generic -= 2
+            } else when kind == lexer::Tk::EQUAL && square == 0 && generic == 0 && paren == 0 {
+                return true
+            } else when kind == lexer::Tk::EOF || kind == lexer::Tk::RBRACE || kind == lexer::Tk::DEFINE {
+                return false
+            } else when kind == lexer::Tk::COMMA && square == 0 && generic == 0 && paren == 0 {
+                return false
+            }
+            index += 1
+        }
+        return false
+    }
+
+    fun index_assignment_start(self) -> bool {
+        when self.peek_kind() != lexer::Tk::IDENT || self.kind_at(self.at + 1) != lexer::Tk::LBRACKET {
+            return false
+        }
+        mut depth: u64 = 0
+        mut index := self.at + 1
+        count := self.tokens.len()
+        while index < count {
+            kind := self.tokens[index].kind
+            when kind == lexer::Tk::LBRACKET {
+                depth += 1
+            } else when kind == lexer::Tk::RBRACKET {
+                when depth > 0 {
+                    depth -= 1
+                }
+                when depth == 0 {
+                    return self.kind_at(index + 1) == lexer::Tk::EQUAL
+                }
+            } else when kind == lexer::Tk::EOF || kind == lexer::Tk::RBRACE {
+                return false
+            }
+            index += 1
+        }
+        return false
+    }
+
+    fun statement(mut self) -> Result<String, lexer::Diag> {
+        kind := self.peek_kind()
+        next := self.kind_at(self.at + 1)
+        when kind == lexer::Tk::MUT {
+            return self.declaration_statement()
+        }
+        when kind == lexer::Tk::STAR {
+            return self.dereference_assignment()
+        }
+        when kind == lexer::Tk::IDENT && self.short_declaration_start() {
+            return self.declaration_statement()
+        }
+        when kind == lexer::Tk::IDENT && self.index_assignment_start() {
+            return self.index_assignment()
+        }
+        when kind == lexer::Tk::ECHO {
+            return self.echo_statement()
+        }
+        when kind == lexer::Tk::WHEN {
+            return self.if_statement()
+        }
+        when kind == lexer::Tk::WHILE {
+            return self.while_statement()
+        }
+        when kind == lexer::Tk::FOR {
+            return self.for_statement()
+        }
+        when kind == lexer::Tk::BREAK || kind == lexer::Tk::CONTINUE {
+            token := self.next()
+            mut out := String("\n")
+            when kind == lexer::Tk::BREAK {
+                out.append(word("Break"))
+            } else {
+                out.append(word("Continue"))
+            }
+            out.append(enc_span(token.start, token.end))
+            return Result::Ok(out)
+        }
+        when kind == lexer::Tk::RETURN {
+            return self.return_statement()
+        }
+        when kind == lexer::Tk::IDENT && self.field_assignment_start() {
+            return self.field_assignment()
+        }
+        when kind == lexer::Tk::IDENT && is_assignment_kind(next) {
+            return self.assignment()
+        }
+        when kind == lexer::Tk::IDENT && (next == lexer::Tk::LPAREN || next == lexer::Tk::DOT || next == lexer::Tk::COLON_COLON) {
+            expression := self.expression(0)?
+            return self.expression_statement(expression)
+        }
+        return Result::Err(self.error("expected a declaration, assignment, function call, `break`, `continue`, `return`, or `echo` statement"))
+    }
+
+    fun index_assignment(mut self) -> Result<String, lexer::Diag> {
+        name := self.ident("expected array variable")?
+        self.expect(lexer::Tk::LBRACKET, "expected `[` after array variable")?
+        index := self.expression(0)?
+        self.expect(lexer::Tk::RBRACKET, "expected `]` after array index")?
+        self.expect(lexer::Tk::EQUAL, "expected `=` after array index")?
+        value := self.expression(0)?
+        mut out := String("\n")
+        out.append(word("IndexAssign"))
+        out.append(enc_str(name.text))
+        out.append(index.code)
+        out.append(value.code)
+        out.append(enc_span(name.start, value.end))
+        return Result::Ok(out)
+    }
+
+    fun dereference_assignment(mut self) -> Result<String, lexer::Diag> {
+        target := self.expression(10)?
+        when target.kind != Ek::DEREF {
+            return Result::Err(self.error("expected a dereference assignment target"))
+        }
+        self.expect(lexer::Tk::EQUAL, "expected `=` after dereference assignment target")?
+        value := self.expression(0)?
+        mut out := String("\n")
+        out.append(word("DerefAssign"))
+        out.append(target.head)
+        out.append(value.code)
+        out.append(enc_span(target.start, value.end))
+        return Result::Ok(out)
+    }
+
+    fun return_statement(mut self) -> Result<String, lexer::Diag> {
+        start := self.next().start
+        mut out := String("\n")
+        out.append(word("Return"))
+        when self.peek_kind() == lexer::Tk::RBRACE || self.peek_kind() == lexer::Tk::EOF {
+            out.append(enc_none())
+            out.append(enc_span(start, self.prev_end()))
+            return Result::Ok(out)
+        }
+        value := self.expression(0)?
+        out.append(enc_some(value.code))
+        out.append(enc_span(start, value.end))
+        return Result::Ok(out)
+    }
+
+    fun expression_statement(self, expression: Expr) -> Result<String, lexer::Diag> {
+        mut out := String("\n")
+        when expression.kind == Ek::CALL {
+            out.append(expression.code)
+            return Result::Ok(out)
+        }
+        when expression.kind == Ek::METHOD_CALL {
+            out.append(word("MethodCall"))
+            out.append(expression.head)
+            out.append(expression.tail)
+            out.append(enc_span(expression.start, expression.end))
+            return Result::Ok(out)
+        }
+        when expression.kind == Ek::PROPAGATE_CALL || expression.kind == Ek::PROPAGATE_NESTED {
+            // `call()?` propagates a failure and discards the success value.
+            out.append(word("Let"))
+            out.append(enc_text("_"))
+            out.append(enc_bool(false))
+            out.append(enc_none())
+            out.append(expression.code)
+            out.append(enc_span(expression.start, expression.end))
+            return Result::Ok(out)
+        }
+        return Result::Err(self.error("only a function call can be used as an expression statement"))
+    }
+
+    fun if_statement(mut self) -> Result<String, lexer::Diag> {
+        when self.if_depth >= Limits::IF_DEPTH {
+            return Result::Err(self.nesting_error("conditional"))
+        }
+        self.if_depth += 1
+        result := self.if_statement_inner()
+        self.if_depth -= 1
+        return result
+    }
+
+    fun if_statement_inner(mut self) -> Result<String, lexer::Diag> {
+        start := self.next().start
+        condition := self.condition_before_block()?
+        mut then_body := String()
+        when self.brace_consumed {
+            then_body = self.block_statements_after_open()?
+        } else {
+            then_body = self.block_statements()?
+        }
+        mut else_body := enc_uint(0)
+        when self.peek_kind() == lexer::Tk::ELSE {
+            self.skip()
+            when self.peek_kind() == lexer::Tk::WHEN {
+                else_body = enc_list(1, self.if_statement()?)
+            } else {
+                else_body = self.block_statements()?
+            }
+        }
+        mut out := String("\n")
+        out.append(word("If"))
+        out.append(condition)
+        out.append(then_body)
+        out.append(else_body)
+        out.append(enc_span(start, self.prev_end()))
+        return Result::Ok(out)
+    }
+
+    // Parses a `when` or `while` condition. In recovering mode a malformed
+    // condition is reported and replaced; `brace_consumed` records whether
+    // the error consumed the body's opening `{`.
+    fun condition_before_block(mut self) -> Result<String, lexer::Diag> {
+        expression_start := self.at
+        self.brace_consumed = false
+        parsed := self.expression(0)
+        when parsed.is_ok() {
+            return Result::Ok(parsed.unwrap().code)
+        }
+        error := parsed.unwrap_err()
+        when !self.recovering {
+            return Result::Err(error)
+        }
+        consumed := self.diagnostic_token_was_consumed(expression_start, error.start, error.end)
+            && self.source_text(error.start, error.end) == "{"
+        start := error.start
+        end := error.end
+        self.push_recovery(error)
+        when !consumed {
+            self.synchronize_control_body(expression_start)
+        }
+        self.brace_consumed = consumed
+        mut code := word("Bool")
+        code.append(enc_bool(false))
+        code.append(enc_span(start, end))
+        return Result::Ok(code)
+    }
+    // Returns the encoded statement list of a `{ ... }` block.
+    fun block_statements(mut self) -> Result<String, lexer::Diag> {
+        return self.block_statements_with_opening(false)
+    }
+
+    fun block_statements_after_open(mut self) -> Result<String, lexer::Diag> {
+        return self.block_statements_with_opening(true)
+    }
+
+    fun block_statements_with_opening(mut self, opening_consumed: bool) -> Result<String, lexer::Diag> {
+        when self.block_depth >= Limits::BLOCK_DEPTH {
+            return Result::Err(self.nesting_error("block"))
+        }
+        self.block_depth += 1
+        result := self.block_statements_inner(opening_consumed)
+        self.block_depth -= 1
+        return result
+    }
+    fun block_statements_inner(mut self, opening_consumed: bool) -> Result<String, lexer::Diag> {
+        when !opening_consumed {
+            self.expect(lexer::Tk::LBRACE, "expected `{` to start block")?
+        }
+        mut statements := String()
+        mut count: u64 = 0
+        while self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
+            statement_start := self.at
+            statement := self.statement()
+            when statement.is_ok() {
+                statements.append(statement.unwrap())
+                count += 1
+            } else {
+                when !self.recovering {
+                    return Result::Err(statement.unwrap_err())
+                }
+                self.push_recovery(statement.unwrap_err())
+                self.synchronize_statement(statement_start, true)
+            }
+        }
+        self.expect(lexer::Tk::RBRACE, "expected `}` to close block")?
+        return Result::Ok(enc_list(count, statements))
+    }
+    fun while_statement(mut self) -> Result<String, lexer::Diag> {
+        start := self.next().start
+        condition := self.condition_before_block()?
+        mut body := String()
+        when self.brace_consumed {
+            body = self.block_statements_after_open()?
+        } else {
+            body = self.block_statements()?
+        }
+        mut out := String("\n")
+        out.append(word("While"))
+        out.append(condition)
+        out.append(body)
+        out.append(enc_span(start, self.prev_end()))
+        return Result::Ok(out)
+    }
+    fun for_statement(mut self) -> Result<String, lexer::Diag> {
+        start := self.next().start
+        header_start := self.at
+        header := self.for_header()
+        mut body := String()
+        when header.is_ok() {
+            body = self.block_statements()?
+        } else {
+            error := header.unwrap_err()
+            when !self.recovering {
+                return Result::Err(error)
+            }
+            consumed := self.diagnostic_token_was_consumed(header_start, error.start, error.end)
+                && self.source_text(error.start, error.end) == "{"
+            error_start := error.start
+            error_end := error.end
+            self.push_recovery(error)
+            when !consumed {
+                self.synchronize_control_body(header_start)
+            }
+            when consumed {
+                body = self.block_statements_after_open()?
+            } else when self.peek_kind() == lexer::Tk::LBRACE {
+                body = self.block_statements()?
+            } else {
+                body = enc_uint(0)
+            }
+            // The program is rejected; the placeholder only keeps parsing going.
+            mut placeholder := word("Int")
+            placeholder.append(enc_uint(0))
+            placeholder.append(enc_span(error_start, error_end))
+            mut out := String("\n")
+            out.append(word("For"))
+            out.append(enc_text("_error"))
+            out.append(enc_span(error_start, error_end))
+            out.append(placeholder.clone())
+            out.append(placeholder)
+            out.append(body)
+            out.append(enc_span(start, self.prev_end()))
+            return Result::Ok(out)
+        }
+        record := header.unwrap()
+        mut out := String("\n")
+        when record.count == 2 {
+            out.append(word("For"))
+        } else {
+            out.append(word("ForEach"))
+        }
+        out.append(record.code)
+        out.append(body)
+        out.append(enc_span(start, self.prev_end()))
+        return Result::Ok(out)
+    }
+
+    // Parses `name in collection` or `name in start..end` and checks that a
+    // body follows. `count` is 2 for a range.
+    fun for_header(mut self) -> Result<Encoded, lexer::Diag> {
+        name := self.ident("expected loop variable after `for`")?
+        self.expect(lexer::Tk::IN, "expected `in` after the `for` loop variable")?
+        first := self.expression(0)?
+        mut code := enc_str(name.text)
+        code.append(enc_span(name.start, name.end))
+        code.append(first.code)
+        mut count: u64 = 1
+        when self.peek_kind() == lexer::Tk::DOT_DOT {
+            self.skip()
+            code.append(self.expression(0)?.code)
+            count = 2
+        }
+        when self.peek_kind() != lexer::Tk::LBRACE {
+            return Result::Err(self.error("expected `{` to start block"))
+        }
+        return Result::Ok(Encoded { code: code, count: count })
+    }
+    fun declaration_statement(mut self) -> Result<String, lexer::Diag> {
+        start := self.peek().start
+        mutable := self.consume_if(lexer::Tk::MUT)
+        name := self.ident("expected variable name after `mut`")?
+        mut annotation := enc_none()
+        mut annotated := false
+        when self.peek_kind() == lexer::Tk::COLON {
+            self.skip()
+            annotation = enc_some(self.encode_type(self.type_name()?))
+            annotated = true
+        }
+        when annotated {
+            self.expect(lexer::Tk::EQUAL, "expected `=` after the explicit type")?
+        } else {
+            self.expect(lexer::Tk::DEFINE, "expected `:=` for an inferred declaration")?
+        }
+        value := self.expression(0)?
+        mut out := String("\n")
+        out.append(word("Let"))
+        out.append(enc_str(name.text))
+        out.append(enc_bool(mutable))
+        out.append(annotation)
+        out.append(value.code)
+        out.append(enc_span(start, value.end))
+        return Result::Ok(out)
+    }
+
+    fun assignment(mut self) -> Result<String, lexer::Diag> {
+        name := self.ident("expected variable name")?
+        operator := self.next()
+        value := self.expression(0)?
+        mut out := String("\n")
+        when operator.kind == lexer::Tk::EQUAL {
+            out.append(word("Assign"))
+            out.append(enc_str(name.text))
+        } else {
+            op := compound_op_name(operator.kind)
+            when op == "" {
+                return Result::Err(lexer::diag("R0010", String("expected an assignment operator"), operator.start, operator.end))
+            }
+            out.append(word("Compound"))
+            out.append(enc_str(name.text))
+            out.append(word(op))
+        }
+        out.append(value.code)
+        out.append(enc_span(name.start, value.end))
+        return Result::Ok(out)
+    }
+
+    fun field_assignment(mut self) -> Result<String, lexer::Diag> {
+        object := self.ident("expected variable name")?
+        mut fields := String()
+        mut field_count: u64 = 0
+        while self.peek_kind() == lexer::Tk::DOT {
+            when field_count >= Limits::EXPRESSION_DEPTH {
+                return Result::Err(self.nesting_error("field access"))
+            }
+            self.skip()
+            field := self.field_name_after_dot()?
+            fields.append(enc_str(field.text))
+            fields.append(enc_span(field.start, field.end))
+            field_count += 1
+        }
+        operator := self.next()
+        mut op := enc_none()
+        when operator.kind != lexer::Tk::EQUAL {
+            name := compound_op_name(operator.kind)
+            when name == "" {
+                return Result::Err(lexer::diag(
+                    "R0010",
+                    String("expected an assignment operator after field name"),
+                    operator.start,
+                    operator.end
+                ))
+            }
+            op = enc_some(word(name))
+        }
+        value := self.expression(0)?
+        mut out := String("\n")
+        out.append(word("FieldAssign"))
+        out.append(enc_str(object.text))
+        out.append(enc_list(field_count, fields))
+        out.append(op)
+        out.append(value.code)
+        out.append(enc_span(object.start, value.end))
+        return Result::Ok(out)
+    }
+
+    fun field_name_after_dot(mut self) -> Result<Name, lexer::Diag> {
+        token := self.next()
+        when token.kind == lexer::Tk::IDENT {
+            return Result::Ok(Name { text: self.texts[token.text], start: token.start, end: token.end })
+        }
+        when token.kind == lexer::Tk::INTEGER {
+            mut name := String("_")
+            name.append(String(token.value))
+            return Result::Ok(Name { text: name, start: token.start, end: token.end })
+        }
+        return Result::Err(lexer::diag(
+            "R0010",
+            String("expected field name or tuple index after `.`"),
+            token.start,
+            token.end
+        ))
+    }
+
+    fun string_has_braces(self, index: u64) -> bool {
+        when self.kind_at(index) != lexer::Tk::STRING {
+            return false
+        }
+        token := self.tokens[index]
+        value := self.texts[token.text]
+        return value.contains("{") || value.contains("}")
+    }
+
+    fun echo_statement(mut self) -> Result<String, lexer::Diag> {
+        start := self.next().start
+        grouped := self.peek_kind() == lexer::Tk::LPAREN && self.string_has_braces(self.at + 1)
+        when grouped {
+            self.skip()
+        }
+        when self.string_has_braces(self.at) {
+            token := self.next()
+            template := self.print_template(self.texts[token.text], token.start, token.end)?
+            when template.count == 0 {
+                return Result::Err(lexer::diag("R0010", String("expected echo interpolation"), token.start, token.end))
+            }
+            mut end := token.end
+            when grouped {
+                end = self.expect(lexer::Tk::RPAREN, "expected `)` after echo template")?.end
+            }
+            mut out := String("\n")
+            out.append(word("Template"))
+            out.append(template.code)
+            out.append(enc_span(start, end))
+            return Result::Ok(out)
+        }
+        value := self.expression(0)?
+        mut out := String("\n")
+        out.append(word("Print"))
+        out.append(value.code)
+        out.append(enc_span(start, self.prev_end()))
+        return Result::Ok(out)
+    }
+
+    // Splits an interpolated echo string into text and value parts. Returns
+    // `count == 0` when the string uses no template syntax; otherwise `code`
+    // is the encoded part list. Spans map back into the raw source literal.
+    fun print_template(self, value: String, string_start: u64, string_end: u64) -> Result<Encoded, lexer::Diag> {
+        raw_start := string_start + 1
+        mut raw_end: u64 = 0
+        when string_end > 0 {
+            raw_end = string_end - 1
+        }
+        mut raw := String()
+        when raw_start <= raw_end && raw_end <= self.src.len() {
+            raw = self.src.slice(raw_start, raw_end)
+        }
+        mut offsets := Vec<u64>()
+        mut raw_at: u64 = 0
+        raw_length := raw.len()
+        while raw_at < raw_length {
+            current := raw.byte_at(raw_at) as u32
+            when current == 92 {
+                raw_at += 1
+                offsets.push(raw_start + raw_at)
+                when raw_at < raw_length {
+                    raw_at += 1
+                }
+            } else {
+                width := lexer::utf8_width_of_lead(current)
+                mut sub: u64 = 0
+                while sub < width {
+                    offsets.push(raw_start + raw_at + sub)
+                    sub += 1
+                }
+                raw_at += width
+            }
+        }
+        offsets.push(raw_end)
+
+        length := value.len()
+        mut at: u64 = 0
+        mut text := String()
+        mut parts := String()
+        mut part_count: u64 = 0
+        mut used := false
+        while at < length {
+            current := value.byte_at(at) as u32
+            mut following: u32 = 256
+            when at + 1 < length {
+                following = value.byte_at(at + 1) as u32
+            }
+            when current == 123 && following == 123 {
+                text.push('{')
+                at += 2
+                used = true
+            } else when current == 125 && following == 125 {
+                text.push('}')
+                at += 2
+                used = true
+            } else when current == 123 {
+                open := at
+                mut close := open + 1
+                while close < length && value.byte_at(close) != 125 {
+                    close += 1
+                }
+                when close >= length {
+                    return Result::Err(lexer::diag_help(
+                        "R0014",
+                        String("unterminated echo interpolation"),
+                        mapped_offset(offsets.clone(), raw_end, open),
+                        mapped_offset(offsets.clone(), raw_end, length),
+                        String("close the interpolation with `}`")
+                    ))
+                }
+                name_start := open + 1
+                name_end := close
+                name := value.slice(name_start, name_end)
+                mut segments := Vec<String>()
+                mut valid := !name.is_empty()
+                for segment in name.split(".") {
+                    when is_identifier(segment.clone()) {
+                        segments.push(segment)
+                    } else when is_digits(segment.clone()) && segment.len() <= 9 {
+                        mut field := String("_")
+                        field.append(segment)
+                        segments.push(field)
+                    } else {
+                        valid = false
+                        break
+                    }
+                }
+                when !valid {
+                    return Result::Err(lexer::diag_help(
+                        "R0014",
+                        String("echo interpolation must contain a variable name or field path"),
+                        mapped_offset(offsets.clone(), raw_end, open),
+                        mapped_offset(offsets.clone(), raw_end, name_end + 1),
+                        String("use a variable such as `{name}` or a field path such as `{player.health}`")
+                    ))
+                }
+                when !text.is_empty() {
+                    parts.append(word("T"))
+                    parts.append(enc_str(text.clone()))
+                    part_count += 1
+                    text = String()
+                }
+                mut expression := String()
+                mut cursor := name_start
+                mut segment_index: u64 = 0
+                for segment in segments {
+                    when segment_index > 0 {
+                        cursor += 1
+                    }
+                    segment_start := mapped_offset(offsets.clone(), raw_end, cursor)
+                    segment_end := mapped_offset(offsets.clone(), raw_end, cursor + segment.len())
+                    cursor += segment.len()
+                    when segment_index == 0 {
+                        expression = word("Name")
+                        expression.append(enc_str(segment))
+                        expression.append(enc_span(segment_start, segment_end))
+                    } else {
+                        mut field := word("Field")
+                        field.append(expression)
+                        field.append(enc_str(segment))
+                        field.append(enc_span(segment_start, segment_end))
+                        field.append(enc_span(segment_start, segment_end))
+                        expression = field
+                    }
+                    segment_index += 1
+                }
+                parts.append(word("V"))
+                parts.append(expression)
+                part_count += 1
+                at = name_end + 1
+                used = true
+            } else when current == 125 {
+                return Result::Err(lexer::diag_help(
+                    "R0014",
+                    String("unmatched `}` in echo interpolation"),
+                    mapped_offset(offsets.clone(), raw_end, at),
+                    mapped_offset(offsets.clone(), raw_end, at + 1),
+                    String("write `}}` to echo a literal `}`")
+                ))
+            } else {
+                width := lexer::utf8_width_of_lead(current)
+                text.append(value.slice(at, at + width))
+                at += width
+            }
+        }
+        when !used {
+            return Result::Ok(Encoded { code: String(), count: 0 })
+        }
+        when !text.is_empty() {
+            parts.append(word("T"))
+            parts.append(enc_str(text))
+            part_count += 1
+        }
+        return Result::Ok(Encoded { code: enc_list(part_count, parts), count: 1 })
+    }
+}
+
+fun mapped_offset(offsets: Vec<u64>, fallback: u64, index: u64) -> u64 {
+    when index < offsets.len() {
+        return offsets[index]
+    }
+    return fallback
+}
+
+// ---------------------------------------------------------------------------
+// Expressions.
+
+extend Parser {
+    fun expression(mut self, min_precedence: u64) -> Result<Expr, lexer::Diag> {
+        when self.expression_depth >= Limits::EXPRESSION_DEPTH {
+            return Result::Err(self.nesting_error("expression"))
+        }
+        self.expression_depth += 1
+        result := self.expression_inner(min_precedence)
+        self.expression_depth -= 1
+        return result
+    }
+
+    fun expressions_until(mut self, closing: u32) -> Result<Encoded, lexer::Diag> {
+        // `a, b, c` with no trailing comma, stopping before `closing`.
+        mut code := String()
+        mut count: u64 = 0
+        when self.peek_kind() != closing {
+            while true {
+                code.append(self.expression(0)?.code)
+                count += 1
+                when self.peek_kind() == lexer::Tk::COMMA {
+                    self.skip()
+                } else {
+                    break
+                }
+            }
+        }
+        return Result::Ok(Encoded { code: code, count: count })
+    }
+
+    // A path literal (`ns::Point { ... }`) also stops after a trailing comma
+    // at the end of input; a plain literal then expects another field.
+    fun struct_literal_fields(mut self, path_literal: bool) -> Result<Encoded, lexer::Diag> {
+        mut code := String()
+        mut count: u64 = 0
+        while true {
+            field := self.ident("expected field name in structure literal")?
+            self.expect(lexer::Tk::COLON, "expected `:` after structure literal field")?
+            value := self.expression(0)?
+            code.append(enc_str(field.text))
+            code.append(value.code)
+            code.append(enc_span(field.start, field.end))
+            count += 1
+            when self.peek_kind() == lexer::Tk::COMMA {
+                self.skip()
+                when self.peek_kind() == lexer::Tk::RBRACE || (path_literal && self.peek_kind() == lexer::Tk::EOF) {
+                    break
+                }
+            } else {
+                break
+            }
+        }
+        return Result::Ok(Encoded { code: code, count: count })
+    }
+
+    // Arguments of `name(...)`. In recovering mode a malformed argument is
+    // reported and skipped; `closing_consumed` records that the error
+    // consumed the closing `)` at `closing_end`.
+    fun call_arguments(mut self) -> Result<Encoded, lexer::Diag> {
+        self.closing_consumed = false
+        mut code := String()
+        mut count: u64 = 0
+        when self.peek_kind() == lexer::Tk::RPAREN {
+            return Result::Ok(Encoded { code: code, count: count })
+        }
+        while true {
+            argument_start := self.at
+            parsed := self.expression(0)
+            when parsed.is_ok() {
+                code.append(parsed.unwrap().code)
+                count += 1
+            } else {
+                error := parsed.unwrap_err()
+                when !self.recovering {
+                    return Result::Err(error)
+                }
+                token_consumed := self.diagnostic_token_was_consumed(argument_start, error.start, error.end)
+                consumed := self.source_text(error.start, error.end)
+                error_end := error.end
+                self.push_recovery(error)
+                when token_consumed && consumed == ")" {
+                    self.closing_consumed = true
+                    self.closing_end = error_end
+                    break
+                }
+                when !token_consumed || consumed != "," {
+                    self.synchronize_expression_list(lexer::Tk::RPAREN)
+                }
+                when self.peek_kind() == lexer::Tk::RPAREN || self.peek_kind() == lexer::Tk::EOF {
+                    break
+                }
+                continue
+            }
+            when self.peek_kind() == lexer::Tk::COMMA {
+                self.skip()
+            } else when self.recovering && self.starts_expression() {
+                self.push_recovery(self.error("expected `,` between function arguments"))
+            } else {
+                break
+            }
+        }
+        return Result::Ok(Encoded { code: code, count: count })
+    }
+
+    // Fields of `Name { ... }`, with the same recovery as call arguments.
+    fun recovering_struct_literal_fields(mut self) -> Result<Encoded, lexer::Diag> {
+        self.closing_consumed = false
+        mut code := String()
+        mut count: u64 = 0
+        when self.peek_kind() == lexer::Tk::RBRACE {
+            return Result::Ok(Encoded { code: code, count: count })
+        }
+        while true {
+            field_start := self.at
+            parsed := self.struct_literal_field()
+            when parsed.is_ok() {
+                code.append(parsed.unwrap())
+                count += 1
+            } else {
+                error := parsed.unwrap_err()
+                when !self.recovering {
+                    return Result::Err(error)
+                }
+                token_consumed := self.diagnostic_token_was_consumed(field_start, error.start, error.end)
+                consumed := self.source_text(error.start, error.end)
+                error_end := error.end
+                self.push_recovery(error)
+                when token_consumed && consumed == "}" {
+                    self.closing_consumed = true
+                    self.closing_end = error_end
+                    break
+                }
+                when !token_consumed || consumed != "," {
+                    self.synchronize_expression_list(lexer::Tk::RBRACE)
+                }
+                when self.peek_kind() == lexer::Tk::RBRACE || self.peek_kind() == lexer::Tk::EOF {
+                    break
+                }
+                continue
+            }
+            when self.peek_kind() == lexer::Tk::COMMA {
+                self.skip()
+                when self.peek_kind() == lexer::Tk::RBRACE {
+                    break
+                }
+            } else when self.recovering && self.peek_kind() == lexer::Tk::IDENT && self.kind_at(self.at + 1) == lexer::Tk::COLON {
+                self.push_recovery(self.error("expected `,` between structure literal fields"))
+            } else {
+                break
+            }
+        }
+        return Result::Ok(Encoded { code: code, count: count })
+    }
+
+    fun struct_literal_field(mut self) -> Result<String, lexer::Diag> {
+        field := self.ident("expected field name in structure literal")?
+        self.expect(lexer::Tk::COLON, "expected `:` after structure literal field")?
+        value := self.expression(0)?
+        mut code := enc_str(field.text)
+        code.append(value.code)
+        code.append(enc_span(field.start, field.end))
+        return Result::Ok(code)
+    }
+
+    fun call_expression(self, name: String, type_arguments: String, arguments: Encoded, start: u64, end: u64) -> Expr {
+        mut code := word("Call")
+        code.append(enc_str(name))
+        code.append(type_arguments)
+        code.append(enc_list(arguments.count, arguments.code))
+        code.append(enc_span(start, end))
+        return Expr {
+            code: code,
+            kind: Ek::CALL,
+            start: start,
+            end: end,
+            head: String(),
+            tail: String()
+        }
+    }
+
+    fun unary(mut self, tag: str, start: u64) -> Result<Expr, lexer::Diag> {
+        inner := self.expression(10)?
+        mut code := word(tag)
+        code.append(inner.code.clone())
+        code.append(enc_span(start, inner.end))
+        mut result := plain_expr(code, start, inner.end)
+        when tag == "Deref" {
+            result.kind = Ek::DEREF
+            result.head = inner.code
+        }
+        return Result::Ok(result)
+    }
+
+    fun expression_inner(mut self, min_precedence: u64) -> Result<Expr, lexer::Diag> {
+        token := self.next()
+        kind := token.kind
+        start := token.start
+        mut left := plain_expr(String(), token.start, token.end)
+        mut name := String()
+        when kind == lexer::Tk::IDENT {
+            name = self.texts[token.text]
+        }
+        when kind == lexer::Tk::LBRACKET {
+            left = self.array_expression(start)?
+        } else when kind == lexer::Tk::CHARACTER {
+            mut code := word("Char")
+            code.append(enc_uint(token.value))
+            code.append(enc_span(token.start, token.end))
+            left.code = code
+        } else when kind == lexer::Tk::INTEGER {
+            mut code := word("Int")
+            code.append(enc_uint(token.value))
+            code.append(enc_span(token.start, token.end))
+            left.code = code
+        } else when kind == lexer::Tk::FLOAT {
+            mut code := word("Float")
+            code.append(word(""))
+            code.append(self.texts[token.text])
+            code.append(enc_span(token.start, token.end))
+            left.code = code
+        } else when kind == lexer::Tk::STRING {
+            mut code := word("Str")
+            code.append(enc_str(self.texts[token.text]))
+            code.append(enc_span(token.start, token.end))
+            left.code = code
+        } else when kind == lexer::Tk::TRUE || kind == lexer::Tk::FALSE {
+            mut code := word("Bool")
+            code.append(enc_bool(kind == lexer::Tk::TRUE))
+            code.append(enc_span(token.start, token.end))
+            left.code = code
+        } else when kind == lexer::Tk::WHEN {
+            left = self.if_expression(start)?
+        } else when kind == lexer::Tk::IDENT && (name == "Map" || name == "HashMap" || name == "Set") && self.peek_kind() == lexer::Tk::LESS {
+            self.skip()
+            key := self.type_name()?
+            when name == "Set" {
+                self.expect_type_greater("expected `>` after Set element type")?
+                self.expect(lexer::Tk::LPAREN, "expected `()` after Set<T>")?
+                end := self.expect(lexer::Tk::RPAREN, "expected empty `()` after Set<T>")?.end
+                mut code := word("NewSet")
+                code.append(self.encode_type(key))
+                code.append(enc_span(start, end))
+                // The bootstrap parser returns a Set constructor directly,
+                // without applying postfix operators.
+                return Result::Ok(plain_expr(code, start, end))
+            }
+            self.expect(lexer::Tk::COMMA, "expected `,` between Map key and value types")?
+            value := self.type_name()?
+            self.expect_type_greater("expected `>` after Map key and value types")?
+            self.ensure_map_option_specialization(value, token.start, token.end)
+            self.expect(lexer::Tk::LPAREN, "expected `()` after `Map<K, V>`")?
+            end := self.expect(lexer::Tk::RPAREN, "expected empty `()` after `Map<K, V>`")?.end
+            mut code := word("NewMap")
+            code.append(self.encode_type(key))
+            code.append(self.encode_type(value))
+            code.append(enc_span(start, end))
+            left = plain_expr(code, start, end)
+        } else when kind == lexer::Tk::IDENT && (name == "sizeof" || name == "alignof") && self.peek_kind() == lexer::Tk::LPAREN {
+            self.skip()
+            ty := self.type_name()?
+            end := self.expect(lexer::Tk::RPAREN, "expected `)` after layout type")?.end
+            mut code := word("Layout")
+            code.append(self.encode_type(ty))
+            code.append(enc_bool(name == "alignof"))
+            code.append(enc_span(start, end))
+            left = plain_expr(code, start, end)
+        } else when kind == lexer::Tk::IDENT && name == "Vec" && self.peek_kind() == lexer::Tk::LESS {
+            self.skip()
+            element := self.type_name()?
+            self.expect(lexer::Tk::GREATER, "expected `>` after the `Vec` element type")?
+            when self.peek_kind() != lexer::Tk::LPAREN {
+                return Result::Err(self.error("expected `()` after `Vec<T>` to construct an empty vector"))
+            }
+            self.skip()
+            end := self.expect(lexer::Tk::RPAREN, "expected `()`, e.g. `Vec<i32>()`")?.end
+            mut code := word("NewVec")
+            code.append(self.encode_type(element))
+            code.append(enc_span(start, end))
+            left = plain_expr(code, start, end)
+        } else when kind == lexer::Tk::IDENT && name != "Vec" && self.peek_kind() == lexer::Tk::COLON_COLON {
+            left = self.path_expression(name, token)?
+        } else when kind == lexer::Tk::CHOOSE {
+            left = self.choose_expression(start)?
+        } else when kind == lexer::Tk::IDENT && self.peek_kind() == lexer::Tk::LPAREN {
+            self.skip()
+            arguments := self.call_arguments()?
+            mut end := self.closing_end
+            when !self.closing_consumed {
+                end = self.expect(lexer::Tk::RPAREN, "expected `)` after arguments")?.end
+            }
+            when name == "read_file_result" {
+                self.result_specialization(Ty::STRING as u64, Ty::I32 as u64, start, end)
+            }
+            left = self.call_expression(name, enc_uint(0), arguments, start, end)
+        } else when kind == lexer::Tk::IDENT && self.peek_kind() == lexer::Tk::LBRACE
+            && self.kind_at(self.at + 1) == lexer::Tk::IDENT && self.kind_at(self.at + 2) == lexer::Tk::COLON {
+            self.skip()
+            fields := self.recovering_struct_literal_fields()?
+            mut end := self.closing_end
+            when !self.closing_consumed {
+                end = self.expect(lexer::Tk::RBRACE, "expected `}` after structure literal")?.end
+            }
+            mut code := word("Struct")
+            code.append(enc_str(name))
+            code.append(enc_list(fields.count, fields.code))
+            code.append(enc_span(start, end))
+            left = plain_expr(code, start, end)
+        } else when kind == lexer::Tk::IDENT {
+            mut code := word("Name")
+            code.append(enc_str(name))
+            code.append(enc_span(token.start, token.end))
+            left.code = code
+        } else when kind == lexer::Tk::MINUS {
+            left = self.unary("Negate", start)?
+        } else when kind == lexer::Tk::BANG {
+            left = self.unary("Not", start)?
+        } else when kind == lexer::Tk::TILDE {
+            left = self.unary("BitNot", start)?
+        } else when kind == lexer::Tk::BIT_AND {
+            raw := self.peek_is_ident("raw")
+            when raw {
+                self.skip()
+            }
+            mutable := self.consume_if(lexer::Tk::MUT)
+            value := self.expression(10)?
+            mut code := word("AddressOf")
+            code.append(enc_bool(mutable))
+            code.append(enc_bool(raw))
+            code.append(value.code)
+            code.append(enc_span(start, value.end))
+            left = plain_expr(code, start, value.end)
+        } else when kind == lexer::Tk::STAR {
+            left = self.unary("Deref", start)?
+        } else when kind == lexer::Tk::LPAREN {
+            when self.peek_kind() == lexer::Tk::RPAREN {
+                end := self.next().end
+                return Result::Err(lexer::diag_help(
+                    "R0012",
+                    String("empty tuple values are not supported"),
+                    start,
+                    end,
+                    String("use a tuple with at least one element")
+                ))
+            }
+            first := self.expression(0)?
+            when self.peek_kind() == lexer::Tk::COMMA {
+                mut values := first.code
+                mut count: u64 = 1
+                while self.peek_kind() == lexer::Tk::COMMA {
+                    self.skip()
+                    when self.peek_kind() == lexer::Tk::RPAREN {
+                        break
+                    }
+                    values.append(self.expression(0)?.code)
+                    count += 1
+                }
+                end := self.expect(lexer::Tk::RPAREN, "expected `)` after tuple elements")?.end
+                mut code := word("Tuple")
+                code.append(enc_list(count, values))
+                code.append(enc_span(start, end))
+                left = plain_expr(code, start, end)
+            } else {
+                self.expect(lexer::Tk::RPAREN, "expected `)` after expression")?
+                left = first
+            }
+        } else {
+            return Result::Err(lexer::diag_help(
+                "R0012",
+                String("expected expression"),
+                token.start,
+                token.end,
+                String("start with a literal, variable, function call, unary operator, or `(`.")
+            ))
+        }
+        return self.postfix(left, min_precedence)
+    }
+
+    fun postfix(mut self, initial: Expr, min_precedence: u64) -> Result<Expr, lexer::Diag> {
+        mut left := initial
+        mut postfix_depth: u64 = 0
+        while true {
+            kind := self.peek_kind()
+            when kind == lexer::Tk::LBRACKET {
+                when postfix_depth >= Limits::EXPRESSION_DEPTH {
+                    return Result::Err(self.nesting_error("indexing"))
+                }
+                postfix_depth += 1
+                self.skip()
+                index := self.expression(0)?
+                end := self.expect(lexer::Tk::RBRACKET, "expected `]` after index")?.end
+                mut code := word("Index")
+                code.append(left.code)
+                code.append(index.code)
+                code.append(enc_span(left.start, end))
+                left = plain_expr(code, left.start, end)
+                continue
+            }
+            when kind == lexer::Tk::QUESTION {
+                when postfix_depth >= Limits::EXPRESSION_DEPTH {
+                    return Result::Err(self.nesting_error("error propagation"))
+                }
+                postfix_depth += 1
+                end := self.next().end
+                mut code := word("Propagate")
+                code.append(left.code)
+                code.append(enc_span(left.start, end))
+                inner_kind := left.kind
+                left = plain_expr(code, left.start, end)
+                when inner_kind == Ek::CALL || inner_kind == Ek::METHOD_CALL {
+                    left.kind = Ek::PROPAGATE_CALL
+                } else when inner_kind == Ek::PROPAGATE_CALL {
+                    left.kind = Ek::PROPAGATE_NESTED
+                }
+                continue
+            }
+            when kind == lexer::Tk::DOT {
+                when postfix_depth >= Limits::EXPRESSION_DEPTH {
+                    return Result::Err(self.nesting_error("field access"))
+                }
+                postfix_depth += 1
+                self.skip()
+                field := self.field_name_after_dot()?
+                mut type_arguments := Vec<u64>()
+                when self.peek_kind() == lexer::Tk::COLON_COLON {
+                    self.skip()
+                    self.expect(lexer::Tk::LESS, "expected `<` after `::` in generic method call")?
+                    while true {
+                        type_arguments.push(self.type_name()?)
+                        when self.peek_kind() == lexer::Tk::COMMA {
+                            self.skip()
+                        } else {
+                            break
+                        }
+                    }
+                    self.expect_type_greater("expected `>` after generic method arguments")?
+                }
+                when self.peek_kind() == lexer::Tk::LPAREN {
+                    self.skip()
+                    mut arguments := String()
+                    mut count: u64 = 0
+                    while self.peek_kind() != lexer::Tk::RPAREN && self.peek_kind() != lexer::Tk::EOF {
+                        arguments.append(self.expression(0)?.code)
+                        count += 1
+                        when self.peek_kind() != lexer::Tk::COMMA {
+                            break
+                        }
+                        self.skip()
+                    }
+                    end := self.expect(lexer::Tk::RPAREN, "expected `)` after method arguments")?.end
+                    mut head := left.code
+                    head.append(enc_str(field.text))
+                    tail := enc_list(count, arguments)
+                    mut code := word("MethodCall")
+                    code.append(head.clone())
+                    code.append(self.encode_types(type_arguments))
+                    code.append(tail.clone())
+                    code.append(enc_span(left.start, end))
+                    left = Expr {
+                        code: code,
+                        kind: Ek::METHOD_CALL,
+                        start: left.start,
+                        end: end,
+                        head: head,
+                        tail: tail
+                    }
+                } else {
+                    mut code := word("Field")
+                    code.append(left.code)
+                    code.append(enc_str(field.text))
+                    code.append(enc_span(field.start, field.end))
+                    code.append(enc_span(left.start, field.end))
+                    left = plain_expr(code, left.start, field.end)
+                }
+                continue
+            }
+            when kind == lexer::Tk::AS {
+                when postfix_depth >= Limits::EXPRESSION_DEPTH {
+                    return Result::Err(self.nesting_error("cast"))
+                }
+                postfix_depth += 1
+                self.skip()
+                target := self.type_name()?
+                end := self.prev_end()
+                mut code := word("Cast")
+                code.append(left.code)
+                code.append(self.encode_type(target))
+                code.append(enc_span(left.start, end))
+                left = plain_expr(code, left.start, end)
+                continue
+            }
+            when kind == lexer::Tk::STAR && self.kind_at(self.at + 1) == lexer::Tk::IDENT
+                && self.kind_at(self.at + 2) == lexer::Tk::EQUAL {
+                break
+            }
+            precedence := binary_precedence(kind)
+            when precedence == 0 || precedence < min_precedence {
+                break
+            }
+            self.skip()
+            right := self.expression(precedence + 1)?
+            mut code := word("Binary")
+            code.append(word(binary_op_name(kind)))
+            code.append(left.code)
+            code.append(right.code)
+            code.append(enc_span(left.start, right.end))
+            left = plain_expr(code, left.start, right.end)
+        }
+        return Result::Ok(left)
+    }
+
+    fun array_expression(mut self, start: u64) -> Result<Expr, lexer::Diag> {
+        when self.peek_kind() == lexer::Tk::RBRACKET {
+            end := self.next().end
+            mut code := word("Array")
+            code.append(enc_uint(0))
+            code.append(enc_span(start, end))
+            return Result::Ok(plain_expr(code, start, end))
+        }
+        first := self.expression(0)?
+        when self.peek_kind() == lexer::Tk::SEMICOLON {
+            self.skip()
+            length := self.next()
+            when length.kind != lexer::Tk::INTEGER {
+                return Result::Err(lexer::diag_help(
+                    "R0012",
+                    String("expected a non-negative integer array length"),
+                    length.start,
+                    length.end,
+                    String("write `[value; 4]`; the length is an integer literal, same as `[T; 4]`")
+                ))
+            }
+            when self.peek_kind() != lexer::Tk::RBRACKET {
+                next := self.peek()
+                return Result::Err(lexer::diag_help(
+                    "R0012",
+                    String("array length must be an integer literal"),
+                    next.start,
+                    next.end,
+                    String("write `[value; 4]`; the length cannot be an expression")
+                ))
+            }
+            end := self.expect(lexer::Tk::RBRACKET, "expected `]` after array repeat")?.end
+            mut code := word("Repeat")
+            code.append(first.code)
+            code.append(enc_uint(length.value))
+            code.append(enc_span(start, end))
+            return Result::Ok(plain_expr(code, start, end))
+        }
+        mut elements := first.code
+        mut count: u64 = 1
+        when self.peek_kind() == lexer::Tk::COMMA {
+            while true {
+                self.skip()
+                when self.peek_kind() == lexer::Tk::RBRACKET {
+                    break
+                }
+                elements.append(self.expression(0)?.code)
+                count += 1
+                when self.peek_kind() != lexer::Tk::COMMA {
+                    break
+                }
+            }
+        }
+        end := self.expect(lexer::Tk::RBRACKET, "expected `]` after array elements")?.end
+        mut code := word("Array")
+        code.append(enc_list(count, elements))
+        code.append(enc_span(start, end))
+        return Result::Ok(plain_expr(code, start, end))
+    }
+
+    // `name::...` paths: calls, enum constructors, and qualified structure
+    // literals, including explicit generic arguments.
+    fun path_expression(mut self, first: String, token: lexer::Token) -> Result<Expr, lexer::Diag> {
+        start := token.start
+        mut path := Vec<String>()
+        path.push(first)
+        mut type_arguments := Vec<u64>()
+        while self.peek_kind() == lexer::Tk::COLON_COLON {
+            self.skip()
+            when self.peek_kind() == lexer::Tk::LESS {
+                self.skip()
+                while true {
+                    type_arguments.push(self.type_name()?)
+                    when self.peek_kind() == lexer::Tk::COMMA {
+                        self.skip()
+                    } else {
+                        break
+                    }
+                }
+                self.expect_type_greater("expected `>` after generic call arguments")?
+                break
+            }
+            path.push(self.ident("expected path segment after `::`")?.text)
+        }
+        when !type_arguments.is_empty() && self.peek_kind() == lexer::Tk::COLON_COLON
+            && self.generic_enum_templates.contains_key(join(path.clone(), "::")) {
+            specialized := self.specialize_generic_enum(join(path.clone(), "::"), type_arguments.clone(), token.start, token.end)?
+            self.skip()
+            variant := self.ident("expected variant after generic enum type")?.text
+            path = Vec<String>()
+            path.push(specialized)
+            path.push(variant)
+            type_arguments = Vec<u64>()
+        }
+        when !type_arguments.is_empty() && self.peek_kind() == lexer::Tk::LBRACE
+            && self.generic_struct_templates.contains_key(join(path.clone(), "::")) {
+            specialized := self.specialize_generic_struct(join(path.clone(), "::"), type_arguments.clone(), token.start, token.end)?
+            path = Vec<String>()
+            path.push(specialized)
+        }
+        when self.peek_kind() == lexer::Tk::LPAREN {
+            self.skip()
+            arguments := self.expressions_until(lexer::Tk::RPAREN)?
+            end := self.expect(lexer::Tk::RPAREN, "expected `)` after enum variant arguments")?.end
+            types := self.encode_types(type_arguments)
+            return Result::Ok(self.call_expression(join(path, "::"), types, arguments, start, end))
+        }
+        when self.peek_kind() == lexer::Tk::LBRACE && self.kind_at(self.at + 1) == lexer::Tk::IDENT
+            && self.kind_at(self.at + 2) == lexer::Tk::COLON {
+            self.skip()
+            mut fields := Encoded { code: String(), count: 0 }
+            when self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
+                fields = self.struct_literal_fields(true)?
+            }
+            end := self.expect(lexer::Tk::RBRACE, "expected `}` after structure literal")?.end
+            mut code := word("Struct")
+            code.append(enc_str(join(path, "::")))
+            code.append(enc_list(fields.count, fields.code))
+            code.append(enc_span(start, end))
+            return Result::Ok(plain_expr(code, start, end))
+        }
+        when path.len() >= 2 {
+            variant := path.pop().unwrap()
+            end := self.prev_end()
+            mut code := word("Enum")
+            code.append(enc_str(join(path, "::")))
+            code.append(enc_str(variant))
+            code.append(enc_uint(0))
+            code.append(enc_span(start, end))
+            return Result::Ok(plain_expr(code, start, end))
+        }
+        return Result::Err(self.error("expected a function call or enum variant after `::`"))
+    }
+
+    fun choose_expression(mut self, start: u64) -> Result<Expr, lexer::Diag> {
+        value := self.expression(0)?
+        self.expect(lexer::Tk::LBRACE, "expected `{` after `choose` value")?
+        mut arms := String()
+        mut arm_count: u64 = 0
+        while self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
+            arm_start := self.at
+            arm := self.choose_arm()
+            when arm.is_ok() {
+                arms.append(arm.unwrap())
+                arm_count += 1
+            } else {
+                when !self.recovering {
+                    return Result::Err(arm.unwrap_err())
+                }
+                self.push_recovery(arm.unwrap_err())
+                when self.at == arm_start {
+                    self.skip()
+                }
+                while self.peek_kind() != lexer::Tk::COMMA && self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
+                    self.skip()
+                }
+            }
+            when self.peek_kind() == lexer::Tk::COMMA {
+                self.skip()
+            } else when self.peek_kind() != lexer::Tk::RBRACE {
+                break
+            }
+        }
+        end := self.expect(lexer::Tk::RBRACE, "expected `}` after choose arms")?.end
+        mut code := word("Choose")
+        code.append(value.code)
+        code.append(enc_list(arm_count, arms))
+        code.append(enc_span(start, end))
+        return Result::Ok(plain_expr(code, start, end))
+    }
+
+    fun choose_arm(mut self) -> Result<String, lexer::Diag> {
+        arm_start := self.at
+        arm_token := self.tokens[arm_start]
+        mut arm := String()
+        mut pattern := String()
+        when self.peek_is_ident("_") {
+            self.skip()
+            pattern.append(enc_none())
+            pattern.append(enc_none())
+            pattern.append(enc_uint(0))
+        } else {
+            first := self.ident("expected enum name in pattern")?
+            mut path := Vec<String>()
+            path.push(first.text)
+            mut type_arguments := Vec<u64>()
+            while self.peek_kind() == lexer::Tk::COLON_COLON {
+                self.skip()
+                when self.peek_kind() == lexer::Tk::LESS {
+                    self.skip()
+                    while true {
+                        type_arguments.push(self.type_name()?)
+                        when self.peek_kind() == lexer::Tk::COMMA {
+                            self.skip()
+                        } else {
+                            break
+                        }
+                    }
+                    self.expect_type_greater("expected `>` after generic enum pattern arguments")?
+                    break
+                }
+                path.push(self.ident("expected pattern path segment after `::`")?.text)
+            }
+            when !type_arguments.is_empty() && self.peek_kind() == lexer::Tk::COLON_COLON
+                && self.generic_enum_templates.contains_key(join(path.clone(), "::")) {
+                specialized := self.specialize_generic_enum(join(path.clone(), "::"), type_arguments, arm_token.start, arm_token.end)?
+                self.skip()
+                variant := self.ident("expected variant after generic enum type")?.text
+                path = Vec<String>()
+                path.push(specialized)
+                path.push(variant)
+            }
+            when path.len() < 2 {
+                return Result::Err(self.error("expected `::Variant` after enum name in pattern"))
+            }
+            variant := path.pop().unwrap()
+            mut bindings := Vec<String>()
+            when self.peek_kind() == lexer::Tk::LPAREN {
+                self.skip()
+                when self.peek_kind() != lexer::Tk::RPAREN {
+                    while true {
+                        bindings.push(self.ident("expected binding name")?.text)
+                        when self.peek_kind() == lexer::Tk::COMMA {
+                            self.skip()
+                        } else {
+                            break
+                        }
+                    }
+                }
+                self.expect(lexer::Tk::RPAREN, "expected `)` after bindings")?
+            }
+            pattern.append(enc_some(enc_str(join(path, "::"))))
+            pattern.append(enc_some(enc_str(variant)))
+            pattern.append(enc_strings(bindings))
+        }
+        self.expect(lexer::Tk::FAT_ARROW, "expected `=>` after choose pattern")?
+        body := self.expression(0)?
+        arm.append(pattern)
+        arm.append(body.code)
+        arm.append(enc_span(arm_token.start, self.prev_end()))
+        return Result::Ok(arm)
+    }
+
+    fun if_expression(mut self, start: u64) -> Result<Expr, lexer::Diag> {
+        condition := self.expression(0)?
+        then_value := self.expression_block("expected `{` after when-expression condition")?
+        self.expect(lexer::Tk::ELSE, "when expression requires an `else` branch")?
+        mut else_value := plain_expr(String(), 0, 0)
+        when self.peek_kind() == lexer::Tk::WHEN {
+            else_value = self.expression(10)?
+        } else {
+            else_value = self.expression_block("expected `{` after `else`")?
+        }
+        end := self.prev_end()
+        mut code := word("If")
+        code.append(condition.code)
+        code.append(then_value.code)
+        code.append(else_value.code)
+        code.append(enc_span(start, end))
+        return Result::Ok(plain_expr(code, start, end))
+    }
+
+    fun expression_block(mut self, opening_message: str) -> Result<Expr, lexer::Diag> {
+        self.expect(lexer::Tk::LBRACE, opening_message)?
+        value := self.expression(0)?
+        self.expect(lexer::Tk::RBRACE, "expected `}` after when-expression value")?
+        return Result::Ok(value)
+    }
+
+    // Looks ahead to decide whether a `when` at the start of a function body
+    // statement is the function's tail value. The token position is restored.
+    fun if_expression_reaches_function_end(mut self) -> bool {
+        start := self.at
+        self.speculative = true
+        attempt := self.expression(0)
+        reaches_end := attempt.is_ok() && self.peek_kind() == lexer::Tk::RBRACE
+        self.at = start
+        self.speculative = false
+        return reaches_end
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Entry point.
+
+pub fun encode_error(error: lexer::Diag) -> String {
+    mut out := word("Error")
+    out.append(enc_str(error.code))
+    out.append(enc_str(error.message))
+    out.append(enc_span(error.start, error.end))
+    when error.has_help {
+        out.append(enc_some(enc_str(error.help)))
+    } else {
+        out.append(enc_none())
+    }
+    return out
+}
+
+fun primitive_type(kind: u32) -> TypeNode {
+    return TypeNode {
+        kind: kind,
+        name: String(),
+        first: 0,
+        second: 0,
+        length: 0,
+        flag: false,
+        has_result: false,
+        params: Vec<u64>(),
+        start: 0,
+        end: 0
+    }
+}
+
+pub fun encode_errors(errors: Vec<lexer::Diag>) -> String {
+    mut out := word("Errors")
+    out.append(enc_uint(errors.len()))
+    for error in errors {
+        out.append(enc_str(error.code))
+        out.append(enc_str(error.message))
+        out.append(enc_span(error.start, error.end))
+        when error.has_help {
+            out.append(enc_some(enc_str(error.help)))
+        } else {
+            out.append(enc_none())
+        }
+    }
+    return out
+}
+
+// Parses a complete source text and returns the encoded result: the syntax
+// tree, or the first lexical or syntax diagnostic. In recovering mode every
+// independent diagnostic is reported.
+pub fun parse(source: String, recovering: bool) -> String {
+    lexed := lexer::lex(source.clone(), recovering)
+    when lexed.failed {
+        when recovering {
+            return encode_errors(lexed.errors)
+        }
+        return encode_error(lexed.error)
+    }
+    tokens := lexed.tokens
+    texts := lexed.texts
+    // Structures marked `#[drop(...)]` own resources; Map values of those
+    // types do not get an `Option` specialization.
+    mut custom_drop_types := Set<String>()
+    count := tokens.len()
+    mut index: u64 = 0
+    while index < count {
+        when tokens[index].kind == lexer::Tk::HASH && index + 2 < count
+            && tokens[index + 2].kind == lexer::Tk::IDENT && texts[tokens[index + 2].text] == "drop" {
+            mut closing := index + 3
+            while closing < count && tokens[closing].kind != lexer::Tk::RBRACKET {
+                closing += 1
+            }
+            when closing + 2 < count && tokens[closing + 1].kind == lexer::Tk::STRUCT
+                && tokens[closing + 2].kind == lexer::Tk::IDENT {
+                custom_drop_types.insert(texts[tokens[closing + 2].text])
+            }
+        }
+        index += 1
+    }
+    mut types := Vec<TypeNode>()
+    mut kind: u32 = 0
+    while kind <= Ty::BOOL {
+        types.push(primitive_type(kind))
+        kind += 1
+    }
+    mut parser := Parser {
+        src: source,
+        tokens: tokens,
+        texts: texts,
+        at: 0,
+        expression_depth: 0,
+        block_depth: 0,
+        if_depth: 0,
+        types: types,
+        type_aliases: Map<String, u64>(),
+        generic_type_aliases: Map<String, u64>(),
+        alias_templates: Vec<AliasTemplate>(),
+        tuple_type_names: Map<String, String>(),
+        tuple_type_structs: Vec<String>(),
+        templates: Vec<Template>(),
+        template_fields: Vec<FieldTemplate>(),
+        template_variants: Vec<VariantTemplate>(),
+        generic_struct_templates: Map<String, u64>(),
+        generic_struct_keys: Map<String, String>(),
+        generic_struct_placeholder_keys: Map<String, String>(),
+        generic_struct_placeholders: Map<String, u64>(),
+        generic_structs: Vec<String>(),
+        generic_enum_keys: Map<String, String>(),
+        generic_enum_placeholder_keys: Map<String, String>(),
+        generic_enum_placeholders: Map<String, u64>(),
+        generic_enums: Vec<String>(),
+        generic_enum_templates: Map<String, u64>(),
+        placeholders: Vec<Placeholder>(),
+        namespace_path: Vec<String>(),
+        generic_type_parameters: Set<String>(),
+        custom_drop_types: custom_drop_types,
+        pending_methods: String(),
+        pending_method_count: 0,
+        recovering: recovering,
+        speculative: false,
+        recovery_diagnostics: Vec<lexer::Diag>(),
+        control_indices: Vec<u64>(),
+        control_markers: Vec<u32>(),
+        declared: String(),
+        drained: Vec<lexer::Diag>(),
+        diagnostics: Vec<lexer::Diag>(),
+        brace_consumed: false,
+        closing_consumed: false,
+        closing_end: 0
+    }
+    result := parser.program()
+    when result.is_ok() {
+        return result.unwrap()
+    }
+    when recovering {
+        return encode_errors(parser.diagnostics)
+    }
+    return encode_error(result.unwrap_err())
+}

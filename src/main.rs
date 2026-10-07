@@ -7,8 +7,9 @@ use std::{
 };
 
 use ryn::{
-    check_project, check_source_recovering, compile_project_with_optimize,
-    compile_source_with_optimize,
+    check_project_with_frontend, check_source_with_frontend, compile_project_with_frontend,
+    compile_source_with_frontend,
+    frontend::{self, Frontend},
     lockfile::{validate_project_lock_if_present, write_project_lock},
     manifest::{Dependency, Manifest, Optimize},
     source::SourceFile,
@@ -70,18 +71,70 @@ fn run_cli() -> Result<Option<i32>, String> {
         println!("locked {}", lock.display());
         return Ok(None);
     }
+    if command == "ast" {
+        // Prints the bootstrap parser's encoded syntax tree; the self-hosted
+        // frontend must produce the same bytes for the same input.
+        let mut recovering = false;
+        let mut monomorphize = false;
+        let mut path = None;
+        for argument in args.by_ref() {
+            match argument.to_str() {
+                Some("--recover") if !recovering => recovering = true,
+                Some("--monomorphize") if !monomorphize => monomorphize = true,
+                _ if path.is_none() => path = Some(PathBuf::from(argument)),
+                _ => return Err(usage()),
+            }
+        }
+        let path = path.ok_or_else(usage)?;
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("error[R0001]: cannot read {}: {e}", path.display()))?;
+        if monomorphize {
+            print!(
+                "{}",
+                ryn::ast_codec::encode_result(
+                    &ryn::parser::parse(&text).and_then(ryn::generics::monomorphize)
+                )
+            );
+        } else if recovering {
+            print!(
+                "{}",
+                ryn::ast_codec::encode_recovering_result(&ryn::parser::parse_recovering(&text))
+            );
+        } else {
+            print!(
+                "{}",
+                ryn::ast_codec::encode_result(&ryn::parser::parse(&text))
+            );
+        }
+        return Ok(None);
+    }
+    if command == "bootstrap" {
+        if args.next().is_some() {
+            return Err(usage());
+        }
+        bootstrap()?;
+        return Ok(None);
+    }
     if !matches!(command.as_str(), "check" | "build" | "run") {
         return Err(usage());
     }
     let mut requested_input = None;
     let mut output = None;
     let mut release = false;
+    let mut frontend_name = None;
     let mut program_args = Vec::new();
     while let Some(argument) = args.next() {
         match argument.to_str() {
             Some("--") if command == "run" => {
                 program_args.extend(args);
                 break;
+            }
+            Some("--frontend") if frontend_name.is_none() => {
+                let name = args
+                    .next()
+                    .and_then(|name| name.into_string().ok())
+                    .ok_or_else(usage)?;
+                frontend_name = Some(name);
             }
             Some("-o" | "--output") if command != "check" && output.is_none() => {
                 let path = args
@@ -109,13 +162,14 @@ fn run_cli() -> Result<Option<i32>, String> {
     let input = source_path(&requested_input)?;
     let source = SourceFile::load(&input)
         .map_err(|e| format!("error[R0001]: cannot read {}: {e}", input.display()))?;
+    let frontend = frontend::select(frontend_name.as_deref())?;
 
     match command.as_str() {
         "check" => {
             if project_manifest.is_some() {
-                check_project(&requested_input)?;
+                check_project_with_frontend(&requested_input, &frontend)?;
             } else {
-                check_source_recovering(&source).map_err(|errors| {
+                check_source_with_frontend(&source, &frontend).map_err(|errors| {
                     errors
                         .iter()
                         .map(|error| error.render(&source))
@@ -138,7 +192,12 @@ fn run_cli() -> Result<Option<i32>, String> {
                     Optimize::None
                 });
             let cache = if project_manifest.is_some() {
-                Some(project_cache_entry(&requested_input, &output, optimize)?)
+                Some(project_cache_entry(
+                    &requested_input,
+                    &output,
+                    optimize,
+                    &frontend,
+                )?)
             } else {
                 None
             };
@@ -150,9 +209,9 @@ fn run_cli() -> Result<Option<i32>, String> {
             });
             if !cache_hit {
                 if project_manifest.is_some() {
-                    compile_project_with_optimize(&requested_input, &output, optimize)?;
+                    compile_project_with_frontend(&requested_input, &output, optimize, &frontend)?;
                 } else {
-                    compile_source_with_optimize(&source, &output, optimize)
+                    compile_source_with_frontend(&source, &output, optimize, &frontend)
                         .map_err(|error| error.render(&source))?;
                 }
                 if let Some((path, key)) = cache {
@@ -206,6 +265,7 @@ fn project_cache_entry(
     project: &Path,
     output: &Path,
     optimize: Optimize,
+    frontend: &Frontend,
 ) -> Result<(PathBuf, String), String> {
     let project = fs::canonicalize(project).map_err(|error| {
         format!("error[R0401]: cannot resolve project for build cache: {error}")
@@ -223,6 +283,15 @@ fn project_cache_entry(
         format!("error[R0401]: cannot locate compiler for build cache: {error}")
     })?;
     hash_file(&mut hash, &compiler)?;
+    // Switching frontends rebuilds: a stale executable would hide a
+    // self-hosted frontend regression.
+    match frontend {
+        Frontend::Bootstrap => hash.feed(b"frontend:bootstrap"),
+        Frontend::SelfHosted(executable) => {
+            hash.feed(b"frontend:self-hosted");
+            hash_file(&mut hash, executable)?;
+        }
+    }
     for file in files {
         hash_file(&mut hash, &file)?;
     }
@@ -534,12 +603,91 @@ fn output_path(input: &Path) -> PathBuf {
 }
 
 fn usage() -> String {
-    "usage:\n  ryn new <path>\n  ryn check <file.ryn|project-dir>\n  ryn build <file.ryn|project-dir> [--release] [-o|--output <path>]\n  ryn run <file.ryn|project-dir> [--release] [-o|--output <path>] [-- <program-args...>]\n  ryn clean <project-dir>".into()
+    "usage:\n  ryn new <path>\n  ryn check <file.ryn|project-dir> [--frontend <ryn|rust>]\n  ryn build <file.ryn|project-dir> [--release] [-o|--output <path>] [--frontend <ryn|rust>]\n  ryn run <file.ryn|project-dir> [--release] [-o|--output <path>] [--frontend <ryn|rust>] [-- <program-args...>]\n  ryn clean <project-dir>\n  ryn bootstrap".into()
+}
+
+/// Rebuilds the self-hosted frontend with itself until it reproduces itself.
+///
+/// Stage 1 is built by the bootstrap parser, stage 2 by stage 1, and stage 3
+/// by stage 2. Builds are reproducible, so a correct self-hosted frontend
+/// makes all three executables identical. The verified stage is installed as
+/// the compiler's cached frontend.
+fn bootstrap() -> Result<(), String> {
+    let cache = frontend::cache_directory();
+    let work = cache.join("bootstrap");
+    if work.exists() {
+        fs::remove_dir_all(&work)
+            .map_err(|error| format!("error[R0902]: cannot clear {}: {error}", work.display()))?;
+    }
+    let executable = |stage: usize| {
+        work.join(if cfg!(windows) {
+            format!("stage{stage}.exe")
+        } else {
+            format!("stage{stage}")
+        })
+    };
+    let mut parser = Frontend::Bootstrap;
+    let mut previous: Option<Vec<u8>> = None;
+    for stage in 1..=3 {
+        let started = std::time::Instant::now();
+        let output = executable(stage);
+        frontend::build_self_hosted(&work.join(format!("stage{stage}-src")), &output, &parser)?;
+        let bytes = fs::read(&output)
+            .map_err(|error| format!("error[R0902]: cannot read {}: {error}", output.display()))?;
+        let parsed_by = match stage {
+            1 => "the bootstrap parser (Rust)".to_owned(),
+            _ => format!("the stage {} self-hosted frontend", stage - 1),
+        };
+        println!(
+            "stage {stage}: frontend parsed by {parsed_by}, built in {:.1}s ({} bytes)",
+            started.elapsed().as_secs_f64(),
+            bytes.len()
+        );
+        if let Some(previous) = &previous
+            && previous != &bytes
+        {
+            return Err(format!(
+                "error[R0903]: stage {stage} differs from stage {}: the self-hosted frontend does not reproduce itself",
+                stage - 1
+            ));
+        }
+        previous = Some(bytes);
+        parser = Frontend::SelfHosted(output);
+    }
+    for (path, text) in frontend::SELF_HOSTED_SOURCES {
+        if !path.ends_with(".ryn") {
+            continue;
+        }
+        let expected = ryn::ast_codec::encode_result(&ryn::parser::parse(text));
+        let actual = ryn::ast_codec::encode_result(&parser.parse(text));
+        if expected != actual {
+            return Err(format!(
+                "error[R0903]: the self-hosted frontend parses {path} differently from the bootstrap parser"
+            ));
+        }
+    }
+    let installed = cache.join(if cfg!(windows) {
+        "ryn-frontend.exe"
+    } else {
+        "ryn-frontend"
+    });
+    if installed.is_file() {
+        fs::remove_file(&installed).map_err(|error| {
+            format!(
+                "error[R0902]: cannot replace {}: {error}",
+                installed.display()
+            )
+        })?;
+    }
+    frontend::install_executable(&executable(3), &installed)?;
+    println!("fixpoint reached: stages 1, 2 and 3 are byte-identical");
+    println!("installed {}", installed.display());
+    Ok(())
 }
 
 fn help_text() -> String {
     format!(
-        "Ryn — Reliable. Fast. Native.\n\n{}\n\nCommands:\n  new <path>        Create a project with a native Hello World example\n  check <source>    Check a .ryn file or project directory\n  build <source>    Compile a .ryn file or project directory\n  run <source>      Compile and run a .ryn file or project directory\n  lock <project>    Resolve and write ryn.lock for supported dependencies\n  clean <project>   Remove the project's build directory\n\nA project directory uses src/main.ryn as its entry point.\nProject outputs go under build/debug or build/release; build/cache is reserved for compiler caches.\nAn i32 result from main becomes the process exit code for run.\nPass program arguments to run after --.\nclean removes only the direct build directory and refuses symbolic links.\n\nOptions:\n  --release            Use the project's release output directory\n  -o, --output <path>  Set the executable path for build or run\n  -h, --help           Show this help\n  -V, --version        Show compiler version\n",
+        "Ryn — Reliable. Fast. Native.\n\n{}\n\nCommands:\n  new <path>        Create a project with a native Hello World example\n  check <source>    Check a .ryn file or project directory\n  build <source>    Compile a .ryn file or project directory\n  run <source>      Compile and run a .ryn file or project directory\n  lock <project>    Resolve and write ryn.lock for supported dependencies\n  clean <project>   Remove the project's build directory\n  bootstrap         Rebuild the self-hosted frontend with itself and verify the fixpoint\n\nA project directory uses src/main.ryn as its entry point.\nProject outputs go under build/debug or build/release; build/cache is reserved for compiler caches.\nAn i32 result from main becomes the process exit code for run.\nPass program arguments to run after --.\nclean removes only the direct build directory and refuses symbolic links.\n\nOptions:\n  --release            Use the project's release output directory\n  -o, --output <path>  Set the executable path for build or run\n  --frontend <name>    Parse with the self-hosted `ryn` frontend (default) or the `rust` bootstrap parser\n  -h, --help           Show this help\n  -V, --version        Show compiler version\n",
         usage()
     )
 }

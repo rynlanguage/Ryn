@@ -2,12 +2,14 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
 use crate::{
+    ast::Program,
+    frontend::Frontend,
     lockfile::resolve_locked_git_dependency,
     manifest::{Dependency, Manifest},
-    parser,
     sema::{self, RynIr},
     source::{Diagnostic, SourceFile, Span},
 };
@@ -17,6 +19,8 @@ struct SourceUnit {
     path: PathBuf,
     module_path: String,
     text: String,
+    /// The module parsed on its own, before the combined project parse.
+    program: Rc<Program>,
 }
 
 struct Segment {
@@ -25,7 +29,10 @@ struct Segment {
     source: SourceUnit,
 }
 
-pub(crate) fn check_project(project: &Path) -> Result<(RynIr, Vec<PathBuf>), String> {
+pub(crate) fn check_project(
+    project: &Path,
+    frontend: &Frontend,
+) -> Result<(RynIr, Vec<PathBuf>), String> {
     let root = fs::canonicalize(project).map_err(|error| {
         format!(
             "error[R0420]: cannot resolve project directory {}: {error}",
@@ -72,6 +79,7 @@ pub(crate) fn check_project(project: &Path) -> Result<(RynIr, Vec<PathBuf>), Str
         &dependency_roots,
         &mut discovered,
         &mut units,
+        frontend,
     )?;
 
     let mut text = String::new();
@@ -86,18 +94,18 @@ pub(crate) fn check_project(project: &Path) -> Result<(RynIr, Vec<PathBuf>), Str
             // directive outside every source span so diagnostics still map cleanly.
             text.push_str("namespace;\n");
         }
-        let importing_program = parser::parse(&source.text)
-            .map_err(|error| render_local_diagnostic(error, &source.path, &source.text))?;
-        for import in importing_program.uses {
+        for import in &source.program.uses {
             let module_path = import.path.join("::");
             let Some(module_alias) = import.path.last() else {
                 continue;
             };
             for provider in units.iter().filter(|unit| unit.module_path == module_path) {
-                let exported = parser::parse(&provider.text).map_err(|error| {
-                    render_local_diagnostic(error, &provider.path, &provider.text)
-                })?;
-                for alias in exported.type_aliases.iter().filter(|alias| alias.public) {
+                for alias in provider
+                    .program
+                    .type_aliases
+                    .iter()
+                    .filter(|alias| alias.public)
+                {
                     let Some(equals) = provider.text[alias.span.start..alias.span.end].find('=')
                     else {
                         continue;
@@ -139,7 +147,7 @@ pub(crate) fn check_project(project: &Path) -> Result<(RynIr, Vec<PathBuf>), Str
         text.push('\n');
     }
 
-    let mut program = parser::parse_recovering(&text).map_err(|errors| {
+    let mut program = frontend.parse_recovering(&text).map_err(|errors| {
         errors
             .into_iter()
             .map(|error| render_project_diagnostic(error, &segments))
@@ -190,6 +198,12 @@ pub(crate) fn check_project(project: &Path) -> Result<(RynIr, Vec<PathBuf>), Str
             definition
                 .module_path
                 .clone_from(&segment.source.module_path);
+            if !definition.module_path.is_empty()
+                && let Some(drop_function) = &mut definition.drop_function
+                && !drop_function.contains("::")
+            {
+                *drop_function = format!("{}::{drop_function}", definition.module_path);
+            }
         }
     }
     for definition in &mut program.enums {
@@ -227,6 +241,9 @@ pub(crate) fn check_project(project: &Path) -> Result<(RynIr, Vec<PathBuf>), Str
         .iter()
         .map(|segment| segment.source.path.clone())
         .collect();
+    let program = frontend
+        .monomorphize(program)
+        .map_err(|error| render_project_diagnostic(error, &segments))?;
     let ir = sema::analyze(program).map_err(|error| render_project_diagnostic(error, &segments))?;
     Ok((ir, source_paths))
 }
@@ -319,6 +336,7 @@ fn load_module(
     dependency_roots: &HashMap<String, PathBuf>,
     discovered: &mut HashMap<PathBuf, String>,
     units: &mut Vec<SourceUnit>,
+    frontend: &Frontend,
 ) -> Result<(), String> {
     let canonical = if module_path.starts_with("std::") {
         path.to_path_buf()
@@ -366,14 +384,14 @@ fn load_module(
             .text()
             .to_owned()
     };
-    let parsed = parser::parse_recovering(&module_text).map_err(|errors| {
+    let parsed = frontend.parse_recovering(&module_text).map_err(|errors| {
         errors
             .into_iter()
             .map(|error| render_local_diagnostic(error, &canonical, &module_text))
             .collect::<Vec<_>>()
             .join("\n\n")
     })?;
-    for import in parsed.uses {
+    for import in &parsed.uses {
         let imported_path = import.path.join("::");
         let (module_root, module_file) =
             resolve_module_file(source_root, dependency_roots, &import.path).map_err(
@@ -386,12 +404,14 @@ fn load_module(
             dependency_roots,
             discovered,
             units,
+            frontend,
         )?;
     }
     units.push(SourceUnit {
         path: canonical,
         module_path,
         text: module_text,
+        program: Rc::new(parsed),
     });
     Ok(())
 }

@@ -1,0 +1,222 @@
+// Generic function specialization, written in Ryn.
+//
+// A faithful port of the bootstrap pass in `src/generics.rs`. It reads a
+// parsed program in the `src/ast_codec.rs` text format, clones each generic
+// function for every combination of type arguments its call sites infer,
+// rewrites those calls to the specialized names, and writes the program back
+// in the same format for semantic analysis.
+//
+// The syntax tree lives in arenas of nodes addressed by index. Index 0 of the
+// type arena means "no type".
+
+use frontend::lexer
+
+struct TypeKind {
+    unused: u8
+}
+
+extend TypeKind {
+    pub const NONE: u32 = 0
+    pub const I8: u32 = 1
+    pub const I16: u32 = 2
+    pub const I32: u32 = 3
+    pub const I64: u32 = 4
+    pub const U8: u32 = 5
+    pub const U16: u32 = 6
+    pub const U32: u32 = 7
+    pub const U64: u32 = 8
+    pub const F32: u32 = 9
+    pub const F64: u32 = 10
+    pub const STR: u32 = 11
+    pub const STRING: u32 = 12
+    pub const CHAR: u32 = 13
+    pub const BOOL: u32 = 14
+    pub const NAMED: u32 = 20
+    pub const PARAM: u32 = 21
+    pub const VEC: u32 = 22
+    pub const MAP: u32 = 23
+    pub const SET: u32 = 24
+    pub const ARRAY: u32 = 25
+    pub const SLICE: u32 = 26
+    pub const REF: u32 = 27
+    pub const RAW: u32 = 28
+    pub const FNPTR: u32 = 29
+}
+
+// Expression kinds.
+struct Ex {
+    unused: u8
+}
+
+extend Ex {
+    pub const INT: u32 = 1
+    pub const FLOAT: u32 = 2
+    pub const STR: u32 = 3
+    pub const CHAR: u32 = 4
+    pub const BOOL: u32 = 5
+    pub const NAME: u32 = 6
+    pub const CALL: u32 = 7
+    pub const METHOD_CALL: u32 = 8
+    pub const STRUCT: u32 = 9
+    pub const FIELD: u32 = 10
+    pub const IF: u32 = 11
+    pub const BINARY: u32 = 12
+    pub const NEGATE: u32 = 13
+    pub const NOT: u32 = 14
+    pub const BIT_NOT: u32 = 15
+    pub const ADDRESS_OF: u32 = 16
+    pub const DEREF: u32 = 17
+    pub const CAST: u32 = 18
+    pub const LAYOUT: u32 = 19
+    pub const NEW_VEC: u32 = 20
+    pub const NEW_MAP: u32 = 21
+    pub const NEW_SET: u32 = 22
+    pub const TUPLE: u32 = 23
+    pub const ARRAY: u32 = 24
+    pub const REPEAT: u32 = 25
+    pub const INDEX: u32 = 26
+    pub const PROPAGATE: u32 = 27
+    pub const ENUM: u32 = 28
+    pub const CHOOSE: u32 = 29
+}
+
+// Statement kinds.
+struct St {
+    unused: u8
+}
+
+extend St {
+    pub const LET: u32 = 1
+    pub const ASSIGN: u32 = 2
+    pub const INDEX_ASSIGN: u32 = 3
+    pub const DEREF_ASSIGN: u32 = 4
+    pub const FIELD_ASSIGN: u32 = 5
+    pub const COMPOUND: u32 = 6
+    pub const PRINT: u32 = 7
+    pub const TEMPLATE: u32 = 8
+    pub const CALL: u32 = 9
+    pub const METHOD_CALL: u32 = 10
+    pub const IF: u32 = 11
+    pub const WHILE: u32 = 12
+    pub const FOR: u32 = 13
+    pub const FOR_EACH: u32 = 14
+    pub const BREAK: u32 = 15
+    pub const CONTINUE: u32 = 16
+    pub const RETURN: u32 = 17
+}
+
+#[derive(Clone)]
+struct TreeType {
+    kind: u32,
+    name: String,
+    first: u64,
+    second: u64,
+    length: u64,
+    flag: bool,
+    has_result: bool,
+    params: Vec<u64>,
+    start: u64,
+    end: u64
+}
+
+// `text` holds a name, literal text, operator, field, method, or enum name;
+// `text2` an enum variant. `a`, `b`, `c` are child expressions, `list` the
+// arguments, elements, structure literal values, or choose arms, and `types`
+// the explicit type arguments.
+#[derive(Clone)]
+struct ExprNode {
+    kind: u32,
+    text: String,
+    text2: String,
+    value: u64,
+    flag: bool,
+    flag2: bool,
+    a: u64,
+    b: u64,
+    c: u64,
+    ty: u64,
+    ty2: u64,
+    list: Vec<u64>,
+    types: Vec<u64>,
+    names: Vec<String>,
+    spans: Vec<u64>,
+    start: u64,
+    end: u64,
+    name_start: u64,
+    name_end: u64
+}
+
+#[derive(Clone)]
+struct ArmNode {
+    has_enum: bool,
+    enum_name: String,
+    has_variant: bool,
+    variant: String,
+    bindings: Vec<String>,
+    body: u64,
+    start: u64,
+    end: u64
+}
+
+// `parts` and `part_kinds` describe a template: kind 1 is text taken from
+// `names`, kind 2 a value expression.
+#[derive(Clone)]
+struct StmtNode {
+    kind: u32,
+    text: String,
+    flag: bool,
+    has: bool,
+    op: String,
+    ty: u64,
+    a: u64,
+    b: u64,
+    c: u64,
+    body: Vec<u64>,
+    body2: Vec<u64>,
+    names: Vec<String>,
+    spans: Vec<u64>,
+    parts: Vec<u64>,
+    part_kinds: Vec<u32>,
+    types: Vec<u64>,
+    list: Vec<u64>,
+    start: u64,
+    end: u64,
+    name_start: u64,
+    name_end: u64
+}
+
+// Each bound list is kept in its encoded form; specialization only renames
+// the bounded parameter.
+#[derive(Clone)]
+struct FunctionNode {
+    name: String,
+    extern_c: bool,
+    has_symbol: bool,
+    symbol: String,
+    type_params: Vec<String>,
+    bound_params: Vec<String>,
+    bound_lists: Vec<String>,
+    public: bool,
+    module_path: String,
+    param_names: Vec<String>,
+    param_types: Vec<u64>,
+    param_spans: Vec<u64>,
+    has_return: bool,
+    return_type: u64,
+    body: Vec<u64>,
+    has_value: bool,
+    value: u64,
+    start: u64,
+    end: u64
+}
+
+struct EnumNode {
+    name: String,
+    raw: String,
+    variant_names: Vec<String>,
+    variant_counts: Vec<u64>,
+    fields: Vec<u64>,
+    start: u64,
+    end: u64
+}
+

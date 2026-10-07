@@ -1,0 +1,1054 @@
+// Ryn lexer, written in Ryn.
+//
+// This is a faithful port of the Rust bootstrap lexer (`src/lexer.rs`): it
+// produces the same tokens, spans, and first diagnostic for every input, so
+// the self-hosted parser can reproduce the bootstrap syntax tree exactly.
+// Spans are UTF-8 byte offsets into the source text.
+
+// Token kinds. The numbering is private to the self-hosted frontend.
+pub struct Tk {
+    unused: u8
+}
+
+extend Tk {
+    pub const FUN: u32 = 1
+    pub const MUT: u32 = 2
+    pub const TRUE: u32 = 3
+    pub const FALSE: u32 = 4
+    pub const WHEN: u32 = 5
+    pub const ELSE: u32 = 6
+    pub const WHILE: u32 = 7
+    pub const FOR: u32 = 8
+    pub const IN: u32 = 9
+    pub const BREAK: u32 = 10
+    pub const CONTINUE: u32 = 11
+    pub const RETURN: u32 = 12
+    pub const ECHO: u32 = 13
+    pub const STRUCT: u32 = 14
+    pub const AS: u32 = 15
+    pub const ENUM: u32 = 16
+    pub const TYPE: u32 = 17
+    pub const CHOOSE: u32 = 18
+    pub const USE: u32 = 19
+    pub const NAMESPACE: u32 = 20
+    pub const PUB: u32 = 21
+    pub const EXTEND: u32 = 22
+    pub const SHAPE: u32 = 23
+    pub const CONST: u32 = 24
+    pub const IDENT: u32 = 30
+    pub const STRING: u32 = 31
+    pub const CHARACTER: u32 = 32
+    pub const INTEGER: u32 = 33
+    pub const FLOAT: u32 = 34
+    pub const EQUAL_EQUAL: u32 = 40
+    pub const BANG: u32 = 41
+    pub const QUESTION: u32 = 42
+    pub const BANG_EQUAL: u32 = 43
+    pub const LESS: u32 = 44
+    pub const LESS_EQUAL: u32 = 45
+    pub const GREATER: u32 = 46
+    pub const GREATER_EQUAL: u32 = 47
+    pub const BIT_AND: u32 = 48
+    pub const BIT_AND_EQUAL: u32 = 49
+    pub const BIT_OR: u32 = 50
+    pub const BIT_OR_EQUAL: u32 = 51
+    pub const SHIFT_LEFT: u32 = 52
+    pub const SHIFT_LEFT_EQUAL: u32 = 53
+    pub const SHIFT_RIGHT: u32 = 54
+    pub const SHIFT_RIGHT_EQUAL: u32 = 55
+    pub const CARET: u32 = 56
+    pub const CARET_EQUAL: u32 = 57
+    pub const TILDE: u32 = 58
+    pub const AND_AND: u32 = 59
+    pub const OR_OR: u32 = 60
+    pub const LPAREN: u32 = 61
+    pub const RPAREN: u32 = 62
+    pub const LBRACKET: u32 = 63
+    pub const RBRACKET: u32 = 64
+    pub const LBRACE: u32 = 65
+    pub const RBRACE: u32 = 66
+    pub const COMMA: u32 = 67
+    pub const SEMICOLON: u32 = 68
+    pub const COLON: u32 = 69
+    pub const COLON_COLON: u32 = 70
+    pub const DEFINE: u32 = 71
+    pub const DOT: u32 = 72
+    pub const DOT_DOT: u32 = 73
+    pub const EQUAL: u32 = 74
+    pub const PLUS_EQUAL: u32 = 75
+    pub const MINUS_EQUAL: u32 = 76
+    pub const STAR_EQUAL: u32 = 77
+    pub const SLASH_EQUAL: u32 = 78
+    pub const PERCENT_EQUAL: u32 = 79
+    pub const PLUS: u32 = 80
+    pub const MINUS: u32 = 81
+    pub const STAR: u32 = 82
+    pub const SLASH: u32 = 83
+    pub const PERCENT: u32 = 84
+    pub const ARROW: u32 = 85
+    pub const FAT_ARROW: u32 = 86
+    pub const HASH: u32 = 87
+    pub const EOF: u32 = 99
+}
+
+// `text` indexes `Lexed.texts` for identifiers, string values, and float
+// literals; `value` holds an integer value or a character's scalar value.
+pub struct Token {
+    pub kind: u32,
+    pub start: u64,
+    pub end: u64,
+    pub text: u64,
+    pub value: u64
+}
+
+pub struct Diag {
+    pub code: String,
+    pub message: String,
+    pub start: u64,
+    pub end: u64,
+    pub has_help: bool,
+    pub help: String
+}
+
+pub struct Lexed {
+    pub tokens: Vec<Token>,
+    pub texts: Vec<String>,
+    pub failed: bool,
+    pub error: Diag,
+    pub errors: Vec<Diag>
+}
+
+pub fun diag(code: str, message: String, start: u64, end: u64) -> Diag {
+    return Diag {
+        code: String(code),
+        message: message,
+        start: start,
+        end: end,
+        has_help: false,
+        help: String()
+    }
+}
+
+pub fun diag_help(code: str, message: String, start: u64, end: u64, help: String) -> Diag {
+    return Diag {
+        code: String(code),
+        message: message,
+        start: start,
+        end: end,
+        has_help: true,
+        help: help
+    }
+}
+
+// Byte-level helpers. Positions past the end read as 256, which matches no
+// byte, like `bytes.get(i)` returning `None` in the bootstrap lexer.
+pub fun is_digit(byte: u32) -> bool {
+    return byte >= 48 && byte <= 57
+}
+
+pub fun is_alpha(byte: u32) -> bool {
+    return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+}
+
+pub fun is_alnum(byte: u32) -> bool {
+    return is_alpha(byte) || is_digit(byte)
+}
+
+fun is_hex_digit(byte: u32) -> bool {
+    return is_digit(byte) || (byte >= 65 && byte <= 70) || (byte >= 97 && byte <= 102)
+}
+
+fun is_space(byte: u32) -> bool {
+    // ASCII whitespace as defined by `u8::is_ascii_whitespace`.
+    return byte == 32 || byte == 9 || byte == 10 || byte == 12 || byte == 13
+}
+
+// Returns the digit value of `byte` in `radix`, or 99 when it is not a digit.
+fun radix_digit(byte: u32, radix: u32) -> u32 {
+    mut value: u32 = 99
+    when is_digit(byte) {
+        value = byte - 48
+    } else when byte >= 97 && byte <= 122 {
+        value = byte - 97 + 10
+    } else when byte >= 65 && byte <= 90 {
+        value = byte - 65 + 10
+    }
+    when value < radix {
+        return value
+    }
+    return 99
+}
+
+pub fun utf8_width_of_lead(byte: u32) -> u64 {
+    when byte < 128 { return 1 }
+    when byte >= 240 { return 4 }
+    when byte >= 224 { return 3 }
+    return 2
+}
+
+pub fun char_width(value: char) -> u64 {
+    code := value as u32
+    when code < 128 { return 1 }
+    when code < 2048 { return 2 }
+    when code < 65536 { return 3 }
+    return 4
+}
+
+fun hex_text(value: u32) -> String {
+    mut digits := String()
+    mut rest := value
+    when rest == 0 {
+        digits.push('0')
+    }
+    while rest > 0 {
+        digit := rest % 16
+        when digit < 10 {
+            digits.push(String(digit).char_at(0))
+        } else {
+            letters := String("abcdef")
+            digits.push(letters.char_at((digit - 10) as u64))
+        }
+        rest = rest / 16
+    }
+    return digits.reverse()
+}
+
+// Rust's `{:?}` rendering of a character, used by the R0005 message.
+fun debug_char(value: char) -> String {
+    code := value as u32
+    mut text := String("'")
+    when code == 39 {
+        text.append("\\'")
+    } else when code == 92 {
+        text.append("\\\\")
+    } else when code == 0 {
+        text.append("\\0")
+    } else when code == 9 {
+        text.append("\\t")
+    } else when code == 10 {
+        text.append("\\n")
+    } else when code == 13 {
+        text.append("\\r")
+    } else when code < 32 || (code >= 127 && code < 160) || code == 173
+        || (code >= 768 && code < 880) || (code >= 8203 && code < 8208)
+        || code == 8232 || code == 8233 || code == 65279 {
+        text.append("\\u{")
+        text.append(hex_text(code))
+        text.push('}')
+    } else {
+        text.push(value)
+    }
+    text.push('\'')
+    return text
+}
+
+// In recovering mode the lexer keeps going after a malformed token, exactly
+// where the bootstrap lexer resumes, and gathers every diagnostic; otherwise
+// it stops at the first one. `stopped` ends lexing in both modes.
+struct Lexer {
+    src: String,
+    len: u64,
+    at: u64,
+    tokens: Vec<Token>,
+    texts: Vec<String>,
+    recovering: bool,
+    stopped: bool,
+    errors: Vec<Diag>
+}
+
+// The outcome of decoding `\u{...}`: the character and the byte after the
+// escape, or `valid == false` with the end of the malformed escape.
+struct Escape {
+    valid: bool,
+    value: char,
+    end: u64
+}
+
+extend Lexer {
+    fun byte(self, index: u64) -> u32 {
+        when index >= self.len {
+            return 256
+        }
+        return self.src.byte_at(index) as u32
+    }
+
+    fun char_at_byte(self, index: u64) -> char {
+        width := utf8_width_of_lead(self.byte(index))
+        piece := self.src.slice(index, index + width)
+        return piece.char_at(0)
+    }
+
+    fun fail(mut self, error: Diag) {
+        self.errors.push(error)
+        when !self.recovering {
+            self.stopped = true
+        }
+    }
+
+    // Skips the rest of a malformed string literal; returns the byte after
+    // its closing quote, or the source length.
+    fun skip_to_string_end(self, start: u64) -> u64 {
+        mut at := start
+        while at < self.len {
+            current := self.byte(at)
+            when current == 34 {
+                return at + 1
+            }
+            when current == 92 {
+                at += 1
+                when at < self.len {
+                    at += char_width(self.char_at_byte(at))
+                }
+            } else {
+                at += char_width(self.char_at_byte(at))
+            }
+        }
+        return self.len
+    }
+
+    // Resumes after a malformed string literal in recovering mode.
+    fun resume_after_string(mut self, from: u64) {
+        when self.recovering {
+            self.at = self.skip_to_string_end(from)
+            when self.at == self.len {
+                self.stopped = true
+            }
+        }
+    }
+
+    fun push(mut self, kind: u32, start: u64, end: u64, text: u64, value: u64) {
+        self.tokens.push(Token { kind: kind, start: start, end: end, text: text, value: value })
+    }
+
+    fun push_text(mut self, value: String) -> u64 {
+        index := self.texts.len()
+        self.texts.push(value)
+        return index
+    }
+
+    fun skip_block_comment(self, start: u64) -> u64 {
+        // Returns the byte after the closing `*/`, or `len + 1` when the
+        // comment is unterminated.
+        mut cursor := start + 2
+        mut depth: u64 = 1
+        while cursor < self.len {
+            current := self.byte(cursor)
+            next := self.byte(cursor + 1)
+            when current == 47 && next == 42 {
+                depth += 1
+                cursor += 2
+            } else when current == 42 && next == 47 {
+                depth -= 1
+                cursor += 2
+                when depth == 0 {
+                    return cursor
+                }
+            } else {
+                cursor += 1
+            }
+        }
+        return self.len + 1
+    }
+
+    fun unicode_escape_end(self, start: u64) -> u64 {
+        mut at := start
+        while at < self.len {
+            current := self.byte(at)
+            when current == 125 {
+                return at + 1
+            }
+            when current == 34 {
+                return at
+            }
+            at += 1
+        }
+        return at
+    }
+
+    // `at` points at the `u` of `\u{...}`.
+    fun decode_unicode_escape(self, at: u64) -> Escape {
+        when self.byte(at + 1) != 123 {
+            return Escape { valid: false, value: ' ', end: at + 1 }
+        }
+        mut cursor := at + 2
+        mut digits: u32 = 0
+        mut value: u32 = 0
+        while cursor < self.len {
+            current := self.byte(cursor)
+            when current == 125 {
+                when digits == 0 {
+                    return Escape { valid: false, value: ' ', end: cursor + 1 }
+                }
+                when value > 1114111 || (value >= 55296 && value <= 57343) {
+                    return Escape { valid: false, value: ' ', end: cursor + 1 }
+                }
+                return Escape { valid: true, value: char_from_u32(value), end: cursor + 1 }
+            }
+            when is_hex_digit(current) && digits < 6 {
+                value = value * 16 + radix_digit(current, 16)
+                digits += 1
+                cursor += 1
+            } else when current == 34 {
+                return Escape { valid: false, value: ' ', end: cursor }
+            } else {
+                return Escape { valid: false, value: ' ', end: self.unicode_escape_end(cursor) }
+            }
+        }
+        return Escape { valid: false, value: ' ', end: cursor }
+    }
+
+    fun character_literal(mut self, start: u64) {
+        mut at := start + 1
+        mut parsed := false
+        mut value := ' '
+        when self.byte(at) == 92 {
+            at += 1
+            escape := self.byte(at)
+            when escape == 117 {
+                decoded := self.decode_unicode_escape(at)
+                when decoded.valid {
+                    at = decoded.end
+                    parsed = true
+                    value = decoded.value
+                }
+            } else when escape != 256 {
+                at += 1
+                parsed = true
+                when escape == 110 {
+                    value = '\n'
+                } else when escape == 114 {
+                    value = '\r'
+                } else when escape == 116 {
+                    value = '\t'
+                } else when escape == 48 {
+                    value = '\0'
+                } else when escape == 92 {
+                    value = '\\'
+                } else when escape == 39 {
+                    value = '\''
+                } else when escape == 34 {
+                    value = '"'
+                } else {
+                    parsed = false
+                }
+            }
+        } else {
+            first := self.byte(at)
+            when first != 256 && first != 39 && first != 10 && first != 13 {
+                value = self.char_at_byte(at)
+                at += char_width(value)
+                parsed = true
+            }
+        }
+        when parsed && self.byte(at) == 39 {
+            self.push(Tk::CHARACTER, start, at + 1, 0, (value as u32) as u64)
+            self.at = at + 1
+            return
+        }
+        while at < self.len && self.byte(at) != 39 && self.byte(at) != 10 && self.byte(at) != 13 {
+            at += 1
+        }
+        when self.byte(at) == 39 {
+            at += 1
+        }
+        mut end := at
+        when end < start + 1 {
+            end = start + 1
+        }
+        self.fail(diag_help(
+            "R0019",
+            String("character literal must contain exactly one Unicode scalar value"),
+            start,
+            end,
+            String("use a single character such as 'a', '\\n', or '\\u{1F980}'")
+        ))
+        self.at = end
+    }
+
+    fun string_literal(mut self, start: u64) {
+        mut at := start + 1
+        mut value := String()
+        while at < self.len && self.byte(at) != 34 {
+            when self.byte(at) == 92 {
+                at += 1
+                when at == self.len {
+                    break
+                }
+                escape := self.byte(at)
+                when escape == 117 {
+                    escape_start := at - 1
+                    decoded := self.decode_unicode_escape(at)
+                    when decoded.valid {
+                        value.push(decoded.value)
+                        at = decoded.end
+                        continue
+                    }
+                    self.fail(diag(
+                        "R0004",
+                        String("invalid Unicode escape; expected `\\u{...}` with a valid Unicode scalar value"),
+                        escape_start,
+                        decoded.end
+                    ))
+                    self.resume_after_string(decoded.end)
+                    return
+                }
+                when escape == 48 {
+                    value.push('\0')
+                } else when escape == 110 {
+                    value.push('\n')
+                } else when escape == 114 {
+                    value.push('\r')
+                } else when escape == 116 {
+                    value.push('\t')
+                } else when escape == 34 {
+                    value.push('"')
+                } else when escape == 92 {
+                    value.push('\\')
+                } else {
+                    invalid := self.char_at_byte(at)
+                    self.fail(diag(
+                        "R0004",
+                        String("unsupported string escape"),
+                        at - 1,
+                        at + char_width(invalid)
+                    ))
+                    self.resume_after_string(at + char_width(invalid))
+                    return
+                }
+                at += 1
+            } else {
+                current := self.char_at_byte(at)
+                value.push(current)
+                at += char_width(current)
+            }
+        }
+        when at == self.len {
+            self.fail(diag("R0003", String("unterminated string literal"), start, at))
+            self.stopped = true
+            return
+        }
+        text := self.push_text(value)
+        self.push(Tk::STRING, start, at + 1, text, 0)
+        self.at = at + 1
+    }
+
+    // Scans decimal digits and `_` separators starting at `self.at`; returns
+    // the first misplaced separator offset, or `len + 1` when there is none.
+    fun scan_decimal_digits(mut self, digit_before: bool) -> u64 {
+        mut previous_was_digit := digit_before
+        mut invalid := self.len + 1
+        while self.at < self.len {
+            current := self.byte(self.at)
+            when is_digit(current) {
+                previous_was_digit = true
+                self.at += 1
+            } else when current == 95 {
+                when (!previous_was_digit || !is_digit(self.byte(self.at + 1))) && invalid > self.len {
+                    invalid = self.at
+                }
+                previous_was_digit = false
+                self.at += 1
+            } else {
+                break
+            }
+        }
+        return invalid
+    }
+
+    fun separator_error(mut self, at: u64) {
+        self.fail(diag("R0008", String("numeric separators must appear between digits"), at, at + 1))
+    }
+
+    fun radix_integer(mut self, start: u64, radix: u32) {
+        self.at += 2
+        digits_start := self.at
+        mut digit_count: u64 = 0
+        mut previous_was_digit := false
+        mut invalid_separator := self.len + 1
+        mut invalid_digit := self.len + 1
+        mut invalid_digit_byte: u32 = 0
+        while self.at < self.len {
+            current := self.byte(self.at)
+            when current == 95 {
+                next_is_digit := radix_digit(self.byte(self.at + 1), radix) != 99
+                when (!previous_was_digit || !next_is_digit) && invalid_separator > self.len {
+                    invalid_separator = self.at
+                }
+                previous_was_digit = false
+                self.at += 1
+            } else when is_alnum(current) {
+                when radix_digit(current, radix) != 99 {
+                    digit_count += 1
+                    previous_was_digit = true
+                } else {
+                    previous_was_digit = false
+                    when invalid_digit > self.len {
+                        invalid_digit = self.at
+                        invalid_digit_byte = current
+                    }
+                }
+                self.at += 1
+            } else {
+                break
+            }
+        }
+        when invalid_separator <= self.len && (invalid_digit > self.len || invalid_separator < invalid_digit) {
+            self.separator_error(invalid_separator)
+            return
+        }
+        when invalid_digit <= self.len {
+            mut message := String("digit `")
+            message.push(self.char_at_byte(invalid_digit))
+            message.append("` is not valid in a base-")
+            message.append(String(radix))
+            message.append(" integer literal")
+            help := when radix == 2 {
+                String("use only `0` and `1` after the `0b` prefix")
+            } else {
+                String("use hexadecimal digits `0`-`9`, `a`-`f`, or `A`-`F` after the `0x` prefix")
+            }
+            self.fail(diag_help("R0009", message, invalid_digit, invalid_digit + 1, help))
+            return
+        }
+        when digit_count == 0 {
+            mut message := String("expected at least one base-")
+            message.append(String(radix))
+            message.append(" digit after the prefix")
+            self.fail(diag("R0009", message, start, self.at))
+            return
+        }
+        mut value: u64 = 0
+        maximum: u64 = 18446744073709551615
+        mut cursor := digits_start
+        while cursor < self.at {
+            current := self.byte(cursor)
+            when current != 95 {
+                digit := radix_digit(current, radix) as u64
+                when value > (maximum - digit) / (radix as u64) {
+                    self.fail(diag(
+                        "R0006",
+                        String("integer literal is outside the supported u64 range"),
+                        start,
+                        self.at
+                    ))
+                    return
+                }
+                value = value * (radix as u64) + digit
+            }
+            cursor += 1
+        }
+        self.push(Tk::INTEGER, start, self.at, 0, value)
+    }
+
+    fun number(mut self, start: u64) {
+        first := self.byte(start)
+        second := self.byte(start + 1)
+        when first == 48 && (second == 98 || second == 66) {
+            self.radix_integer(start, 2)
+            return
+        }
+        when first == 48 && (second == 120 || second == 88) {
+            self.radix_integer(start, 16)
+            return
+        }
+        self.at = start + 1
+        mut invalid_separator := self.scan_decimal_digits(true)
+        mut is_float := false
+        when self.byte(self.at) == 46 && (is_digit(self.byte(self.at + 1)) || self.byte(self.at + 1) == 95) {
+            is_float = true
+            self.at += 1
+            fraction_separator := self.scan_decimal_digits(false)
+            when invalid_separator > self.len {
+                invalid_separator = fraction_separator
+            }
+        }
+        when self.byte(self.at) == 101 || self.byte(self.at) == 69 {
+            is_float = true
+            self.at += 1
+            when self.byte(self.at) == 43 || self.byte(self.at) == 45 {
+                self.at += 1
+            }
+            exponent_start := self.at
+            exponent_separator := self.scan_decimal_digits(false)
+            when invalid_separator > self.len {
+                invalid_separator = exponent_separator
+            }
+            mut has_digit := false
+            mut cursor := exponent_start
+            while cursor < self.at {
+                when is_digit(self.byte(cursor)) {
+                    has_digit = true
+                }
+                cursor += 1
+            }
+            when !has_digit {
+                self.fail(diag(
+                    "R0007",
+                    String("expected exponent digits in floating-point literal"),
+                    start,
+                    self.at
+                ))
+                return
+            }
+        }
+        when invalid_separator <= self.len {
+            self.separator_error(invalid_separator)
+            return
+        }
+        mut normalized := String()
+        mut cursor := start
+        while cursor < self.at {
+            current := self.byte(cursor)
+            when current != 95 {
+                normalized.push(self.char_at_byte(cursor))
+            }
+            cursor += 1
+        }
+        when is_float {
+            parsed := normalized.try_to_f64()
+            when parsed.is_none() {
+                self.fail(diag(
+                    "R0007",
+                    String("floating-point literal is outside the supported f64 range"),
+                    start,
+                    self.at
+                ))
+                return
+            }
+            value := parsed.unwrap()
+            when value - value != 0.0 {
+                self.fail(diag("R0007", String("floating-point literal must be finite"), start, self.at))
+                return
+            }
+            text := self.push_text(String(value))
+            self.push(Tk::FLOAT, start, self.at, text, 0)
+            return
+        }
+        parsed := normalized.try_to_u64()
+        when parsed.is_none() {
+            self.fail(diag(
+                "R0006",
+                String("integer literal is outside the supported u64 range"),
+                start,
+                self.at
+            ))
+            return
+        }
+        mut value := parsed.unwrap()
+        unit_start := self.at
+        mut unit_end := self.at
+        while is_alpha(self.byte(unit_end)) {
+            unit_end += 1
+        }
+        unit := self.src.slice(unit_start, unit_end)
+        mut multiplier: u64 = 0
+        when unit == "ms" {
+            multiplier = 1
+        } else when unit == "s" {
+            multiplier = 1000
+        } else when unit == "min" {
+            multiplier = 60000
+        } else when unit == "h" {
+            multiplier = 3600000
+        }
+        when multiplier != 0 {
+            maximum: u64 = 18446744073709551615
+            when value > maximum / multiplier {
+                self.fail(diag_help(
+                    "R0006",
+                    String("duration literal exceeds the supported millisecond range"),
+                    start,
+                    unit_end,
+                    String("use a shorter duration")
+                ))
+                return
+            }
+            value = value * multiplier
+            self.at = unit_end
+        }
+        self.push(Tk::INTEGER, start, self.at, 0, value)
+    }
+
+    fun identifier(mut self, start: u64) {
+        mut at := start + 1
+        while is_alnum(self.byte(at)) || self.byte(at) == 95 {
+            at += 1
+        }
+        self.at = at
+        word := self.src.slice(start, at)
+        kind := keyword_kind(word.clone())
+        when kind == Tk::IDENT {
+            text := self.push_text(word)
+            self.push(Tk::IDENT, start, at, text, 0)
+        } else {
+            self.push(kind, start, at, 0, 0)
+        }
+    }
+
+    // Recognizes punctuation at `self.at`; returns the token kind and moves
+    // past it, or returns 0 when the byte starts no punctuation.
+    fun punctuation(mut self) -> u32 {
+        current := self.byte(self.at)
+        next := self.byte(self.at + 1)
+        third := self.byte(self.at + 2)
+        mut kind: u32 = 0
+        mut width: u64 = 1
+        when current == 40 {
+            kind = Tk::LPAREN
+        } else when current == 41 {
+            kind = Tk::RPAREN
+        } else when current == 91 {
+            kind = Tk::LBRACKET
+        } else when current == 93 {
+            kind = Tk::RBRACKET
+        } else when current == 123 {
+            kind = Tk::LBRACE
+        } else when current == 125 {
+            kind = Tk::RBRACE
+        } else when current == 44 {
+            kind = Tk::COMMA
+        } else when current == 59 {
+            kind = Tk::SEMICOLON
+        } else when current == 58 {
+            when next == 61 {
+                kind = Tk::DEFINE
+                width = 2
+            } else when next == 58 {
+                kind = Tk::COLON_COLON
+                width = 2
+            } else {
+                kind = Tk::COLON
+            }
+        } else when current == 46 {
+            when next == 46 {
+                kind = Tk::DOT_DOT
+                width = 2
+            } else {
+                kind = Tk::DOT
+            }
+        } else when current == 61 {
+            when next == 61 {
+                kind = Tk::EQUAL_EQUAL
+                width = 2
+            } else when next == 62 {
+                kind = Tk::FAT_ARROW
+                width = 2
+            } else {
+                kind = Tk::EQUAL
+            }
+        } else when current == 33 {
+            when next == 61 {
+                kind = Tk::BANG_EQUAL
+                width = 2
+            } else {
+                kind = Tk::BANG
+            }
+        } else when current == 63 {
+            kind = Tk::QUESTION
+        } else when current == 60 {
+            when next == 60 && third == 61 {
+                kind = Tk::SHIFT_LEFT_EQUAL
+                width = 3
+            } else when next == 60 {
+                kind = Tk::SHIFT_LEFT
+                width = 2
+            } else when next == 61 {
+                kind = Tk::LESS_EQUAL
+                width = 2
+            } else {
+                kind = Tk::LESS
+            }
+        } else when current == 62 {
+            when next == 62 && third == 61 {
+                kind = Tk::SHIFT_RIGHT_EQUAL
+                width = 3
+            } else when next == 62 {
+                kind = Tk::SHIFT_RIGHT
+                width = 2
+            } else when next == 61 {
+                kind = Tk::GREATER_EQUAL
+                width = 2
+            } else {
+                kind = Tk::GREATER
+            }
+        } else when current == 38 {
+            when next == 61 {
+                kind = Tk::BIT_AND_EQUAL
+                width = 2
+            } else when next == 38 {
+                kind = Tk::AND_AND
+                width = 2
+            } else {
+                kind = Tk::BIT_AND
+            }
+        } else when current == 124 {
+            when next == 61 {
+                kind = Tk::BIT_OR_EQUAL
+                width = 2
+            } else when next == 124 {
+                kind = Tk::OR_OR
+                width = 2
+            } else {
+                kind = Tk::BIT_OR
+            }
+        } else when current == 94 {
+            when next == 61 {
+                kind = Tk::CARET_EQUAL
+                width = 2
+            } else {
+                kind = Tk::CARET
+            }
+        } else when current == 126 {
+            kind = Tk::TILDE
+        } else when current == 35 {
+            kind = Tk::HASH
+        } else when current == 43 {
+            when next == 61 {
+                kind = Tk::PLUS_EQUAL
+                width = 2
+            } else {
+                kind = Tk::PLUS
+            }
+        } else when current == 45 {
+            when next == 62 {
+                kind = Tk::ARROW
+                width = 2
+            } else when next == 61 {
+                kind = Tk::MINUS_EQUAL
+                width = 2
+            } else {
+                kind = Tk::MINUS
+            }
+        } else when current == 42 {
+            when next == 61 {
+                kind = Tk::STAR_EQUAL
+                width = 2
+            } else {
+                kind = Tk::STAR
+            }
+        } else when current == 47 {
+            when next == 61 {
+                kind = Tk::SLASH_EQUAL
+                width = 2
+            } else {
+                kind = Tk::SLASH
+            }
+        } else when current == 37 {
+            when next == 61 {
+                kind = Tk::PERCENT_EQUAL
+                width = 2
+            } else {
+                kind = Tk::PERCENT
+            }
+        }
+        when kind != 0 {
+            self.push(kind, self.at, self.at + width, 0, 0)
+            self.at += width
+        }
+        return kind
+    }
+
+    fun run(mut self) {
+        while self.at < self.len && !self.stopped {
+            current := self.byte(self.at)
+            when is_space(current) {
+                self.at += 1
+                continue
+            }
+            when current == 47 && self.byte(self.at + 1) == 47 {
+                while self.at < self.len && self.byte(self.at) != 10 && self.byte(self.at) != 13 {
+                    self.at += 1
+                }
+                continue
+            }
+            when current == 47 && self.byte(self.at + 1) == 42 {
+                end := self.skip_block_comment(self.at)
+                when end > self.len {
+                    self.fail(diag_help(
+                        "R0018",
+                        String("unterminated block comment"),
+                        self.at,
+                        self.len,
+                        String("close the comment with `*/`")
+                    ))
+                    self.stopped = true
+                    return
+                }
+                self.at = end
+                continue
+            }
+            start := self.at
+            when current == 39 {
+                self.character_literal(start)
+            } else when current == 34 {
+                self.string_literal(start)
+            } else when is_alpha(current) || current == 95 {
+                self.identifier(start)
+            } else when is_digit(current) {
+                self.number(start)
+            } else when self.punctuation() == 0 {
+                unexpected := self.char_at_byte(start)
+                mut message := String("unexpected character ")
+                message.append(debug_char(unexpected))
+                self.fail(diag("R0005", message, start, start + char_width(unexpected)))
+                self.at = start + char_width(unexpected)
+            }
+        }
+    }
+}
+
+pub fun keyword_kind(word: String) -> u32 {
+    when word == "fun" { return Tk::FUN }
+    when word == "mut" { return Tk::MUT }
+    when word == "true" { return Tk::TRUE }
+    when word == "false" { return Tk::FALSE }
+    when word == "when" { return Tk::WHEN }
+    when word == "else" { return Tk::ELSE }
+    when word == "while" { return Tk::WHILE }
+    when word == "for" { return Tk::FOR }
+    when word == "in" { return Tk::IN }
+    when word == "break" { return Tk::BREAK }
+    when word == "continue" { return Tk::CONTINUE }
+    when word == "return" { return Tk::RETURN }
+    when word == "echo" { return Tk::ECHO }
+    when word == "struct" { return Tk::STRUCT }
+    when word == "as" { return Tk::AS }
+    when word == "enum" { return Tk::ENUM }
+    when word == "type" { return Tk::TYPE }
+    when word == "use" { return Tk::USE }
+    when word == "namespace" { return Tk::NAMESPACE }
+    when word == "pub" { return Tk::PUB }
+    when word == "extend" { return Tk::EXTEND }
+    when word == "shape" { return Tk::SHAPE }
+    when word == "const" { return Tk::CONST }
+    when word == "choose" { return Tk::CHOOSE }
+    return Tk::IDENT
+}
+
+pub fun lex(source: String, recovering: bool) -> Lexed {
+    length := source.len()
+    mut lexer := Lexer {
+        src: source,
+        len: length,
+        at: 0,
+        tokens: Vec<Token>(),
+        texts: Vec<String>(),
+        recovering: recovering,
+        stopped: false,
+        errors: Vec<Diag>()
+    }
+    lexer.run()
+    lexer.push(Tk::EOF, length, length, 0, 0)
+    failed := !lexer.errors.is_empty()
+    mut first := diag("", String(), 0, 0)
+    when failed {
+        first = lexer.errors[0]
+    }
+    return Lexed {
+        tokens: lexer.tokens,
+        texts: lexer.texts,
+        failed: failed,
+        error: first,
+        errors: lexer.errors
+    }
+}

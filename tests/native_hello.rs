@@ -42,6 +42,39 @@ fn run_source_text(label: &str, source_text: &str) -> std::process::Output {
 }
 
 #[test]
+fn array_repeat_literals_copy_one_evaluation() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/array_repeat.ryn");
+    let result = run_source(&source);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "compiler/runtime failed: {stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        "65\n65\n0\n1\nryn\n4\n21\n1\n7\n7\n1\n0\nowned\n3\n"
+    );
+}
+
+#[test]
+fn language_additions_from_the_self_hosted_frontend_run_natively() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/language_0_1.ryn");
+    let result = run_source(&source);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "compiler/runtime failed: {stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        "2
+fun
+keyword
+fun!
+233
+3
+R1
+3
+path call
+"
+    );
+}
+
+#[test]
 fn hello_ryn_runs_through_native_backend() {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/hello.ryn");
     let result = run_source(&source);
@@ -97,11 +130,90 @@ fn repr_c_small_integer_records_use_the_native_c_aggregate_abi() {
     );
 }
 
+#[test]
+fn raw_pointer_to_repr_c_record_with_array_keeps_all_fields_addressable() {
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/raw_pointer_repr_c_array.ryn");
+    let result = run_source(&source);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "compiler/runtime failed: {stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        "7\n11\n22\n33\n44\n99\n"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn dynamic_library_symbols_can_be_called_with_a_declared_c_signature() {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/dynamic_library.ryn");
     let result = run_source(&source);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "compiler/runtime failed: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "42\n");
+}
+
+#[test]
+fn raw_pointer_casts_reinterpret_the_same_address() {
+    let result = run_source_text(
+        "pointer-reinterpret",
+        r#"
+            fun main() {
+                mut value: i32 = 42
+                raw := &raw mut value
+                bytes := raw as *u8
+                restored := bytes as *i32
+                echo *restored
+                echo pointer_is_null(bytes)
+            }
+        "#,
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "compiler/runtime failed: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "42\nfalse\n");
+}
+
+#[test]
+fn integer_address_casts_to_a_raw_pointer() {
+    let result = run_source_text(
+        "int-to-pointer",
+        r#"
+            fun main() {
+                echo pointer_is_null(32512 as *u8)
+                echo pointer_is_null(0 as *u8)
+            }
+        "#,
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "compiler/runtime failed: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "false\ntrue\n");
+}
+
+#[cfg(windows)]
+#[test]
+fn borrowed_raw_pointer_field_casts_to_a_function_pointer() {
+    let result = run_source_text(
+        "pointer-field-cast",
+        r#"
+            type AbsFn = extern "C" fun(i32) -> i32
+
+            struct Handle { ptr: *u8 }
+
+            extend Handle {
+                fun apply(self, value: i32) -> i32 {
+                    function: AbsFn = self.ptr as AbsFn
+                    return function(value)
+                }
+            }
+
+            fun main() {
+                library := load_library("ucrtbase.dll")
+                handle := Handle { ptr: load_symbol(library, "abs") }
+                echo handle.apply(-42)
+                unload_library(library)
+            }
+        "#,
+    );
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(result.status.success(), "compiler/runtime failed: {stderr}");
     assert_eq!(String::from_utf8_lossy(&result.stdout), "42\n");
@@ -1217,4 +1329,137 @@ fn operator_methods_resolve_struct_arithmetic() {
         String::from_utf8_lossy(&result.stdout),
         "11\n22\n33\n2\n27\n1\n"
     );
+}
+
+#[test]
+fn copyable_expression_receivers_chain_methods() {
+    let result = run_source_text(
+        "method-chain",
+        r#"
+            struct Pair { x: f32, y: f32 }
+
+            #[repr(C)]
+            struct Wide {
+                c0: f32,
+                c1: f32,
+                c2: f32,
+                c3: f32,
+                c4: f32,
+                c5: f32,
+            }
+
+            extend Pair {
+                fun make(x: f32, y: f32) -> Pair => Pair { x: x, y: y }
+                fun add(self, rhs: Pair) -> Pair => Pair { x: self.x + rhs.x, y: self.y + rhs.y }
+            }
+
+            extend Wide {
+                fun make(first: f32, last: f32) -> Wide => Wide {
+                    c0: first, c1: 10.0, c2: 20.0, c3: 30.0, c4: 40.0, c5: last,
+                }
+                fun scaled(self, factor: f32) -> f32 {
+                    return self.c0 * factor + self.c5
+                }
+            }
+
+            fun main() {
+                sum := Pair::make(1.0, 2.0).add(Pair::make(3.0, 4.0)).add(Pair::make(0.5, 0.5))
+                echo sum.x
+                echo sum.y
+                echo Wide::make(2.0, 3.0).scaled(2.0)
+            }
+        "#,
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "compiler/runtime failed: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "4.5\n6.5\n7\n");
+}
+
+#[test]
+fn while_condition_reruns_copy_receivers_without_dropping_owners() {
+    let result = run_source_text(
+        "while-receiver",
+        r#"
+            struct Pair { x: f32, y: f32 }
+
+            extend Pair {
+                fun make(x: f32, y: f32) -> Pair => Pair { x: x, y: y }
+                fun add(self, rhs: Pair) -> Pair => Pair { x: self.x + rhs.x, y: self.y + rhs.y }
+                fun below(self, limit: f32) -> bool => self.x < limit
+            }
+
+            fun main() {
+                text := String("ab")
+                mut count: u64 = 0
+                while count < text.len() {
+                    count = count + 1
+                }
+                echo count
+                mut base: f32 = 0.0
+                mut steps: u64 = 0
+                while Pair::make(base, 0.0).add(Pair::make(1.0, 0.0)).below(3.0) && steps < 5 {
+                    steps = steps + 1
+                    base = base + 1.0
+                }
+                echo steps
+                echo text.len()
+            }
+        "#,
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "compiler/runtime failed: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "2\n2\n2\n");
+}
+
+#[test]
+fn repr_c_method_fields_use_packed_byte_offsets() {
+    let result = run_source_text(
+        "repr-c-method-fields",
+        r#"
+            #[repr(C)]
+            struct Wide {
+                c0: f32,
+                c1: f32,
+                c2: f32,
+                c3: f32,
+                c4: f32,
+                c5: f32,
+            }
+
+            struct Plain {
+                c0: f32,
+                c1: f32,
+                c5: f32,
+            }
+
+            extend Wide {
+                fun diag(self) -> f32 {
+                    return self.c0 * 2.0 + self.c5
+                }
+
+                fun set_tail(mut self, value: f32) {
+                    self.c5 = value
+                }
+            }
+
+            extend Plain {
+                fun pick(self) -> f32 {
+                    return self.c0 + self.c5
+                }
+            }
+
+            fun main() {
+                mut wide := Wide { c0: 2.0, c1: 10.0, c2: 20.0, c3: 30.0, c4: 40.0, c5: 3.0 }
+                echo wide.diag()
+                wide.set_tail(7.0)
+                echo wide.c5
+                echo wide.c0
+                plain := Plain { c0: 2.0, c1: 10.0, c5: 3.0 }
+                echo plain.pick()
+            }
+        "#,
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "compiler/runtime failed: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "7\n7\n2\n5\n");
 }

@@ -1,0 +1,6 @@
+name: module-drop-project
+version: 0.1.0
+owner: ryn
+dependencies: {}
+build:
+  optimize: speed

@@ -239,6 +239,12 @@ pub enum Expression {
     },
     Tuple(Vec<Expression>, Span),
     ArrayLiteral(Vec<Expression>, Span),
+    /// `[value; length]` evaluates `value` once and copies it `length` times.
+    ArrayRepeat {
+        value: Box<Expression>,
+        length: u64,
+        span: Span,
+    },
     Index {
         value: Box<Expression>,
         index: Box<Expression>,
@@ -292,7 +298,7 @@ impl Expression {
             Self::MapConstructor { span, .. } => *span,
             Self::SetConstructor { span, .. } => *span,
             Self::Tuple(_, span) => *span,
-            Self::ArrayLiteral(_, span) => *span,
+            Self::ArrayLiteral(_, span) | Self::ArrayRepeat { span, .. } => *span,
             Self::Index { span, .. } => *span,
             Self::Propagate(_, span) => *span,
             Self::EnumConstruct { span, .. } | Self::Choose { span, .. } => *span,

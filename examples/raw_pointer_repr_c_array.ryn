@@ -1,0 +1,32 @@
+type Words = [u16; 4]
+
+#[repr(C)]
+struct NativeBuffer {
+    words: Words,
+    marker: u32,
+}
+
+type BufferCallback = fun(*NativeBuffer) -> i32
+
+fun visit_buffer(buffer: *NativeBuffer) -> i32 {
+    return 7
+}
+
+fun invoke(callback: BufferCallback, buffer: *NativeBuffer) -> i32 {
+    return callback(buffer)
+}
+
+fun main() -> i32 {
+    mut buffer := NativeBuffer {
+        words: [11, 22, 33, 44],
+        marker: 99,
+    }
+    pointer := &raw mut buffer
+    echo invoke(visit_buffer, pointer)
+    echo buffer.words[0]
+    echo buffer.words[1]
+    echo buffer.words[2]
+    echo buffer.words[3]
+    echo buffer.marker
+    return 0
+}

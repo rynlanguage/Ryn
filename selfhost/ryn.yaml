@@ -1,0 +1,10 @@
+name: ryn-frontend
+version: 0.1.0
+owner: v3nn7
+
+dependencies:
+
+build:
+  optimize: speed
+  debug: none
+  release: speed

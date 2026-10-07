@@ -867,8 +867,10 @@ impl Parser<'_> {
     }
 
     fn next_attribute_is_derive(&self) -> bool {
-        let next = &self.tokens[self.at + 2].kind;
-        matches!(next, TokenKind::Ident(name) if name == "derive")
+        matches!(
+            self.tokens.get(self.at + 2).map(|token| &token.kind),
+            Some(TokenKind::Ident(name)) if name == "derive"
+        )
     }
 
     fn derive_attribute(&mut self) -> Result<Vec<String>, Diagnostic> {
@@ -1483,10 +1485,7 @@ impl Parser<'_> {
                 match self.expression(0) {
                     Ok(expression) => {
                         if (return_type.is_none() || !matches!(self.peek().kind, TokenKind::RBrace))
-                            && matches!(
-                                expression,
-                                Expression::Call { .. } | Expression::MethodCall { .. }
-                            )
+                            && is_call_statement(&expression)
                         {
                             body.push(self.expression_statement(expression)?);
                             continue;
@@ -2414,7 +2413,7 @@ impl Parser<'_> {
             TokenKind::Ident(_)
                 if matches!(
                     self.tokens.get(self.at + 1).map(|t| &t.kind),
-                    Some(TokenKind::LParen | TokenKind::Dot)
+                    Some(TokenKind::LParen | TokenKind::Dot | TokenKind::ColonColon)
                 ) =>
             {
                 self.call_statement()
@@ -2516,6 +2515,14 @@ impl Parser<'_> {
                 value,
                 name,
                 arguments,
+                span,
+            }),
+            // `call()?` propagates a failure and discards the success value.
+            Expression::Propagate(inner, span) if is_call_statement(&inner) => Ok(Statement::Let {
+                name: "_".into(),
+                mutable: false,
+                annotation: None,
+                value: Expression::Propagate(inner, span),
                 span,
             }),
             _ => Err(self.error("only a function call can be used as an expression statement")),
@@ -3228,6 +3235,70 @@ impl Parser<'_> {
         Ok(Some(parts))
     }
 
+    fn array_expression(&mut self, start: usize) -> Result<Expression, Diagnostic> {
+        if matches!(self.peek().kind, TokenKind::RBracket) {
+            let end = self.next().span.end;
+            return Ok(Expression::ArrayLiteral(Vec::new(), Span { start, end }));
+        }
+        let first = self.expression(0)?;
+        if matches!(self.peek().kind, TokenKind::Semicolon) {
+            self.next();
+            let length_token = self.next();
+            let TokenKind::Integer(length) = length_token.kind else {
+                return Err(Diagnostic {
+                    code: "R0012",
+                    message: "expected a non-negative integer array length".into(),
+                    span: length_token.span,
+                    help: Some(
+                        "write `[value; 4]`; the length is an integer literal, same as `[T; 4]`"
+                            .into(),
+                    ),
+                });
+            };
+            if !matches!(self.peek().kind, TokenKind::RBracket) {
+                return Err(Diagnostic {
+                    code: "R0012",
+                    message: "array length must be an integer literal".into(),
+                    span: self.peek().span,
+                    help: Some("write `[value; 4]`; the length cannot be an expression".into()),
+                });
+            }
+            let end = self
+                .expect(
+                    |kind| matches!(kind, TokenKind::RBracket),
+                    "expected `]` after array repeat",
+                )?
+                .span
+                .end;
+            return Ok(Expression::ArrayRepeat {
+                value: Box::new(first),
+                length,
+                span: Span { start, end },
+            });
+        }
+        let mut elements = vec![first];
+        if matches!(self.peek().kind, TokenKind::Comma) {
+            loop {
+                self.next();
+                if matches!(self.peek().kind, TokenKind::RBracket) {
+                    break;
+                }
+                elements.push(self.expression(0)?);
+                if !matches!(self.peek().kind, TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        let end = self
+            .expect(
+                |kind| matches!(kind, TokenKind::RBracket),
+                "expected `]` after array elements",
+            )?
+            .span
+            .end;
+        Ok(Expression::ArrayLiteral(elements, Span { start, end }))
+    }
+
     fn expression(&mut self, min_precedence: u8) -> Result<Expression, Diagnostic> {
         if self.expression_depth >= MAX_EXPRESSION_DEPTH {
             return Err(self.nesting_error("expression"));
@@ -3243,35 +3314,7 @@ impl Parser<'_> {
             Token {
                 kind: TokenKind::LBracket,
                 span,
-            } => {
-                let mut elements = Vec::new();
-                if !matches!(self.peek().kind, TokenKind::RBracket) {
-                    loop {
-                        elements.push(self.expression(0)?);
-                        if !matches!(self.peek().kind, TokenKind::Comma) {
-                            break;
-                        }
-                        self.next();
-                        if matches!(self.peek().kind, TokenKind::RBracket) {
-                            break;
-                        }
-                    }
-                }
-                let end = self
-                    .expect(
-                        |kind| matches!(kind, TokenKind::RBracket),
-                        "expected `]` after array elements",
-                    )?
-                    .span
-                    .end;
-                Expression::ArrayLiteral(
-                    elements,
-                    Span {
-                        start: span.start,
-                        end,
-                    },
-                )
-            }
+            } => self.array_expression(span.start)?,
             Token {
                 kind: TokenKind::Character(value),
                 span,
@@ -4281,6 +4324,21 @@ impl Parser<'_> {
     }
 }
 
+/// Calls, method calls, and `?` applied to either may stand alone as
+/// statements.
+fn is_call_statement(expression: &Expression) -> bool {
+    match expression {
+        Expression::Call { .. } | Expression::MethodCall { .. } => true,
+        Expression::Propagate(inner, _) => {
+            matches!(
+                **inner,
+                Expression::Call { .. } | Expression::MethodCall { .. }
+            )
+        }
+        _ => false,
+    }
+}
+
 fn type_key(ty: &TypeName) -> String {
     match ty {
         TypeName::I8 => "i8".into(),
@@ -5005,6 +5063,13 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn attribute_marker_at_end_of_input_is_a_diagnostic() {
+        let error = parse("fun main() {} #").expect_err("a lone `#` is incomplete");
+        assert_eq!(error.code, "R0010");
+        assert_eq!(error.message, "expected `[` after `#`");
     }
 
     #[test]

@@ -1,0 +1,99 @@
+// Language additions in Ryn 0.1.0, found while writing the self-hosted
+// frontend in Ryn.
+
+namespace report;
+
+fun line(text: str) {
+    echo text
+}
+
+namespace;
+
+struct Problem {
+    code: String,
+    at: u64
+}
+
+struct Tokens {
+    words: Vec<String>,
+    seen: Map<String, u64>,
+    at: u64
+}
+
+extend Tokens {
+    // `mut self` methods mutate collection fields in place.
+    fun add(mut self, word: str) {
+        self.words.push(String(word))
+        self.seen.insert(String(word), self.at)
+        self.at += 1
+    }
+
+    // `vec[i]` reads an element; owned elements are cloned.
+    fun first(self) -> String {
+        return self.words[0]
+    }
+
+    fun expect(mut self, word: str) -> Result<u64, Problem> {
+        when self.words.is_empty() || self.words[self.words.len() - 1] != word {
+            return Result::Err(Problem { code: String("R1"), at: self.at })
+        }
+        return Result::Ok(self.at)
+    }
+
+    // `call()?` is a statement: it propagates the failure and discards the
+    // success value. Structure error payloads propagate too.
+    fun expect_both(mut self, first: str, second: str) -> Result<u64, Problem> {
+        self.expect(first)?
+        self.add(second)
+        self.expect(second)?
+        return Result::Ok(self.at)
+    }
+}
+
+fun shout(text: str) -> String {
+    mut loud := String(text)
+    loud.append("!")
+    return loud
+}
+
+fun main() {
+    mut tokens := Tokens { words: Vec<String>(), seen: Map<String, u64>(), at: 0 }
+    tokens.add("fun")
+    tokens.add("main")
+    echo tokens.words.len()
+    echo tokens.first()
+
+    // A `String` compares with a `str` literal.
+    word := tokens.first()
+    when word == "fun" {
+        echo "keyword"
+    }
+
+    // A `str` parameter borrows a `String` argument.
+    echo shout(word)
+
+    // A `char` converts to its Unicode scalar value.
+    echo 'é' as u32
+
+    // `_ := value` keeps a value without naming it, and may repeat.
+    _ := tokens.expect("main")
+    _ := tokens.expect("other")
+
+    ok := tokens.expect_both("main", "end")
+    echo ok.unwrap()
+    failed := tokens.expect_both("nope", "x")
+    message := choose failed {
+        Result::Ok(at) => String(at),
+        Result::Err(problem) => problem.code
+    }
+    echo message
+
+    // Map<String, _> keys own independent copies of the keys.
+    keys := tokens.seen.keys()
+    echo keys.len()
+
+    // Calls through a path are statements inside blocks too.
+    when keys.len() > 1 {
+        report::line("path call")
+    }
+}

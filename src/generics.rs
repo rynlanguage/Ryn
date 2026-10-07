@@ -13,7 +13,10 @@ use crate::{
 
 const MAX_SPECIALIZATIONS: usize = 256;
 
-pub(crate) fn monomorphize(mut program: Program) -> Result<Program, Diagnostic> {
+/// Specializes every generic function for the type arguments its call sites
+/// infer and removes the generic templates. A program without generic
+/// functions is returned unchanged.
+pub fn monomorphize(mut program: Program) -> Result<Program, Diagnostic> {
     let enum_definitions = program.enums.clone();
     let generic_functions = program
         .functions
@@ -764,6 +767,7 @@ fn substitute_expression(expression: &mut Expression, substitutions: &HashMap<St
                 substitute_expression(value, substitutions);
             }
         }
+        Expression::ArrayRepeat { value, .. } => substitute_expression(value, substitutions),
         Expression::Tuple(values, _) => {
             for value in values {
                 substitute_expression(value, substitutions);
@@ -1421,6 +1425,16 @@ fn rewrite_expression(
                 )?;
             }
         }
+        Expression::ArrayRepeat { value, .. } => rewrite_expression(
+            value,
+            environment,
+            caller,
+            templates,
+            functions,
+            enum_definitions,
+            specializations,
+            pending,
+        )?,
         Expression::Tuple(values, _) => {
             for value in values {
                 rewrite_expression(
@@ -1641,6 +1655,25 @@ fn infer_type(
                 )
             })?;
             Some(TypeName::Array(Box::new(element), values.len(), *span))
+        }
+        Expression::ArrayRepeat {
+            value,
+            length,
+            span,
+        } => {
+            let element = infer_type(
+                value,
+                environment,
+                functions,
+                templates,
+                enum_definitions,
+                caller,
+            )?;
+            Some(TypeName::Array(
+                Box::new(element),
+                usize::try_from(*length).ok()?,
+                *span,
+            ))
         }
         Expression::Tuple(_, _) => None,
         Expression::Index { value, .. } => {

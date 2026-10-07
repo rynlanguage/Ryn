@@ -1,0 +1,492 @@
+
+// ---------------------------------------------------------------------------
+// Types: keys, substitution, and unification.
+
+struct Limit {
+    unused: u8
+}
+
+extend Limit {
+    pub const SPECIALIZATIONS: u64 = 256
+}
+
+fun diag_help(code: str, message: String, start: u64, end: u64, help: String) -> lexer::Diag {
+    return lexer::diag_help(code, message, start, end, help)
+}
+
+extend Tree {
+    fun type_key(self, ty: u64) -> String {
+        node := self.types[ty]
+        kind := node.kind
+        when kind == TypeKind::I8 { return String("i8") }
+        when kind == TypeKind::I16 { return String("i16") }
+        when kind == TypeKind::I32 { return String("i32") }
+        when kind == TypeKind::I64 { return String("i64") }
+        when kind == TypeKind::U8 { return String("u8") }
+        when kind == TypeKind::U16 { return String("u16") }
+        when kind == TypeKind::U32 { return String("u32") }
+        when kind == TypeKind::U64 { return String("u64") }
+        when kind == TypeKind::F32 { return String("f32") }
+        when kind == TypeKind::F64 { return String("f64") }
+        when kind == TypeKind::STR { return String("str") }
+        when kind == TypeKind::STRING { return String("String") }
+        when kind == TypeKind::CHAR { return String("char") }
+        when kind == TypeKind::BOOL { return String("bool") }
+        when kind == TypeKind::NAMED { return node.name }
+        when kind == TypeKind::PARAM {
+            mut key := String("$")
+            key.append(node.name)
+            return key
+        }
+        when kind == TypeKind::VEC || kind == TypeKind::SET {
+            mut key := when kind == TypeKind::VEC { String("Vec<") } else { String("Set<") }
+            key.append(self.type_key(node.first))
+            key.push('>')
+            return key
+        }
+        when kind == TypeKind::MAP {
+            mut key := String("Map<")
+            key.append(self.type_key(node.first))
+            key.push(',')
+            key.append(self.type_key(node.second))
+            key.push('>')
+            return key
+        }
+        when kind == TypeKind::ARRAY {
+            mut key := String("[")
+            key.append(self.type_key(node.first))
+            key.push(';')
+            key.append(String(node.length))
+            key.push(']')
+            return key
+        }
+        when kind == TypeKind::SLICE {
+            mut key := String("&[")
+            key.append(self.type_key(node.first))
+            key.push(']')
+            return key
+        }
+        when kind == TypeKind::REF {
+            mut key := String("&")
+            when node.flag {
+                key.append("mut ")
+            }
+            key.append(self.type_key(node.first))
+            return key
+        }
+        when kind == TypeKind::RAW {
+            mut key := String("*")
+            key.append(self.type_key(node.first))
+            return key
+        }
+        mut key := String()
+        when node.flag {
+            key.append("extern \"C\" ")
+        }
+        key.append("fun(")
+        mut first := true
+        for parameter in node.params.clone() {
+            when !first {
+                key.push(',')
+            }
+            first = false
+            key.append(self.type_key(parameter))
+        }
+        key.push(')')
+        when node.has_result {
+            key.append("->")
+            key.append(self.type_key(node.first))
+        }
+        return key
+    }
+
+    fun named(mut self, kind: u32, name: String, start: u64, end: u64) -> u64 {
+        mut node := blank_type(kind)
+        node.name = name
+        node.start = start
+        node.end = end
+        return self.new_type(node)
+    }
+
+    fun wrapped(mut self, kind: u32, first: u64, start: u64, end: u64) -> u64 {
+        mut node := blank_type(kind)
+        node.first = first
+        node.start = start
+        node.end = end
+        return self.new_type(node)
+    }
+
+    // Mirrors `generics::substitute_type`: names and parameters found in
+    // `substitutions` are replaced, recursively through compound types.
+    fun substitute_type(mut self, ty: u64, substitutions: Map<String, u64>) -> u64 {
+        node := self.types[ty]
+        kind := node.kind
+        when kind == TypeKind::NAMED || kind == TypeKind::PARAM {
+            when substitutions.contains_key(node.name.clone()) {
+                return substitutions.get(node.name).unwrap()
+            }
+            return ty
+        }
+        when kind == TypeKind::VEC || kind == TypeKind::SET || kind == TypeKind::SLICE || kind == TypeKind::REF || kind == TypeKind::RAW || kind == TypeKind::ARRAY {
+            mut copy := node
+            new_first := self.substitute_type(copy.first, substitutions)
+            copy.first = new_first
+            return self.new_type(copy)
+        }
+        when kind == TypeKind::MAP {
+            mut copy := node
+            new_first := self.substitute_type(copy.first, substitutions.clone())
+            copy.first = new_first
+            new_second := self.substitute_type(copy.second, substitutions)
+            copy.second = new_second
+            return self.new_type(copy)
+        }
+        when kind == TypeKind::FNPTR {
+            mut copy := node
+            mut parameters := Vec<u64>()
+            for parameter in copy.params.clone() {
+                parameters.push(self.substitute_type(parameter, substitutions.clone()))
+            }
+            copy.params = parameters
+            when copy.has_result {
+                new_first := self.substitute_type(copy.first, substitutions)
+                copy.first = new_first
+            }
+            return self.new_type(copy)
+        }
+        return ty
+    }
+
+    fun type_has_parameter(self, ty: u64) -> bool {
+        node := self.types[ty]
+        kind := node.kind
+        when kind == TypeKind::PARAM {
+            return true
+        }
+        when kind == TypeKind::ARRAY || kind == TypeKind::SLICE || kind == TypeKind::VEC || kind == TypeKind::REF || kind == TypeKind::RAW {
+            return self.type_has_parameter(node.first)
+        }
+        when kind == TypeKind::MAP {
+            return self.type_has_parameter(node.first) || self.type_has_parameter(node.second)
+        }
+        return false
+    }
+
+    fun enum_has_type_parameters(self, index: u64) -> bool {
+        for field in self.enums[index].fields.clone() {
+            when self.type_has_parameter(field) {
+                return true
+            }
+        }
+        return false
+    }
+
+    fun find_enum(self, name: String) -> u64 {
+        // Returns the enum index plus one, or zero when absent.
+        mut index: u64 = 0
+        count := self.enums.len()
+        while index < count {
+            when self.enums[index].name == name {
+                return index + 1
+            }
+            index += 1
+        }
+        return 0
+    }
+
+    fun mismatch(self, pattern: u64, actual: u64, start: u64, end: u64) -> lexer::Diag {
+        mut message := String("generic argument has type `")
+        message.append(self.type_key(actual))
+        message.append("` but the parameter pattern is `")
+        message.append(self.type_key(pattern))
+        message.push('`')
+        return diag_help("R0263", message, start, end, String("pass a value whose type matches the generic function parameter"))
+    }
+
+    fun conflict(self, parameter: String, previous: u64, actual: u64, start: u64, end: u64) -> lexer::Diag {
+        mut message := String("generic parameter `")
+        message.append(parameter.clone())
+        message.append("` has conflicting types")
+        mut help := String("this call uses both `")
+        help.append(self.type_key(previous))
+        help.append("` and `")
+        help.append(self.type_key(actual))
+        help.append("` for `")
+        help.append(parameter)
+        help.push('`')
+        return diag_help("R0263", message, start, end, help)
+    }
+
+    fun unify(mut self, pattern: u64, actual: u64, substitutions: Map<String, u64>, start: u64, end: u64) -> Result<Map<String, u64>, lexer::Diag> {
+        mut result := substitutions
+        left := self.types[pattern]
+        right := self.types[actual]
+        when left.kind == TypeKind::PARAM {
+            when result.contains_key(left.name.clone()) {
+                previous := result.get(left.name.clone()).unwrap()
+                when self.type_key(previous) != self.type_key(actual) {
+                    return Result::Err(self.conflict(left.name, previous, actual, start, end))
+                }
+            } else {
+                result.insert(left.name, actual)
+            }
+            return Result::Ok(result)
+        }
+        when (left.kind == TypeKind::VEC && right.kind == TypeKind::VEC) || (left.kind == TypeKind::SLICE && right.kind == TypeKind::SLICE)
+            || (left.kind == TypeKind::SLICE && right.kind == TypeKind::ARRAY)
+            || (left.kind == TypeKind::ARRAY && right.kind == TypeKind::ARRAY && left.length == right.length) {
+            return self.unify(left.first, right.first, result, start, end)
+        }
+        when left.kind == TypeKind::MAP && right.kind == TypeKind::MAP {
+            result = self.unify(left.first, right.first, result, start, end)?
+            return self.unify(left.second, right.second, result, start, end)
+        }
+        when left.kind == TypeKind::FNPTR && right.kind == TypeKind::FNPTR && left.params.len() == right.params.len() && left.flag == right.flag {
+            mut index: u64 = 0
+            while index < left.params.len() {
+                result = self.unify(left.params[index], right.params[index], result, start, end)?
+                index += 1
+            }
+            when left.has_result && right.has_result {
+                return self.unify(left.first, right.first, result, start, end)
+            }
+            when left.has_result || right.has_result {
+                return Result::Err(self.mismatch(pattern, actual, start, end))
+            }
+            return Result::Ok(result)
+        }
+        when left.kind == TypeKind::NAMED && right.kind == TypeKind::NAMED && left.name != right.name {
+            pattern_enum := self.find_enum(left.name.clone())
+            actual_enum := self.find_enum(right.name.clone())
+            mut same_family := false
+            when pattern_enum != 0 && actual_enum != 0 {
+                same_family = (starts_with_text(left.name.clone(), "$RynOption#") && starts_with_text(right.name.clone(), "$RynOption#"))
+                    || (starts_with_text(left.name.clone(), "$RynResult#") && starts_with_text(right.name.clone(), "$RynResult#"))
+            }
+            when same_family {
+                pattern_definition := self.enums[pattern_enum - 1]
+                actual_definition := self.enums[actual_enum - 1]
+                when pattern_definition.variant_names.len() == actual_definition.variant_names.len() {
+                    mut variant: u64 = 0
+                    mut pattern_field: u64 = 0
+                    mut actual_field: u64 = 0
+                    while variant < pattern_definition.variant_names.len() {
+                        pattern_count := pattern_definition.variant_counts[variant]
+                        actual_count := actual_definition.variant_counts[variant]
+                        when pattern_definition.variant_names[variant] != actual_definition.variant_names[variant]
+                            || pattern_count != actual_count {
+                            return Result::Err(self.mismatch(pattern, actual, start, end))
+                        }
+                        mut field: u64 = 0
+                        while field < pattern_count {
+                            result = self.unify(
+                                pattern_definition.fields[pattern_field + field],
+                                actual_definition.fields[actual_field + field],
+                                result,
+                                start,
+                                end
+                            )?
+                            field += 1
+                        }
+                        pattern_field += pattern_count
+                        actual_field += actual_count
+                        variant += 1
+                    }
+                    replacement := self.named(TypeKind::NAMED, right.name.clone(), right.start, right.end)
+                    result.insert(left.name, replacement)
+                    return Result::Ok(result)
+                }
+            }
+            return Result::Err(self.mismatch(pattern, actual, left.start, left.end))
+        }
+        when self.type_key(pattern) == self.type_key(actual) {
+            return Result::Ok(result)
+        }
+        return Result::Err(self.mismatch(pattern, actual, start, end))
+    }
+
+    fun merge(self, substitutions: Map<String, u64>, additions: Map<String, u64>, start: u64, end: u64) -> Result<Map<String, u64>, lexer::Diag> {
+        mut result := substitutions
+        for parameter in additions.keys() {
+            actual := additions.get(parameter.clone()).unwrap()
+            when result.contains_key(parameter.clone()) {
+                previous := result.get(parameter.clone()).unwrap()
+                when self.type_key(previous) != self.type_key(actual) {
+                    return Result::Err(self.conflict(parameter, previous, actual, start, end))
+                }
+            } else {
+                result.insert(parameter, actual)
+            }
+        }
+        return Result::Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Copying a generic function body with its type parameters substituted.
+
+extend Tree {
+    fun copy_types(mut self, types: Vec<u64>, substitutions: Map<String, u64>) -> Vec<u64> {
+        mut copies := Vec<u64>()
+        for ty in types {
+            copies.push(self.substitute_type(ty, substitutions.clone()))
+        }
+        return copies
+    }
+
+    fun copy_exprs(mut self, expressions: Vec<u64>, substitutions: Map<String, u64>) -> Vec<u64> {
+        mut copies := Vec<u64>()
+        for expression in expressions {
+            copies.push(self.copy_expr(expression, substitutions.clone()))
+        }
+        return copies
+    }
+
+    fun copy_expr(mut self, index: u64, substitutions: Map<String, u64>) -> u64 {
+        mut node := self.exprs[index]
+        kind := node.kind
+        when kind == Ex::CALL {
+            new_types := self.copy_types(node.types.clone(), substitutions.clone())
+            node.types = new_types
+            new_list := self.copy_exprs(node.list.clone(), substitutions)
+            node.list = new_list
+        } else when kind == Ex::METHOD_CALL {
+            new_a := self.copy_expr(node.a, substitutions.clone())
+            node.a = new_a
+            new_types := self.copy_types(node.types.clone(), substitutions.clone())
+            node.types = new_types
+            new_list := self.copy_exprs(node.list.clone(), substitutions)
+            node.list = new_list
+        } else when kind == Ex::STRUCT || kind == Ex::ARRAY || kind == Ex::TUPLE {
+            new_list := self.copy_exprs(node.list.clone(), substitutions)
+            node.list = new_list
+        } else when kind == Ex::FIELD || kind == Ex::NEGATE || kind == Ex::NOT || kind == Ex::BIT_NOT
+            || kind == Ex::DEREF || kind == Ex::PROPAGATE || kind == Ex::ADDRESS_OF || kind == Ex::REPEAT {
+            new_a := self.copy_expr(node.a, substitutions)
+            node.a = new_a
+        } else when kind == Ex::IF {
+            new_a := self.copy_expr(node.a, substitutions.clone())
+            node.a = new_a
+            new_b := self.copy_expr(node.b, substitutions.clone())
+            node.b = new_b
+            new_c := self.copy_expr(node.c, substitutions)
+            node.c = new_c
+        } else when kind == Ex::BINARY || kind == Ex::INDEX {
+            new_a := self.copy_expr(node.a, substitutions.clone())
+            node.a = new_a
+            new_b := self.copy_expr(node.b, substitutions)
+            node.b = new_b
+        } else when kind == Ex::CAST {
+            new_a := self.copy_expr(node.a, substitutions.clone())
+            node.a = new_a
+            new_ty := self.substitute_type(node.ty, substitutions)
+            node.ty = new_ty
+        } else when kind == Ex::LAYOUT || kind == Ex::NEW_VEC || kind == Ex::NEW_SET {
+            new_ty := self.substitute_type(node.ty, substitutions)
+            node.ty = new_ty
+        } else when kind == Ex::NEW_MAP {
+            new_ty := self.substitute_type(node.ty, substitutions.clone())
+            node.ty = new_ty
+            new_ty2 := self.substitute_type(node.ty2, substitutions)
+            node.ty2 = new_ty2
+        } else when kind == Ex::ENUM {
+            when substitutions.contains_key(node.text.clone()) {
+                replacement := self.types[substitutions.get(node.text.clone()).unwrap()]
+                when replacement.kind == TypeKind::NAMED {
+                    node.text = replacement.name
+                }
+            }
+            new_list := self.copy_exprs(node.list.clone(), substitutions)
+            node.list = new_list
+        } else when kind == Ex::CHOOSE {
+            new_a := self.copy_expr(node.a, substitutions.clone())
+            node.a = new_a
+            mut arms := Vec<u64>()
+            for arm_index in node.list.clone() {
+                mut arm := self.arms[arm_index]
+                new_body := self.copy_expr(arm.body, substitutions.clone())
+                arm.body = new_body
+                arms.push(self.arms.len())
+                self.arms.push(arm)
+            }
+            node.list = arms
+        }
+        return self.new_expr(node)
+    }
+
+    fun copy_stmts(mut self, statements: Vec<u64>, substitutions: Map<String, u64>) -> Vec<u64> {
+        mut copies := Vec<u64>()
+        for statement in statements {
+            copies.push(self.copy_stmt(statement, substitutions.clone()))
+        }
+        return copies
+    }
+
+    fun copy_stmt(mut self, index: u64, substitutions: Map<String, u64>) -> u64 {
+        mut node := self.stmts[index]
+        kind := node.kind
+        when kind == St::LET {
+            when node.has {
+                new_ty := self.substitute_type(node.ty, substitutions.clone())
+                node.ty = new_ty
+            }
+            new_a := self.copy_expr(node.a, substitutions)
+            node.a = new_a
+        } else when kind == St::ASSIGN || kind == St::COMPOUND || kind == St::PRINT || kind == St::FIELD_ASSIGN {
+            new_a := self.copy_expr(node.a, substitutions)
+            node.a = new_a
+        } else when kind == St::INDEX_ASSIGN || kind == St::DEREF_ASSIGN {
+            new_a := self.copy_expr(node.a, substitutions.clone())
+            node.a = new_a
+            new_b := self.copy_expr(node.b, substitutions)
+            node.b = new_b
+        } else when kind == St::TEMPLATE {
+            mut parts := Vec<u64>()
+            mut part: u64 = 0
+            while part < node.parts.len() {
+                when node.part_kinds[part] == 2 {
+                    parts.push(self.copy_expr(node.parts[part], substitutions.clone()))
+                } else {
+                    parts.push(0)
+                }
+                part += 1
+            }
+            node.parts = parts
+        } else when kind == St::CALL {
+            new_types := self.copy_types(node.types.clone(), substitutions.clone())
+            node.types = new_types
+            new_list := self.copy_exprs(node.list.clone(), substitutions)
+            node.list = new_list
+        } else when kind == St::METHOD_CALL {
+            new_a := self.copy_expr(node.a, substitutions.clone())
+            node.a = new_a
+            new_list := self.copy_exprs(node.list.clone(), substitutions)
+            node.list = new_list
+        } else when kind == St::IF {
+            new_a := self.copy_expr(node.a, substitutions.clone())
+            node.a = new_a
+            new_body := self.copy_stmts(node.body.clone(), substitutions.clone())
+            node.body = new_body
+            new_body2 := self.copy_stmts(node.body2.clone(), substitutions)
+            node.body2 = new_body2
+        } else when kind == St::WHILE || kind == St::FOR_EACH {
+            new_a := self.copy_expr(node.a, substitutions.clone())
+            node.a = new_a
+            new_body := self.copy_stmts(node.body.clone(), substitutions)
+            node.body = new_body
+        } else when kind == St::FOR {
+            new_a := self.copy_expr(node.a, substitutions.clone())
+            node.a = new_a
+            new_b := self.copy_expr(node.b, substitutions.clone())
+            node.b = new_b
+            new_body := self.copy_stmts(node.body.clone(), substitutions)
+            node.body = new_body
+        } else when kind == St::RETURN {
+            when node.has {
+                new_a := self.copy_expr(node.a, substitutions)
+                node.a = new_a
+            }
+        }
+        return self.new_stmt(node)
+    }
+}

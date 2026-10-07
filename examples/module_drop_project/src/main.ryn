@@ -1,0 +1,7 @@
+use resource
+
+fun main() {
+    mut handle: i32 = 42
+    item := resource::Resource { handle: &raw mut handle }
+    echo 7
+}

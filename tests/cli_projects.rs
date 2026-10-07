@@ -37,6 +37,22 @@ fn project_imports_generic_type_aliases() {
 }
 
 #[test]
+fn imported_module_keeps_private_custom_destructor_attached_to_its_type() {
+    let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/module_drop_project");
+    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
+        .arg("run")
+        .arg(&project)
+        .output()
+        .expect("ryn process starts");
+    assert!(
+        output.status.success(),
+        "project failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "7\n");
+}
+
+#[test]
 fn path_library_exposes_an_owned_path_type_through_a_project_dependency() {
     let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/path_project");
     let output = Command::new(env!("CARGO_BIN_EXE_ryn"))

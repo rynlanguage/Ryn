@@ -53,6 +53,9 @@ fn fail_fixtures_are_rejected_with_the_expected_diagnostic_codes() {
         ("return_local_reference.ryn", "R0248"),
         ("return_aliased_local_reference.ryn", "R0248"),
         ("ffi_unsupported_record.ryn", "R0247"),
+        ("array_repeat_string.ryn", "R0256"),
+        ("array_repeat_length.ryn", "R0240"),
+        ("array_repeat_bad_length.ryn", "R0012"),
     ];
     let failures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/fail");
 

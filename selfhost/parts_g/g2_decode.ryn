@@ -1,0 +1,885 @@
+
+// The decoded program and the specialization state. Declarations this pass
+// never changes (uses, structures, aliases, extends, shapes, and retained
+// enums) are kept as their original encoded text.
+struct Tree {
+    text: String,
+    at: u64,
+    failed: bool,
+    types: Vec<TreeType>,
+    exprs: Vec<ExprNode>,
+    arms: Vec<ArmNode>,
+    stmts: Vec<StmtNode>,
+    functions: Vec<FunctionNode>,
+    enums: Vec<EnumNode>,
+    uses_raw: String,
+    use_count: u64,
+    use_paths: Vec<String>,
+    use_aliases: Vec<String>,
+    structs_raw: String,
+    struct_count: u64,
+    aliases_raw: String,
+    alias_count: u64,
+    extends_raw: String,
+    extend_count: u64,
+    shapes_raw: String,
+    shape_count: u64,
+    templates: Map<String, u64>,
+    known: Map<String, u64>,
+    specializations: Map<String, String>,
+    pending: Vec<u64>
+}
+
+fun word(text: str) -> String {
+    mut out := String(" ")
+    out.append(text)
+    return out
+}
+
+fun enc_uint(value: u64) -> String {
+    mut out := String(" ")
+    out.append(String(value))
+    return out
+}
+
+fun enc_bool(value: bool) -> String {
+    when value {
+        return String(" 1")
+    }
+    return String(" 0")
+}
+
+fun enc_str(value: String) -> String {
+    mut out := String(" ")
+    out.append(String(value.len()))
+    out.push(':')
+    out.append(value)
+    return out
+}
+
+fun enc_span(start: u64, end: u64) -> String {
+    mut out := String(" ")
+    out.append(String(start))
+    out.push(' ')
+    out.append(String(end))
+    return out
+}
+
+fun enc_strings(values: Vec<String>) -> String {
+    mut out := enc_uint(values.len())
+    for value in values {
+        out.append(enc_str(value))
+    }
+    return out
+}
+
+fun is_space(byte: u32) -> bool {
+    return byte == 32 || byte == 9 || byte == 10 || byte == 12 || byte == 13
+}
+
+fun starts_with_text(value: String, prefix: str) -> bool {
+    return value.starts_with(prefix)
+}
+
+fun blank_type(kind: u32) -> TreeType {
+    return TreeType {
+        kind: kind,
+        name: String(),
+        first: 0,
+        second: 0,
+        length: 0,
+        flag: false,
+        has_result: false,
+        params: Vec<u64>(),
+        start: 0,
+        end: 0
+    }
+}
+
+fun blank_expr(kind: u32) -> ExprNode {
+    return ExprNode {
+        kind: kind,
+        text: String(),
+        text2: String(),
+        value: 0,
+        flag: false,
+        flag2: false,
+        a: 0,
+        b: 0,
+        c: 0,
+        ty: 0,
+        ty2: 0,
+        list: Vec<u64>(),
+        types: Vec<u64>(),
+        names: Vec<String>(),
+        spans: Vec<u64>(),
+        start: 0,
+        end: 0,
+        name_start: 0,
+        name_end: 0
+    }
+}
+
+fun blank_stmt(kind: u32) -> StmtNode {
+    return StmtNode {
+        kind: kind,
+        text: String(),
+        flag: false,
+        has: false,
+        op: String(),
+        ty: 0,
+        a: 0,
+        b: 0,
+        c: 0,
+        body: Vec<u64>(),
+        body2: Vec<u64>(),
+        names: Vec<String>(),
+        spans: Vec<u64>(),
+        parts: Vec<u64>(),
+        part_kinds: Vec<u32>(),
+        types: Vec<u64>(),
+        list: Vec<u64>(),
+        start: 0,
+        end: 0,
+        name_start: 0,
+        name_end: 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reading the text format.
+
+extend Tree {
+    fun byte(self, index: u64) -> u32 {
+        when index >= self.text.len() {
+            return 256
+        }
+        return self.text.byte_at(index) as u32
+    }
+
+    fun skip_space(mut self) {
+        length := self.text.len()
+        while self.at < length && is_space(self.text.byte_at(self.at) as u32) {
+            self.at += 1
+        }
+    }
+
+    fun word(mut self) -> String {
+        self.skip_space()
+        start := self.at
+        length := self.text.len()
+        while self.at < length && !is_space(self.text.byte_at(self.at) as u32) {
+            self.at += 1
+        }
+        when start == self.at {
+            self.failed = true
+        }
+        return self.text.slice(start, self.at)
+    }
+
+    fun uint(mut self) -> u64 {
+        value := self.word().try_to_u64()
+        when value.is_none() {
+            self.failed = true
+            return 0
+        }
+        return value.unwrap()
+    }
+
+    fun boolean(mut self) -> bool {
+        return self.word() == "1"
+    }
+
+    fun string(mut self) -> String {
+        self.skip_space()
+        mut length: u64 = 0
+        mut digits: u64 = 0
+        while lexer::is_digit(self.byte(self.at)) {
+            length = length * 10 + (self.byte(self.at) - 48) as u64
+            self.at += 1
+            digits += 1
+        }
+        when digits == 0 || self.byte(self.at) != 58 || self.at + 1 + length > self.text.len() {
+            self.failed = true
+            return String()
+        }
+        start := self.at + 1
+        self.at = start + length
+        return self.text.slice(start, self.at)
+    }
+
+    fun strings(mut self) -> Vec<String> {
+        count := self.uint()
+        mut values := Vec<String>()
+        mut index: u64 = 0
+        while index < count && !self.failed {
+            values.push(self.string())
+            index += 1
+        }
+        return values
+    }
+
+    // Reads an option marker: `+` for a present value, `-` for none.
+    fun present(mut self) -> bool {
+        return self.word() == "+"
+    }
+
+    fun new_type(mut self, node: TreeType) -> u64 {
+        index := self.types.len()
+        self.types.push(node)
+        return index
+    }
+
+    fun new_expr(mut self, node: ExprNode) -> u64 {
+        index := self.exprs.len()
+        self.exprs.push(node)
+        return index
+    }
+
+    fun new_stmt(mut self, node: StmtNode) -> u64 {
+        index := self.stmts.len()
+        self.stmts.push(node)
+        return index
+    }
+
+    fun decode_type(mut self) -> u64 {
+        tag := self.word()
+        when tag == "i8" { return TypeKind::I8 as u64 }
+        when tag == "i16" { return TypeKind::I16 as u64 }
+        when tag == "i32" { return TypeKind::I32 as u64 }
+        when tag == "i64" { return TypeKind::I64 as u64 }
+        when tag == "u8" { return TypeKind::U8 as u64 }
+        when tag == "u16" { return TypeKind::U16 as u64 }
+        when tag == "u32" { return TypeKind::U32 as u64 }
+        when tag == "u64" { return TypeKind::U64 as u64 }
+        when tag == "f32" { return TypeKind::F32 as u64 }
+        when tag == "f64" { return TypeKind::F64 as u64 }
+        when tag == "str" { return TypeKind::STR as u64 }
+        when tag == "String" { return TypeKind::STRING as u64 }
+        when tag == "char" { return TypeKind::CHAR as u64 }
+        when tag == "bool" { return TypeKind::BOOL as u64 }
+        mut node := blank_type(0)
+        when tag == "Named" || tag == "Param" {
+            node.kind = when tag == "Named" { TypeKind::NAMED } else { TypeKind::PARAM }
+            node.name = self.string()
+        } else when tag == "Vec" || tag == "Set" || tag == "Slice" || tag == "Raw" {
+            node.kind = when tag == "Vec" {
+                TypeKind::VEC
+            } else when tag == "Set" {
+                TypeKind::SET
+            } else when tag == "Slice" {
+                TypeKind::SLICE
+            } else {
+                TypeKind::RAW
+            }
+            node.first = self.decode_type()
+        } else when tag == "Map" {
+            node.kind = TypeKind::MAP
+            node.first = self.decode_type()
+            node.second = self.decode_type()
+        } else when tag == "Array" {
+            node.kind = TypeKind::ARRAY
+            node.first = self.decode_type()
+            node.length = self.uint()
+        } else when tag == "Ref" {
+            node.kind = TypeKind::REF
+            node.first = self.decode_type()
+            node.flag = self.boolean()
+        } else when tag == "FnPtr" {
+            node.kind = TypeKind::FNPTR
+            node.params = self.decode_types()
+            when self.present() {
+                node.has_result = true
+                node.first = self.decode_type()
+            }
+            node.flag = self.boolean()
+        } else {
+            self.failed = true
+            return 0
+        }
+        node.start = self.uint()
+        node.end = self.uint()
+        return self.new_type(node)
+    }
+
+    fun decode_types(mut self) -> Vec<u64> {
+        count := self.uint()
+        mut values := Vec<u64>()
+        mut index: u64 = 0
+        while index < count && !self.failed {
+            values.push(self.decode_type())
+            index += 1
+        }
+        return values
+    }
+
+    fun decode_exprs(mut self) -> Vec<u64> {
+        count := self.uint()
+        mut values := Vec<u64>()
+        mut index: u64 = 0
+        while index < count && !self.failed {
+            values.push(self.decode_expr())
+            index += 1
+        }
+        return values
+    }
+
+    fun decode_expr(mut self) -> u64 {
+        tag := self.word()
+        mut node := blank_expr(0)
+        when tag == "Int" {
+            node.kind = Ex::INT
+            node.value = self.uint()
+        } else when tag == "Float" {
+            node.kind = Ex::FLOAT
+            node.text = self.word()
+        } else when tag == "Str" {
+            node.kind = Ex::STR
+            node.text = self.string()
+        } else when tag == "Char" {
+            node.kind = Ex::CHAR
+            node.value = self.uint()
+        } else when tag == "Bool" {
+            node.kind = Ex::BOOL
+            node.flag = self.boolean()
+        } else when tag == "Name" {
+            node.kind = Ex::NAME
+            node.text = self.string()
+        } else when tag == "Call" {
+            node.kind = Ex::CALL
+            node.text = self.string()
+            node.types = self.decode_types()
+            node.list = self.decode_exprs()
+        } else when tag == "MethodCall" {
+            node.kind = Ex::METHOD_CALL
+            node.a = self.decode_expr()
+            node.text = self.string()
+            node.types = self.decode_types()
+            node.list = self.decode_exprs()
+        } else when tag == "Struct" {
+            node.kind = Ex::STRUCT
+            node.text = self.string()
+            count := self.uint()
+            mut index: u64 = 0
+            while index < count && !self.failed {
+                node.names.push(self.string())
+                node.list.push(self.decode_expr())
+                node.spans.push(self.uint())
+                node.spans.push(self.uint())
+                index += 1
+            }
+        } else when tag == "Field" {
+            node.kind = Ex::FIELD
+            node.a = self.decode_expr()
+            node.text = self.string()
+            node.name_start = self.uint()
+            node.name_end = self.uint()
+        } else when tag == "If" {
+            node.kind = Ex::IF
+            node.a = self.decode_expr()
+            node.b = self.decode_expr()
+            node.c = self.decode_expr()
+        } else when tag == "Binary" {
+            node.kind = Ex::BINARY
+            node.text = self.word()
+            node.a = self.decode_expr()
+            node.b = self.decode_expr()
+        } else when tag == "Negate" || tag == "Not" || tag == "BitNot" || tag == "Deref" || tag == "Propagate" {
+            node.kind = when tag == "Negate" {
+                Ex::NEGATE
+            } else when tag == "Not" {
+                Ex::NOT
+            } else when tag == "BitNot" {
+                Ex::BIT_NOT
+            } else when tag == "Deref" {
+                Ex::DEREF
+            } else {
+                Ex::PROPAGATE
+            }
+            node.a = self.decode_expr()
+        } else when tag == "AddressOf" {
+            node.kind = Ex::ADDRESS_OF
+            node.flag = self.boolean()
+            node.flag2 = self.boolean()
+            node.a = self.decode_expr()
+        } else when tag == "Cast" {
+            node.kind = Ex::CAST
+            node.a = self.decode_expr()
+            node.ty = self.decode_type()
+        } else when tag == "Layout" {
+            node.kind = Ex::LAYOUT
+            node.ty = self.decode_type()
+            node.flag = self.boolean()
+        } else when tag == "NewVec" || tag == "NewSet" {
+            node.kind = when tag == "NewVec" { Ex::NEW_VEC } else { Ex::NEW_SET }
+            node.ty = self.decode_type()
+        } else when tag == "NewMap" {
+            node.kind = Ex::NEW_MAP
+            node.ty = self.decode_type()
+            node.ty2 = self.decode_type()
+        } else when tag == "Tuple" || tag == "Array" {
+            node.kind = when tag == "Tuple" { Ex::TUPLE } else { Ex::ARRAY }
+            node.list = self.decode_exprs()
+        } else when tag == "Repeat" {
+            node.kind = Ex::REPEAT
+            node.a = self.decode_expr()
+            node.value = self.uint()
+        } else when tag == "Index" {
+            node.kind = Ex::INDEX
+            node.a = self.decode_expr()
+            node.b = self.decode_expr()
+        } else when tag == "Enum" {
+            node.kind = Ex::ENUM
+            node.text = self.string()
+            node.text2 = self.string()
+            node.list = self.decode_exprs()
+        } else when tag == "Choose" {
+            node.kind = Ex::CHOOSE
+            node.a = self.decode_expr()
+            count := self.uint()
+            mut index: u64 = 0
+            while index < count && !self.failed {
+                node.list.push(self.decode_arm())
+                index += 1
+            }
+        } else {
+            self.failed = true
+            return 0
+        }
+        node.start = self.uint()
+        node.end = self.uint()
+        return self.new_expr(node)
+    }
+
+    fun decode_arm(mut self) -> u64 {
+        mut arm := ArmNode {
+            has_enum: false,
+            enum_name: String(),
+            has_variant: false,
+            variant: String(),
+            bindings: Vec<String>(),
+            body: 0,
+            start: 0,
+            end: 0
+        }
+        when self.present() {
+            arm.has_enum = true
+            arm.enum_name = self.string()
+        }
+        when self.present() {
+            arm.has_variant = true
+            arm.variant = self.string()
+        }
+        arm.bindings = self.strings()
+        arm.body = self.decode_expr()
+        arm.start = self.uint()
+        arm.end = self.uint()
+        index := self.arms.len()
+        self.arms.push(arm)
+        return index
+    }
+
+    fun decode_stmts(mut self) -> Vec<u64> {
+        count := self.uint()
+        mut values := Vec<u64>()
+        mut index: u64 = 0
+        while index < count && !self.failed {
+            values.push(self.decode_stmt())
+            index += 1
+        }
+        return values
+    }
+
+    fun decode_stmt(mut self) -> u64 {
+        tag := self.word()
+        mut node := blank_stmt(0)
+        when tag == "Let" {
+            node.kind = St::LET
+            node.text = self.string()
+            node.flag = self.boolean()
+            when self.present() {
+                node.has = true
+                node.ty = self.decode_type()
+            }
+            node.a = self.decode_expr()
+        } else when tag == "Assign" {
+            node.kind = St::ASSIGN
+            node.text = self.string()
+            node.a = self.decode_expr()
+        } else when tag == "IndexAssign" {
+            node.kind = St::INDEX_ASSIGN
+            node.text = self.string()
+            node.a = self.decode_expr()
+            node.b = self.decode_expr()
+        } else when tag == "DerefAssign" {
+            node.kind = St::DEREF_ASSIGN
+            node.a = self.decode_expr()
+            node.b = self.decode_expr()
+        } else when tag == "FieldAssign" {
+            node.kind = St::FIELD_ASSIGN
+            node.text = self.string()
+            count := self.uint()
+            mut index: u64 = 0
+            while index < count && !self.failed {
+                node.names.push(self.string())
+                node.spans.push(self.uint())
+                node.spans.push(self.uint())
+                index += 1
+            }
+            when self.present() {
+                node.has = true
+                node.op = self.word()
+            }
+            node.a = self.decode_expr()
+        } else when tag == "Compound" {
+            node.kind = St::COMPOUND
+            node.text = self.string()
+            node.op = self.word()
+            node.a = self.decode_expr()
+        } else when tag == "Print" {
+            node.kind = St::PRINT
+            node.a = self.decode_expr()
+        } else when tag == "Template" {
+            node.kind = St::TEMPLATE
+            count := self.uint()
+            mut index: u64 = 0
+            while index < count && !self.failed {
+                part := self.word()
+                when part == "T" {
+                    node.part_kinds.push(1)
+                    node.names.push(self.string())
+                    node.parts.push(0)
+                } else {
+                    node.part_kinds.push(2)
+                    node.names.push(String())
+                    node.parts.push(self.decode_expr())
+                }
+                index += 1
+            }
+        } else when tag == "Call" {
+            node.kind = St::CALL
+            node.text = self.string()
+            node.types = self.decode_types()
+            node.list = self.decode_exprs()
+        } else when tag == "MethodCall" {
+            node.kind = St::METHOD_CALL
+            node.a = self.decode_expr()
+            node.text = self.string()
+            node.list = self.decode_exprs()
+        } else when tag == "If" {
+            node.kind = St::IF
+            node.a = self.decode_expr()
+            node.body = self.decode_stmts()
+            node.body2 = self.decode_stmts()
+        } else when tag == "While" {
+            node.kind = St::WHILE
+            node.a = self.decode_expr()
+            node.body = self.decode_stmts()
+        } else when tag == "For" {
+            node.kind = St::FOR
+            node.text = self.string()
+            node.name_start = self.uint()
+            node.name_end = self.uint()
+            node.a = self.decode_expr()
+            node.b = self.decode_expr()
+            node.body = self.decode_stmts()
+        } else when tag == "ForEach" {
+            node.kind = St::FOR_EACH
+            node.text = self.string()
+            node.name_start = self.uint()
+            node.name_end = self.uint()
+            node.a = self.decode_expr()
+            node.body = self.decode_stmts()
+        } else when tag == "Break" {
+            node.kind = St::BREAK
+        } else when tag == "Continue" {
+            node.kind = St::CONTINUE
+        } else when tag == "Return" {
+            node.kind = St::RETURN
+            when self.present() {
+                node.has = true
+                node.a = self.decode_expr()
+            }
+        } else {
+            self.failed = true
+            return 0
+        }
+        node.start = self.uint()
+        node.end = self.uint()
+        return self.new_stmt(node)
+    }
+
+    fun decode_function(mut self) -> u64 {
+        mut function := FunctionNode {
+            name: self.string(),
+            extern_c: false,
+            has_symbol: false,
+            symbol: String(),
+            type_params: Vec<String>(),
+            bound_params: Vec<String>(),
+            bound_lists: Vec<String>(),
+            public: false,
+            module_path: String(),
+            param_names: Vec<String>(),
+            param_types: Vec<u64>(),
+            param_spans: Vec<u64>(),
+            has_return: false,
+            return_type: 0,
+            body: Vec<u64>(),
+            has_value: false,
+            value: 0,
+            start: 0,
+            end: 0
+        }
+        function.extern_c = self.boolean()
+        when self.present() {
+            function.has_symbol = true
+            function.symbol = self.string()
+        }
+        function.type_params = self.strings()
+        bound_count := self.uint()
+        mut index: u64 = 0
+        while index < bound_count && !self.failed {
+            function.bound_params.push(self.string())
+            list_start := self.at
+            self.strings()
+            function.bound_lists.push(self.text.slice(list_start, self.at))
+            index += 1
+        }
+        function.public = self.boolean()
+        function.module_path = self.string()
+        parameter_count := self.uint()
+        index = 0
+        while index < parameter_count && !self.failed {
+            function.param_names.push(self.string())
+            function.param_types.push(self.decode_type())
+            function.param_spans.push(self.uint())
+            function.param_spans.push(self.uint())
+            index += 1
+        }
+        when self.present() {
+            function.has_return = true
+            function.return_type = self.decode_type()
+        }
+        function.body = self.decode_stmts()
+        when self.present() {
+            function.has_value = true
+            function.value = self.decode_expr()
+        }
+        function.start = self.uint()
+        function.end = self.uint()
+        index = self.functions.len()
+        self.functions.push(function)
+        return index
+    }
+
+    fun decode_enum(mut self) -> u64 {
+        start_text := self.at
+        mut definition := EnumNode {
+            name: self.string(),
+            raw: String(),
+            variant_names: Vec<String>(),
+            variant_counts: Vec<u64>(),
+            fields: Vec<u64>(),
+            start: 0,
+            end: 0
+        }
+        self.strings()
+        variant_count := self.uint()
+        mut index: u64 = 0
+        while index < variant_count && !self.failed {
+            definition.variant_names.push(self.string())
+            fields := self.decode_types()
+            definition.variant_counts.push(fields.len())
+            for field in fields {
+                definition.fields.push(field)
+            }
+            self.uint()
+            self.uint()
+            index += 1
+        }
+        self.boolean()
+        self.string()
+        definition.start = self.uint()
+        definition.end = self.uint()
+        definition.raw = self.text.slice(start_text, self.at)
+        index = self.enums.len()
+        self.enums.push(definition)
+        return index
+    }
+
+    // Declarations that pass through unchanged are decoded only to find
+    // where they end.
+    fun skip_struct(mut self) {
+        self.string()
+        self.strings()
+        count := self.uint()
+        mut index: u64 = 0
+        while index < count && !self.failed {
+            self.string()
+            self.decode_type()
+            self.boolean()
+            self.uint()
+            self.uint()
+            index += 1
+        }
+        self.boolean()
+        self.boolean()
+        when self.present() {
+            self.string()
+        }
+        self.strings()
+        self.string()
+        self.uint()
+        self.uint()
+    }
+
+    fun skip_alias(mut self) {
+        self.string()
+        self.strings()
+        self.decode_type()
+        self.boolean()
+        self.string()
+        self.uint()
+        self.uint()
+    }
+
+    fun skip_extend(mut self) {
+        self.decode_type()
+        when self.present() {
+            self.string()
+        }
+        functions := self.uint()
+        mut index: u64 = 0
+        while index < functions && !self.failed {
+            self.decode_function()
+            index += 1
+        }
+        constants := self.uint()
+        index = 0
+        while index < constants && !self.failed {
+            self.string()
+            self.decode_type()
+            self.decode_expr()
+            self.boolean()
+            self.uint()
+            self.uint()
+            index += 1
+        }
+        self.string()
+        self.uint()
+        self.uint()
+    }
+
+    fun skip_shape(mut self) {
+        self.string()
+        count := self.uint()
+        mut index: u64 = 0
+        while index < count && !self.failed {
+            self.string()
+            parameters := self.uint()
+            mut parameter: u64 = 0
+            while parameter < parameters && !self.failed {
+                self.string()
+                self.decode_type()
+                self.uint()
+                self.uint()
+                parameter += 1
+            }
+            when self.present() {
+                self.decode_type()
+            }
+            when self.present() {
+                self.decode_stmts()
+            }
+            when self.present() {
+                self.decode_expr()
+            }
+            self.uint()
+            self.uint()
+            index += 1
+        }
+        self.string()
+        self.uint()
+        self.uint()
+    }
+
+    // Reads the encoded program. Returns false when the input is not an
+    // `Ok` program.
+    fun decode_program(mut self) -> bool {
+        when self.word() != "Ok" {
+            return false
+        }
+        self.use_count = self.uint()
+        mut index: u64 = 0
+        while index < self.use_count && !self.failed {
+            start := self.at
+            path := self.strings()
+            self.uint()
+            self.uint()
+            self.uses_raw.append(self.text.slice(start, self.at))
+            self.use_aliases.push(path[path.len() - 1])
+            self.use_paths.push(join(path, "::"))
+            index += 1
+        }
+        self.struct_count = self.uint()
+        index = 0
+        while index < self.struct_count && !self.failed {
+            start := self.at
+            self.skip_struct()
+            self.structs_raw.append(self.text.slice(start, self.at))
+            index += 1
+        }
+        enum_count := self.uint()
+        index = 0
+        while index < enum_count && !self.failed {
+            self.decode_enum()
+            index += 1
+        }
+        self.alias_count = self.uint()
+        index = 0
+        while index < self.alias_count && !self.failed {
+            start := self.at
+            self.skip_alias()
+            self.aliases_raw.append(self.text.slice(start, self.at))
+            index += 1
+        }
+        self.extend_count = self.uint()
+        index = 0
+        while index < self.extend_count && !self.failed {
+            start := self.at
+            self.skip_extend()
+            self.extends_raw.append(self.text.slice(start, self.at))
+            index += 1
+        }
+        self.shape_count = self.uint()
+        index = 0
+        while index < self.shape_count && !self.failed {
+            start := self.at
+            self.skip_shape()
+            self.shapes_raw.append(self.text.slice(start, self.at))
+            index += 1
+        }
+        function_count := self.uint()
+        index = 0
+        while index < function_count && !self.failed {
+            self.decode_function()
+            index += 1
+        }
+        self.skip_space()
+        return !self.failed && self.at == self.text.len()
+    }
+}
+
+fun join(values: Vec<String>, separator: str) -> String {
+    mut out := String()
+    mut first := true
+    for value in values {
+        when !first {
+            out.append(separator)
+        }
+        first = false
+        out.append(value)
+    }
+    return out
+}

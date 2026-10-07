@@ -1103,14 +1103,9 @@ fn emit_vec_struct_field_callback(
     clone: bool,
 ) -> Result<(), String> {
     match ty {
-        Type::OwnedString
-        | Type::Vec(_)
-        | Type::Map(_)
-        | Type::Set(_)
-        | Type::Enum(_)
-        | Type::Reference(_, _)
-        | Type::RawPointer(_)
-        | Type::FunctionPointer(_) => {
+        // Pointer-sized scalars (references, raw and function pointers) were
+        // copied with the rest of the record and own nothing to release.
+        Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Set(_) | Type::Enum(_) => {
             let function_id = match ty {
                 Type::OwnedString => {
                     runtime.owned_strings[if clone {
@@ -1126,7 +1121,7 @@ fn emit_vec_struct_field_callback(
                         VecOp::Drop as usize
                     }]
                 }
-                Type::Map(_) => {
+                Type::Map(_) | Type::Set(_) => {
                     runtime.maps[if clone {
                         MapOp::Clone as usize
                     } else {
@@ -1568,7 +1563,20 @@ fn define_function(
         );
         for parameter in &function.parameters {
             if let Some(Some(slot)) = address_slots.get(parameter.slot) {
-                store_variable_to_stack_slot(&mut b, parameter.slot, *slot, pointer_type)?;
+                let c_layout = matches!(
+                    parameter.ty,
+                    Type::Struct(id) if codegen_env.structs[id].repr_c
+                );
+                store_local_variables_to_stack_slot(
+                    &mut b,
+                    parameter.slot,
+                    parameter.ty,
+                    *slot,
+                    0,
+                    pointer_type,
+                    codegen_env.structs,
+                    c_layout,
+                )?;
             }
         }
         let sret_pointer = if matches!(function.return_type, Some(Type::Struct(_) | Type::Array(_)))
@@ -1663,6 +1671,7 @@ fn define_function(
             function_return: function.return_type,
             sret_pointer,
             address_slots: &address_slots,
+            addressed_slot_types: &function.addressed_slot_types,
         };
         let mut seal_state = BlockSealState::default();
         let mut loops = Vec::new();
@@ -1733,6 +1742,10 @@ fn reference_storage_layout(ty: Type, structs: &[RynStruct]) -> (u32, u32) {
         Type::I16 | Type::U16 => (2, 2),
         Type::I32 | Type::U32 | Type::F32 | Type::Char => (4, 4),
         Type::I64 | Type::U64 | Type::F64 => (8, 8),
+        Type::Struct(id) if structs.get(id).is_some_and(|definition| definition.repr_c) => {
+            let (size, align) = crate::sema::type_layout(ty, structs);
+            (size as u32, align as u32)
+        }
         Type::Struct(id) => {
             let slot_count = structs
                 .get(id)
@@ -1746,7 +1759,44 @@ fn reference_storage_layout(ty: Type, structs: &[RynStruct]) -> (u32, u32) {
     }
 }
 
+fn align_up(offset: usize, alignment: usize) -> usize {
+    offset.saturating_add(alignment - 1) / alignment * alignment
+}
+
+/// Byte offset of one field in a pointer to a structure.
+///
+/// An addressed `#[repr(C)]` value is stored with C packing. Every other
+/// structure reference keeps the native 8-byte slot stride.
+fn field_memory_offset(
+    structs: &[RynStruct],
+    struct_id: usize,
+    field_index: usize,
+    c_layout: bool,
+) -> Result<i32, String> {
+    let definition = structs
+        .get(struct_id)
+        .ok_or("internal error: reference field structure is missing")?;
+    if !c_layout {
+        let field = definition
+            .fields
+            .get(field_index)
+            .ok_or("internal error: reference field index is out of range")?;
+        return Ok((field.slot_offset * 8) as i32);
+    }
+    let mut cursor = 0usize;
+    for (index, field) in definition.fields.iter().enumerate() {
+        let (field_size, field_align) = crate::sema::type_layout(field.ty, structs);
+        cursor = align_up(cursor, field_align);
+        if index == field_index {
+            return Ok(cursor as i32);
+        }
+        cursor = cursor.saturating_add(field_size);
+    }
+    Err("internal error: reference field index is out of range".into())
+}
+
 /// Stores every leaf variable of a local into its stack home.
+#[allow(clippy::too_many_arguments)]
 fn store_local_variables_to_stack_slot(
     b: &mut FunctionBuilder<'_>,
     root: usize,
@@ -1755,18 +1805,49 @@ fn store_local_variables_to_stack_slot(
     base_offset: i32,
     pointer_type: types::Type,
     structs: &[RynStruct],
+    c_layout: bool,
 ) -> Result<(), String> {
     match ty {
         Type::Struct(struct_id) => {
+            let mut c_offset = 0usize;
             for field in &structs[struct_id].fields {
+                let field_offset = if c_layout {
+                    let (field_size, field_align) = crate::sema::type_layout(field.ty, structs);
+                    c_offset = align_up(c_offset, field_align);
+                    let offset = c_offset;
+                    c_offset = c_offset.saturating_add(field_size);
+                    offset
+                } else {
+                    field.slot_offset * 8
+                };
                 store_local_variables_to_stack_slot(
                     b,
                     root + field.slot_offset,
                     field.ty,
                     slot,
-                    base_offset + (field.slot_offset * 8) as i32,
+                    base_offset + field_offset as i32,
                     pointer_type,
                     structs,
+                    c_layout,
+                )?;
+            }
+            Ok(())
+        }
+        Type::Array(array_id) => {
+            let (element, length) = array_info(array_id);
+            let stride = storage_slot_width(element, structs);
+            let (element_size, _) = crate::sema::type_layout(element, structs);
+            let byte_stride = if c_layout { element_size } else { stride * 8 };
+            for index in 0..length {
+                store_local_variables_to_stack_slot(
+                    b,
+                    root + index * stride,
+                    element,
+                    slot,
+                    base_offset + (index * byte_stride) as i32,
+                    pointer_type,
+                    structs,
+                    c_layout,
                 )?;
             }
             Ok(())
@@ -1788,6 +1869,7 @@ fn store_local_variables_to_stack_slot(
 
 /// Loads every leaf of a local's stack home back into its variables after a
 /// mutable method call wrote through the receiver reference.
+#[allow(clippy::too_many_arguments)]
 fn sync_stack_slot_to_variables(
     b: &mut FunctionBuilder<'_>,
     root: usize,
@@ -1796,18 +1878,49 @@ fn sync_stack_slot_to_variables(
     base_offset: i32,
     pointer_type: types::Type,
     structs: &[RynStruct],
+    c_layout: bool,
 ) -> Result<(), String> {
     match ty {
         Type::Struct(struct_id) => {
+            let mut c_offset = 0usize;
             for field in &structs[struct_id].fields {
+                let field_offset = if c_layout {
+                    let (field_size, field_align) = crate::sema::type_layout(field.ty, structs);
+                    c_offset = align_up(c_offset, field_align);
+                    let offset = c_offset;
+                    c_offset = c_offset.saturating_add(field_size);
+                    offset
+                } else {
+                    field.slot_offset * 8
+                };
                 sync_stack_slot_to_variables(
                     b,
                     root + field.slot_offset,
                     field.ty,
                     slot,
-                    base_offset + (field.slot_offset * 8) as i32,
+                    base_offset + field_offset as i32,
                     pointer_type,
                     structs,
+                    c_layout,
+                )?;
+            }
+            Ok(())
+        }
+        Type::Array(array_id) => {
+            let (element, length) = array_info(array_id);
+            let stride = storage_slot_width(element, structs);
+            let (element_size, _) = crate::sema::type_layout(element, structs);
+            let byte_stride = if c_layout { element_size } else { stride * 8 };
+            for index in 0..length {
+                sync_stack_slot_to_variables(
+                    b,
+                    root + index * stride,
+                    element,
+                    slot,
+                    base_offset + (index * byte_stride) as i32,
+                    pointer_type,
+                    structs,
+                    c_layout,
                 )?;
             }
             Ok(())
@@ -1822,18 +1935,6 @@ fn sync_stack_slot_to_variables(
             Ok(())
         }
     }
-}
-
-fn store_variable_to_stack_slot(
-    b: &mut FunctionBuilder<'_>,
-    variable: usize,
-    slot: StackSlot,
-    pointer_type: types::Type,
-) -> Result<(), String> {
-    let value = b.use_var(Variable::from_u32(variable as u32));
-    let address = b.ins().stack_addr(pointer_type, slot, 0);
-    b.ins().store(MemFlagsData::new(), value, address, 0);
-    Ok(())
 }
 
 fn load_addressed_local(
@@ -2230,6 +2331,7 @@ fn emit_statements(
                         0,
                         module.target_config().pointer_type(),
                         env.structs,
+                        matches!(*ty, Type::Struct(id) if env.structs[id].repr_c),
                     )?;
                 }
                 true
@@ -2249,6 +2351,7 @@ fn emit_statements(
                         0,
                         module.target_config().pointer_type(),
                         env.structs,
+                        matches!(*ty, Type::Struct(id) if env.structs[id].repr_c),
                     )?;
                 }
                 true
@@ -2257,6 +2360,29 @@ fn emit_statements(
                 let compiled = emit_expr(b, module, value, env, seal_state)?;
                 drop_binding(b, env, *slot, *ty, seal_state);
                 store_local(b, *slot, *ty, compiled, env.structs)?;
+                // A borrowed receiver reads the structure from its stack home;
+                // refresh that copy so it never holds the released field.
+                for (root, root_type) in env.addressed_slot_types.iter().enumerate() {
+                    let Some(root_type) = root_type else {
+                        continue;
+                    };
+                    let width = storage_slot_width(*root_type, env.structs);
+                    if *slot < root || *slot >= root + width {
+                        continue;
+                    }
+                    if let Some(Some(stack_slot)) = env.address_slots.get(root) {
+                        store_local_variables_to_stack_slot(
+                            b,
+                            root,
+                            *root_type,
+                            *stack_slot,
+                            0,
+                            module.target_config().pointer_type(),
+                            env.structs,
+                            matches!(*root_type, Type::Struct(id) if env.structs[id].repr_c),
+                        )?;
+                    }
+                }
                 true
             }
             IrStatement::ReferenceFieldAssign {
@@ -2276,21 +2402,26 @@ fn emit_statements(
                     .fields
                     .get(*field_index)
                     .ok_or("internal error: reference field index is out of range")?;
-                let offset = (field.slot_offset * 8) as i32;
+                let c_layout = env.structs[*struct_id].repr_c;
+                let offset = field_memory_offset(env.structs, *struct_id, *field_index, c_layout)?;
                 let compiled = emit_expr(b, module, value, env, seal_state)?;
                 // Release the previous field owner before overwriting the handle.
                 if matches!(
                     field.ty,
                     Type::OwnedString | Type::Vec(_) | Type::Map(_) | Type::Set(_) | Type::Enum(_)
                 ) {
+                    // Borrow the stored handle so the old owner itself is
+                    // released, not a fresh clone of it.
                     let previous = load_reference_field(
                         b,
                         field.ty,
                         pointer,
                         offset,
+                        c_layout,
                         module.target_config().pointer_type(),
                         env.structs,
                         env.print_functions,
+                        true,
                     )?;
                     let owned = match field.ty {
                         Type::OwnedString => CompiledValue::OwnedString {
@@ -2312,15 +2443,15 @@ fn emit_statements(
                     };
                     drop_temporary(b, env.print_functions, owned);
                 }
-                let values = flatten_value(compiled);
-                for (index, value) in values.iter().enumerate() {
-                    b.ins().store(
-                        MemFlagsData::new(),
-                        *value,
-                        pointer,
-                        offset + (index * 8) as i32,
-                    );
-                }
+                store_reference_value(
+                    b,
+                    field.ty,
+                    compiled,
+                    pointer,
+                    offset,
+                    env.structs,
+                    c_layout,
+                )?;
                 true
             }
             IrStatement::DereferenceAssign { pointer, ty, value } => {
@@ -2556,7 +2687,11 @@ fn emit_statements(
                     false
                 }
             }
-            IrStatement::While { condition, body } => {
+            IrStatement::While {
+                setup,
+                condition,
+                body,
+            } => {
                 let header = b.create_block();
                 let loop_body = b.create_block();
                 let exit = b.create_block();
@@ -2567,6 +2702,7 @@ fn emit_statements(
                 seal_ready(b, from, seal_state);
                 b.switch_to_block(header);
                 seal_state.deferred.push(header);
+                let _ = emit_statements(b, module, env, setup, seal_state, loops)?;
                 let condition = as_bool(emit_expr(b, module, condition, env, seal_state)?)?;
                 b.ins().brif(condition, loop_body, &[], exit, &[]);
                 b.switch_to_block(loop_body);
@@ -3106,14 +3242,105 @@ fn emit_print_text(
     Ok(())
 }
 
+fn store_reference_value(
+    b: &mut FunctionBuilder<'_>,
+    ty: Type,
+    value: CompiledValue,
+    pointer: Value,
+    offset: i32,
+    structs: &[RynStruct],
+    c_layout: bool,
+) -> Result<(), String> {
+    match ty {
+        Type::Struct(struct_id) => {
+            let CompiledValue::Struct {
+                struct_id: actual,
+                fields,
+            } = value
+            else {
+                return Err("internal error: reference field value is not a structure".into());
+            };
+            if actual != struct_id || fields.len() != structs[struct_id].fields.len() {
+                return Err(
+                    "internal error: reference field structure layout does not match".into(),
+                );
+            }
+            let mut cursor = 0usize;
+            for (field, field_value) in structs[struct_id].fields.iter().zip(fields) {
+                let field_offset = if c_layout {
+                    let (field_size, field_align) = crate::sema::type_layout(field.ty, structs);
+                    cursor = align_up(cursor, field_align);
+                    let at = cursor as i32;
+                    cursor = cursor.saturating_add(field_size);
+                    at
+                } else {
+                    (field.slot_offset * 8) as i32
+                };
+                store_reference_value(
+                    b,
+                    field.ty,
+                    field_value,
+                    pointer,
+                    offset + field_offset,
+                    structs,
+                    c_layout,
+                )?;
+            }
+            Ok(())
+        }
+        Type::Array(array_id) => {
+            let CompiledValue::Array(values) = value else {
+                return Err("internal error: reference field value is not an array".into());
+            };
+            let (element, length) = array_info(array_id);
+            if values.len() != length {
+                return Err("internal error: reference field array has the wrong length".into());
+            }
+            let stride = if c_layout {
+                let (element_size, element_align) = crate::sema::type_layout(element, structs);
+                align_up(element_size, element_align)
+            } else {
+                storage_slot_width(element, structs) * 8
+            };
+            for (index, element_value) in values.into_iter().enumerate() {
+                store_reference_value(
+                    b,
+                    element,
+                    element_value,
+                    pointer,
+                    offset + (index * stride) as i32,
+                    structs,
+                    c_layout,
+                )?;
+            }
+            Ok(())
+        }
+        _ => {
+            let values = flatten_value(value);
+            for (index, word) in values.iter().enumerate() {
+                b.ins().store(
+                    MemFlagsData::new(),
+                    *word,
+                    pointer,
+                    offset + (index * 8) as i32,
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn load_reference_field(
     b: &mut FunctionBuilder<'_>,
     ty: Type,
     pointer: Value,
     offset: i32,
+    c_layout: bool,
     pointer_type: types::Type,
     structs: &[RynStruct],
     runtime: PrintFunctions,
+    borrow: bool,
 ) -> Result<CompiledValue, String> {
     match ty {
         Type::I8
@@ -3135,7 +3362,7 @@ fn load_reference_field(
             Ok(CompiledValue::Integer(
                 b.ins()
                     .load(pointer_type, MemFlagsData::new(), pointer, offset),
-                Type::U64,
+                ty,
             ))
         }
         Type::F32 => Ok(CompiledValue::F32(b.ins().load(
@@ -3160,6 +3387,12 @@ fn load_reference_field(
             let handle = b
                 .ins()
                 .load(pointer_type, MemFlagsData::new(), pointer, offset);
+            if borrow {
+                return Ok(CompiledValue::OwnedString {
+                    ptr: handle,
+                    temporary: false,
+                });
+            }
             let clone = b
                 .ins()
                 .call(runtime.owned_strings[StringOp::Clone as usize], &[handle]);
@@ -3172,6 +3405,12 @@ fn load_reference_field(
             let handle = b
                 .ins()
                 .load(pointer_type, MemFlagsData::new(), pointer, offset);
+            if borrow {
+                return Ok(CompiledValue::Vec {
+                    ptr: handle,
+                    temporary: false,
+                });
+            }
             let clone = b
                 .ins()
                 .call(runtime.owned_vecs[VecOp::Clone as usize], &[handle]);
@@ -3180,10 +3419,16 @@ fn load_reference_field(
                 temporary: true,
             })
         }
-        Type::Map(_) => {
+        Type::Map(_) | Type::Set(_) => {
             let handle = b
                 .ins()
                 .load(pointer_type, MemFlagsData::new(), pointer, offset);
+            if borrow {
+                return Ok(CompiledValue::Map {
+                    ptr: handle,
+                    temporary: false,
+                });
+            }
             let clone = b.ins().call(runtime.maps[MapOp::Clone as usize], &[handle]);
             Ok(CompiledValue::Map {
                 ptr: b.func.dfg.inst_results(clone)[0],
@@ -3194,6 +3439,12 @@ fn load_reference_field(
             let handle = b
                 .ins()
                 .load(pointer_type, MemFlagsData::new(), pointer, offset);
+            if borrow {
+                return Ok(CompiledValue::Enum {
+                    ptr: handle,
+                    temporary: false,
+                });
+            }
             let clone = b.ins().call(runtime.enum_clone, &[handle]);
             Ok(CompiledValue::Enum {
                 ptr: b.func.dfg.inst_results(clone)[0],
@@ -3202,15 +3453,27 @@ fn load_reference_field(
         }
         Type::Struct(struct_id) => {
             let mut fields = Vec::new();
+            let mut cursor = 0usize;
             for field in &structs[struct_id].fields {
+                let field_offset = if c_layout {
+                    let (field_size, field_align) = crate::sema::type_layout(field.ty, structs);
+                    cursor = align_up(cursor, field_align);
+                    let at = cursor as i32;
+                    cursor = cursor.saturating_add(field_size);
+                    at
+                } else {
+                    (field.slot_offset * 8) as i32
+                };
                 fields.push(load_reference_field(
                     b,
                     field.ty,
                     pointer,
-                    offset + (field.slot_offset * 8) as i32,
+                    offset + field_offset,
+                    c_layout,
                     pointer_type,
                     structs,
                     runtime,
+                    borrow,
                 )?);
             }
             Ok(CompiledValue::Struct { struct_id, fields })
@@ -3421,6 +3684,7 @@ fn collect_strings(ir: &RynIr) -> BTreeSet<String> {
                     expr(value, out);
                 }
             }
+            IrExpression::ArrayRepeat { value, .. } => expr(value, out),
             IrExpression::ArrayAsSlice { array, .. } => expr(array, out),
             IrExpression::ArrayIndex { array, index, .. } => {
                 expr(array, out);
@@ -3536,7 +3800,12 @@ fn collect_strings(ir: &RynIr) -> BTreeSet<String> {
                     stmts(then_body, structs, enums, out);
                     stmts(else_body, structs, enums, out);
                 }
-                IrStatement::While { condition, body } => {
+                IrStatement::While {
+                    setup,
+                    condition,
+                    body,
+                } => {
+                    stmts(setup, structs, enums, out);
                     expr(condition, out);
                     stmts(body, structs, enums, out);
                 }
@@ -3952,6 +4221,14 @@ fn emit_expr(
             let mut compiled = Vec::with_capacity(values.len());
             for value in values {
                 compiled.push(emit_expr(b, module, value, env, seal_state)?);
+            }
+            CompiledValue::Array(compiled)
+        }
+        IrExpression::ArrayRepeat { value, length } => {
+            let element = emit_expr(b, module, value, env, seal_state)?;
+            let mut compiled = Vec::with_capacity(*length);
+            for _ in 0..*length {
+                compiled.push(element.clone());
             }
             CompiledValue::Array(compiled)
         }
@@ -4402,6 +4679,7 @@ fn emit_expr(
             pointer,
             struct_id,
             field_index,
+            borrowed,
             ..
         } => {
             let pointer = emit_expr(b, module, pointer, env, seal_state)?;
@@ -4412,15 +4690,18 @@ fn emit_expr(
                 .fields
                 .get(*field_index)
                 .ok_or("internal error: reference field index is out of range")?;
-            let offset = (field.slot_offset * 8) as i32;
+            let c_layout = env.structs[*struct_id].repr_c;
+            let offset = field_memory_offset(env.structs, *struct_id, *field_index, c_layout)?;
             load_reference_field(
                 b,
                 field.ty,
                 pointer,
                 offset,
+                c_layout,
                 module.target_config().pointer_type(),
                 env.structs,
                 env.print_functions,
+                *borrowed,
             )?
         }
         IrExpression::Local { .. } => {
@@ -4539,7 +4820,26 @@ fn emit_expr(
             source,
             target,
         } => {
-            if matches!(source, Type::RawPointer(_) | Type::FunctionPointer(_))
+            if matches!(target, Type::RawPointer(_)) && integer_width(*source).is_some() {
+                let (value, actual_source) =
+                    as_numeric(emit_expr(b, module, value, env, seal_state)?)?;
+                if actual_source != *source {
+                    return Err(
+                        "internal error: address cast source differs from checked type".into(),
+                    );
+                }
+                let pointer_type = module.target_config().pointer_type();
+                let source_width = integer_width(*source).expect("integer source");
+                let converted = match u32::from(source_width).cmp(&pointer_type.bits()) {
+                    std::cmp::Ordering::Less if is_signed_integer_type(*source) => {
+                        b.ins().sextend(pointer_type, value)
+                    }
+                    std::cmp::Ordering::Less => b.ins().uextend(pointer_type, value),
+                    std::cmp::Ordering::Greater => b.ins().ireduce(pointer_type, value),
+                    std::cmp::Ordering::Equal => value,
+                };
+                CompiledValue::Integer(converted, *target)
+            } else if matches!(source, Type::RawPointer(_) | Type::FunctionPointer(_))
                 && matches!(target, Type::RawPointer(_) | Type::FunctionPointer(_))
             {
                 let CompiledValue::Integer(pointer, actual_source) =
@@ -4553,6 +4853,21 @@ fn emit_expr(
                     );
                 }
                 CompiledValue::Integer(pointer, *target)
+            } else if *source == Type::Char {
+                let CompiledValue::Integer(value, Type::Char) =
+                    emit_expr(b, module, value, env, seal_state)?
+                else {
+                    return Err("internal error: char cast source is not a char".into());
+                };
+                let target_clif = clif_integer_type(*target).ok_or_else(|| {
+                    "internal error: char cast target is not an integer".to_string()
+                })?;
+                let converted = match target_clif.bits().cmp(&32) {
+                    std::cmp::Ordering::Less => b.ins().ireduce(target_clif, value),
+                    std::cmp::Ordering::Greater => b.ins().uextend(target_clif, value),
+                    std::cmp::Ordering::Equal => value,
+                };
+                CompiledValue::Integer(converted, *target)
             } else {
                 let (value, actual_source) =
                     as_numeric(emit_expr(b, module, value, env, seal_state)?)?;
@@ -4830,29 +5145,35 @@ fn emit_expr(
                     b.ins().icmp_imm_s(IntCC::Equal, equal, 0)
                 })
             } else if *ty == Type::Str {
-                let CompiledValue::Str {
-                    ptr: left_ptr,
-                    len: left_len,
-                } = left
-                else {
-                    return Err(
-                        "internal error: string comparison has a non-string left operand".into(),
-                    );
+                // Either side may be a borrowed view of an owning String
+                // (`name == "fun"`); release a temporary owner afterwards.
+                let (left_ptr, left_len) = match left {
+                    CompiledValue::Str { ptr, len }
+                    | CompiledValue::StrViewOwned { ptr, len, .. } => (ptr, len),
+                    _ => {
+                        return Err(
+                            "internal error: string comparison has a non-string left operand"
+                                .into(),
+                        );
+                    }
                 };
-                let CompiledValue::Str {
-                    ptr: right_ptr,
-                    len: right_len,
-                } = right
-                else {
-                    return Err(
-                        "internal error: string comparison has a non-string right operand".into(),
-                    );
+                let (right_ptr, right_len) = match right {
+                    CompiledValue::Str { ptr, len }
+                    | CompiledValue::StrViewOwned { ptr, len, .. } => (ptr, len),
+                    _ => {
+                        return Err(
+                            "internal error: string comparison has a non-string right operand"
+                                .into(),
+                        );
+                    }
                 };
                 let call = b.ins().call(
                     env.print_functions.string_equals,
                     &[left_ptr, left_len, right_ptr, right_len],
                 );
                 let equal = b.func.dfg.inst_results(call)[0];
+                drop_temporary(b, env.print_functions, left);
+                drop_temporary(b, env.print_functions, right);
                 let condition = if *op == BinaryOp::Eq {
                     equal
                 } else if *op == BinaryOp::Ne {
@@ -5136,7 +5457,17 @@ fn emit_vec_call(
             );
             let slot_ptr = b.func.dfg.inst_results(call)[0];
             let mut result = emit_elem_load(b, slot_ptr, elem, pointer_type, env.structs)?;
-            if matches!(elem, Type::Struct(_)) {
+            // Reading an element yields an independent owner; the Vec keeps
+            // its own copy.
+            if matches!(
+                elem,
+                Type::Struct(_)
+                    | Type::OwnedString
+                    | Type::Vec(_)
+                    | Type::Map(_)
+                    | Type::Set(_)
+                    | Type::Enum(_)
+            ) {
                 result = clone_array_element(b, env.print_functions, result)?;
             }
             Ok(flatten_value(result))
@@ -6280,6 +6611,12 @@ fn emit_call(
             }
             let signature_ref = b.import_signature(call_signature);
             let call = b.ins().call_indirect(signature_ref, callee, &values);
+            sync_mutably_addressed_arguments(
+                b,
+                &arguments[1..],
+                env,
+                module.target_config().pointer_type(),
+            )?;
             let results = b.func.dfg.inst_results(call).to_vec();
             if signature.extern_c
                 && let Some(result) = signature.result
@@ -6296,6 +6633,38 @@ fn emit_call(
             }
         }
     }
+}
+
+fn sync_mutably_addressed_arguments(
+    b: &mut FunctionBuilder<'_>,
+    arguments: &[IrExpression],
+    env: &ExprEnv<'_>,
+    pointer_type: types::Type,
+) -> Result<(), String> {
+    for argument in arguments {
+        let IrExpression::AddressOf {
+            slot,
+            ty,
+            pointer_type: Type::Reference(_, true) | Type::RawPointer(_),
+            ..
+        } = argument
+        else {
+            continue;
+        };
+        if let Some(Some(stack_slot)) = env.address_slots.get(*slot) {
+            sync_stack_slot_to_variables(
+                b,
+                *slot,
+                *ty,
+                *stack_slot,
+                0,
+                pointer_type,
+                env.structs,
+                matches!(*ty, Type::Struct(id) if env.structs[id].repr_c),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn emit_function_call(
@@ -6346,8 +6715,19 @@ fn emit_function_call(
         .function_parameters
         .get(function_index)
         .ok_or_else(|| "internal error: missing function parameter types".to_string())?;
+    // A `str` argument may borrow a temporary String; release it after the call.
+    let mut borrowed_temporaries = Vec::new();
     for (index, arg) in arguments.iter().enumerate() {
         let value = emit_expr(b, module, arg, env, seal_state)?;
+        if matches!(
+            value,
+            CompiledValue::StrViewOwned {
+                temporary: true,
+                ..
+            }
+        ) {
+            borrowed_temporaries.push(value.clone());
+        }
         let flattened = flatten_value(value);
         if external
             && let Some((size, fields)) = parameter_types
@@ -6360,26 +6740,10 @@ fn emit_function_call(
         }
     }
     let inst = b.ins().call(callee, &args);
-    // A mutable receiver borrow writes through the caller's stack home; refresh
-    // the receiver's variables so later reads observe the mutations.
-    if let Some(IrExpression::AddressOf {
-        slot,
-        ty,
-        pointer_type: Type::Reference(_, true),
-        ..
-    }) = arguments.first()
-        && let Some(Some(stack_slot)) = env.address_slots.get(*slot)
-    {
-        sync_stack_slot_to_variables(
-            b,
-            *slot,
-            *ty,
-            *stack_slot,
-            0,
-            module.target_config().pointer_type(),
-            env.structs,
-        )?;
+    for value in borrowed_temporaries {
+        drop_temporary(b, env.print_functions, value);
     }
+    sync_mutably_addressed_arguments(b, arguments, env, module.target_config().pointer_type())?;
     let results = b.func.dfg.inst_results(inst).to_vec();
     if let Some((slot, ty)) = return_slot {
         let pointer = b
@@ -6942,7 +7306,43 @@ fn emit_propagate(
         .variants
         .get(*failure_variant)
         .ok_or("internal error: generic failure tag is out of range")?;
-    let encoded_failure = if let Some(failure_type) = failure_type {
+    // Aggregate error payloads (structures and arrays) keep the same word
+    // layout in the returned enum, so their words move across unchanged.
+    let aggregate_failure = failure_type
+        .filter(|ty| matches!(ty, Type::Struct(_) | Type::Array(_)))
+        .map(|ty| value_width(ty, env.structs));
+    let moved_failure = if let Some(words) = aggregate_failure {
+        if failure_definition.fields.as_slice() != [failure_type.unwrap_or(Type::Bool)] {
+            return Err(
+                "internal error: generic failure payload differs from the checked type".into(),
+            );
+        }
+        let slot = b.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            (words.max(1) * 8) as u32,
+            3,
+        ));
+        for word in 0..words {
+            let word_index = b.ins().iconst(types::I64, word as i64);
+            let get = b
+                .ins()
+                .call(env.print_functions.enum_word, &[ptr, word_index]);
+            let raw = b.func.dfg.inst_results(get)[0];
+            b.ins()
+                .stack_store(types::I64, raw, slot, (word * 8) as i32);
+            b.ins()
+                .call(env.print_functions.enum_clear_word, &[ptr, word_index]);
+        }
+        Some((
+            b.ins().stack_addr(pointer_type, slot, 0),
+            (words * 8) as u64,
+        ))
+    } else {
+        None
+    };
+    let encoded_failure = if moved_failure.is_some() {
+        None
+    } else if let Some(failure_type) = failure_type {
         if failure_definition.fields.as_slice() != [*failure_type] {
             return Err(
                 "internal error: generic failure payload differs from the checked type".into(),
@@ -6983,7 +7383,9 @@ fn emit_propagate(
     } else if !output_variant.fields.is_empty() {
         return Err("internal error: return Option `None` unexpectedly has a payload".into());
     }
-    let (payload, payload_len) = if let Some(encoded) = encoded_failure {
+    let (payload, payload_len) = if let Some(moved) = moved_failure {
+        moved
+    } else if let Some(encoded) = encoded_failure {
         let payload_slot =
             b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
         let payload = b.ins().stack_addr(pointer_type, payload_slot, 0);
@@ -7427,6 +7829,7 @@ struct ExprEnv<'a> {
     function_return: Option<Type>,
     sret_pointer: Option<Value>,
     address_slots: &'a [Option<StackSlot>],
+    addressed_slot_types: &'a [Option<Type>],
 }
 
 fn enum_drop_plan_len(definition: &RynEnum, structs: &[RynStruct]) -> usize {
@@ -7779,6 +8182,14 @@ fn run_rust_link(
         .arg("debuginfo=0")
         .arg("-C")
         .arg(format!("link-arg={}", object.display()));
+    // Runtime panic locations name the wrapper source; map the per-build
+    // temporary directory to a fixed name so builds are reproducible.
+    if let Some(directory) = wrapper.parent() {
+        command.arg(format!(
+            "--remap-path-prefix={}=ryn-build",
+            directory.display()
+        ));
+    }
     if let Some(runtime_object) = runtime_object {
         command
             .arg("-C")
@@ -7795,6 +8206,8 @@ fn run_rust_link(
             "link-arg=/PDB:{}",
             wrapper.with_extension("pdb").display()
         ));
+        // Reproducible images: the same program links to the same bytes.
+        command.arg("-C").arg("link-arg=/Brepro");
     }
     command.status().map_err(|error| {
         BuildError::Link(format!(

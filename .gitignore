@@ -8,3 +8,5 @@
 /examples/**/build/cache/
 /.ryn/
 /examples/*/.ryn/
+/selfhost/build/
+/selfhost/.ryn/

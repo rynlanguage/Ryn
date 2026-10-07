@@ -267,6 +267,21 @@ unsafe extern "C" fn ryn_vec_elem_map_clone(source: *const u8, output: *mut u8) 
     unsafe { ptr::write(output.cast::<*mut RynMap>(), ryn_map_clone(pointer)) };
 }
 
+unsafe extern "C" fn ryn_vec_elem_vec_drop(slot: *mut u8) {
+    let pointer = unsafe { ptr::read(slot.cast::<*mut super::vectors::RynVec>()) };
+    super::vectors::ryn_vec_drop(pointer);
+}
+
+unsafe extern "C" fn ryn_vec_elem_vec_clone(source: *const u8, output: *mut u8) {
+    let pointer = unsafe { ptr::read(source.cast::<*const super::vectors::RynVec>()) };
+    unsafe {
+        ptr::write(
+            output.cast::<*mut super::vectors::RynVec>(),
+            super::vectors::ryn_vec_clone(pointer),
+        )
+    };
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn ryn_vec_map_element(drop_out: *mut usize, clone_out: *mut usize) {
     if drop_out.is_null() || clone_out.is_null() {
@@ -406,37 +421,19 @@ fn owned_element_callbacks(
     Option<super::vectors::CloneElement>,
 ) {
     match kind {
+        // Element callbacks receive the address of the slot holding the
+        // handle, so wrap the handle-based runtime functions.
         VALUE_STRING => (
-            Some(unsafe {
-                std::mem::transmute::<usize, super::vectors::DropElement>(
-                    super::strings::ryn_string_drop as usize,
-                )
-            }),
-            Some(unsafe {
-                std::mem::transmute::<usize, super::vectors::CloneElement>(
-                    super::strings::ryn_string_clone as usize,
-                )
-            }),
+            Some(super::strings::ryn_vec_elem_string_drop as super::vectors::DropElement),
+            Some(super::strings::ryn_vec_elem_string_clone as super::vectors::CloneElement),
         ),
         VALUE_VEC => (
-            Some(unsafe {
-                std::mem::transmute::<usize, super::vectors::DropElement>(
-                    super::vectors::ryn_vec_drop as usize,
-                )
-            }),
-            Some(unsafe {
-                std::mem::transmute::<usize, super::vectors::CloneElement>(
-                    super::vectors::ryn_vec_clone as usize,
-                )
-            }),
+            Some(ryn_vec_elem_vec_drop as super::vectors::DropElement),
+            Some(ryn_vec_elem_vec_clone as super::vectors::CloneElement),
         ),
         VALUE_MAP => (
-            Some(unsafe {
-                std::mem::transmute::<usize, super::vectors::DropElement>(ryn_map_drop as usize)
-            }),
-            Some(unsafe {
-                std::mem::transmute::<usize, super::vectors::CloneElement>(ryn_map_clone as usize)
-            }),
+            Some(ryn_vec_elem_map_drop as super::vectors::DropElement),
+            Some(ryn_vec_elem_map_clone as super::vectors::CloneElement),
         ),
         VALUE_STRUCT => match custom {
             Some((drop_callback, clone_callback)) => (

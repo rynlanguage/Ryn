@@ -513,6 +513,9 @@ pub enum IrExpression {
         field_index: usize,
         ty: Type,
         span: Span,
+        /// Load owned handles without cloning them; the caller only reads or
+        /// mutates the stored value in place and never takes ownership.
+        borrowed: bool,
     },
     ValueAddress {
         value: Box<IrExpression>,
@@ -548,6 +551,11 @@ pub enum IrExpression {
         output_failure_variant: usize,
     },
     ArrayValue(Vec<IrExpression>),
+    /// One evaluated element, replicated `length` times. The element is copyable.
+    ArrayRepeat {
+        value: Box<IrExpression>,
+        length: usize,
+    },
     ArrayAsSlice {
         array: Box<IrExpression>,
         slice_id: usize,
@@ -663,6 +671,8 @@ pub enum IrStatement {
         else_body: Vec<IrStatement>,
     },
     While {
+        /// Temporaries the condition needs, evaluated on every iteration.
+        setup: Vec<IrStatement>,
         condition: IrExpression,
         body: Vec<IrStatement>,
     },
@@ -2085,6 +2095,29 @@ fn is_option_ast_payload(definition: &EnumDef, payload: &TypeName) -> bool {
         && definition.variants[1].fields.is_empty()
 }
 
+/// Builtin collection and String methods operate on the stored handle in
+/// place, so a receiver read through a reference (`self.items.push(x)`) must
+/// not clone the field first: the mutation would land on the copy.
+fn borrow_reference_receiver(receiver: &mut IrExpression, ty: Type) {
+    if !matches!(
+        ty,
+        Type::Vec(_) | Type::Map(_) | Type::Set(_) | Type::OwnedString
+    ) {
+        return;
+    }
+    let mut current = receiver;
+    loop {
+        match current {
+            IrExpression::ReferenceField { borrowed, .. } => {
+                *borrowed = true;
+                return;
+            }
+            IrExpression::Field { value, .. } => current = value,
+            _ => return,
+        }
+    }
+}
+
 fn is_option_u64(definition: &RynEnum) -> bool {
     definition.name.starts_with("$RynOption")
         && definition.variants.len() == 2
@@ -2132,6 +2165,9 @@ struct Analyzer<'a> {
     return_type: Option<Type>,
     recover_block_errors: bool,
     recovery_diagnostics: Vec<Diagnostic>,
+    /// Lets created while lowering an expression. They run just before the
+    /// statement that uses them, or at the top of a `while` header.
+    pending_statements: Vec<IrStatement>,
 }
 
 impl<'a> Analyzer<'a> {
@@ -2166,6 +2202,7 @@ impl<'a> Analyzer<'a> {
             return_type: None,
             recover_block_errors: false,
             recovery_diagnostics: Vec::new(),
+            pending_statements: Vec::new(),
         }
     }
 
@@ -2366,13 +2403,14 @@ impl<'a> Analyzer<'a> {
         function: Function,
         parameters: Vec<LocalBinding>,
         body_always_returns: bool,
-        statements: Vec<IrStatement>,
+        mut statements: Vec<IrStatement>,
     ) -> Result<RynFunction, Diagnostic> {
         let return_type = self.return_type;
         let return_value = match (return_type, function.return_value) {
             (Some(expected), Some(value)) => {
                 let span = value.span();
                 let (value, actual) = self.expression(value, Some(expected))?;
+                statements.extend(std::mem::take(&mut self.pending_statements));
                 self.validate_reference_return(&value, function.span)?;
                 if expected != actual {
                     return Err(diag(
@@ -2748,6 +2786,53 @@ impl<'a> Analyzer<'a> {
     }
 
     fn statement(&mut self, statement: Statement) -> Result<IrStatement, Diagnostic> {
+        match self.lower_statement(statement) {
+            Ok(lowered) => Ok(self.attach_pending(lowered)),
+            Err(error) => {
+                self.pending_statements.clear();
+                Err(error)
+            }
+        }
+    }
+
+    fn attach_pending(&mut self, statement: IrStatement) -> IrStatement {
+        let mut pending = std::mem::take(&mut self.pending_statements);
+        if pending.is_empty() {
+            statement
+        } else {
+            pending.push(statement);
+            IrStatement::Block(pending)
+        }
+    }
+
+    /// Stores a copyable expression in a fresh local so a shared method can borrow it.
+    fn materialize_copy_receiver(
+        &mut self,
+        value: IrExpression,
+        ty: Type,
+        span: Span,
+    ) -> Result<IrExpression, Diagnostic> {
+        if !receiver_is_copyable(ty, self.structs) {
+            return Err(diag(
+                "R0235",
+                "method receivers must be a local variable for now",
+                span,
+            )
+            .with_help(
+                "assign the value to a local first; only copyable expression receivers are stored in a temporary",
+            ));
+        }
+        let slot = self.allocate(ty);
+        self.pending_statements.push(IrStatement::Let {
+            slot,
+            ty,
+            value,
+            span,
+        });
+        Ok(IrExpression::Local { slot, ty, span })
+    }
+
+    fn lower_statement(&mut self, statement: Statement) -> Result<IrStatement, Diagnostic> {
         match statement {
             Statement::Let {
                 name,
@@ -2756,7 +2841,10 @@ impl<'a> Analyzer<'a> {
                 value,
                 span,
             } => {
-                if self.names.contains_key(&name) {
+                // `_ := value` evaluates and keeps the value until the end of
+                // the scope without binding a name, so it may repeat.
+                let discard = name == "_";
+                if !discard && self.names.contains_key(&name) {
                     let value_span = value.span();
                     let error = diag(
                         "R0202",
@@ -2814,7 +2902,9 @@ impl<'a> Analyzer<'a> {
                     )));
                 }
                 let slot = self.allocate(ty);
-                self.names.insert(name, Binding { slot, ty, mutable });
+                if !discard {
+                    self.names.insert(name, Binding { slot, ty, mutable });
+                }
                 Ok(IrStatement::Let {
                     slot,
                     ty,
@@ -3279,7 +3369,8 @@ impl<'a> Analyzer<'a> {
                     }
                     _ => None,
                 };
-                let (root_ir, mut current_ty) = self.expression(root_expression, None)?;
+                let (mut root_ir, mut current_ty) = self.expression(root_expression, None)?;
+                borrow_reference_receiver(&mut root_ir, current_ty);
                 let mut statements = Vec::with_capacity(links.len());
                 let link_count = links.len();
                 for (link_index, (link_name, link_arguments, link_span)) in
@@ -3388,6 +3479,7 @@ impl<'a> Analyzer<'a> {
                 let (condition, ty) = match self.expression(condition, Some(Type::Bool)) {
                     Ok(result) => result,
                     Err(error) if self.recover_block_errors => {
+                        self.pending_statements.clear();
                         let outer_names = self.names.clone();
                         self.loop_depth += 1;
                         let _ = self.block(body);
@@ -3397,6 +3489,7 @@ impl<'a> Analyzer<'a> {
                     }
                     Err(error) => return Err(error),
                 };
+                let setup = std::mem::take(&mut self.pending_statements);
                 if ty != Type::Bool {
                     let error = diag(
                         "R0207",
@@ -3419,7 +3512,11 @@ impl<'a> Analyzer<'a> {
                 self.loop_depth -= 1;
                 let body = body?;
                 self.names = outer_names;
-                Ok(IrStatement::While { condition, body })
+                Ok(IrStatement::While {
+                    setup,
+                    condition,
+                    body,
+                })
             }
             Statement::For {
                 name,
@@ -4115,6 +4212,77 @@ impl<'a> Analyzer<'a> {
                     Type::Struct(struct_id),
                 ))
             }
+            Expression::ArrayRepeat {
+                value,
+                length,
+                span,
+            } => {
+                let length = usize::try_from(length).map_err(|_| {
+                    diag("R0012", "array length exceeds the host limit", span)
+                        .with_help("use a smaller fixed array length")
+                })?;
+                let (element, element_ty) = match expected {
+                    Some(Type::Array(id)) => {
+                        let (element_ty, expected_len) = array_info(id);
+                        if length != expected_len {
+                            return Err(diag(
+                                "R0240",
+                                format!(
+                                    "array repeat has length {length} but the expected array needs {expected_len}"
+                                ),
+                                span,
+                            ));
+                        }
+                        let value_span = value.span();
+                        let (element, actual) = self.expression(*value, Some(element_ty))?;
+                        if actual != element_ty {
+                            return Err(diag(
+                                "R0205",
+                                format!(
+                                    "array element requires `{}` but has type `{}`",
+                                    type_name(element_ty),
+                                    type_name(actual)
+                                ),
+                                value_span,
+                            ));
+                        }
+                        (element, element_ty)
+                    }
+                    Some(other) => {
+                        return Err(diag(
+                            "R0205",
+                            format!(
+                                "array repeat does not match expected type `{}`",
+                                type_name(other)
+                            ),
+                            span,
+                        ));
+                    }
+                    None => self.expression(*value, None)?,
+                };
+                validate_array_literal_elem(element_ty, self.structs, span)?;
+                if !repeat_element_is_copy(element_ty, self.structs) {
+                    return Err(diag(
+                        "R0256",
+                        format!(
+                            "array repeat cannot copy `{}` elements",
+                            type_name(element_ty)
+                        ),
+                        span,
+                    )
+                    .with_help(
+                        "repeat expressions evaluate the element once and copy the bits; write an element list for String, Vec, Map, Set, or enum values",
+                    ));
+                }
+                let ty = Type::Array(intern_array(element_ty, length));
+                Ok((
+                    IrExpression::ArrayRepeat {
+                        value: Box::new(element),
+                        length,
+                    },
+                    ty,
+                ))
+            }
             Expression::ArrayLiteral(elements, span) => {
                 let mut elements = elements.into_iter();
                 let (element_ty, length, first_value) = match expected {
@@ -4199,8 +4367,36 @@ impl<'a> Analyzer<'a> {
                         element,
                     ));
                 }
+                if let Type::Vec(elem_id) = array_ty {
+                    // `items[i]` reads like `items.index(i)`, cloning the element.
+                    let mut receiver = array;
+                    borrow_reference_receiver(&mut receiver, array_ty);
+                    let (target, arguments, result) = self.lower_vec_method(
+                        receiver,
+                        elem_id,
+                        "index".into(),
+                        vec![*index],
+                        span,
+                        true,
+                    )?;
+                    let return_type = result.ok_or_else(|| {
+                        diag("R0241", "this Vec element type cannot be indexed", span)
+                    })?;
+                    return Ok((
+                        IrExpression::Call {
+                            target,
+                            arguments,
+                            return_type,
+                        },
+                        return_type,
+                    ));
+                }
                 let Type::Array(array_id) = array_ty else {
-                    return Err(diag("R0241", "indexing requires a fixed array", span));
+                    return Err(diag(
+                        "R0241",
+                        "indexing requires a fixed array, slice, or Vec",
+                        span,
+                    ));
                 };
                 let (element, length) = array_info(array_id);
                 let mut seen_structs = HashSet::new();
@@ -4365,6 +4561,7 @@ impl<'a> Analyzer<'a> {
                             field_index,
                             ty: field_info.ty,
                             span,
+                            borrowed: false,
                         },
                         field_info.ty,
                     ));
@@ -5153,7 +5350,9 @@ impl<'a> Analyzer<'a> {
                 if matches!(target, Type::RawPointer(_)) {
                     let inner_span = inner.span();
                     let (value, source) = self.expression(*inner, None)?;
-                    if matches!(source, Type::FunctionPointer(_)) {
+                    if matches!(source, Type::RawPointer(_) | Type::FunctionPointer(_))
+                        || is_integer(source)
+                    {
                         return Ok((
                             IrExpression::Cast {
                                 value: Box::new(value),
@@ -5166,10 +5365,13 @@ impl<'a> Analyzer<'a> {
                     return Err(diag(
                         "R0206",
                         format!(
-                            "raw pointer cast requires a function pointer, found `{}`",
+                            "raw pointer cast requires an integer address, a raw pointer, or a function pointer, found `{}`",
                             type_name(source)
                         ),
                         inner_span,
+                    )
+                    .with_help(
+                        "write `pointer as *u8` to reinterpret a raw pointer, or `32512 as *u8` for a Win32 resource id",
                     ));
                 }
                 if !is_numeric(target) {
@@ -5187,7 +5389,9 @@ impl<'a> Analyzer<'a> {
                 let literal_context =
                     matches!(inner.as_ref(), Expression::Integer(..)) && is_integer(target);
                 let (value, source) = self.expression(*inner, literal_context.then_some(target))?;
-                if !is_numeric(source) {
+                // A `char` converts to its Unicode scalar value, like a `u32`.
+                let char_to_integer = source == Type::Char && is_integer(target);
+                if !is_numeric(source) && !char_to_integer {
                     return Err(diag(
                         "R0206",
                         format!(
@@ -5279,12 +5483,16 @@ impl<'a> Analyzer<'a> {
                     }
                     _ => None,
                 };
+                // Without a syntactic hint, the checked left operand types a
+                // literal on the right: `self.byte(i) != 123` compares `u32`s.
+                let left_context =
+                    (is_numeric(left_ty) && (!bitwise || is_integer(left_ty))).then_some(left_ty);
                 let (right, right_ty) = self.expression(
                     *right,
                     if shift {
                         Some(Type::U32)
                     } else {
-                        operator_parameter_type.or(context)
+                        operator_parameter_type.or(context).or(left_context)
                     },
                 )?;
                 if let Type::Struct(struct_id) = left_ty {
@@ -5310,6 +5518,22 @@ impl<'a> Analyzer<'a> {
                         return Ok(operator);
                     }
                 }
+                // `String == str` compares the String's text through a borrowed view.
+                let (left, left_ty, right, right_ty) = match (op, left_ty, right_ty) {
+                    (BinaryOp::Eq | BinaryOp::Ne, Type::OwnedString, Type::Str) => (
+                        IrExpression::StringAsStr(Box::new(left)),
+                        Type::Str,
+                        right,
+                        right_ty,
+                    ),
+                    (BinaryOp::Eq | BinaryOp::Ne, Type::Str, Type::OwnedString) => (
+                        left,
+                        left_ty,
+                        IrExpression::StringAsStr(Box::new(right)),
+                        Type::Str,
+                    ),
+                    _ => (left, left_ty, right, right_ty),
+                };
                 let result_ty = match op {
                     BinaryOp::Add
                     | BinaryOp::Sub
@@ -5968,6 +6192,7 @@ impl<'a> Analyzer<'a> {
             .and_then(|name| self.names.get(name))
             .is_none_or(|binding| binding.mutable || self.parameter_slots.contains(&binding.slot));
         let (mut receiver, receiver_ty) = self.expression(value, None)?;
+        borrow_reference_receiver(&mut receiver, receiver_ty);
         if matches!(name.as_str(), "parse" | "try_parse") {
             if type_arguments.len() != 1 {
                 return Err(diag(
@@ -6026,7 +6251,11 @@ impl<'a> Analyzer<'a> {
                 span,
                 mutable,
             );
-        } else if !type_arguments.is_empty() {
+        } else if !type_arguments.is_empty()
+            && !(name == "unwrap_or"
+                && type_arguments.len() == 1
+                && matches!(receiver_ty, Type::Enum(_)))
+        {
             return Err(diag(
                 "R0234",
                 "this method does not accept type arguments",
@@ -6189,6 +6418,32 @@ impl<'a> Analyzer<'a> {
                 || definition.name.starts_with("$RynResult#"))
                 && name == "unwrap_or"
             {
+                if let Some(type_argument) = type_arguments.first() {
+                    let requested_type = self.resolve_type_name(type_argument)?;
+                    let expected_type = definition.variants.iter().find_map(|variant| {
+                        (variant.name
+                            == if definition.name.starts_with("$RynResult#") {
+                                "Ok"
+                            } else {
+                                "Some"
+                            })
+                        .then(|| variant.fields.first().copied())
+                        .flatten()
+                    });
+                    if expected_type != Some(requested_type) {
+                        return Err(diag(
+                            "R0212",
+                            format!(
+                                "unwrap_or type argument `{}` does not match the payload type `{}`",
+                                type_name(requested_type),
+                                expected_type
+                                    .map(type_name)
+                                    .unwrap_or_else(|| "unknown".into())
+                            ),
+                            span,
+                        ));
+                    }
+                }
                 if arguments.len() != 1 {
                     return Err(diag(
                         "R0211",
@@ -7289,6 +7544,18 @@ impl<'a> Analyzer<'a> {
             )
             .with_help("declare the receiver's root binding with `mut`"));
         }
+        let receiver = if matches!(receiver, IrExpression::Local { .. }) {
+            receiver
+        } else if self_mutable {
+            return Err(diag(
+                "R0235",
+                "method receivers must be a local variable for now",
+                span,
+            )
+            .with_help("assign the value to a local first; `mut self` cannot borrow a temporary"));
+        } else {
+            self.materialize_copy_receiver(receiver, receiver_ty, span)?
+        };
         let borrow = self.receiver_borrow(receiver, receiver_ty, self_mutable, span)?;
         let mut lowered = vec![borrow];
         for argument in arguments {
@@ -8424,6 +8691,10 @@ impl<'a> Analyzer<'a> {
             };
             match self.expression_for_parameter(argument, *expected) {
                 Ok((argument, actual)) if actual == *expected => lowered.push(argument),
+                // A `str` parameter borrows an owning String for the call.
+                Ok((argument, Type::OwnedString)) if *expected == Type::Str => {
+                    lowered.push(IrExpression::StringAsStr(Box::new(argument)));
+                }
                 Ok((argument, actual)) => {
                     let diagnostic = diag(
                         "R0212",
@@ -8472,6 +8743,9 @@ impl<'a> Analyzer<'a> {
             Expression::ArrayLiteral(values, _) => {
                 Some(Type::Array(intern_array(vec_elem(slice_id), values.len())))
             }
+            Expression::ArrayRepeat { length, .. } => usize::try_from(*length)
+                .ok()
+                .map(|length| Type::Array(intern_array(vec_elem(slice_id), length))),
             _ => None,
         };
         let array_context = hinted_array.or(literal_array);
@@ -8534,8 +8808,13 @@ impl<'a> Analyzer<'a> {
                 }
                 continue;
             };
-            let accepts_owned_path =
-                matches!(target, IrCallTarget::Filesystem(_)) && expected == Type::Str;
+            // Builtins that read text borrow an owning String for the call;
+            // the runtime call releases a temporary owner afterwards.
+            let accepts_owned_path = expected == Type::Str
+                && matches!(
+                    target,
+                    IrCallTarget::Filesystem(_) | IrCallTarget::String(_) | IrCallTarget::System(_)
+                );
             let analyzed = if accepts_owned_path {
                 self.expression(argument, None)
             } else {
@@ -8867,6 +9146,41 @@ fn validate_array_elem(elem: Type, span: Span) -> Result<(), Diagnostic> {
     ))
 }
 
+fn repeat_element_is_copy(ty: Type, structs: &[RynStruct]) -> bool {
+    match ty {
+        Type::I8
+        | Type::I16
+        | Type::I32
+        | Type::I64
+        | Type::U8
+        | Type::U16
+        | Type::U32
+        | Type::U64
+        | Type::F32
+        | Type::F64
+        | Type::Bool
+        | Type::Char
+        | Type::Str
+        | Type::RawPointer(_)
+        | Type::FunctionPointer(_)
+        | Type::Reference(_, _) => true,
+        Type::Array(id) => repeat_element_is_copy(array_info(id).0, structs),
+        Type::Struct(id) => {
+            structs[id].drop_function.is_none()
+                && structs[id]
+                    .fields
+                    .iter()
+                    .all(|field| repeat_element_is_copy(field.ty, structs))
+        }
+        Type::OwnedString
+        | Type::Vec(_)
+        | Type::Map(_)
+        | Type::Set(_)
+        | Type::Enum(_)
+        | Type::Slice(_) => false,
+    }
+}
+
 fn validate_array_literal_elem(
     elem: Type,
     structs: &[RynStruct],
@@ -9010,6 +9324,26 @@ fn name_span(name: &TypeName) -> Span {
         | TypeName::RawPointer(_, span)
         | TypeName::FunctionPointer(_, _, _, span) => *span,
         _ => Span::default(),
+    }
+}
+
+fn receiver_is_copyable(ty: Type, structs: &[RynStruct]) -> bool {
+    match ty {
+        Type::OwnedString
+        | Type::Vec(_)
+        | Type::Map(_)
+        | Type::Set(_)
+        | Type::Enum(_)
+        | Type::Str
+        | Type::Slice(_)
+        | Type::Reference(_, _)
+        | Type::FunctionPointer(_) => false,
+        Type::Struct(_) => !type_has_owned_data_in_sema(ty, structs),
+        Type::Array(id) => {
+            let (element, _) = array_info(id);
+            receiver_is_copyable(element, structs)
+        }
+        _ => true,
     }
 }
 
@@ -9676,7 +10010,7 @@ pub(crate) fn storage_slot_width(ty: Type, structs: &[RynStruct]) -> usize {
     }
 }
 
-fn type_layout(ty: Type, structs: &[RynStruct]) -> (usize, usize) {
+pub(crate) fn type_layout(ty: Type, structs: &[RynStruct]) -> (usize, usize) {
     fn align_up(size: usize, align: usize) -> usize {
         size.saturating_add(align - 1) / align * align
     }

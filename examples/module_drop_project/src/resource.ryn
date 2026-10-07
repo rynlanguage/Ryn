@@ -1,0 +1,6 @@
+#[drop(release)]
+pub struct Resource {
+    pub handle: *i32,
+}
+
+fun release(resource: Resource) {}

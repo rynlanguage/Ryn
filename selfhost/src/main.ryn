@@ -1,0 +1,39 @@
+// The self-hosted Ryn frontend.
+//
+// usage: ryn-frontend [--recover] <source.ryn> <output>
+//        ryn-frontend --monomorphize <program> <output>
+//
+// The first form lexes and parses a source file and writes the encoded
+// syntax tree, or its diagnostics; `--recover` reports every independent
+// syntax error instead of the first. The second form reads an encoded
+// program, specializes its generic functions, and writes the result.
+
+use std::fs
+use std::io
+use frontend::generics
+use frontend::parser
+
+fun main() -> i32 {
+    mut mode := String()
+    mut first: u32 = 0
+    when arg_count() == 3 {
+        mode = String(arg(0))
+        first = 1
+    }
+    when arg_count() != first + 2 || (first == 1 && mode != "--recover" && mode != "--monomorphize") {
+        io::eprintln("usage: ryn-frontend [--recover|--monomorphize] <input> <output>")
+        return 2
+    }
+    input := read_file(arg(first))
+    mut encoded := String()
+    when mode == "--monomorphize" {
+        encoded = generics::specialize(input)
+    } else {
+        encoded = parser::parse(input, mode == "--recover")
+    }
+    when !fs::write(arg(first + 1), encoded) {
+        io::eprintln("ryn-frontend: cannot write the output")
+        return 1
+    }
+    return 0
+}

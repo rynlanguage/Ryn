@@ -1,10 +1,60 @@
-use std::{env, path::PathBuf, process::Command};
+use std::{
+    collections::hash_map::DefaultHasher,
+    env, fs,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn main() {
     configure_windows_stack();
+    if let Err(error) = set_compiler_build_fingerprint() {
+        panic!("could not fingerprint the Ryn compiler sources: {error}");
+    }
     if let Err(error) = build_runtime_shim() {
         panic!("could not build the native runtime shim: {error}");
     }
+}
+
+fn set_compiler_build_fingerprint() -> Result<(), String> {
+    fn collect(directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+        println!("cargo:rerun-if-changed={}", directory.display());
+        let entries = fs::read_dir(directory)
+            .map_err(|error| format!("cannot read {}: {error}", directory.display()))?;
+        for entry in entries {
+            let path = entry
+                .map_err(|error| {
+                    format!("cannot read an entry in {}: {error}", directory.display())
+                })?
+                .path();
+            if path.is_dir() {
+                collect(&path, files)?;
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                println!("cargo:rerun-if-changed={}", path.display());
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    println!("cargo:rerun-if-changed=build.rs");
+    let mut files = Vec::new();
+    collect(Path::new("src"), &mut files)?;
+    files.push(PathBuf::from("build.rs"));
+    files.sort();
+
+    let mut hasher = DefaultHasher::new();
+    for path in files {
+        path.hash(&mut hasher);
+        fs::read(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?
+            .hash(&mut hasher);
+    }
+    println!(
+        "cargo:rustc-env=RYN_COMPILER_BUILD_FINGERPRINT={:016x}",
+        hasher.finish()
+    );
+    Ok(())
 }
 
 fn configure_windows_stack() {
