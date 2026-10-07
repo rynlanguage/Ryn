@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::manifest::{Dependency, Manifest};
+use crate::registry;
 
 const LOCK_VERSION: u32 = 1;
 
@@ -28,6 +29,9 @@ struct LockedPackage {
     branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     revision: Option<String>,
+    /// SHA-256 of a registry package archive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checksum: Option<String>,
 }
 
 pub fn write_project_lock(project: &Path) -> Result<PathBuf, String> {
@@ -117,6 +121,7 @@ fn collect(
         return Ok(());
     }
     for (name, dependency) in &manifest.dependencies {
+        let mut checksum = None;
         let (dependency_root, source, branch, revision) = match dependency {
             Dependency::Path { path } => {
                 let resolved = fs::canonicalize(canonical.join(path)).map_err(|error| {
@@ -154,11 +159,36 @@ fn collect(
                     resolve_git(project_root, git, branch.as_deref(), pinned_revision)?;
                 (resolved, format!("git:{git}"), branch.clone(), Some(commit))
             }
-            Dependency::Version(_) => {
-                return Err(format!(
-                    "error[R0432]: cannot lock dependency `{name}` in `{}`: registry resolution is not implemented",
-                    manifest.name
-                ));
+            Dependency::Version(requirement) => {
+                let registry_url = registry::registry_url();
+                let source = registry::lock_source(&registry_url);
+                let pinned = lock
+                    .and_then(|lock| {
+                        lock.packages
+                            .iter()
+                            .find(|entry| entry.parent == manifest.name && entry.name == *name)
+                    })
+                    .filter(|entry| {
+                        entry.source == source && registry::version_matches(requirement, &entry.version)
+                    })
+                    .and_then(|entry| entry.checksum.clone().map(|sum| (entry.version.clone(), sum)));
+                let (version, sum) = match pinned {
+                    Some(pinned) if !refresh_git => pinned,
+                    _ if refresh_git => {
+                        let resolved = registry::resolve(&registry_url, name, requirement)?;
+                        (resolved.version, resolved.checksum)
+                    }
+                    _ => {
+                        return Err(format!(
+                            "error[R0431]: registry dependency `{name}` {requirement} in `{}` is missing from or differs from ryn.lock; run `ryn lock {}`",
+                            manifest.name,
+                            project_root.display()
+                        ));
+                    }
+                };
+                let resolved = registry::fetch(project_root, &registry_url, name, &version, &sum)?;
+                checksum = Some(sum);
+                (resolved, source, None, None)
             }
         };
         let dependency_manifest =
@@ -176,6 +206,7 @@ fn collect(
             source,
             branch,
             revision,
+            checksum,
         });
         collect(
             &dependency_root,
@@ -188,6 +219,47 @@ fn collect(
         )?;
     }
     Ok(())
+}
+
+/// Finds the registry package pinned in ryn.lock for `parent`'s dependency
+/// `name` and returns its unpacked root, downloading it when not cached.
+pub fn resolve_locked_registry_dependency(
+    project: &Path,
+    parent: &str,
+    name: &str,
+    requirement: &str,
+) -> Result<PathBuf, String> {
+    let root = fs::canonicalize(project)
+        .map_err(|error| format!("error[R0430]: cannot resolve project: {error}"))?;
+    let lock_path = root.join("ryn.lock");
+    let text = fs::read_to_string(&lock_path).map_err(|error| {
+        format!(
+            "error[R0431]: registry dependency `{name}` requires {} (`ryn lock {}`): {error}",
+            lock_path.display(),
+            root.display()
+        )
+    })?;
+    let lock: Lockfile = serde_yaml::from_str(&text)
+        .map_err(|error| format!("error[R0430]: invalid {}: {error}", lock_path.display()))?;
+    let registry_url = registry::registry_url();
+    let entry = lock
+        .packages
+        .iter()
+        .find(|entry| entry.parent == parent && entry.name == name)
+        .filter(|entry| {
+            entry.source == registry::lock_source(&registry_url)
+                && registry::version_matches(requirement, &entry.version)
+        })
+        .ok_or_else(|| {
+            format!(
+                "error[R0431]: registry dependency `{name}` {requirement} is not pinned in ryn.lock; run `ryn lock {}`",
+                root.display()
+            )
+        })?;
+    let checksum = entry.checksum.as_deref().ok_or_else(|| {
+        format!("error[R0431]: registry dependency `{name}` has no checksum in ryn.lock")
+    })?;
+    registry::fetch(&root, &registry_url, name, &entry.version, checksum)
 }
 
 pub fn resolve_locked_git_dependency(

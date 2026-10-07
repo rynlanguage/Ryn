@@ -14,6 +14,17 @@ pub struct Manifest {
     pub version: String,
     #[serde(default = "default_owner")]
     pub owner: String,
+    /// Package metadata shown by the registry; unused by the compiler itself.
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub repository: Option<String>,
+    #[serde(default)]
+    pub homepage: Option<String>,
+    #[serde(default)]
+    pub keywords: Vec<String>,
     #[serde(default, deserialize_with = "null_default")]
     pub dependencies: BTreeMap<String, Dependency>,
     #[serde(default)]

@@ -17,6 +17,7 @@ pub mod manifest;
 pub mod map_ops;
 mod modules;
 pub mod parser;
+pub mod registry;
 pub mod sema;
 pub mod source;
 pub mod string_ops;

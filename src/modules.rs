@@ -8,7 +8,7 @@ use std::{
 use crate::{
     ast::Program,
     frontend::Frontend,
-    lockfile::resolve_locked_git_dependency,
+    lockfile::{resolve_locked_git_dependency, resolve_locked_registry_dependency},
     manifest::{Dependency, Manifest},
     sema::{self, RynIr},
     source::{Diagnostic, SourceFile, Span},
@@ -308,12 +308,12 @@ fn collect_path_dependencies(
                 git,
                 branch.as_deref(),
             )?,
-            Dependency::Version(_) => {
-                return Err(format!(
-                    "error[R0425]: registry dependency `{name}` in `{}` cannot be resolved yet",
-                    manifest.name
-                ));
-            }
+            Dependency::Version(requirement) => resolve_locked_registry_dependency(
+                project_root,
+                &manifest.name,
+                name,
+                requirement,
+            )?,
         };
         let dependency_manifest =
             Manifest::load_project(&dependency_root).map_err(|error| error.to_string())?;

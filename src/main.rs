@@ -12,6 +12,7 @@ use ryn::{
     frontend::{self, Frontend},
     lockfile::{validate_project_lock_if_present, write_project_lock},
     manifest::{Dependency, Manifest, Optimize},
+    registry,
     source::SourceFile,
 };
 
@@ -60,6 +61,32 @@ fn run_cli() -> Result<Option<i32>, String> {
             return Err(usage());
         }
         clean_project(&path)?;
+        return Ok(None);
+    }
+    if command == "login" {
+        let token = args
+            .next()
+            .and_then(|s| s.into_string().ok())
+            .ok_or_else(usage)?;
+        if args.next().is_some() {
+            return Err(usage());
+        }
+        let path = registry::login(&token)?;
+        println!("saved registry token to {}", path.display());
+        return Ok(None);
+    }
+    if command == "publish" {
+        let path = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        if args.next().is_some() || !path.join("ryn.yaml").is_file() {
+            return Err(usage());
+        }
+        // A package with an entry point must check cleanly before it is uploaded.
+        // Library-only packages have no src/main.ryn and are checked by their users.
+        if path.join("src").join("main.ryn").is_file() {
+            check_project_with_frontend(&path, &frontend::select(None)?)?;
+        }
+        let url = registry::publish(&path)?;
+        println!("published {url}");
         return Ok(None);
     }
     if command == "lock" {
@@ -156,7 +183,16 @@ fn run_cli() -> Result<Option<i32>, String> {
     } else {
         None
     };
-    if project_manifest.is_some() {
+    if let Some(manifest) = &project_manifest {
+        // The first build of a project with registry dependencies creates ryn.lock.
+        let uses_registry = manifest
+            .dependencies
+            .values()
+            .any(|dependency| matches!(dependency, Dependency::Version(_)));
+        if uses_registry && !requested_input.join("ryn.lock").is_file() {
+            let lock = write_project_lock(&requested_input)?;
+            eprintln!("note: created {}", lock.display());
+        }
         validate_project_lock_if_present(&requested_input)?;
     }
     let input = source_path(&requested_input)?;
@@ -603,7 +639,7 @@ fn output_path(input: &Path) -> PathBuf {
 }
 
 fn usage() -> String {
-    "usage:\n  ryn new <path>\n  ryn check <file.ryn|project-dir> [--frontend <ryn|rust>]\n  ryn build <file.ryn|project-dir> [--release] [-o|--output <path>] [--frontend <ryn|rust>]\n  ryn run <file.ryn|project-dir> [--release] [-o|--output <path>] [--frontend <ryn|rust>] [-- <program-args...>]\n  ryn clean <project-dir>\n  ryn bootstrap".into()
+    "usage:\n  ryn new <path>\n  ryn check <file.ryn|project-dir> [--frontend <ryn|rust>]\n  ryn build <file.ryn|project-dir> [--release] [-o|--output <path>] [--frontend <ryn|rust>]\n  ryn run <file.ryn|project-dir> [--release] [-o|--output <path>] [--frontend <ryn|rust>] [-- <program-args...>]\n  ryn clean <project-dir>\n  ryn lock <project-dir>\n  ryn login <token>\n  ryn publish [project-dir]\n  ryn bootstrap".into()
 }
 
 /// Rebuilds the self-hosted frontend with itself until it reproduces itself.
@@ -687,7 +723,7 @@ fn bootstrap() -> Result<(), String> {
 
 fn help_text() -> String {
     format!(
-        "Ryn — Reliable. Fast. Native.\n\n{}\n\nCommands:\n  new <path>        Create a project with a native Hello World example\n  check <source>    Check a .ryn file or project directory\n  build <source>    Compile a .ryn file or project directory\n  run <source>      Compile and run a .ryn file or project directory\n  lock <project>    Resolve and write ryn.lock for supported dependencies\n  clean <project>   Remove the project's build directory\n  bootstrap         Rebuild the self-hosted frontend with itself and verify the fixpoint\n\nA project directory uses src/main.ryn as its entry point.\nProject outputs go under build/debug or build/release; build/cache is reserved for compiler caches.\nAn i32 result from main becomes the process exit code for run.\nPass program arguments to run after --.\nclean removes only the direct build directory and refuses symbolic links.\n\nOptions:\n  --release            Use the project's release output directory\n  -o, --output <path>  Set the executable path for build or run\n  --frontend <name>    Parse with the self-hosted `ryn` frontend (default) or the `rust` bootstrap parser\n  -h, --help           Show this help\n  -V, --version        Show compiler version\n",
+        "Ryn — Reliable. Fast. Native.\n\n{}\n\nCommands:\n  new <path>        Create a project with a native Hello World example\n  check <source>    Check a .ryn file or project directory\n  build <source>    Compile a .ryn file or project directory\n  run <source>      Compile and run a .ryn file or project directory\n  lock <project>    Resolve and write ryn.lock for supported dependencies\n  login <token>     Save a pods registry token for publishing\n  publish [project] Check, pack and upload the project to the pods registry\n  clean <project>   Remove the project's build directory\n  bootstrap         Rebuild the self-hosted frontend with itself and verify the fixpoint\n\nA project directory uses src/main.ryn as its entry point.\nProject outputs go under build/debug or build/release; build/cache is reserved for compiler caches.\nAn i32 result from main becomes the process exit code for run.\nPass program arguments to run after --.\nclean removes only the direct build directory and refuses symbolic links.\n\nOptions:\n  --release            Use the project's release output directory\n  -o, --output <path>  Set the executable path for build or run\n  --frontend <name>    Parse with the self-hosted `ryn` frontend (default) or the `rust` bootstrap parser\n  -h, --help           Show this help\n  -V, --version        Show compiler version\n",
         usage()
     )
 }
