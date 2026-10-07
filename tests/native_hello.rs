@@ -1497,7 +1497,11 @@ fun main() -> i32 {
 "#,
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
-    assert!(result.status.success(), "exit {:?}, stderr: {stderr}", result.status.code());
+    assert!(
+        result.status.success(),
+        "exit {:?}, stderr: {stderr}",
+        result.status.code()
+    );
     assert_eq!(String::from_utf8_lossy(&result.stdout), "else-when\nok\n");
 }
 
@@ -1531,7 +1535,11 @@ fun main() -> i32 {
     );
     let stderr = String::from_utf8_lossy(&result.stderr);
     if cfg!(windows) {
-        assert!(result.status.success(), "exit {:?}, stderr: {stderr}", result.status.code());
+        assert!(
+            result.status.success(),
+            "exit {:?}, stderr: {stderr}",
+            result.status.code()
+        );
         assert_eq!(String::from_utf8_lossy(&result.stdout), "ok\n");
     }
 }

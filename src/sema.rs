@@ -2977,7 +2977,9 @@ impl<'a> Analyzer<'a> {
                             .with_help("create the reference with `&mut value`"),
                     );
                 }
-                if !reference_pointee_supported_in(ty, self.structs) {
+                if !reference_pointee_supported_in(ty, self.structs)
+                    || matches!(ty, Type::Struct(_)) && !pointer_record_is_copy(ty, self.structs)
+                {
                     return Err(diag(
                         "R0206",
                         "assignment through this pointer type is not supported yet",
@@ -3096,6 +3098,31 @@ impl<'a> Analyzer<'a> {
                         pointer,
                         pointer_target(target),
                         reference_mutable,
+                        object.clone(),
+                        object_span,
+                        &fields,
+                        op,
+                        value,
+                        span,
+                    );
+                }
+                if let Type::RawPointer(target) = binding.ty {
+                    let pointee = pointer_target(target);
+                    if !matches!(pointee, Type::Struct(id) if self.structs[id].repr_c) {
+                        return Err(diag(
+                            "R0224",
+                            "raw pointer field access requires a #[repr(C)] structure",
+                            object_span,
+                        ));
+                    }
+                    return self.reference_field_assign(
+                        IrExpression::Local {
+                            slot: binding.slot,
+                            ty: binding.ty,
+                            span: object_span,
+                        },
+                        pointee,
+                        true,
                         object.clone(),
                         object_span,
                         &fields,
@@ -3634,14 +3661,17 @@ impl<'a> Analyzer<'a> {
                 self.loop_depth -= 1;
                 self.names = outer_names;
                 let body = body?;
-                Ok(with_setup(setup, IrStatement::For {
-                    slot,
-                    end_slot,
-                    ty,
-                    start,
-                    end,
-                    body,
-                }))
+                Ok(with_setup(
+                    setup,
+                    IrStatement::For {
+                        slot,
+                        end_slot,
+                        ty,
+                        start,
+                        end,
+                        body,
+                    },
+                ))
             }
             Statement::ForEach {
                 name,
@@ -4092,7 +4122,9 @@ impl<'a> Analyzer<'a> {
                     )
                     .with_help("declare the value with `mut` before borrowing it mutably"));
                 }
-                if !reference_pointee_supported_in(binding.ty, self.structs) {
+                if !matches!(binding.ty, Type::Struct(_))
+                    && !reference_pointee_supported_in(binding.ty, self.structs)
+                {
                     return Err(diag(
                         "R0206",
                         format!(
@@ -4134,7 +4166,10 @@ impl<'a> Analyzer<'a> {
                         ));
                     }
                 };
-                if !reference_pointee_supported(pointee) {
+                if !reference_pointee_supported_in(pointee, self.structs)
+                    || matches!(pointee, Type::Struct(_))
+                        && !pointer_record_is_copy(pointee, self.structs)
+                {
                     return Err(diag(
                         "R0206",
                         format!(
@@ -4553,19 +4588,31 @@ impl<'a> Analyzer<'a> {
                 let (value, actual) = self.expression(*value, None)?;
                 let referenced = match actual {
                     Type::Struct(_) => None,
-                    Type::Reference(target, _) => match pointer_target(target) {
-                        Type::Struct(struct_id) => Some(struct_id),
-                        _ => {
-                            return Err(diag(
-                                "R0224",
-                                "field access requires a structure value",
-                                span,
-                            )
-                            .with_help(
-                                "access a field on a value declared with a structure type",
-                            ));
+                    Type::Reference(target, _) | Type::RawPointer(target) => {
+                        match pointer_target(target) {
+                            Type::Struct(struct_id)
+                                if matches!(actual, Type::RawPointer(_))
+                                    && !self.structs[struct_id].repr_c =>
+                            {
+                                return Err(diag(
+                                    "R0224",
+                                    "raw pointer field access requires a #[repr(C)] structure",
+                                    span,
+                                ));
+                            }
+                            Type::Struct(struct_id) => Some(struct_id),
+                            _ => {
+                                return Err(diag(
+                                    "R0224",
+                                    "field access requires a structure value",
+                                    span,
+                                )
+                                .with_help(
+                                    "access a field on a value declared with a structure type",
+                                ));
+                            }
                         }
-                    },
+                    }
                     _ => {
                         return Err(
                             diag("R0224", "field access requires a structure value", span)
@@ -5422,6 +5469,18 @@ impl<'a> Analyzer<'a> {
                 let literal_context =
                     matches!(inner.as_ref(), Expression::Integer(..)) && is_integer(target);
                 let (value, source) = self.expression(*inner, literal_context.then_some(target))?;
+                if matches!(source, Type::RawPointer(_) | Type::FunctionPointer(_))
+                    && matches!(target, Type::U64 | Type::I64)
+                {
+                    return Ok((
+                        IrExpression::Cast {
+                            value: Box::new(value),
+                            source,
+                            target,
+                        },
+                        target,
+                    ));
+                }
                 // A `char` converts to its Unicode scalar value, like a `u32`.
                 let char_to_integer = source == Type::Char && is_integer(target);
                 if !is_numeric(source) && !char_to_integer {
@@ -6091,6 +6150,13 @@ impl<'a> Analyzer<'a> {
             return Err(self.unknown_struct_field(struct_id, final_field, *final_field_span));
         };
         self.check_field_visibility(struct_id, field_index, *final_field_span)?;
+        if field_index == 0 && self.structs[struct_id].drop_function.is_some() {
+            return Err(diag(
+                "R0255",
+                "cannot overwrite the resource handle through a borrowed value",
+                span,
+            ));
+        }
         let value_span = value.span();
         let (value, actual) = if let Some(op) = op {
             let mut left = Expression::Name(object, object_span);
@@ -10172,6 +10238,29 @@ fn reference_pointee_supported(ty: Type) -> bool {
     reference_pointee_supported_in(ty, &[])
 }
 
+// Whole-record pointer copies cannot duplicate owning fields or borrowed views.
+fn pointer_record_is_copy(ty: Type, structs: &[RynStruct]) -> bool {
+    match ty {
+        Type::Struct(id) => {
+            structs[id].drop_function.is_none()
+                && structs[id]
+                    .fields
+                    .iter()
+                    .all(|field| pointer_record_is_copy(field.ty, structs))
+        }
+        Type::Array(id) => pointer_record_is_copy(array_info(id).0, structs),
+        Type::OwnedString
+        | Type::Vec(_)
+        | Type::Map(_)
+        | Type::Set(_)
+        | Type::Enum(_)
+        | Type::Str
+        | Type::Slice(_)
+        | Type::Reference(_, _) => false,
+        _ => true,
+    }
+}
+
 fn reference_pointee_supported_in(ty: Type, structs: &[RynStruct]) -> bool {
     if matches!(
         ty,
@@ -10187,6 +10276,8 @@ fn reference_pointee_supported_in(ty: Type, structs: &[RynStruct]) -> bool {
             | Type::F64
             | Type::Char
             | Type::Bool
+            | Type::RawPointer(_)
+            | Type::FunctionPointer(_)
     ) {
         return true;
     }

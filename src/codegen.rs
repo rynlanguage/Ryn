@@ -1741,7 +1741,9 @@ fn reference_storage_layout(ty: Type, structs: &[RynStruct]) -> (u32, u32) {
         Type::I8 | Type::U8 | Type::Bool => (1, 1),
         Type::I16 | Type::U16 => (2, 2),
         Type::I32 | Type::U32 | Type::F32 | Type::Char => (4, 4),
-        Type::I64 | Type::U64 | Type::F64 => (8, 8),
+        Type::I64 | Type::U64 | Type::F64 | Type::RawPointer(_) | Type::FunctionPointer(_) => {
+            (8, 8)
+        }
         Type::Struct(id) if structs.get(id).is_some_and(|definition| definition.repr_c) => {
             let (size, align) = crate::sema::type_layout(ty, structs);
             (size as u32, align as u32)
@@ -1943,17 +1945,82 @@ fn load_addressed_local(
     ty: Type,
     address_slots: &[Option<StackSlot>],
     pointer_type: types::Type,
+    addressed_types: &[Option<Type>],
+    structs: &[RynStruct],
 ) -> Result<Option<Value>, String> {
-    let Some(Some(stack_slot)) = address_slots.get(slot) else {
-        return Ok(None);
-    };
-    let address = b.ins().stack_addr(pointer_type, *stack_slot, 0);
-    Ok(Some(b.ins().load(
-        clif_scalar_type(ty, pointer_type)?,
-        MemFlagsData::new(),
-        address,
-        0,
-    )))
+    for (root, root_type) in addressed_types.iter().enumerate() {
+        let Some(root_type) = root_type else { continue };
+        let Some(Some(stack_slot)) = address_slots.get(root) else {
+            continue;
+        };
+        if slot < root || slot >= root + storage_slot_width(*root_type, structs) {
+            continue;
+        }
+        let c_layout = matches!(root_type, Type::Struct(id) if structs[*id].repr_c);
+        if let Some(offset) = addressed_leaf_offset(*root_type, slot - root, structs, c_layout) {
+            let address = b.ins().stack_addr(pointer_type, *stack_slot, 0);
+            return Ok(Some(b.ins().load(
+                clif_scalar_type(ty, pointer_type)?,
+                MemFlagsData::new(),
+                address,
+                offset,
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn addressed_leaf_offset(
+    ty: Type,
+    slot: usize,
+    structs: &[RynStruct],
+    c_layout: bool,
+) -> Option<i32> {
+    match ty {
+        Type::Struct(id) => {
+            let mut cursor = 0usize;
+            for field in &structs[id].fields {
+                let offset = if c_layout {
+                    let (size, align) = crate::sema::type_layout(field.ty, structs);
+                    cursor = align_up(cursor, align);
+                    let offset = cursor;
+                    cursor += size;
+                    offset
+                } else {
+                    field.slot_offset * 8
+                };
+                if slot >= field.slot_offset
+                    && slot < field.slot_offset + storage_slot_width(field.ty, structs)
+                {
+                    return addressed_leaf_offset(
+                        field.ty,
+                        slot - field.slot_offset,
+                        structs,
+                        c_layout,
+                    )
+                    .map(|leaf| offset as i32 + leaf);
+                }
+            }
+            None
+        }
+        Type::Array(id) => {
+            let (element, length) = array_info(id);
+            let width = storage_slot_width(element, structs);
+            let index = slot / width;
+            if index >= length {
+                return None;
+            }
+            let stride = if c_layout {
+                let (size, align) = crate::sema::type_layout(element, structs);
+                align_up(size, align)
+            } else {
+                width * 8
+            };
+            addressed_leaf_offset(element, slot % width, structs, c_layout)
+                .map(|leaf| (index * stride) as i32 + leaf)
+        }
+        _ => (slot == 0).then_some(0),
+    }
 }
 
 fn bind_parameter_value(
@@ -2357,6 +2424,25 @@ fn emit_statements(
                 true
             }
             IrStatement::FieldAssign { slot, ty, value } => {
+                // A raw-pointer alias may have changed other fields since the last call.
+                for (root, root_type) in env.addressed_slot_types.iter().enumerate() {
+                    let Some(root_type) = root_type else { continue };
+                    if *slot < root || *slot >= root + storage_slot_width(*root_type, env.structs) {
+                        continue;
+                    }
+                    if let Some(Some(stack_slot)) = env.address_slots.get(root) {
+                        sync_stack_slot_to_variables(
+                            b,
+                            root,
+                            *root_type,
+                            *stack_slot,
+                            0,
+                            module.target_config().pointer_type(),
+                            env.structs,
+                            matches!(*root_type, Type::Struct(id) if env.structs[id].repr_c),
+                        )?;
+                    }
+                }
                 let compiled = emit_expr(b, module, value, env, seal_state)?;
                 drop_binding(b, env, *slot, *ty, seal_state);
                 store_local(b, *slot, *ty, compiled, env.structs)?;
@@ -2462,15 +2548,8 @@ fn emit_statements(
                     );
                 };
                 let value = emit_expr(b, module, value, env, seal_state)?;
-                let values = flatten_value(value);
-                let [value] = values.as_slice() else {
-                    return Err("internal error: dereference assignment value is not scalar".into());
-                };
-                let expected = clif_scalar_type(*ty, module.target_config().pointer_type())?;
-                if b.func.dfg.value_type(*value) != expected {
-                    return Err("internal error: dereference assignment type mismatch".into());
-                }
-                b.ins().store(MemFlagsData::new(), *value, pointer, 0);
+                let c_layout = matches!(ty, Type::Struct(id) if env.structs[*id].repr_c);
+                store_reference_value(b, *ty, value, pointer, 0, env.structs, c_layout)?;
                 true
             }
             IrStatement::ArrayAssign {
@@ -3478,6 +3557,30 @@ fn load_reference_field(
             }
             Ok(CompiledValue::Struct { struct_id, fields })
         }
+        Type::Array(id) => {
+            let (element, length) = array_info(id);
+            let stride = if c_layout {
+                let (size, align) = crate::sema::type_layout(element, structs);
+                align_up(size, align)
+            } else {
+                storage_slot_width(element, structs) * 8
+            };
+            let mut values = Vec::with_capacity(length);
+            for index in 0..length {
+                values.push(load_reference_field(
+                    b,
+                    element,
+                    pointer,
+                    offset + (index * stride) as i32,
+                    c_layout,
+                    pointer_type,
+                    structs,
+                    runtime,
+                    borrow,
+                )?);
+            }
+            Ok(CompiledValue::Array(values))
+        }
         _ => Err("internal error: unsupported reference field type".into()),
     }
 }
@@ -4012,6 +4115,20 @@ fn emit_expr(
             let CompiledValue::Integer(pointer, _) = pointer else {
                 return Err("internal error: dereference operand is not a pointer".into());
             };
+            if matches!(ty, Type::Struct(_) | Type::Array(_)) {
+                let c_layout = matches!(ty, Type::Struct(id) if env.structs[*id].repr_c);
+                return load_reference_field(
+                    b,
+                    *ty,
+                    pointer,
+                    0,
+                    c_layout,
+                    module.target_config().pointer_type(),
+                    env.structs,
+                    env.print_functions,
+                    true,
+                );
+            }
             // Owning handles load as borrowed views; the reference's home keeps
             // ownership, so the view must never be stored or consumed.
             if matches!(
@@ -4092,6 +4209,8 @@ fn emit_expr(
                     *ty,
                     env.address_slots,
                     module.target_config().pointer_type(),
+                    env.addressed_slot_types,
+                    env.structs,
                 )?
                 .unwrap_or_else(|| b.use_var(Variable::from_u32(*slot as u32))),
                 *ty,
@@ -4108,6 +4227,8 @@ fn emit_expr(
                 Type::F32,
                 env.address_slots,
                 module.target_config().pointer_type(),
+                env.addressed_slot_types,
+                env.structs,
             )?
             .unwrap_or_else(|| b.use_var(Variable::from_u32(*slot as u32))),
         ),
@@ -4122,6 +4243,8 @@ fn emit_expr(
                 Type::F64,
                 env.address_slots,
                 module.target_config().pointer_type(),
+                env.addressed_slot_types,
+                env.structs,
             )?
             .unwrap_or_else(|| b.use_var(Variable::from_u32(*slot as u32))),
         ),
@@ -4136,6 +4259,8 @@ fn emit_expr(
                 Type::Bool,
                 env.address_slots,
                 module.target_config().pointer_type(),
+                env.addressed_slot_types,
+                env.structs,
             )?
             .unwrap_or_else(|| b.use_var(Variable::from_u32(*slot as u32))),
         ),
@@ -4157,6 +4282,22 @@ fn emit_expr(
             ty: Type::Struct(struct_id),
             ..
         } => {
+            if let Some(Some(home)) = env.address_slots.get(*slot) {
+                let pointer = b
+                    .ins()
+                    .stack_addr(module.target_config().pointer_type(), *home, 0);
+                return load_reference_field(
+                    b,
+                    Type::Struct(*struct_id),
+                    pointer,
+                    0,
+                    env.structs[*struct_id].repr_c,
+                    module.target_config().pointer_type(),
+                    env.structs,
+                    env.print_functions,
+                    true,
+                );
+            }
             let mut fields = Vec::new();
             for field in &env.structs[*struct_id].fields {
                 let field_slot = *slot + field.slot_offset;
@@ -4853,6 +4994,20 @@ fn emit_expr(
                     );
                 }
                 CompiledValue::Integer(pointer, *target)
+            } else if matches!(source, Type::RawPointer(_) | Type::FunctionPointer(_))
+                && matches!(target, Type::U64 | Type::I64)
+            {
+                let CompiledValue::Integer(pointer, _) =
+                    emit_expr(b, module, value, env, seal_state)?
+                else {
+                    return Err("internal error: pointer address cast is not a pointer".into());
+                };
+                let integer = if module.target_config().pointer_type().bits() < 64 {
+                    b.ins().uextend(types::I64, pointer)
+                } else {
+                    pointer
+                };
+                CompiledValue::Integer(integer, *target)
             } else if *source == Type::Char {
                 let CompiledValue::Integer(value, Type::Char) =
                     emit_expr(b, module, value, env, seal_state)?

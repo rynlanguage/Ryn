@@ -161,7 +161,12 @@ fn temp_path(label: &str) -> PathBuf {
 
 /// Runs curl and returns the HTTP status and body. `headers` are written to a
 /// temporary file so tokens never appear on a command line.
-fn curl(method: &str, url: &str, headers: &[String], upload: Option<&Path>) -> Result<Response, String> {
+fn curl(
+    method: &str,
+    url: &str,
+    headers: &[String],
+    upload: Option<&Path>,
+) -> Result<Response, String> {
     let body_file = temp_path("http-body");
     let header_file = temp_path("http-headers");
     let mut command = Command::new("curl");
@@ -182,10 +187,14 @@ fn curl(method: &str, url: &str, headers: &[String], upload: Option<&Path>) -> R
     if !headers.is_empty() {
         fs::write(&header_file, headers.join("\n") + "\n")
             .map_err(|error| format!("error[R0434]: cannot prepare request headers: {error}"))?;
-        command.arg("--header").arg(format!("@{}", header_file.display()));
+        command
+            .arg("--header")
+            .arg(format!("@{}", header_file.display()));
     }
     if let Some(upload) = upload {
-        command.arg("--data-binary").arg(format!("@{}", upload.display()));
+        command
+            .arg("--data-binary")
+            .arg(format!("@{}", upload.display()));
     }
     let output = command.arg("--").arg(url).output();
     let _ = fs::remove_file(&header_file);
@@ -200,7 +209,10 @@ fn curl(method: &str, url: &str, headers: &[String], upload: Option<&Path>) -> R
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let status = String::from_utf8_lossy(&output.stdout).trim().parse().unwrap_or(0);
+    let status = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
     Ok(Response { status, body })
 }
 
@@ -216,7 +228,9 @@ fn encode(component: &str) -> String {
     let mut out = String::new();
     for byte in component.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             _ => out.push_str(&format!("%{byte:02X}")),
         }
     }
@@ -262,7 +276,10 @@ pub fn is_sha256(text: &str) -> bool {
 
 /// Lowercase hex SHA-256, the checksum format pods and ryn.lock use.
 pub fn sha256_hex(data: &[u8]) -> String {
-    Sha256::digest(data).iter().map(|byte| format!("{byte:02x}")).collect()
+    Sha256::digest(data)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
@@ -302,9 +319,14 @@ pub fn fetch(
         ));
     }
     if parse_version(version).is_none() || !valid_package_name(name) {
-        return Err(format!("error[R0436]: invalid locked package `{name}` {version}"));
+        return Err(format!(
+            "error[R0436]: invalid locked package `{name}` {version}"
+        ));
     }
-    let cache = project.join(".ryn").join("registry").join(format!("{name}-{version}"));
+    let cache = project
+        .join(".ryn")
+        .join("registry")
+        .join(format!("{name}-{version}"));
     let marker = cache.join(".ryn-checksum");
     if fs::read_to_string(&marker).is_ok_and(|text| text.trim() == checksum) {
         return package_root(&cache, name);
@@ -383,9 +405,9 @@ pub fn valid_package_name(name: &str) -> bool {
     !bytes.is_empty()
         && bytes.len() <= 64
         && bytes[0].is_ascii_lowercase()
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_'))
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -399,19 +421,26 @@ fn credentials_path() -> PathBuf {
             .map(PathBuf::from)
             .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
     };
-    base.unwrap_or_else(env::temp_dir).join("ryn").join("credentials")
+    base.unwrap_or_else(env::temp_dir)
+        .join("ryn")
+        .join("credentials")
 }
 
 /// Saves a registry token for `ryn publish`.
 pub fn login(token: &str) -> Result<PathBuf, String> {
     let token = token.trim();
-    if token.is_empty() || token.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+    if token.is_empty()
+        || token
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
         return Err("error[R0437]: the token must be a single word, such as pods_xxxxxxxx".into());
     }
     let path = credentials_path();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("error[R0437]: cannot create {}: {error}", parent.display()))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            format!("error[R0437]: cannot create {}: {error}", parent.display())
+        })?;
     }
     fs::write(&path, format!("{token}\n"))
         .map_err(|error| format!("error[R0437]: cannot write {}: {error}", path.display()))?;
@@ -424,7 +453,10 @@ pub fn login(token: &str) -> Result<PathBuf, String> {
 }
 
 fn token() -> Result<String, String> {
-    if let Some(token) = env::var("RYN_TOKEN").ok().filter(|token| !token.trim().is_empty()) {
+    if let Some(token) = env::var("RYN_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+    {
         return Ok(token.trim().to_string());
     }
     let path = credentials_path();
@@ -432,7 +464,9 @@ fn token() -> Result<String, String> {
         .ok()
         .map(|text| text.trim().to_string())
         .filter(|token| !token.is_empty())
-        .ok_or_else(|| "error[R0437]: no registry token; run `ryn login <token>` or set RYN_TOKEN".into())
+        .ok_or_else(|| {
+            "error[R0437]: no registry token; run `ryn login <token>` or set RYN_TOKEN".into()
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -444,10 +478,14 @@ fn copy_tree(from: &Path, to: &Path, total: &mut u64) -> Result<(), String> {
     let entries = fs::read_dir(from)
         .map_err(|error| format!("error[R0438]: cannot read {}: {error}", from.display()))?;
     for entry in entries {
-        let entry = entry.map_err(|error| format!("error[R0438]: cannot read directory: {error}"))?;
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("error[R0438]: cannot inspect {}: {error}", entry.path().display()))?;
+        let entry =
+            entry.map_err(|error| format!("error[R0438]: cannot read directory: {error}"))?;
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "error[R0438]: cannot inspect {}: {error}",
+                entry.path().display()
+            )
+        })?;
         let name = entry.file_name();
         if name.to_string_lossy().starts_with('.') || file_type.is_symlink() {
             continue;
@@ -457,7 +495,10 @@ fn copy_tree(from: &Path, to: &Path, total: &mut u64) -> Result<(), String> {
             copy_tree(&entry.path(), &target, total)?;
         } else if file_type.is_file() {
             *total += fs::copy(entry.path(), &target).map_err(|error| {
-                format!("error[R0438]: cannot copy {}: {error}", entry.path().display())
+                format!(
+                    "error[R0438]: cannot copy {}: {error}",
+                    entry.path().display()
+                )
             })?;
         }
     }
@@ -534,7 +575,9 @@ pub fn package(project: &Path) -> Result<(PathBuf, Manifest), String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let size = fs::metadata(&archive).map(|meta| meta.len()).unwrap_or(total);
+    let size = fs::metadata(&archive)
+        .map(|meta| meta.len())
+        .unwrap_or(total);
     if size > MAX_ARCHIVE_BYTES {
         return Err(format!(
             "error[R0438]: the package archive is {} KB; the registry accepts at most {} KB",
@@ -575,7 +618,10 @@ pub fn publish(project: &Path) -> Result<String, String> {
     let published: PublishedJson = serde_yaml::from_slice(&response.body)
         .map_err(|error| format!("error[R0439]: unexpected registry response: {error}"))?;
     Ok(published.url.unwrap_or_else(|| {
-        format!("{registry}/packages/{}/{}", published.name, published.version)
+        format!(
+            "{registry}/packages/{}/{}",
+            published.name, published.version
+        )
     }))
 }
 
@@ -604,9 +650,13 @@ mod tests {
 
     #[test]
     fn requirement_and_name_validation() {
-        assert!(valid_requirement("1.2.3") && valid_requirement("^0.1.0") && valid_requirement("*"));
+        assert!(
+            valid_requirement("1.2.3") && valid_requirement("^0.1.0") && valid_requirement("*")
+        );
         assert!(!valid_requirement("1.2") && !valid_requirement("latest"));
         assert!(valid_package_name("rynix") && valid_package_name("vec-math_2"));
-        assert!(!valid_package_name("Rynix") && !valid_package_name("2d") && !valid_package_name(""));
+        assert!(
+            !valid_package_name("Rynix") && !valid_package_name("2d") && !valid_package_name("")
+        );
     }
 }

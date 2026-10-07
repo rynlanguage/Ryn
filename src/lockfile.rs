@@ -169,9 +169,15 @@ fn collect(
                             .find(|entry| entry.parent == manifest.name && entry.name == *name)
                     })
                     .filter(|entry| {
-                        entry.source == source && registry::version_matches(requirement, &entry.version)
+                        entry.source == source
+                            && registry::version_matches(requirement, &entry.version)
                     })
-                    .and_then(|entry| entry.checksum.clone().map(|sum| (entry.version.clone(), sum)));
+                    .and_then(|entry| {
+                        entry
+                            .checksum
+                            .clone()
+                            .map(|sum| (entry.version.clone(), sum))
+                    });
                 let (version, sum) = match pinned {
                     Some(pinned) if !refresh_git => pinned,
                     _ if refresh_git => {

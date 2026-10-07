@@ -20,9 +20,10 @@ fn temp_dir(label: &str) -> PathBuf {
 
 fn tar() -> Command {
     if cfg!(windows) {
-        let system = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
-            .join("System32")
-            .join("tar.exe");
+        let system =
+            PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into()))
+                .join("System32")
+                .join("tar.exe");
         if system.is_file() {
             return Command::new(system);
         }
@@ -39,7 +40,11 @@ fn package_archive(root: &Path) -> Vec<u8> {
         "name: mathlib\nversion: 1.2.0\nowner: tester\ndescription: Test math\ndependencies: {}\n",
     )
     .unwrap();
-    fs::write(package.join("src").join("ops.ryn"), "pub fun triple(x: i32) -> i32 => x * 3\n").unwrap();
+    fs::write(
+        package.join("src").join("ops.ryn"),
+        "pub fun triple(x: i32) -> i32 => x * 3\n",
+    )
+    .unwrap();
     let archive = root.join("mathlib.tar.gz");
     let status = tar()
         .arg("-czf")
@@ -83,13 +88,16 @@ fn serve(archive: Vec<u8>, checksum: String, seen: Arc<Mutex<Seen>>) -> String {
             let header = |name: &str| {
                 headers.iter().find_map(|h| {
                     let (key, value) = h.split_once(':')?;
-                    key.eq_ignore_ascii_case(name).then(|| value.trim().to_string())
+                    key.eq_ignore_ascii_case(name)
+                        .then(|| value.trim().to_string())
                 })
             };
             if header("Expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue")) {
                 stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
             }
-            let length: usize = header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let length: usize = header("Content-Length")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
             let mut parts = request_line.split_whitespace();
@@ -101,7 +109,8 @@ fn serve(archive: Vec<u8>, checksum: String, seen: Arc<Mutex<Seen>>) -> String {
                 (
                     "200 OK",
                     "application/json",
-                    format!("{{\"version\": \"1.2.0\", \"checksum\": \"{checksum}\"}}").into_bytes(),
+                    format!("{{\"version\": \"1.2.0\", \"checksum\": \"{checksum}\"}}")
+                        .into_bytes(),
                 )
             } else if method == "GET" && path == "/api/v1/packages/mathlib/1.2.0/download" {
                 ("200 OK", "application/gzip", archive.clone())
@@ -164,16 +173,27 @@ fn registry_dependencies_lock_fetch_verify_and_publish() {
 
     // The first run creates ryn.lock, downloads, verifies and builds.
     let run = ryn(&["run", app_arg]);
-    assert!(run.status.success(), "stderr: {}", String::from_utf8_lossy(&run.stderr));
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
     assert_eq!(String::from_utf8_lossy(&run.stdout), "42\n");
     let lock = fs::read_to_string(app.join("ryn.lock")).unwrap();
     assert!(lock.contains("version: 1.2.0"), "{lock}");
     assert!(lock.contains(&format!("checksum: {checksum}")), "{lock}");
-    assert!(lock.contains(&format!("source: registry:{registry}")), "{lock}");
+    assert!(
+        lock.contains(&format!("source: registry:{registry}")),
+        "{lock}"
+    );
 
     // A tampered pin is refused before anything is unpacked.
     fs::remove_dir_all(app.join(".ryn")).unwrap();
-    fs::write(app.join("ryn.lock"), lock.replace(&checksum, &"0".repeat(64))).unwrap();
+    fs::write(
+        app.join("ryn.lock"),
+        lock.replace(&checksum, &"0".repeat(64)),
+    )
+    .unwrap();
     let tampered = ryn(&["run", app_arg]);
     assert!(!tampered.status.success());
     assert!(String::from_utf8_lossy(&tampered.stderr).contains("checksum mismatch"));
@@ -181,7 +201,11 @@ fn registry_dependencies_lock_fetch_verify_and_publish() {
 
     // Publishing is rejected for path dependencies and sends the token otherwise.
     let publish = ryn(&["publish", app_arg]);
-    assert!(publish.status.success(), "stderr: {}", String::from_utf8_lossy(&publish.stderr));
+    assert!(
+        publish.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&publish.stderr)
+    );
     assert!(String::from_utf8_lossy(&publish.stdout).contains("/packages/usesmath/0.1.0"));
     let uploads = &seen.lock().unwrap().uploads;
     assert_eq!(uploads.len(), 1);

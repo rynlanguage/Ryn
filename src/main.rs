@@ -76,7 +76,10 @@ fn run_cli() -> Result<Option<i32>, String> {
         return Ok(None);
     }
     if command == "publish" {
-        let path = args.next().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let path = args
+            .next()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
         if args.next().is_some() || !path.join("ryn.yaml").is_file() {
             return Err(usage());
         }
