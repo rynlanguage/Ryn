@@ -691,6 +691,16 @@ pub enum IrStatement {
     },
 }
 
+/// Runs `setup` (temporaries hoisted out of an expression) before `statement`.
+fn with_setup(mut setup: Vec<IrStatement>, statement: IrStatement) -> IrStatement {
+    if setup.is_empty() {
+        statement
+    } else {
+        setup.push(statement);
+        IrStatement::Block(setup)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum IrCallTarget {
     Function(usize),
@@ -2796,13 +2806,8 @@ impl<'a> Analyzer<'a> {
     }
 
     fn attach_pending(&mut self, statement: IrStatement) -> IrStatement {
-        let mut pending = std::mem::take(&mut self.pending_statements);
-        if pending.is_empty() {
-            statement
-        } else {
-            pending.push(statement);
-            IrStatement::Block(pending)
-        }
+        let pending = std::mem::take(&mut self.pending_statements);
+        with_setup(pending, statement)
     }
 
     /// Stores a copyable expression in a fresh local so a shared method can borrow it.
@@ -3454,16 +3459,22 @@ impl<'a> Analyzer<'a> {
                     }
                     return Err(error);
                 }
+                // Receiver temporaries from the condition must run before it, not
+                // inside the first statement of the branch.
+                let setup = std::mem::take(&mut self.pending_statements);
                 let outer_names = self.names.clone();
                 let then_body = self.block(then_body)?;
                 self.names = outer_names.clone();
                 let else_body = self.block(else_body)?;
                 self.names = outer_names;
-                Ok(IrStatement::If {
-                    condition,
-                    then_body,
-                    else_body,
-                })
+                Ok(with_setup(
+                    setup,
+                    IrStatement::If {
+                        condition,
+                        then_body,
+                        else_body,
+                    },
+                ))
             }
             Statement::While {
                 condition,
@@ -3540,7 +3551,13 @@ impl<'a> Analyzer<'a> {
                 }
 
                 let start_hint = self.integer_type_hint(&end);
-                let (start, ty) = match self.expression(start, start_hint) {
+                // A bare literal start takes the end's type when the hint cannot see it,
+                // as in `0..items.count()`.
+                let start_literal = match &start {
+                    Expression::Integer(value, span) => Some((*value, *span)),
+                    _ => None,
+                };
+                let (start, mut ty) = match self.expression(start, start_hint) {
                     Ok(value) => value,
                     Err(error) if self.recover_block_errors => {
                         self.recover_for_after_invalid_start(&name, name_span, end, body);
@@ -3572,6 +3589,17 @@ impl<'a> Analyzer<'a> {
                     }
                     Err(error) => return Err(error),
                 };
+                let mut start = start;
+                if end_ty != ty
+                    && is_integer(end_ty)
+                    && let Some((value, span)) = start_literal
+                    && let Ok((retyped, retyped_ty)) =
+                        self.expression(Expression::Integer(value, span), Some(end_ty))
+                    && retyped_ty == end_ty
+                {
+                    start = retyped;
+                    ty = end_ty;
+                }
                 if end_ty != ty {
                     let error = diag(
                         "R0206",
@@ -3589,6 +3617,7 @@ impl<'a> Analyzer<'a> {
                     return Err(error);
                 }
 
+                let setup = std::mem::take(&mut self.pending_statements);
                 let slot = self.allocate(ty);
                 let end_slot = self.allocate(ty);
                 let outer_names = self.names.clone();
@@ -3605,14 +3634,14 @@ impl<'a> Analyzer<'a> {
                 self.loop_depth -= 1;
                 self.names = outer_names;
                 let body = body?;
-                Ok(IrStatement::For {
+                Ok(with_setup(setup, IrStatement::For {
                     slot,
                     end_slot,
                     ty,
                     start,
                     end,
                     body,
-                })
+                }))
             }
             Statement::ForEach {
                 name,
@@ -3642,6 +3671,7 @@ impl<'a> Analyzer<'a> {
                 }
                 let collection_span = collection.span();
                 let (collection, collection_type) = self.expression(collection, None)?;
+                let setup = std::mem::take(&mut self.pending_statements);
                 let elem = match collection_type {
                     Type::Vec(elem_id) => vec_elem(elem_id),
                     Type::Slice(elem_id) => vec_elem(elem_id),
@@ -3764,22 +3794,25 @@ impl<'a> Analyzer<'a> {
                 let mut loop_body = Vec::with_capacity(body.len() + 1);
                 loop_body.push(item);
                 loop_body.extend(body);
-                Ok(IrStatement::Block(vec![
-                    IrStatement::Let {
-                        slot: vector_slot,
-                        ty: collection_type,
-                        value: collection,
-                        span: collection_span,
-                    },
-                    IrStatement::For {
-                        slot: index_slot,
-                        end_slot,
-                        ty: Type::U64,
-                        start: IrExpression::Integer(0, Type::U64),
-                        end: length,
-                        body: loop_body,
-                    },
-                ]))
+                Ok(with_setup(
+                    setup,
+                    IrStatement::Block(vec![
+                        IrStatement::Let {
+                            slot: vector_slot,
+                            ty: collection_type,
+                            value: collection,
+                            span: collection_span,
+                        },
+                        IrStatement::For {
+                            slot: index_slot,
+                            end_slot,
+                            ty: Type::U64,
+                            start: IrExpression::Integer(0, Type::U64),
+                            end: length,
+                            body: loop_body,
+                        },
+                    ]),
+                ))
             }
             Statement::Break(span) => {
                 if self.loop_depth == 0 {
@@ -10265,7 +10298,13 @@ fn is_equality_type(ty: Type) -> bool {
     is_numeric(ty)
         || matches!(
             ty,
-            Type::Str | Type::OwnedString | Type::Char | Type::Bool | Type::Struct(_)
+            Type::Str
+                | Type::OwnedString
+                | Type::Char
+                | Type::Bool
+                | Type::Struct(_)
+                | Type::RawPointer(_)
+                | Type::FunctionPointer(_)
         )
 }
 fn integer_bounds(ty: Type) -> (i128, i128) {

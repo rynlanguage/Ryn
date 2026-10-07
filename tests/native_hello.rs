@@ -1463,3 +1463,75 @@ fn repr_c_method_fields_use_packed_byte_offsets() {
     assert!(result.status.success(), "compiler/runtime failed: {stderr}");
     assert_eq!(String::from_utf8_lossy(&result.stdout), "7\n7\n2\n5\n");
 }
+
+#[test]
+fn receiver_temporaries_in_conditions_run_before_the_branch() {
+    // A copyable receiver such as `V::ZERO` is stored in a temporary. That temporary used to
+    // be emitted into the first statement of the `when` branch or the loop body, so the
+    // condition read an uninitialized slot.
+    let result = run_source_text(
+        "receiver-temporaries",
+        r#"struct V { x: i32 }
+
+extend V {
+    pub fun add(self, rhs: V) -> V => V { x: self.x + rhs.x }
+    pub fun get(self) -> i32 => self.x
+    pub const THREE: V = V { x: 3 }
+    pub const ZERO: V = V { x: 0 }
+}
+
+fun first(v: V) -> i32 => v.x
+
+fun main() -> i32 {
+    when first(V::ZERO.add(V::THREE)) != 3 { return 1 }
+    when V::ZERO.get() == 1 { return 2 } else when V::ZERO.add(V::THREE).get() == 3 { echo "else-when" } else { return 3 }
+    mut total: i32 = 0
+    for i in (0 as i32)..V::ZERO.add(V::THREE).get() { total += 1 }
+    when total != 3 { return 4 }
+    mut n: i32 = 0
+    while n < V::ZERO.add(V::THREE).get() { n += 1 }
+    when n != 3 { return 5 }
+    echo "ok"
+    return 0
+}
+"#,
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "exit {:?}, stderr: {stderr}", result.status.code());
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "else-when\nok\n");
+}
+
+#[test]
+fn raw_pointers_compare_and_literal_range_starts_follow_the_end_type() {
+    let result = run_source_text(
+        "pointer-equality",
+        r#"struct Counter { items: [i32; 4] }
+
+extend Counter {
+    pub fun count(self) -> u64 => 4
+}
+
+fun main() -> i32 {
+    lib := load_library("kernel32.dll")
+    same := load_library("kernel32.dll")
+    missing := load_symbol(lib, "DefinitelyNotAnExport")
+    when lib != same { return 1 }
+    when lib == missing { return 2 }
+    when !pointer_is_null(missing) { return 3 }
+    c := Counter { items: [1, 2, 3, 4] }
+    mut sum: i32 = 0
+    for i in 0..c.count() { sum += c.items[i] }
+    when sum != 10 { return 4 }
+    unload_library(same)
+    unload_library(lib)
+    echo "ok"
+    return 0
+}
+"#,
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    if cfg!(windows) {
+        assert!(result.status.success(), "exit {:?}, stderr: {stderr}", result.status.code());
+        assert_eq!(String::from_utf8_lossy(&result.stdout), "ok\n");
+    }
+}

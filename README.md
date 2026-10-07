@@ -12,6 +12,8 @@ Ryn explores a language with readable source, strong static types, predictable c
 
 The `0.1.0` milestone moves the compiler's production lexer, parser, and generic specializer into Ryn. The default `ryn check`, `ryn build`, and `ryn run` paths use that executable frontend; `--frontend rust` selects the Rust bootstrap parser. `ryn bootstrap` builds the Ryn frontend in three stages and verifies that stage 3 is byte-identical to stage 2. Semantic analysis, Ryn Guard, Cranelift code generation, and CLI orchestration remain implemented in Rust, so this release is a self-hosted frontend milestone rather than a fully self-hosted compiler. Ryn remains experimental and is not yet a general-purpose production language.
 
+Version `0.1.1` is a correctness update. Copyable method receivers used inside a `when` / `else when` condition, a `for` range bound, or a `for ... in` collection are now evaluated before the condition; previously the temporary was emitted into the first statement of the branch or loop body, so the condition could read an uninitialized value. Raw and function pointers can be compared with `==` and `!=`, and an integer literal range start such as `0..items.count()` takes the type of the end bound.
+
 Implemented syntax and behavior include:
 
 - `//` line comments and nestable `/* ... */` block comments.

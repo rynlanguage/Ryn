@@ -1,6 +1,6 @@
 [package]
 name = "ryn"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Ryn native programming language compiler"
 license = "MPL-2.0"
