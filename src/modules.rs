@@ -69,14 +69,42 @@ pub(crate) fn check_project(
             entry.display()
         ));
     }
+    check_entry(&entry, &source_root, &dependency_roots, frontend)
+}
 
+/// Checks a single source file that imports modules: `std::...` resolves to
+/// the embedded standard library, and other imports to `.ryn` files next to it.
+pub(crate) fn check_file(
+    file: &Path,
+    frontend: &Frontend,
+) -> Result<(RynIr, Vec<PathBuf>), String> {
+    let entry = fs::canonicalize(file)
+        .map_err(|error| format!("error[R0420]: cannot resolve {}: {error}", file.display()))?;
+    let source_root = entry
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("error[R0420]: {} has no parent directory", file.display()))?;
+    let mut dependency_roots = HashMap::<String, PathBuf>::new();
+    dependency_roots.insert(
+        "std".into(),
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("stdlib/std/src"),
+    );
+    check_entry(&entry, &source_root, &dependency_roots, frontend)
+}
+
+fn check_entry(
+    entry: &Path,
+    source_root: &Path,
+    dependency_roots: &HashMap<String, PathBuf>,
+    frontend: &Frontend,
+) -> Result<(RynIr, Vec<PathBuf>), String> {
     let mut units = Vec::new();
     let mut discovered = HashMap::<PathBuf, String>::new();
     load_module(
-        &entry,
+        entry,
         "".into(),
-        &source_root,
-        &dependency_roots,
+        source_root,
+        dependency_roots,
         &mut discovered,
         &mut units,
         frontend,

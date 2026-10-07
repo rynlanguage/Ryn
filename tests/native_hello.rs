@@ -640,6 +640,8 @@ fn failed_linker_removes_its_temporary_build_directory() {
         .arg("fixture.ryn")
         .current_dir(&directory)
         .env("RUSTC", env!("CARGO_BIN_EXE_ryn"))
+        // Windows links in-process; select the rustc driver so it can fail.
+        .env("RYN_LINKER", "rustc")
         .env("TEMP", &directory)
         .env("TMP", &directory)
         .env("TMPDIR", &directory)
@@ -1542,4 +1544,29 @@ fun main() -> i32 {
         );
         assert_eq!(String::from_utf8_lossy(&result.stdout), "ok\n");
     }
+}
+
+#[test]
+fn standalone_files_import_std_and_sibling_modules() {
+    let directory = temp_dir("file-imports");
+    fs::write(
+        directory.join("shapes.ryn"),
+        "pub fun sides() -> i32 => 4\n",
+    )
+    .unwrap();
+    let main = directory.join("main.ryn");
+    fs::write(
+        &main,
+        "use shapes\nuse std::math\n\nfun main() {\n    echo shapes::sides()\n    echo math::sqrt(16.0)\n}\n",
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
+        .arg("run")
+        .arg(&main)
+        .output()
+        .expect("ryn process starts");
+    let _ = fs::remove_dir_all(&directory);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "stderr: {stderr}");
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "4\n4\n");
 }

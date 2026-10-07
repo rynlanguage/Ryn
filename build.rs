@@ -114,5 +114,43 @@ fn build_runtime_shim() -> Result<(), String> {
         "cargo:rustc-env=RYN_RUNTIME_SHIM_OBJECT_PATH={}",
         object_path.display()
     );
+
+    // The same runtime as a self-contained static library (Rust std included)
+    // for Ryn's own linker, so building programs does not need rustc.
+    let library_path = out_dir.join(if target.contains("windows") {
+        "ryn_runtime.lib"
+    } else {
+        "libryn_runtime.a"
+    });
+    let status = Command::new(&rustc)
+        .args([
+            "--edition=2024",
+            "--crate-name",
+            "ryn_runtime",
+            "--crate-type=staticlib",
+            "src/runtime_shim.rs",
+            "--cfg",
+            "ryn_staticlib",
+            "-C",
+            "panic=abort",
+            "-C",
+            "opt-level=2",
+            "-C",
+            "debuginfo=0",
+            "--target",
+            &target,
+            "-o",
+        ])
+        .arg(&library_path)
+        .status()
+        .map_err(|error| format!("could not compile the runtime library with rustc: {error}"))?;
+    if !status.success() {
+        return Err(format!("runtime library compilation exited with {status}"));
+    }
+    println!(
+        "cargo:rustc-env=RYN_RUNTIME_LIBRARY_PATH={}",
+        library_path.display()
+    );
+    println!("cargo:rustc-check-cfg=cfg(ryn_staticlib)");
     Ok(())
 }

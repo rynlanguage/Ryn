@@ -23,6 +23,9 @@ use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, default
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
 const RUNTIME_SHIM_OBJECT: &[u8] = include_bytes!(env!("RYN_RUNTIME_SHIM_OBJECT_PATH"));
+/// The runtime with Rust std as one static library: Ryn's own linker uses it on
+/// Windows, and the system C compiler driver links it on Unix.
+const RUNTIME_LIBRARY: &[u8] = include_bytes!(env!("RYN_RUNTIME_LIBRARY_PATH"));
 const LINKER_ENTRY_SOURCE: &str = r#"
 mod ryn_entry_ffi {
     unsafe extern "C" {
@@ -313,6 +316,36 @@ pub fn link_object(object: &[u8], output: &Path) -> Result<(), BuildError> {
         ))
     })?;
     let staged_output = output_temp_dir.path().join(staged_output_name);
+    // Windows executables are linked in-process; `RYN_LINKER=rustc` selects the
+    // previous rustc-driven link for comparison.
+    #[cfg(windows)]
+    if std::env::var_os("RYN_LINKER").is_none_or(|linker| linker != "rustc") {
+        crate::pe_linker::link(
+            &[("module.obj", object)],
+            RUNTIME_LIBRARY,
+            "ryn_start",
+            &staged_output,
+        )
+        .map_err(|error| BuildError::Link(format!("error[R0300]: link failed: {error}")))?;
+        fs::rename(&staged_output, output).map_err(|error| {
+            BuildError::Environment(format!(
+                "could not install native executable at {}: {error}",
+                output.display()
+            ))
+        })?;
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if std::env::var_os("RYN_LINKER").is_none_or(|linker| linker != "rustc") {
+        link_with_cc(temp_dir.path(), &object_path, &staged_output)?;
+        fs::rename(&staged_output, output).map_err(|error| {
+            BuildError::Environment(format!(
+                "could not install native executable at {}: {error}",
+                output.display()
+            ))
+        })?;
+        return Ok(());
+    }
     link_with_rust(
         &rustc,
         &object_path,
@@ -8195,6 +8228,46 @@ fn as_bool(value: CompiledValue) -> Result<Value, String> {
         CompiledValue::Bool(v) => Ok(v),
         _ => Err("internal error: expected bool after semantic analysis".into()),
     }
+}
+
+/// Links with the system C compiler driver (`CC`, default `cc`) and the
+/// precompiled runtime library; the runtime defines `main`.
+#[cfg(unix)]
+fn link_with_cc(work: &Path, object: &Path, output: &Path) -> Result<(), BuildError> {
+    let library = work.join("libryn_runtime.a");
+    fs::write(&library, RUNTIME_LIBRARY).map_err(|error| {
+        BuildError::Environment(format!("could not write the runtime library: {error}"))
+    })?;
+    let cc = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let mut command = Command::new(&cc);
+    command.arg(object).arg(&library);
+    if cfg!(target_os = "linux") {
+        command.args([
+            "-lgcc_s",
+            "-lutil",
+            "-lrt",
+            "-lpthread",
+            "-lm",
+            "-ldl",
+            "-lc",
+        ]);
+    } else {
+        command.args(["-lpthread", "-lm"]);
+    }
+    let output_status = command.arg("-o").arg(output).output().map_err(|error| {
+        BuildError::Link(format!(
+            "error[R0300]: could not start the C linker `{}`: {error}; install a C toolchain such as gcc or clang, or set CC",
+            cc.to_string_lossy()
+        ))
+    })?;
+    if !output_status.status.success() {
+        return Err(BuildError::Link(format!(
+            "error[R0300]: native link step failed with {}: {}",
+            output_status.status,
+            String::from_utf8_lossy(&output_status.stderr).trim()
+        )));
+    }
+    Ok(())
 }
 
 fn link_with_rust(

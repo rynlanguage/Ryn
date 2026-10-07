@@ -7,8 +7,8 @@ use std::{
 };
 
 use ryn::{
-    check_project_with_frontend, check_source_with_frontend, compile_project_with_frontend,
-    compile_source_with_frontend,
+    check_file_with_imports, check_project_with_frontend, check_source_with_frontend,
+    compile_file_with_imports, compile_project_with_frontend, compile_source_with_frontend,
     frontend::{self, Frontend},
     lockfile::{validate_project_lock_if_present, write_project_lock},
     manifest::{Dependency, Manifest, Optimize},
@@ -202,11 +202,15 @@ fn run_cli() -> Result<Option<i32>, String> {
     let source = SourceFile::load(&input)
         .map_err(|e| format!("error[R0001]: cannot read {}: {e}", input.display()))?;
     let frontend = frontend::select(frontend_name.as_deref())?;
+    // A standalone file with `use` declarations goes through the module loader.
+    let file_imports = project_manifest.is_none() && has_use_declaration(source.text());
 
     match command.as_str() {
         "check" => {
             if project_manifest.is_some() {
                 check_project_with_frontend(&requested_input, &frontend)?;
+            } else if file_imports {
+                check_file_with_imports(&input, &frontend)?;
             } else {
                 check_source_with_frontend(&source, &frontend).map_err(|errors| {
                     errors
@@ -249,6 +253,8 @@ fn run_cli() -> Result<Option<i32>, String> {
             if !cache_hit {
                 if project_manifest.is_some() {
                     compile_project_with_frontend(&requested_input, &output, optimize, &frontend)?;
+                } else if file_imports {
+                    compile_file_with_imports(&input, &output, optimize, &frontend)?;
                 } else {
                     compile_source_with_frontend(&source, &output, optimize, &frontend)
                         .map_err(|error| error.render(&source))?;
@@ -639,6 +645,20 @@ fn output_path(input: &Path) -> PathBuf {
         out.set_extension("");
     }
     out
+}
+
+/// True when a line of the source starts with `use ` outside comments.
+fn has_use_declaration(text: &str) -> bool {
+    let mut block_depth = 0usize;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if block_depth == 0 && trimmed.starts_with("use ") {
+            return true;
+        }
+        block_depth += trimmed.matches("/*").count();
+        block_depth = block_depth.saturating_sub(trimmed.matches("*/").count());
+    }
+    false
 }
 
 fn usage() -> String {

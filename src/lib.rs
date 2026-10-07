@@ -17,6 +17,7 @@ pub mod manifest;
 pub mod map_ops;
 mod modules;
 pub mod parser;
+pub mod pe_linker;
 pub mod registry;
 pub mod sema;
 pub mod source;
@@ -121,6 +122,37 @@ pub fn compile_project_with_frontend(
 ) -> Result<(), String> {
     let output = output.as_ref();
     let (ir, source_paths) = modules::check_project(project.as_ref(), frontend)?;
+    for source in source_paths {
+        if paths_refer_to_same_file(&source, output) {
+            return Err(format!(
+                "error[R0303]: output {} would overwrite module source {}",
+                output.display(),
+                source.display()
+            ));
+        }
+    }
+    codegen::build_native_with_optimize(&ir, output, optimize.codegen_value())
+        .map_err(|error| error.to_string())
+}
+
+/// Checks a standalone source file together with the modules it imports:
+/// `std::...` and `.ryn` files in the same directory.
+pub fn check_file_with_imports(
+    file: impl AsRef<Path>,
+    frontend: &frontend::Frontend,
+) -> Result<sema::RynIr, String> {
+    modules::check_file(file.as_ref(), frontend).map(|(ir, _)| ir)
+}
+
+/// Compiles a standalone source file together with the modules it imports.
+pub fn compile_file_with_imports(
+    file: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    optimize: manifest::Optimize,
+    frontend: &frontend::Frontend,
+) -> Result<(), String> {
+    let output = output.as_ref();
+    let (ir, source_paths) = modules::check_file(file.as_ref(), frontend)?;
     for source in source_paths {
         if paths_refer_to_same_file(&source, output) {
             return Err(format!(

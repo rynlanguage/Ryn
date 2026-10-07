@@ -295,3 +295,34 @@ pub extern "C" fn ryn_array_index_out_of_bounds() {
     );
     std::process::exit(1);
 }
+
+/// Process entry point when the runtime is linked as a static library by
+/// Ryn's own linker. It replaces the Rust `main` wrapper that rustc used to
+/// generate: initialize argument storage, run the program, flush stdout, and
+/// exit with the program's status.
+#[cfg(ryn_staticlib)]
+mod entry {
+    unsafe extern "C" {
+        fn ryn_main() -> i32;
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn ryn_start() -> ! {
+        super::ryn_args_init();
+        // SAFETY: the Cranelift object always defines this C ABI entry point.
+        let code = unsafe { ryn_main() };
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        std::process::exit(code)
+    }
+
+    /// The C runtime normally defines `main` for `cc`-linked Unix executables.
+    #[cfg(unix)]
+    #[unsafe(no_mangle)]
+    pub extern "C" fn main(_argc: i32, _argv: *const *const u8) -> i32 {
+        super::ryn_args_init();
+        // SAFETY: as above.
+        let code = unsafe { ryn_main() };
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        code
+    }
+}
