@@ -137,3 +137,9 @@ generator:
   are declined: user structs, enums, and `extend` blocks (52 programs), types the subset
   does not model (`bool`, 13), calls to standard-library functions (10), and statements
   and expressions not yet covered (8 and 7).
+- Stage 2, step 3c (done): the subset gained `bool` (one `I8` local), boolean
+  literals, `!`, `&&`, `||`, the six comparisons on integers, and `if`/`else`.
+  Each branch becomes its own statement list, ending in `Drop 0` when it falls
+  through, so an empty `else` is a single `Drop 0`, as `guard::check` produces.
+  Declarations inside a branch are still declined, because they need scope handling.
+  Ten corpus programs now lower to identical IR, including `conditions`.

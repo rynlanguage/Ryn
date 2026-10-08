@@ -26,6 +26,12 @@ pub struct Signature {
     ret: String,
 }
 
+// The lowered statements of one branch, and whether control falls off its end.
+pub struct Block {
+    items: Vec<String>,
+    falls: bool,
+}
+
 pub struct Lowering {
     program: ast::Program,
     signatures: Vec<Signature>,
@@ -122,6 +128,14 @@ fun operator_word(op: String) -> Result<String, String> {
     return Result::Err(unsupported("operator"))
 }
 
+fun is_comparison(op: String) -> bool {
+    return op == "Eq" || op == "Ne" || op == "Lt" || op == "Le" || op == "Gt" || op == "Ge"
+}
+
+fun is_logical(op: String) -> bool {
+    return op == "And" || op == "Or"
+}
+
 fun is_integer_word(ty: String) -> bool {
     return ty == "I32" || ty == "I64"
 }
@@ -136,6 +150,9 @@ fun type_word(word: String) -> Result<String, String> {
     }
     when word == "str" {
         return Result::Ok(String("Str"))
+    }
+    when word == "bool" {
+        return Result::Ok(String("Bool"))
     }
     return Result::Err(unsupported("type"))
 }
@@ -275,6 +292,11 @@ extend Lowering {
             self.next_slot += 1
             return Result::Ok(slot)
         }
+        when ty == "Bool" {
+            self.local_types.push(String("I8"))
+            self.next_slot += 1
+            return Result::Ok(slot)
+        }
         when ty == "Str" {
             self.local_types.push(String("Ptr"))
             self.local_types.push(String("I64"))
@@ -295,7 +317,9 @@ extend Lowering {
     fun infer(self, index: u64) -> Result<String, String> {
         choose self.program.exprs[index] {
             ast::Expr::NameRef(name, span) => self.local_type(name),
-            ast::Expr::BinaryE(op, left, right, span) => self.binary_type(left, right),
+            ast::Expr::BinaryE(op, left, right, span) => self.binary_result_type(op, left, right),
+            ast::Expr::BoolLit(value, span) => Result::Ok(String("Bool")),
+            ast::Expr::NotE(value, span) => Result::Ok(String("Bool")),
             ast::Expr::IntLit(value, span) => Result::Ok(String("")),
             ast::Expr::StrLit(text, span) => Result::Ok(String("Str")),
             ast::Expr::CallE(name, type_arguments, arguments, span) => self.call_result_type(name),
@@ -324,6 +348,13 @@ extend Lowering {
         return Result::Ok(self.locals[index].ty.clone())
     }
 
+    fun binary_result_type(self, op: String, left: u64, right: u64) -> Result<String, String> {
+        when is_comparison(op.clone()) || is_logical(op) {
+            return Result::Ok(String("Bool"))
+        }
+        return self.binary_type(left, right)
+    }
+
     fun binary_type(self, left: u64, right: u64) -> Result<String, String> {
         ty := self.infer(left)?
         when !ty.is_empty() {
@@ -338,6 +369,8 @@ extend Lowering {
             ast::Expr::StrLit(text, span) => self.string_literal(text),
             ast::Expr::NameRef(name, span) => self.name(name, span),
             ast::Expr::BinaryE(op, left, right, span) => self.binary(op, left, right, expected),
+            ast::Expr::BoolLit(value, span) => self.boolean_literal(value, expected),
+            ast::Expr::NotE(value, span) => self.negation(value, expected),
             ast::Expr::CallE(name, type_arguments, arguments, span) => self.call(name, type_arguments, arguments, expected),
             _ => Result::Err(unsupported("expression")),
         }
@@ -368,7 +401,60 @@ extend Lowering {
         return Result::Ok(Lowered { text: text, ty: ty })
     }
 
+    fun boolean_literal(self, value: bool, expected: String) -> Result<Lowered, String> {
+        when !expected.is_empty() && expected != "Bool" {
+            return Result::Err(unsupported("boolean where another type is expected"))
+        }
+        mut bit: u64 = 0
+        when value {
+            bit = 1
+        }
+        return Result::Ok(Lowered { text: join(words2(String("Boolean"), num(bit))), ty: String("Bool") })
+    }
+
+    fun negation(mut self, value: u64, expected: String) -> Result<Lowered, String> {
+        when !expected.is_empty() && expected != "Bool" {
+            return Result::Err(unsupported("boolean where another type is expected"))
+        }
+        operand := self.expression(value, String("Bool"))?
+        when operand.ty != "Bool" {
+            return Result::Err(unsupported("negation of a non-boolean"))
+        }
+        return Result::Ok(Lowered { text: join(words2(String("Not"), operand.text)), ty: String("Bool") })
+    }
+
     fun binary(mut self, op: String, left: u64, right: u64, expected: String) -> Result<Lowered, String> {
+        when is_logical(op.clone()) {
+            when !expected.is_empty() && expected != "Bool" {
+                return Result::Err(unsupported("boolean where another type is expected"))
+            }
+            lhs := self.expression(left, String("Bool"))?
+            rhs := self.expression(right, String("Bool"))?
+            when lhs.ty != "Bool" || rhs.ty != "Bool" {
+                return Result::Err(unsupported("logical operator on non-boolean operands"))
+            }
+            text := join(words5(String("Binary"), op, lhs.text, rhs.text, String("Bool")))
+            return Result::Ok(Lowered { text: text, ty: String("Bool") })
+        }
+        when is_comparison(op.clone()) {
+            when !expected.is_empty() && expected != "Bool" {
+                return Result::Err(unsupported("comparison where another type is expected"))
+            }
+            mut operand_ty := self.binary_type(left, right)?
+            when operand_ty.is_empty() {
+                operand_ty = String("I64")
+            }
+            when !is_integer_word(operand_ty.clone()) {
+                return Result::Err(unsupported("comparison of this type"))
+            }
+            lhs := self.expression(left, operand_ty.clone())?
+            rhs := self.expression(right, operand_ty.clone())?
+            when lhs.ty != operand_ty || rhs.ty != operand_ty {
+                return Result::Err(unsupported("mixed operand types"))
+            }
+            text := join(words5(String("Binary"), op, lhs.text, rhs.text, operand_ty))
+            return Result::Ok(Lowered { text: text, ty: String("Bool") })
+        }
         mut ty := expected.clone()
         when ty.is_empty() {
             ty = self.binary_type(left, right)?
@@ -451,6 +537,56 @@ extend Lowering {
         return Result::Ok(false)
     }
 
+    // Lowers the statements of one branch. A branch that falls through ends with `Drop 0`,
+    // as `guard::check` adds it to a nested block. Declarations are left to the later subset.
+    fun block(mut self, body: Vec<u64>) -> Result<Block, String> {
+        locals_before := self.locals.len()
+        start := self.statements.len()
+        mut falls := true
+        for statement in body {
+            falls = !self.statement(statement)?
+        }
+        when self.locals.len() != locals_before {
+            return Result::Err(unsupported("declaration inside a branch"))
+        }
+        when falls {
+            self.statements.push(String("Drop 0"))
+        }
+        mut reversed: Vec<String> = Vec()
+        while self.statements.len() > start {
+            reversed.push(self.statements.pop().unwrap())
+        }
+        mut items: Vec<String> = Vec()
+        mut index: u64 = reversed.len()
+        while index > 0 {
+            index -= 1
+            items.push(reversed[index].clone())
+        }
+        return Result::Ok(Block { items: items, falls: falls })
+    }
+
+    fun if_statement(mut self, condition: u64, then_body: Vec<u64>, else_body: Vec<u64>) -> Result<bool, String> {
+        test := self.expression(condition, String("Bool"))?
+        when test.ty != "Bool" {
+            return Result::Err(unsupported("condition is not a boolean"))
+        }
+        then_block := self.block(then_body)?
+        else_block := self.block(else_body)?
+        mut tokens: Vec<String> = Vec()
+        tokens.push(String("IfStatement"))
+        tokens.push(test.text)
+        tokens.push(num(then_block.items.len()))
+        for item in then_block.items {
+            tokens.push(item)
+        }
+        tokens.push(num(else_block.items.len()))
+        for item in else_block.items {
+            tokens.push(item)
+        }
+        self.statements.push(join(tokens))
+        return Result::Ok(!(then_block.falls || else_block.falls))
+    }
+
     fun template_part(mut self, index: u64) -> Result<String, String> {
         choose self.program.parts[index] {
             ast::TemplatePart::TextPart(text) => text_part(text),
@@ -473,6 +609,7 @@ extend Lowering {
             ast::Stmt::TemplateS(parts, span) => self.template_statement(parts),
             ast::Stmt::ReturnS(value, span) => self.return_statement(value, span),
             ast::Stmt::CallS(name, type_arguments, arguments, span) => self.call_statement(name, type_arguments, arguments),
+            ast::Stmt::IfS(condition, then_body, else_body, span) => self.if_statement(condition, then_body, else_body),
             _ => Result::Err(unsupported("statement")),
         }
     }
