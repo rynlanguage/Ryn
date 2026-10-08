@@ -59,6 +59,8 @@ pub struct Lowering {
     loop_depth: u64,
     visible: u64,
     structs: Vec<StructInfo>,
+    type_names: Vec<String>,
+    type_words: Vec<String>,
 }
 
 // Joins tokens with single spaces. A token may hold spaces itself, as a length-prefixed string does.
@@ -397,7 +399,7 @@ extend Lowering {
     }
 
     fun annotation(self, index: u64) -> Result<String, String> {
-        return resolve_type(self.program.types[index], self.struct_names())
+        return resolve_type(self.program.types[index], self.type_names.clone(), self.type_words.clone())
     }
 
     fun struct_names(self) -> Vec<String> {
@@ -1228,22 +1230,23 @@ fun struct_id_of(ty: String) -> Option<u64> {
     return Option::Some(parsed.unwrap())
 }
 
-fun struct_type_word(names: Vec<String>, name: String) -> Result<String, String> {
+// The IR word a declared name stands for: a structure, or an alias with its target's word.
+fun named_type_word(names: Vec<String>, words: Vec<String>, name: String) -> Result<String, String> {
     mut id: u64 = 0
     while id < names.len() {
         when names[id] == name {
-            return Result::Ok(struct_word(id))
+            return Result::Ok(words[id].clone())
         }
         id += 1
     }
     return Result::Err(unsupported("unknown type"))
 }
 
-// The IR word for a declared type: a scalar, `str`, or a named structure.
-fun resolve_type(node: ast::TypeNode, names: Vec<String>) -> Result<String, String> {
+// The IR word for a declared type: a scalar, `str`, a named structure, or an alias.
+fun resolve_type(node: ast::TypeNode, names: Vec<String>, words: Vec<String>) -> Result<String, String> {
     choose node {
         ast::TypeNode::Simple(word) => type_word(word),
-        ast::TypeNode::NamedTy(name, span) => struct_type_word(names, name),
+        ast::TypeNode::NamedTy(name, span) => named_type_word(names, words, name),
         _ => Result::Err(unsupported("type")),
     }
 }
@@ -1254,15 +1257,28 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
     when !program.uses.is_empty() || !program.enums.is_empty() {
         return Result::Err(unsupported("items other than functions"))
     }
-    when !program.type_aliases.is_empty() || !program.extends.is_empty() || !program.shapes.is_empty() {
+    when !program.extends.is_empty() || !program.shapes.is_empty() {
         return Result::Err(unsupported("items other than functions"))
     }
-    mut names: Vec<String> = Vec()
+    mut type_names: Vec<String> = Vec()
+    mut type_words: Vec<String> = Vec()
     mut struct_position: u64 = 0
     while struct_position < program.structs.len() {
         definition := program.struct_defs[program.structs[struct_position]]
-        names.push(definition.name.clone())
+        type_names.push(definition.name.clone())
+        type_words.push(struct_word(struct_position))
         struct_position += 1
+    }
+    mut alias_position: u64 = 0
+    while alias_position < program.type_aliases.len() {
+        alias := program.alias_defs[program.type_aliases[alias_position]]
+        when !alias.type_parameters.is_empty() {
+            return Result::Err(unsupported("generic alias"))
+        }
+        target := resolve_type(program.types[alias.ty], type_names.clone(), type_words.clone())?
+        type_names.push(alias.name.clone())
+        type_words.push(target)
+        alias_position += 1
     }
     mut structs: Vec<StructInfo> = Vec()
     mut struct_index: u64 = 0
@@ -1278,7 +1294,7 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         while field_position < definition.fields.len() {
             field := program.struct_fields[definition.fields[field_position]]
             field_names.push(field.name)
-            field_types.push(resolve_type(program.types[field.ty], names.clone())?)
+            field_types.push(resolve_type(program.types[field.ty], type_names.clone(), type_words.clone())?)
             mut public: u64 = 0
             when field.public {
                 public = 1
@@ -1302,12 +1318,12 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         mut parameter_index: u64 = 0
         while parameter_index < definition.parameters.len() {
             parameter := program.parameters[definition.parameters[parameter_index]]
-            params.push(resolve_type(program.types[parameter.ty], names.clone())?)
+            params.push(resolve_type(program.types[parameter.ty], type_names.clone(), type_words.clone())?)
             parameter_index += 1
         }
         mut ret := String("")
         when definition.return_type.is_some() {
-            ret = resolve_type(program.types[definition.return_type.unwrap()], names.clone())?
+            ret = resolve_type(program.types[definition.return_type.unwrap()], type_names.clone(), type_words.clone())?
         }
         when definition.name == "main" {
             when !params.is_empty() {
@@ -1333,6 +1349,8 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         loop_depth: 0,
         visible: 0,
         structs: structs,
+        type_names: type_names,
+        type_words: type_words,
     }
     mut functions: Vec<String> = Vec()
     mut id: u64 = 0

@@ -181,3 +181,8 @@ generator:
   chains), typed by the expected type, else by its branches, else `i64`. Twenty-two
   corpus programs now lower to identical IR; the two new ones are the structure
   program and one with a `when` value.
+- Stage 2, step 4c (verified by hand, no corpus program yet): non-generic type
+  aliases, resolved through one table of names and type words that also holds the
+  structures. A scratch program using an alias for a structure and for a scalar
+  lowered identically to `sema`. Corpus programs with aliases also use pointers,
+  function pointers, or FFI types, so the gate count is unchanged.
