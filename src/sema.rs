@@ -549,6 +549,8 @@ pub enum IrExpression {
         success_variant: usize,
         failure_variant: usize,
         output_failure_variant: usize,
+        // `defer` bodies that the early return leaves, run before the function returns.
+        deferred: Vec<IrStatement>,
     },
     ArrayValue(Vec<IrExpression>),
     /// One evaluated element, replicated `length` times. The element is copyable.
@@ -2196,8 +2198,6 @@ struct Analyzer<'a> {
     loop_defer_bases: Vec<usize>,
     // Non-zero while a `defer` body is being lowered: control may not leave it.
     defer_nesting: usize,
-    // True while the function's result expression is lowered, after its `defer` blocks were registered.
-    tail_defers_pending: bool,
     function_name: String,
     module_path: String,
     return_type: Option<Type>,
@@ -2238,7 +2238,6 @@ impl<'a> Analyzer<'a> {
             defer_frames: Vec::new(),
             loop_defer_bases: Vec::new(),
             defer_nesting: 0,
-            tail_defers_pending: false,
             function_name: String::new(),
             module_path: String::new(),
             return_type: None,
@@ -2456,7 +2455,9 @@ impl<'a> Analyzer<'a> {
         deferred: Vec<DeferredBody>,
     ) -> Result<RynFunction, Diagnostic> {
         let return_type = self.return_type;
-        self.tail_defers_pending = !deferred.is_empty();
+        // The function's own `defer` blocks stay pending while the result is lowered, so a `?`
+        // in the result expression runs them too.
+        self.defer_frames.push(deferred.clone());
         let mut return_value = match (return_type, function.return_value) {
             (Some(expected), Some(value)) => {
                 let span = value.span();
@@ -2515,7 +2516,7 @@ impl<'a> Analyzer<'a> {
             }
             (None, None) => None,
         };
-        self.tail_defers_pending = false;
+        self.defer_frames.pop();
         if !deferred.is_empty() {
             // The result is computed first, so the deferred bodies run after it and cannot change it.
             let leaving = self.lower_frame(deferred)?;
@@ -5132,16 +5133,9 @@ impl<'a> Analyzer<'a> {
                     return Err(diag("R0268", "`?` cannot leave a `defer` block", span)
                         .with_help("handle the error inside the `defer` block"));
                 }
-                // Early returns from `?` do not run deferred bodies, so they are rejected while any
-                // `defer` is pending in this function.
-                if self.tail_defers_pending || self.defer_frames.iter().any(|frame| !frame.is_empty()) {
-                    return Err(diag(
-                        "R0266",
-                        "`?` cannot be used in a function with a `defer` block yet",
-                        span,
-                    )
-                    .with_help("move the `?` before the `defer` block, or handle the error with `choose`"));
-                }
+                // The early return from `?` runs every `defer` block that is pending in this
+                // function, so those bodies are lowered here and carried by the expression.
+                let deferred = self.leaving_defers(0)?;
                 let (value, input_type) = self.expression(*value, None)?;
                 let Type::Enum(input_enum) = input_type else {
                     return Err(diag(
@@ -5264,6 +5258,7 @@ impl<'a> Analyzer<'a> {
                         success_variant,
                         failure_variant,
                         output_failure_variant,
+                        deferred,
                     },
                     success_type,
                 ))

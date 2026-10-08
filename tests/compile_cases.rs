@@ -60,7 +60,6 @@ fn fail_fixtures_are_rejected_with_the_expected_diagnostic_codes() {
         ("coalesce_not_option.ryn", "R0234"),
         ("defer_return_inside.ryn", "R0267"),
         ("defer_break_outside.ryn", "R0268"),
-        ("defer_propagate.ryn", "R0266"),
         ("defer_reference.ryn", "R0269"),
         ("defer_owned_moved.ryn", "R0240"),
     ];

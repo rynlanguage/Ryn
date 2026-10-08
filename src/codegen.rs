@@ -3896,7 +3896,12 @@ fn collect_strings(ir: &RynIr) -> BTreeSet<String> {
                     expr(&arm.body, out);
                 }
             }
-            IrExpression::Propagate { value, .. } => expr(value, out),
+            IrExpression::Propagate {
+                value, deferred, ..
+            } => {
+                expr(value, out);
+                stmts(deferred, &[], &[], out);
+            }
         }
     }
     fn stmts(
@@ -7420,6 +7425,7 @@ fn emit_propagate(
         success_variant,
         failure_variant,
         output_failure_variant,
+        deferred,
     } = expression
     else {
         return Err(
@@ -7623,6 +7629,10 @@ fn emit_propagate(
         &[output_tag, payload, payload_len, drop_ptr, drop_len],
     );
     let output_value = b.func.dfg.inst_results(create)[0];
+    // The error result is built first, then the pending `defer` blocks run, as they do before
+    // any other return.
+    let mut loops = Vec::new();
+    emit_statements(b, module, env, deferred, seal_state, &mut loops)?;
     drop_slots(b, env, env.owned_slots, seal_state);
     b.ins().return_(&[output_value]);
     let returned = b

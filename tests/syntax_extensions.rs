@@ -166,3 +166,37 @@ fn defer_keeps_owned_values_alive_until_the_block_ends() {
     );
     assert_eq!(String::from_utf8_lossy(&result.stdout), "body\nowned\n");
 }
+
+#[test]
+fn question_mark_runs_pending_defer_blocks_on_its_early_return() {
+    let option = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/programs/pass/defer_propagate_option.ryn"),
+    )
+    .expect("option propagate fixture exists");
+    let result = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/programs/pass/defer_propagate_result.ryn"),
+    )
+    .expect("result propagate fixture exists");
+    for frontend in [None, Some("rust")] {
+        let option_run = run_program("defer-option", &option, frontend);
+        assert!(
+            option_run.status.success(),
+            "option propagation with defer should run with frontend {frontend:?}, stderr:\n{}",
+            String::from_utf8_lossy(&option_run.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&option_run.stdout),
+            "cleanup\n5\ncleanup\n-1\n"
+        );
+        let result_run = run_program("defer-result", &result, frontend);
+        assert!(
+            result_run.status.success(),
+            "result propagation with defer should run with frontend {frontend:?}, stderr:\n{}",
+            String::from_utf8_lossy(&result_run.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&result_run.stdout),
+            "result cleanup\n11\nresult cleanup\n9\n"
+        );
+    }
+}

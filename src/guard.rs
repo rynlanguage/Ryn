@@ -437,7 +437,23 @@ impl Guard<'_> {
                     self.reference_origins = origins;
                 }
             }
-            IrExpression::Propagate { value, .. } => self.expression(value, true)?,
+            IrExpression::Propagate {
+                value, deferred, ..
+            } => {
+                self.expression(value, true)?;
+                // The deferred bodies run only on the early-return path, so their moves and
+                // borrows must not leak into the code that follows the `?`.
+                let available = self.available.clone();
+                let borrowed = self.borrowed.clone();
+                let reference_origins = self.reference_origins.clone();
+                let reference_mutability = self.reference_mutability.clone();
+                let (checked, _) = self.block(std::mem::take(deferred), false)?;
+                *deferred = checked;
+                self.available = available;
+                self.borrowed = borrowed;
+                self.reference_origins = reference_origins;
+                self.reference_mutability = reference_mutability;
+            }
             IrExpression::StringAsStr(value) => self.expression(value, false)?,
             IrExpression::Binary { left, right, .. } => {
                 self.expression(left, false)?;

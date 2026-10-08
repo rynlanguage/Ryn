@@ -1,0 +1,21 @@
+fun checked(value: Result<i32, String>) -> Result<i32, String> {
+    defer {
+        echo "result cleanup"
+    }
+    number := value?
+    Result::Ok(number + 10)
+}
+
+fun main() -> i32 {
+    good: Result<i32, String> = Result::Ok(1)
+    bad: Result<i32, String> = Result::Err(String("bad input"))
+    echo choose checked(good) {
+        Result::Ok(value) => value,
+        Result::Err(message) => -1,
+    }
+    echo choose checked(bad) {
+        Result::Ok(value) => value,
+        Result::Err(message) => message.len() as i32,
+    }
+    return 0
+}
