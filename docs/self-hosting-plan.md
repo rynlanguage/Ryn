@@ -177,3 +177,7 @@ generator:
   A scratch program with all of these lowered identically to `sema`; the scratch file
   was removed. The corpus structure programs still use `when` as a value, enums,
   `extend`, attributes, or collections, so the gate count is unchanged.
+- Stage 2, step 4b (done): `when` as a value (`If` expressions, including `else when`
+  chains), typed by the expected type, else by its branches, else `i64`. Twenty-two
+  corpus programs now lower to identical IR; the two new ones are the structure
+  program and one with a `when` value.

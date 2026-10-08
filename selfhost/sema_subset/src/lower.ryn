@@ -490,6 +490,37 @@ extend Lowering {
     }
 
     // A field read is a read of its slots, with the span of the whole field expression.
+    // The type of a `when` expression from its branches, when they say.
+    fun if_type(self, then_value: u64, else_value: u64) -> Result<String, String> {
+        ty := self.infer(then_value)?
+        when !ty.is_empty() {
+            return Result::Ok(ty)
+        }
+        return self.infer(else_value)
+    }
+
+    // `when c { a } else { b }` as a value: both branches have one type, which is the expected
+    // type when there is one, else the branches' type, else i64.
+    fun if_expression(mut self, condition: u64, then_value: u64, else_value: u64, expected: String) -> Result<Lowered, String> {
+        test := self.expression(condition, String("Bool"))?
+        when test.ty != "Bool" {
+            return Result::Err(unsupported("condition is not a boolean"))
+        }
+        mut ty := expected.clone()
+        when ty.is_empty() {
+            ty = self.if_type(then_value, else_value)?
+        }
+        when ty.is_empty() {
+            ty = String("I64")
+        }
+        then_branch := self.expression(then_value, ty.clone())?
+        else_branch := self.expression(else_value, ty.clone())?
+        when then_branch.ty != ty || else_branch.ty != ty {
+            return Result::Err(unsupported("branches of different types"))
+        }
+        return Result::Ok(Lowered { text: join(words5(String("If"), test.text, then_branch.text, else_branch.text, ty.clone())), ty: ty })
+    }
+
     fun field_type(self, value: u64, name: String) -> Result<String, String> {
         place := self.field_of(value, name)?
         return Result::Ok(place.ty)
@@ -612,6 +643,7 @@ extend Lowering {
             ast::Expr::NegateE(value, span) => self.infer(value),
             ast::Expr::CastE(value, ty, span) => self.annotation(ty),
             ast::Expr::FieldE(value, name, name_span, span) => self.field_type(value, name),
+            ast::Expr::IfE(condition, then_value, else_value, span) => self.if_type(then_value, else_value),
             ast::Expr::StructLit(name, fields, span) => self.struct_literal_type(name),
             ast::Expr::IntLit(value, span) => Result::Ok(String("")),
             ast::Expr::StrLit(text, span) => Result::Ok(String("Str")),
@@ -667,6 +699,7 @@ extend Lowering {
             ast::Expr::NegateE(value, span) => self.arithmetic_negation(value, expected),
             ast::Expr::CastE(value, ty, span) => self.cast(value, ty, expected),
             ast::Expr::FieldE(value, name, name_span, span) => self.field_read(value, name, span, expected),
+            ast::Expr::IfE(condition, then_value, else_value, span) => self.if_expression(condition, then_value, else_value, expected),
             ast::Expr::StructLit(name, fields, span) => self.struct_literal(name, fields, expected),
             ast::Expr::CallE(name, type_arguments, arguments, span) => self.call(name, type_arguments, arguments, expected),
             _ => Result::Err(unsupported("expression")),
