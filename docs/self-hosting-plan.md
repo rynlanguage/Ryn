@@ -186,3 +186,12 @@ generator:
   structures. A scratch program using an alias for a structure and for a scalar
   lowered identically to `sema`. Corpus programs with aliases also use pointers,
   function pointers, or FFI types, so the gate count is unchanged.
+- Stage 2, step 5 (verified by hand, no corpus program yet): owned `String` locals,
+  parameters, and temporaries. `String("...")` lowers to `Call String New` and yields an
+  owned value; each block, function, `break`, and `continue` drops its owned strings,
+  last declared first; a named owned string used by value (call argument, `let`,
+  assignment, `return`, structure field) is a `Move` out of its slot, while printing
+  borrows it. Two scratch programs (a loop with `break`, a block, a function that takes
+  an owned argument, and a moved local) lowered identically to `sema`. The corpus
+  programs with owned strings also use `defer` or `String` methods, so the gate count is
+  unchanged.

@@ -58,6 +58,7 @@ pub struct Lowering {
     return_ty: String,
     loop_depth: u64,
     visible: u64,
+    loop_floors: Vec<u64>,
     structs: Vec<StructInfo>,
     type_names: Vec<String>,
     type_words: Vec<String>,
@@ -213,6 +214,9 @@ fun type_word(word: String) -> Result<String, String> {
     }
     when word == "bool" {
         return Result::Ok(String("Bool"))
+    }
+    when word == "String" {
+        return Result::Ok(String("OwnedString"))
     }
     return Result::Err(unsupported("type"))
 }
@@ -389,6 +393,11 @@ extend Lowering {
             self.next_slot += 1
             return Result::Ok(slot)
         }
+        when ty == "OwnedString" {
+            self.local_types.push(String("OwnedPtr"))
+            self.next_slot += 1
+            return Result::Ok(slot)
+        }
         when ty == "Str" {
             self.local_types.push(String("Ptr"))
             self.local_types.push(String("I64"))
@@ -523,6 +532,35 @@ extend Lowering {
         return Result::Ok(Lowered { text: join(words5(String("If"), test.text, then_branch.text, else_branch.text, ty.clone())), ty: ty })
     }
 
+    // The first visible local of the innermost loop; 0 outside any loop.
+    fun loop_floor(self) -> u64 {
+        when self.loop_floors.is_empty() {
+            return 0
+        }
+        return self.loop_floors[self.loop_floors.len() - 1]
+    }
+
+    // A value that is used by value: an owned string named here is moved out of its local.
+    fun moved_expression(mut self, index: u64, expected: String) -> Result<Lowered, String> {
+        choose self.program.exprs[index] {
+            ast::Expr::NameRef(name, span) => self.moved_name(index, name, expected),
+            _ => self.expression(index, expected),
+        }
+    }
+
+    fun moved_name(mut self, expression: u64, name: String, expected: String) -> Result<Lowered, String> {
+        index := self.find(name)?
+        ty := self.locals[index].ty.clone()
+        when ty != "OwnedString" {
+            return self.expression(expression, expected)
+        }
+        when !expected.is_empty() && expected != ty {
+            return Result::Err(unsupported("owned string where another type is expected"))
+        }
+        slot := self.locals[index].slot
+        return Result::Ok(Lowered { text: join(words3(String("Move"), num(slot), ty.clone())), ty: ty })
+    }
+
     fun field_type(self, value: u64, name: String) -> Result<String, String> {
         place := self.field_of(value, name)?
         return Result::Ok(place.ty)
@@ -561,7 +599,7 @@ extend Lowering {
             init := self.program.inits[fields[position]]
             field := self.field_index(id, init.name)?
             field_ty := self.structs[id].field_types[field].clone()
-            value := self.expression(init.value, field_ty.clone())?
+            value := self.moved_expression(init.value, field_ty.clone())?
             when value.ty != field_ty {
                 return Result::Err(unsupported("structure field type"))
             }
@@ -615,7 +653,7 @@ extend Lowering {
             position += 1
         }
         when op.is_none() {
-            lowered := self.expression(value, place.ty.clone())?
+            lowered := self.moved_expression(value, place.ty.clone())?
             when lowered.ty != place.ty {
                 return Result::Err(unsupported("field assignment type"))
             }
@@ -892,7 +930,7 @@ extend Lowering {
         mut lowered: Vec<String> = Vec()
         mut position: u64 = 0
         while position < arguments.len() {
-            value := self.expression(arguments[position], params[position].clone())?
+            value := self.moved_expression(arguments[position], params[position].clone())?
             when value.ty != params[position] {
                 return Result::Err(unsupported("argument type"))
             }
@@ -904,6 +942,16 @@ extend Lowering {
 
     // The command-line builtins: `arg_count()` returns u32, and `arg(index)` takes a u32 and returns str.
     fun builtin_call(mut self, name: String, arguments: Vec<u64>, expected: String) -> Result<Lowered, String> {
+        when name == "String" {
+            when arguments.len() != 1 || (!expected.is_empty() && expected != "OwnedString") {
+                return Result::Err(unsupported("String shape"))
+            }
+            text := self.expression(arguments[0], String("Str"))?
+            when text.ty != "Str" {
+                return Result::Err(unsupported("String from a non-str value"))
+            }
+            return Result::Ok(Lowered { text: join(words5(String("Call"), String("String"), String("New"), String("1"), join(words2(text.text, String("OwnedString"))))), ty: String("OwnedString") })
+        }
         when name == "arg_count" {
             when !arguments.is_empty() || (!expected.is_empty() && expected != "U32") {
                 return Result::Err(unsupported("arg_count shape"))
@@ -980,11 +1028,12 @@ extend Lowering {
             falls = !self.statement(body[position])?
             position += 1
         }
-        // Declarations in a block go out of scope when it ends; their slots are not reused.
-        self.visible = locals_before
+        // The block's owned strings are dropped while still visible; then the block's names go
+        // out of scope. Their slots are not reused.
         when falls {
-            self.statements.push(String("Drop 0"))
+            self.statements.push(self.owned_drop(locals_before))
         }
+        self.visible = locals_before
         mut reversed: Vec<String> = Vec()
         while self.statements.len() > start {
             reversed.push(self.statements.pop().unwrap())
@@ -1043,7 +1092,9 @@ extend Lowering {
         visible_before := self.visible
         self.declare(Local { name: name, slot: variable_slot, ty: ty.clone(), mutable: false })
         self.loop_depth += 1
+        self.loop_floors.push(visible_before)
         body_block := self.block(body)?
+        self.loop_floors.pop()
         self.loop_depth -= 1
         self.visible = visible_before
         mut bit: u64 = 0
@@ -1072,7 +1123,9 @@ extend Lowering {
             return Result::Err(unsupported("condition is not a boolean"))
         }
         self.loop_depth += 1
+        self.loop_floors.push(self.visible)
         body_block := self.block(body)?
+        self.loop_floors.pop()
         self.loop_depth -= 1
         mut tokens: Vec<String> = Vec()
         tokens.push(String("While"))
@@ -1087,12 +1140,32 @@ extend Lowering {
         return Result::Ok(false)
     }
 
+    // The drop of the owned locals declared from `floor` on, last declared first.
+    fun owned_drop(self, floor: u64) -> String {
+        mut slots: Vec<String> = Vec()
+        mut index: u64 = self.visible
+        while index > floor {
+            index -= 1
+            when self.locals[index].ty == "OwnedString" {
+                slots.push(num(self.locals[index].slot))
+                slots.push(self.locals[index].ty.clone())
+            }
+        }
+        mut tokens: Vec<String> = Vec()
+        tokens.push(String("Drop"))
+        tokens.push(num(slots.len() / 2))
+        for token in slots {
+            tokens.push(token)
+        }
+        return join(tokens)
+    }
+
     // `break` and `continue` leave their scopes, so `guard::check` emits a drop before each.
     fun jump_statement(mut self, word: String) -> Result<bool, String> {
         when self.loop_depth == 0 {
             return Result::Err(unsupported("break or continue outside a loop"))
         }
-        self.statements.push(String("Drop 0"))
+        self.statements.push(self.owned_drop(self.loop_floor()))
         self.statements.push(word)
         return Result::Ok(true)
     }
@@ -1134,7 +1207,7 @@ extend Lowering {
         when annotation.is_some() {
             declared = self.annotation(annotation.unwrap())?
         }
-        lowered := self.expression(value, declared.clone())?
+        lowered := self.moved_expression(value, declared.clone())?
         mut ty := declared.clone()
         when ty.is_empty() {
             ty = lowered.ty.clone()
@@ -1158,7 +1231,7 @@ extend Lowering {
         }
         slot := self.locals[index].slot
         ty := self.locals[index].ty.clone()
-        lowered := self.expression(value, ty.clone())?
+        lowered := self.moved_expression(value, ty.clone())?
         self.statements.push(join(words6(String("Assign"), num(slot), ty, lowered.text, num(span.start), num(span.end))))
         return Result::Ok(false)
     }
@@ -1208,7 +1281,7 @@ extend Lowering {
         when self.return_ty.is_empty() {
             return Result::Err(unsupported("return value without a result type"))
         }
-        lowered := self.expression(value.unwrap(), self.return_ty.clone())?
+        lowered := self.moved_expression(value.unwrap(), self.return_ty.clone())?
         self.statements.push(join(words3(String("Return"), String("+"), lowered.text)))
         return Result::Ok(true)
     }
@@ -1348,6 +1421,7 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         return_ty: String(""),
         loop_depth: 0,
         visible: 0,
+        loop_floors: Vec(),
         structs: structs,
         type_names: type_names,
         type_words: type_words,
@@ -1372,6 +1446,7 @@ extend Lowering {
         self.return_ty = self.signatures[id].ret.clone()
         self.loop_depth = 0
         self.visible = 0
+        self.loop_floors = Vec()
         definition := self.program.function_defs[self.program.functions[id]]
         mut parameters: Vec<String> = Vec()
         mut parameter_index: u64 = 0
@@ -1402,7 +1477,7 @@ extend Lowering {
             return Result::Err(unsupported("function must return a value"))
         }
         when falls_through {
-            self.statements.push(String("Drop 0"))
+            self.statements.push(self.owned_drop(0))
         }
         return Result::Ok(self.function_text(id, parameters))
     }
@@ -1440,10 +1515,15 @@ extend Lowering {
             index += 1
         }
         tokens.push(num(local_count))
-        mut owned: u64 = 0
-        while owned < local_count {
-            tokens.push(String("-"))
-            owned += 1
+        index = 0
+        while index < local_count {
+            when self.local_types[index] == "OwnedPtr" {
+                tokens.push(String("+"))
+                tokens.push(String("OwnedString"))
+            } else {
+                tokens.push(String("-"))
+            }
+            index += 1
         }
         tokens.push(num(self.addressed))
         mut addressed: u64 = 0
