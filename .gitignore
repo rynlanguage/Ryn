@@ -9,4 +9,6 @@
 /.ryn/
 /examples/*/.ryn/
 /selfhost/build/
+/selfhost/**/build/
 /selfhost/.ryn/
+/selfhost/**/.ryn/
