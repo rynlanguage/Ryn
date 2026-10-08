@@ -212,7 +212,15 @@ fn run_propagates_the_i32_main_exit_code_after_flushing_output() {
         String::from_utf8_lossy(&result.stdout),
         "Ryn exit status: 7\n"
     );
-    assert!(result.stderr.is_empty());
+    // The first run after a compiler build prints the one-time note that the self-hosted
+    // frontend is being built; any other stderr would be a diagnostic from the program.
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr
+            .lines()
+            .all(|line| line.starts_with("note: building the self-hosted Ryn frontend")),
+        "unexpected stderr: {stderr}"
+    );
 }
 
 #[test]
