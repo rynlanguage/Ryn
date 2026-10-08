@@ -274,6 +274,69 @@ pub struct ChooseArm {
 }
 
 impl Expression {
+    /// Rewrites `value |> target`. A function name becomes `name(value)`, and a
+    /// call receives `value` as its first argument, so the pipe adds no node of
+    /// its own. Any other right side is rejected at its own span.
+    pub fn pipe_into(
+        value: Expression,
+        target: Expression,
+        span: Span,
+    ) -> Result<Expression, (Span, String)> {
+        match target {
+            Expression::Name(name, _) => Ok(Expression::Call {
+                name,
+                type_arguments: Vec::new(),
+                arguments: vec![value],
+                span,
+            }),
+            Expression::Call {
+                name,
+                type_arguments,
+                mut arguments,
+                ..
+            } => {
+                arguments.insert(0, value);
+                Ok(Expression::Call {
+                    name,
+                    type_arguments,
+                    arguments,
+                    span,
+                })
+            }
+            other => Err((
+                other.span(),
+                "the right side of `|>` must be a function name or a function call".to_owned(),
+            )),
+        }
+    }
+
+    /// Rewrites `value ?? fallback` as a `choose` over an `Option`. The fallback
+    /// is only evaluated in the `None` arm, so it is lazy. The bound name cannot
+    /// be written in source, so it cannot clash with a user variable.
+    pub fn coalesce(value: Expression, fallback: Expression, span: Span) -> Expression {
+        let bound = "$coalesce".to_owned();
+        Expression::Choose {
+            value: Box::new(value),
+            arms: vec![
+                ChooseArm {
+                    enum_name: Some("Option".to_owned()),
+                    variant: Some("Some".to_owned()),
+                    bindings: vec![bound.clone()],
+                    body: Expression::Name(bound, span),
+                    span,
+                },
+                ChooseArm {
+                    enum_name: Some("Option".to_owned()),
+                    variant: Some("None".to_owned()),
+                    bindings: Vec::new(),
+                    body: fallback,
+                    span,
+                },
+            ],
+            span,
+        }
+    }
+
     pub fn span(&self) -> Span {
         match self {
             Self::Integer(_, span)
@@ -380,6 +443,8 @@ pub enum Statement {
         name_span: Span,
         start: Expression,
         end: Expression,
+        // `start..=end` includes `end`; `start..end` stops before it.
+        inclusive: bool,
         body: Vec<Statement>,
         span: Span,
     },

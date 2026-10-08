@@ -2841,6 +2841,7 @@ fn emit_statements(
                 ty,
                 start,
                 end,
+                inclusive,
                 body,
             } => {
                 let start = emit_expr(b, module, start, env, seal_state)?;
@@ -2852,6 +2853,7 @@ fn emit_statements(
                 let loop_body = b.create_block();
                 let increment = b.create_block();
                 let exit = b.create_block();
+                let unsigned = matches!(ty, Type::U8 | Type::U16 | Type::U32 | Type::U64);
                 let from = b
                     .current_block()
                     .ok_or_else(|| "internal error: missing for-loop predecessor".to_string())?;
@@ -2862,10 +2864,13 @@ fn emit_statements(
                 seal_state.deferred.push(header);
                 let current = b.use_var(Variable::from_u32(*slot as u32));
                 let end = b.use_var(Variable::from_u32(*end_slot as u32));
-                let condition = if matches!(ty, Type::U8 | Type::U16 | Type::U32 | Type::U64) {
-                    b.ins().icmp(IntCC::UnsignedLessThan, current, end)
-                } else {
-                    b.ins().icmp(IntCC::SignedLessThan, current, end)
+                // An inclusive range keeps going while `current <= end`; the increment below
+                // leaves before stepping past `end`, so the counter never wraps at the type's limit.
+                let condition = match (unsigned, *inclusive) {
+                    (true, false) => b.ins().icmp(IntCC::UnsignedLessThan, current, end),
+                    (true, true) => b.ins().icmp(IntCC::UnsignedLessThanOrEqual, current, end),
+                    (false, false) => b.ins().icmp(IntCC::SignedLessThan, current, end),
+                    (false, true) => b.ins().icmp(IntCC::SignedLessThanOrEqual, current, end),
                 };
                 b.ins().brif(condition, loop_body, &[], exit, &[]);
 
@@ -2882,6 +2887,19 @@ fn emit_statements(
                 seal_ready(b, loop_body, seal_state);
 
                 b.switch_to_block(increment);
+                let step = if *inclusive {
+                    // The last value of an inclusive range is `end` itself: leave without stepping.
+                    let current = b.use_var(Variable::from_u32(*slot as u32));
+                    let last = b.use_var(Variable::from_u32(*end_slot as u32));
+                    let at_last = b.ins().icmp(IntCC::Equal, current, last);
+                    let step = b.create_block();
+                    b.ins().brif(at_last, exit, &[], step, &[]);
+                    seal_ready(b, increment, seal_state);
+                    b.switch_to_block(step);
+                    step
+                } else {
+                    increment
+                };
                 let current = b.use_var(Variable::from_u32(*slot as u32));
                 let value_type = clif_integer_type(*ty)
                     .ok_or_else(|| "internal error: for-loop has a non-integer type".to_string())?;
@@ -2889,7 +2907,7 @@ fn emit_statements(
                 let next = b.ins().iadd(current, one);
                 b.def_var(Variable::from_u32(*slot as u32), next);
                 b.ins().jump(header, &[]);
-                seal_ready(b, increment, seal_state);
+                seal_ready(b, step, seal_state);
 
                 let deferred_header = seal_state.deferred.pop();
                 debug_assert_eq!(deferred_header, Some(header));

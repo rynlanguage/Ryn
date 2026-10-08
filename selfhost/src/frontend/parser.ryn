@@ -2986,6 +2986,8 @@ extend Parser {
         mut out := String("\n")
         when record.count == 2 {
             out.append(word("For"))
+        } else when record.count == 3 {
+            out.append(word("ForInclusive"))
         } else {
             out.append(word("ForEach"))
         }
@@ -3004,11 +3006,15 @@ extend Parser {
         mut code := enc_str(name.text)
         code.append(enc_span(name.start, name.end))
         code.append(first.code)
+        // Count 1 is a collection loop, 2 an exclusive range, 3 an inclusive range `..=`.
         mut count: u64 = 1
-        when self.peek_kind() == lexer::Tk::DOT_DOT {
+        when self.peek_kind() == lexer::Tk::DOT_DOT || self.peek_kind() == lexer::Tk::DOT_DOT_EQUAL {
+            count = 2
+            when self.peek_kind() == lexer::Tk::DOT_DOT_EQUAL {
+                count = 3
+            }
             self.skip()
             code.append(self.expression(0)?.code)
-            count = 2
         }
         when self.peek_kind() != lexer::Tk::LBRACE {
             return Result::Err(self.error("expected `{` to start block"))
@@ -3820,6 +3826,36 @@ extend Parser {
             when kind == lexer::Tk::STAR && self.kind_at(self.at + 1) == lexer::Tk::IDENT
                 && self.kind_at(self.at + 2) == lexer::Tk::EQUAL {
                 break
+            }
+            // `|>` and `??` bind loosest and are left-associative, like the bootstrap parser.
+            // Both are sent as tagged nodes that ast_codec rewrites into calls and choose.
+            when kind == lexer::Tk::PIPE_GREATER || kind == lexer::Tk::QUESTION_QUESTION {
+                when min_precedence > 0 {
+                    break
+                }
+                pipe := kind == lexer::Tk::PIPE_GREATER
+                self.skip()
+                right := self.expression(1)?
+                when pipe {
+                    when right.kind != Ek::CALL && !right.code.starts_with(word("Name").clone()) {
+                        return Result::Err(lexer::diag_help(
+                            "R0265",
+                            String("the right side of `|>` must be a function name or a function call"),
+                            right.start,
+                            right.end,
+                            String("write `value |> function` or `value |> function(arguments)`")
+                        ))
+                    }
+                }
+                mut code := word("Coalesce")
+                when pipe {
+                    code = word("Pipe")
+                }
+                code.append(left.code)
+                code.append(right.code)
+                code.append(enc_span(left.start, right.end))
+                left = plain_expr(code, left.start, right.end)
+                continue
             }
             precedence := binary_precedence(kind)
             when precedence == 0 || precedence < min_precedence {

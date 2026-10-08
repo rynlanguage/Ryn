@@ -1,0 +1,5 @@
+fun main() -> i32 {
+    value := 4
+    echo value ?? 9
+    return 0
+}

@@ -35,6 +35,8 @@ pub enum TokenKind {
     EqualEqual,
     Bang,
     Question,
+    QuestionQuestion,
+    DotDotEqual,
     BangEqual,
     Less,
     LessEqual,
@@ -53,6 +55,7 @@ pub enum TokenKind {
     Tilde,
     AndAnd,
     OrOr,
+    PipeGreater,
     LParen,
     RParen,
     LBracket,
@@ -191,6 +194,10 @@ fn lex_all(text: &str, recovering: bool) -> (Vec<Token>, Vec<Diagnostic>) {
                 i += 1;
                 TokenKind::Colon
             }
+            b'.' if bytes.get(i + 1) == Some(&b'.') && bytes.get(i + 2) == Some(&b'=') => {
+                i += 3;
+                TokenKind::DotDotEqual
+            }
             b'.' if bytes.get(i + 1) == Some(&b'.') => {
                 i += 2;
                 TokenKind::DotDot
@@ -218,6 +225,10 @@ fn lex_all(text: &str, recovering: bool) -> (Vec<Token>, Vec<Diagnostic>) {
             b'!' => {
                 i += 1;
                 TokenKind::Bang
+            }
+            b'?' if bytes.get(i + 1) == Some(&b'?') => {
+                i += 2;
+                TokenKind::QuestionQuestion
             }
             b'?' => {
                 i += 1;
@@ -274,6 +285,10 @@ fn lex_all(text: &str, recovering: bool) -> (Vec<Token>, Vec<Diagnostic>) {
             b'|' if bytes.get(i + 1) == Some(&b'|') => {
                 i += 2;
                 TokenKind::OrOr
+            }
+            b'|' if bytes.get(i + 1) == Some(&b'>') => {
+                i += 2;
+                TokenKind::PipeGreater
             }
             b'|' => {
                 i += 1;

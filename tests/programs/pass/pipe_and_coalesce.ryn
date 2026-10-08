@@ -1,0 +1,26 @@
+fun double(x: i32) -> i32 => x * 2
+
+fun square(x: i32) -> i32 => x * x
+
+fun clamp_value(value: i32, low: i32, high: i32) -> i32 {
+    when value < low { return low }
+    when value > high { return high }
+    return value
+}
+
+fun first_or_zero(values: Option<i32>) -> i32 {
+    return values ?? 0
+}
+
+fun main() -> i32 {
+    result := 3 |> double |> square
+    echo result
+    clamped := 250 |> clamp_value(0, 100)
+    echo clamped
+    echo 7 |> double |> double
+    echo first_or_zero(Option::Some(41))
+    echo first_or_zero(Option::None) |> double
+    maybe: Option<i32> = Option::Some(5)
+    echo maybe ?? 9
+    return 0
+}

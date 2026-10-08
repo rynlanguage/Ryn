@@ -565,10 +565,12 @@ impl Encoder {
                 name_span,
                 start,
                 end,
+                inclusive,
                 body,
                 span,
             } => {
-                self.word("For");
+                // An inclusive range has its own tag, so the exclusive `For` layout is unchanged.
+                self.word(if *inclusive { "ForInclusive" } else { "For" });
                 self.string(name);
                 self.span(*name_span);
                 self.expression(start);
@@ -1263,6 +1265,16 @@ impl<'a> Decoder<'a> {
                 name_span: self.span()?,
                 start: self.expression()?,
                 end: self.expression()?,
+                inclusive: false,
+                body: self.statements()?,
+                span: self.span()?,
+            },
+            "ForInclusive" => Statement::For {
+                name: self.string()?,
+                name_span: self.span()?,
+                start: self.expression()?,
+                end: self.expression()?,
+                inclusive: true,
                 body: self.statements()?,
                 span: self.span()?,
             },
@@ -1346,6 +1358,21 @@ impl<'a> Decoder<'a> {
                 right: self.boxed_expression()?,
                 span: self.span()?,
             },
+            // The self-hosted parser sends `|>` and `??` as these tags; they are rewritten
+            // exactly as the bootstrap parser rewrites them, so both trees are identical.
+            "Pipe" => {
+                let value = self.expression()?;
+                let target = self.expression()?;
+                let span = self.span()?;
+                Expression::pipe_into(value, target, span)
+                    .map_err(|(_, message)| message)?
+            }
+            "Coalesce" => {
+                let value = self.expression()?;
+                let fallback = self.expression()?;
+                let span = self.span()?;
+                Expression::coalesce(value, fallback, span)
+            }
             "Negate" => Expression::Negate(self.boxed_expression()?, self.span()?),
             "Not" => Expression::Not(self.boxed_expression()?, self.span()?),
             "BitNot" => Expression::BitNot(self.boxed_expression()?, self.span()?),

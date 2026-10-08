@@ -43,6 +43,7 @@ extend Tk {
     pub const EQUAL_EQUAL: u32 = 40
     pub const BANG: u32 = 41
     pub const QUESTION: u32 = 42
+    pub const QUESTION_QUESTION: u32 = 101
     pub const BANG_EQUAL: u32 = 43
     pub const LESS: u32 = 44
     pub const LESS_EQUAL: u32 = 45
@@ -61,6 +62,7 @@ extend Tk {
     pub const TILDE: u32 = 58
     pub const AND_AND: u32 = 59
     pub const OR_OR: u32 = 60
+    pub const PIPE_GREATER: u32 = 100
     pub const LPAREN: u32 = 61
     pub const RPAREN: u32 = 62
     pub const LBRACKET: u32 = 63
@@ -74,6 +76,7 @@ extend Tk {
     pub const DEFINE: u32 = 71
     pub const DOT: u32 = 72
     pub const DOT_DOT: u32 = 73
+    pub const DOT_DOT_EQUAL: u32 = 102
     pub const EQUAL: u32 = 74
     pub const PLUS_EQUAL: u32 = 75
     pub const MINUS_EQUAL: u32 = 76
@@ -820,7 +823,10 @@ extend Lexer {
                 kind = Tk::COLON
             }
         } else when current == 46 {
-            when next == 46 {
+            when next == 46 && third == 61 {
+                kind = Tk::DOT_DOT_EQUAL
+                width = 3
+            } else when next == 46 {
                 kind = Tk::DOT_DOT
                 width = 2
             } else {
@@ -844,7 +850,12 @@ extend Lexer {
                 kind = Tk::BANG
             }
         } else when current == 63 {
-            kind = Tk::QUESTION
+            when next == 63 {
+                kind = Tk::QUESTION_QUESTION
+                width = 2
+            } else {
+                kind = Tk::QUESTION
+            }
         } else when current == 60 {
             when next == 60 && third == 61 {
                 kind = Tk::SHIFT_LEFT_EQUAL
@@ -887,6 +898,9 @@ extend Lexer {
                 width = 2
             } else when next == 124 {
                 kind = Tk::OR_OR
+                width = 2
+            } else when next == 62 {
+                kind = Tk::PIPE_GREATER
                 width = 2
             } else {
                 kind = Tk::BIT_OR

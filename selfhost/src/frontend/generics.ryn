@@ -797,8 +797,9 @@ extend Tree {
             node.kind = St::WHILE
             node.a = self.decode_expr()
             node.body = self.decode_stmts()
-        } else when tag == "For" {
+        } else when tag == "For" || tag == "ForInclusive" {
             node.kind = St::FOR
+            node.flag = tag == "ForInclusive"
             node.text = self.string()
             node.name_start = self.uint()
             node.name_end = self.uint()
@@ -1435,7 +1436,12 @@ extend Tree {
             out.append(self.encode_expr(node.a))
             out.append(self.encode_stmts(node.body.clone()))
         } else when kind == St::FOR {
-            out.append(word("For"))
+            // `flag` marks an inclusive `..=` range; the exclusive layout is unchanged.
+            when node.flag {
+                out.append(word("ForInclusive"))
+            } else {
+                out.append(word("For"))
+            }
             out.append(enc_str(node.text.clone()))
             out.append(enc_span(node.name_start, node.name_end))
             out.append(self.encode_expr(node.a))

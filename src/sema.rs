@@ -682,6 +682,8 @@ pub enum IrStatement {
         ty: Type,
         start: IrExpression,
         end: IrExpression,
+        // `start..=end` includes `end`; codegen stops before incrementing past it.
+        inclusive: bool,
         body: Vec<IrStatement>,
     },
     Break,
@@ -3561,6 +3563,7 @@ impl<'a> Analyzer<'a> {
                 name_span,
                 start,
                 end,
+                inclusive,
                 body,
                 ..
             } => {
@@ -3669,6 +3672,7 @@ impl<'a> Analyzer<'a> {
                         ty,
                         start,
                         end,
+                        inclusive,
                         body,
                     },
                 ))
@@ -3839,6 +3843,7 @@ impl<'a> Analyzer<'a> {
                             ty: Type::U64,
                             start: IrExpression::Integer(0, Type::U64),
                             end: length,
+                            inclusive: false,
                             body: loop_body,
                         },
                     ]),

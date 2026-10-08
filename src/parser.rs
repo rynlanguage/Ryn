@@ -68,7 +68,8 @@ enum ControlMarker {
 }
 
 enum ForHeader {
-    Range(Expression, Expression),
+    // The flag is true for `start..=end`, which includes the end value.
+    Range(Expression, Expression, bool),
     Each(Expression),
 }
 
@@ -2726,13 +2727,14 @@ impl Parser<'_> {
                 "expected `in` after the `for` loop variable",
             )?;
             let collection_or_start = self.expression(0)?;
-            if matches!(self.peek().kind, TokenKind::DotDot) {
+            if matches!(self.peek().kind, TokenKind::DotDot | TokenKind::DotDotEqual) {
+                let inclusive = matches!(self.peek().kind, TokenKind::DotDotEqual);
                 self.next();
                 let range_end = self.expression(0)?;
                 Ok((
                     name,
                     name_span,
-                    ForHeader::Range(collection_or_start, range_end),
+                    ForHeader::Range(collection_or_start, range_end, inclusive),
                 ))
             } else {
                 Ok((name, name_span, ForHeader::Each(collection_or_start)))
@@ -2773,7 +2775,7 @@ impl Parser<'_> {
                 (
                     "_error".into(),
                     error_span,
-                    ForHeader::Range(placeholder, Expression::Integer(0, error_span)),
+                    ForHeader::Range(placeholder, Expression::Integer(0, error_span), false),
                     body,
                 )
             }
@@ -2781,11 +2783,12 @@ impl Parser<'_> {
         };
         let end = self.tokens[self.at - 1].span.end;
         Ok(match header {
-            ForHeader::Range(range_start, range_end) => Statement::For {
+            ForHeader::Range(range_start, range_end, inclusive) => Statement::For {
                 name,
                 name_span,
                 start: range_start,
                 end: range_end,
+                inclusive,
                 body,
                 span: Span { start, end },
             },
@@ -4161,6 +4164,39 @@ impl Parser<'_> {
                 )
             {
                 break;
+            }
+            // `|>` and `??` bind loosest, so `a || b ?? c` is `(a || b) ?? c`. Both are
+            // left-associative: the right side stops before another `|>` or `??`.
+            if matches!(
+                self.peek().kind,
+                TokenKind::PipeGreater | TokenKind::QuestionQuestion
+            ) {
+                if min_precedence > 0 {
+                    break;
+                }
+                let pipe = matches!(self.peek().kind, TokenKind::PipeGreater);
+                self.next();
+                let right = self.expression(1)?;
+                let span = Span {
+                    start: left.span().start,
+                    end: right.span().end,
+                };
+                left = if pipe {
+                    Expression::pipe_into(left, right, span).map_err(|(target_span, message)| {
+                        Diagnostic {
+                            code: "R0265",
+                            message,
+                            span: target_span,
+                            help: Some(
+                                "write `value |> function` or `value |> function(arguments)`"
+                                    .into(),
+                            ),
+                        }
+                    })?
+                } else {
+                    Expression::coalesce(left, right, span)
+                };
+                continue;
             }
             let (op, precedence) = match self.peek().kind {
                 TokenKind::OrOr => (BinaryOp::Or, 1),

@@ -1,0 +1,6 @@
+fun double(x: i32) -> i32 => x * 2
+
+fun main() -> i32 {
+    echo 4 |> 5
+    return 0
+}
