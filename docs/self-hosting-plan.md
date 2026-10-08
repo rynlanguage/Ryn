@@ -150,3 +150,10 @@ generator:
   lowered, as sema omits them. `-N` folds into one literal only when N alone is out of
   range for the type, which is how sema writes the smallest value of a type. Fifteen
   corpus programs now lower to identical IR.
+- Stage 2, step 3e (verified by hand, no corpus program yet): `for name in a..b` and
+  `a..=b` over `i32` and `i64`. The loop variable and a hidden end slot are allocated
+  after the bounds are lowered, the variable is in scope only for the body, and
+  `break`/`continue` follow the `while` rules. A scratch program with inclusive and
+  exclusive ranges, `continue`, and negative bounds lowered identically to `sema`; the
+  scratch file was removed. The corpus programs that use `for` also use `u8`, which the
+  subset does not model yet, so the gate count is unchanged.

@@ -665,6 +665,52 @@ extend Lowering {
         return Result::Ok(!(then_block.falls || else_block.falls))
     }
 
+    // `for name in start..end` (or `..=`): the variable and a hidden end slot are allocated after
+    // the bounds are lowered, and the variable is in scope only for the body.
+    fun for_statement(mut self, name: String, start: u64, end: u64, inclusive: bool, body: Vec<u64>) -> Result<bool, String> {
+        mut ty := self.binary_type(start, end)?
+        when ty.is_empty() {
+            ty = String("I64")
+        }
+        when !is_integer_word(ty.clone()) {
+            return Result::Err(unsupported("range over this type"))
+        }
+        start_value := self.expression(start, ty.clone())?
+        end_value := self.expression(end, ty.clone())?
+        when start_value.ty != ty || end_value.ty != ty {
+            return Result::Err(unsupported("range bounds of mixed types"))
+        }
+        when self.declared(name.clone()) {
+            return Result::Err(unsupported("redeclared name"))
+        }
+        variable_slot := self.allocate(ty.clone())?
+        end_slot := self.allocate(ty.clone())?
+        visible_before := self.visible
+        self.declare(Local { name: name, slot: variable_slot, ty: ty.clone(), mutable: false })
+        self.loop_depth += 1
+        body_block := self.block(body)?
+        self.loop_depth -= 1
+        self.visible = visible_before
+        mut bit: u64 = 0
+        when inclusive {
+            bit = 1
+        }
+        mut tokens: Vec<String> = Vec()
+        tokens.push(String("For"))
+        tokens.push(num(variable_slot))
+        tokens.push(num(end_slot))
+        tokens.push(ty)
+        tokens.push(start_value.text)
+        tokens.push(end_value.text)
+        tokens.push(num(bit))
+        tokens.push(num(body_block.items.len()))
+        for item in body_block.items {
+            tokens.push(item)
+        }
+        self.statements.push(join(tokens))
+        return Result::Ok(false)
+    }
+
     fun while_statement(mut self, condition: u64, body: Vec<u64>) -> Result<bool, String> {
         test := self.expression(condition, String("Bool"))?
         when test.ty != "Bool" {
@@ -720,6 +766,7 @@ extend Lowering {
             ast::Stmt::CallS(name, type_arguments, arguments, span) => self.call_statement(name, type_arguments, arguments),
             ast::Stmt::IfS(condition, then_body, else_body, span) => self.if_statement(condition, then_body, else_body),
             ast::Stmt::WhileS(condition, body, span) => self.while_statement(condition, body),
+            ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => self.for_statement(name, start, end, inclusive, body),
             ast::Stmt::BreakS(span) => self.jump_statement(String("Break")),
             ast::Stmt::ContinueS(span) => self.jump_statement(String("Continue")),
             _ => Result::Err(unsupported("statement")),
