@@ -129,3 +129,11 @@ generator:
   `hello`, `variables`, `exit_code`, `string_escapes`. Next: owned strings and drop
   placement, comparisons and `if`/`while`/`for`, calls and parameters, then the
   remaining expression forms, each behind the same gate.
+- Stage 2, step 3b (done): the subset now covers several functions in source
+  order, with `i32`/`i64`/`str` parameters, calls as expressions and as statements,
+  and per-function locals and tables. Seven corpus programs are accepted and match
+  sema byte for byte: `hello`, `variables`, `exit_code`, `string_escapes`,
+  `evaluation_order`, `function_statements`, `string_abi`. The main reasons the rest
+  are declined: user structs, enums, and `extend` blocks (52 programs), types the subset
+  does not model (`bool`, 13), calls to standard-library functions (10), and statements
+  and expressions not yet covered (8 and 7).

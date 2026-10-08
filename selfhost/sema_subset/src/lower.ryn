@@ -19,8 +19,16 @@ pub struct Lowered {
     ty: String,
 }
 
+// A function's IR-level signature: parameter type words and the result word ("" for none).
+pub struct Signature {
+    name: String,
+    params: Vec<String>,
+    ret: String,
+}
+
 pub struct Lowering {
     program: ast::Program,
+    signatures: Vec<Signature>,
     locals: Vec<Local>,
     local_types: Vec<String>,
     addressed: u64,
@@ -181,7 +189,7 @@ fun result_record(name: String, ok: String, err: String) -> String {
 
 // The generated enums every IR text starts with. `sema::analyze` registers them in this order,
 // skipping `TryParseU64` because `FindU64` already has a `u64` payload.
-fun builtin_enums() -> Vec<String> {
+fun enum_records() -> Vec<String> {
     mut records: Vec<String> = Vec()
     records.push(option_record(String("$RynOption#FindU64"), String("U64")))
     records.push(option_record(String("$RynOption#FileString"), String("OwnedString")))
@@ -290,8 +298,25 @@ extend Lowering {
             ast::Expr::BinaryE(op, left, right, span) => self.binary_type(left, right),
             ast::Expr::IntLit(value, span) => Result::Ok(String("")),
             ast::Expr::StrLit(text, span) => Result::Ok(String("Str")),
+            ast::Expr::CallE(name, type_arguments, arguments, span) => self.call_result_type(name),
             _ => Result::Err(unsupported("expression")),
         }
+    }
+
+    fun call_result_type(self, name: String) -> Result<String, String> {
+        id := self.signature_index(name)?
+        return Result::Ok(self.signatures[id].ret.clone())
+    }
+
+    fun signature_index(self, name: String) -> Result<u64, String> {
+        mut id: u64 = 0
+        while id < self.signatures.len() {
+            when self.signatures[id].name == name {
+                return Result::Ok(id)
+            }
+            id += 1
+        }
+        return Result::Err(unsupported("unknown function"))
     }
 
     fun local_type(self, name: String) -> Result<String, String> {
@@ -313,6 +338,7 @@ extend Lowering {
             ast::Expr::StrLit(text, span) => self.string_literal(text),
             ast::Expr::NameRef(name, span) => self.name(name, span),
             ast::Expr::BinaryE(op, left, right, span) => self.binary(op, left, right, expected),
+            ast::Expr::CallE(name, type_arguments, arguments, span) => self.call(name, type_arguments, arguments, expected),
             _ => Result::Err(unsupported("expression")),
         }
     }
@@ -363,6 +389,68 @@ extend Lowering {
         return Result::Ok(Lowered { text: text, ty: ty })
     }
 
+    // Checks the argument list against a signature and lowers each argument to its parameter type.
+    fun arguments(mut self, id: u64, arguments: Vec<u64>) -> Result<Vec<String>, String> {
+        params := self.signatures[id].params.clone()
+        when arguments.len() != params.len() {
+            return Result::Err(unsupported("argument count"))
+        }
+        mut lowered: Vec<String> = Vec()
+        mut position: u64 = 0
+        while position < arguments.len() {
+            value := self.expression(arguments[position], params[position].clone())?
+            when value.ty != params[position] {
+                return Result::Err(unsupported("argument type"))
+            }
+            lowered.push(value.text)
+            position += 1
+        }
+        return Result::Ok(lowered)
+    }
+
+    fun call(mut self, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, expected: String) -> Result<Lowered, String> {
+        when !type_arguments.is_empty() {
+            return Result::Err(unsupported("generic call"))
+        }
+        id := self.signature_index(name)?
+        ret := self.signatures[id].ret.clone()
+        when ret.is_empty() {
+            return Result::Err(unsupported("value of a call without a result"))
+        }
+        when !expected.is_empty() && expected != ret {
+            return Result::Err(unsupported("call result type"))
+        }
+        lowered := self.arguments(id, arguments)?
+        mut tokens: Vec<String> = Vec()
+        tokens.push(String("Call"))
+        tokens.push(String("Function"))
+        tokens.push(num(id))
+        tokens.push(num(lowered.len()))
+        for text in lowered {
+            tokens.push(text)
+        }
+        tokens.push(ret.clone())
+        return Result::Ok(Lowered { text: join(tokens), ty: ret })
+    }
+
+    fun call_statement(mut self, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>) -> Result<bool, String> {
+        when !type_arguments.is_empty() {
+            return Result::Err(unsupported("generic call"))
+        }
+        id := self.signature_index(name)?
+        lowered := self.arguments(id, arguments)?
+        mut tokens: Vec<String> = Vec()
+        tokens.push(String("CallStatement"))
+        tokens.push(String("Function"))
+        tokens.push(num(id))
+        tokens.push(num(lowered.len()))
+        for text in lowered {
+            tokens.push(text)
+        }
+        self.statements.push(join(tokens))
+        return Result::Ok(false)
+    }
+
     fun template_part(mut self, index: u64) -> Result<String, String> {
         choose self.program.parts[index] {
             ast::TemplatePart::TextPart(text) => text_part(text),
@@ -384,6 +472,7 @@ extend Lowering {
             ast::Stmt::PrintS(value, span) => self.print_statement(value),
             ast::Stmt::TemplateS(parts, span) => self.template_statement(parts),
             ast::Stmt::ReturnS(value, span) => self.return_statement(value, span),
+            ast::Stmt::CallS(name, type_arguments, arguments, span) => self.call_statement(name, type_arguments, arguments),
             _ => Result::Err(unsupported("statement")),
         }
     }
@@ -473,61 +562,7 @@ extend Lowering {
     }
 }
 
-// Lowers `main` and returns the complete IR text, or `unsupported: ...`.
-pub fun lower_program(program: ast::Program) -> Result<String, String> {
-    when !program.uses.is_empty() || !program.structs.is_empty() || !program.enums.is_empty() {
-        return Result::Err(unsupported("items other than functions"))
-    }
-    when !program.type_aliases.is_empty() || !program.extends.is_empty() || !program.shapes.is_empty() {
-        return Result::Err(unsupported("items other than functions"))
-    }
-    when program.functions.len() != 1 {
-        return Result::Err(unsupported("more than one function"))
-    }
-    definition := program.function_defs[program.functions[0]]
-    when definition.name != "main" || !definition.parameters.is_empty() || !definition.type_parameters.is_empty() {
-        return Result::Err(unsupported("function other than a parameterless main"))
-    }
-    when definition.extern_c || definition.external_symbol.is_some() || !definition.type_parameter_bounds.is_empty() {
-        return Result::Err(unsupported("external or generic function"))
-    }
-    mut return_ty := String("")
-    mut return_word := String("-")
-    when definition.return_type.is_some() {
-        return_ty = result_type_word(program.types[definition.return_type.unwrap()])?
-        return_word = join(words2(String("+"), return_ty.clone()))
-    }
-    mut lowering := Lowering {
-        program: program,
-        locals: Vec(),
-        local_types: Vec(),
-        addressed: 0,
-        next_slot: 0,
-        statements: Vec(),
-        return_ty: return_ty.clone(),
-    }
-    mut falls_through := true
-    for statement in definition.body {
-        falls_through = !lowering.statement(statement)?
-    }
-    when definition.return_value.is_some() {
-        when return_ty.is_empty() {
-            return Result::Err(unsupported("result expression without a result type"))
-        }
-        lowered := lowering.expression(definition.return_value.unwrap(), return_ty.clone())?
-        lowering.statements.push(join(words3(String("Return"), String("+"), lowered.text)))
-        falls_through = false
-    }
-    when return_ty.is_empty() == false && falls_through {
-        return Result::Err(unsupported("function must return a value"))
-    }
-    when falls_through {
-        lowering.statements.push(String("Drop 0"))
-    }
-    return Result::Ok(assemble(lowering, return_word))
-}
-
-// The IR word for the declared result type of `main`.
+// The IR word for the declared result type of a function.
 fun result_type_word(node: ast::TypeNode) -> Result<String, String> {
     choose node {
         ast::TypeNode::Simple(word) => type_word(word),
@@ -535,45 +570,170 @@ fun result_type_word(node: ast::TypeNode) -> Result<String, String> {
     }
 }
 
-// The whole IR text: header, builtin enums, the single function, and its local tables.
-fun assemble(lowering: Lowering, return_word: String) -> String {
+// Lowers the program's functions, in source order, and returns the complete IR text, or
+// `unsupported: ...` when the program is outside the subset.
+pub fun lower_program(program: ast::Program) -> Result<String, String> {
+    when !program.uses.is_empty() || !program.structs.is_empty() || !program.enums.is_empty() {
+        return Result::Err(unsupported("items other than functions"))
+    }
+    when !program.type_aliases.is_empty() || !program.extends.is_empty() || !program.shapes.is_empty() {
+        return Result::Err(unsupported("items other than functions"))
+    }
+    count := program.functions.len()
+    mut signatures: Vec<Signature> = Vec()
+    mut main_index: u64 = count
+    mut position: u64 = 0
+    while position < count {
+        definition := program.function_defs[program.functions[position]]
+        when definition.extern_c || definition.external_symbol.is_some() || !definition.type_parameters.is_empty() || !definition.type_parameter_bounds.is_empty() {
+            return Result::Err(unsupported("external or generic function"))
+        }
+        mut params: Vec<String> = Vec()
+        mut parameter_index: u64 = 0
+        while parameter_index < definition.parameters.len() {
+            parameter := program.parameters[definition.parameters[parameter_index]]
+            params.push(result_type_word(program.types[parameter.ty])?)
+            parameter_index += 1
+        }
+        mut ret := String("")
+        when definition.return_type.is_some() {
+            ret = result_type_word(program.types[definition.return_type.unwrap()])?
+        }
+        when definition.name == "main" {
+            when !params.is_empty() {
+                return Result::Err(unsupported("main with parameters"))
+            }
+            main_index = position
+        }
+        signatures.push(Signature { name: definition.name, params: params, ret: ret })
+        position += 1
+    }
+    when main_index == count {
+        return Result::Err(unsupported("no main function"))
+    }
+    mut lowering := Lowering {
+        program: program,
+        signatures: signatures,
+        locals: Vec(),
+        local_types: Vec(),
+        addressed: 0,
+        next_slot: 0,
+        statements: Vec(),
+        return_ty: String(""),
+    }
+    mut functions: Vec<String> = Vec()
+    mut id: u64 = 0
+    while id < count {
+        functions.push(lowering.function(id)?)
+        id += 1
+    }
+    return Result::Ok(assemble(main_index, functions, enum_records()))
+}
+
+extend Lowering {
+    // Lowers one function body. Its locals, slots, and statements start empty.
+    fun function(mut self, id: u64) -> Result<String, String> {
+        self.locals = Vec()
+        self.local_types = Vec()
+        self.addressed = 0
+        self.next_slot = 0
+        self.statements = Vec()
+        self.return_ty = self.signatures[id].ret.clone()
+        definition := self.program.function_defs[self.program.functions[id]]
+        mut parameters: Vec<String> = Vec()
+        mut parameter_index: u64 = 0
+        while parameter_index < definition.parameters.len() {
+            parameter := self.program.parameters[definition.parameters[parameter_index]]
+            ty := self.signatures[id].params[parameter_index].clone()
+            slot := self.allocate(ty.clone())?
+            self.locals.push(Local { name: parameter.name, slot: slot, ty: ty.clone(), mutable: false })
+            parameters.push(num(slot))
+            parameters.push(ty)
+            parameter_index += 1
+        }
+        mut falls_through := true
+        for statement in definition.body {
+            falls_through = !self.statement(statement)?
+        }
+        when definition.return_value.is_some() {
+            when self.return_ty.is_empty() {
+                return Result::Err(unsupported("result expression without a result type"))
+            }
+            lowered := self.expression(definition.return_value.unwrap(), self.return_ty.clone())?
+            self.statements.push(join(words3(String("Return"), String("+"), lowered.text)))
+            falls_through = false
+        }
+        when !self.return_ty.is_empty() && falls_through {
+            return Result::Err(unsupported("function must return a value"))
+        }
+        when falls_through {
+            self.statements.push(String("Drop 0"))
+        }
+        return Result::Ok(self.function_text(id, parameters))
+    }
+}
+
+extend Lowering {
+    // One function's IR: parameters, external symbol, result, return value, statements, tables.
+    fun function_text(self, id: u64, parameters: Vec<String>) -> String {
+        mut tokens: Vec<String> = Vec()
+        tokens.push(num(parameters.len() / 2))
+        for token in parameters {
+            tokens.push(token)
+        }
+        tokens.push(String("-"))
+        ret := self.signatures[id].ret.clone()
+        when ret.is_empty() {
+            tokens.push(String("-"))
+        } else {
+            tokens.push(String("+"))
+            tokens.push(ret)
+        }
+        tokens.push(String("-"))
+        tokens.push(String("-"))
+        local_count := self.local_types.len()
+        tokens.push(num(self.statements.len()))
+        mut index: u64 = 0
+        while index < self.statements.len() {
+            tokens.push(self.statements[index].clone())
+            index += 1
+        }
+        tokens.push(num(local_count))
+        index = 0
+        while index < local_count {
+            tokens.push(self.local_types[index].clone())
+            index += 1
+        }
+        tokens.push(num(local_count))
+        mut owned: u64 = 0
+        while owned < local_count {
+            tokens.push(String("-"))
+            owned += 1
+        }
+        tokens.push(num(self.addressed))
+        mut addressed: u64 = 0
+        while addressed < self.addressed {
+            tokens.push(String("-"))
+            addressed += 1
+        }
+        return join(tokens)
+    }
+}
+
+// The whole IR text: header, builtin enums, and the functions in source order.
+fun assemble(main_index: u64, functions: Vec<String>, enums: Vec<String>) -> String {
     mut tokens: Vec<String> = Vec()
     tokens.push(String("Ir"))
-    tokens.push(String("0"))
+    tokens.push(num(main_index))
     tokens.push(String("-"))
     tokens.push(String("0"))
-    enums := builtin_enums()
     tokens.push(num(enums.len()))
     for record in enums {
         tokens.push(record)
     }
-    tokens.push(String("1"))
-    tokens.push(String("0"))
-    tokens.push(String("-"))
-    tokens.push(return_word)
-    tokens.push(String("-"))
-    tokens.push(String("-"))
-    local_count := lowering.local_types.len()
-    addressed_count := lowering.addressed
-    tokens.push(num(lowering.statements.len()))
-    for statement in lowering.statements {
-        tokens.push(statement)
-    }
-    tokens.push(num(local_count))
-    for local in lowering.local_types {
-        tokens.push(local)
-    }
-    tokens.push(num(local_count))
-    mut owned: u64 = 0
-    while owned < local_count {
-        tokens.push(String("-"))
-        owned += 1
-    }
-    tokens.push(num(addressed_count))
-    mut addressed: u64 = 0
-    while addressed < addressed_count {
-        tokens.push(String("-"))
-        addressed += 1
+    tokens.push(num(functions.len()))
+    for function in functions {
+        tokens.push(function)
     }
     // The bootstrap encoder writes a space before every word, including the first.
     mut out := String(" ")
