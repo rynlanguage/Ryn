@@ -1,5 +1,9 @@
 # Ryn
 
+<p align="center">
+  <img src="assets/Banner.png" alt="Ryn: Reliable. Fast. Native." width="800">
+</p>
+
 **Reliable. Fast. Native.**
 
 Ryn is an early native programming language and compiler that emits machine code with Cranelift. Version `0.1.0` makes the lexer, parser, and generic specializer used by the compiler a self-hosted Ryn program. Rust still performs semantic analysis, ownership checking, native code generation, and build orchestration.
@@ -296,6 +300,25 @@ Run `cargo bench --bench compiler_pipeline` to measure lexer and parser throughp
 - Consider a standard library, language specification, editor tooling, and Ryn Pods after the compiler foundations justify those separate efforts.
 
 Standard library and Pods work are planned; they are not part of the current compiler.
+
+## Brand assets
+
+The [`assets/`](assets/) directory holds the project artwork:
+
+- [`assets/Banner.png`](assets/Banner.png) (1983 × 793) is the wide header used at the top of this README. Use it for repository headers, social previews, and presentations.
+- [`assets/Icon.png`](assets/Icon.png) (1254 × 1254, square) is the mark for avatars, favicons, and application icons. It is shown at small sizes, so keep the margins around it.
+
+Embed an image from a README with a relative path, as the banner above does:
+
+```html
+<img src="assets/Banner.png" alt="Ryn: Reliable. Fast. Native." width="800">
+```
+
+Set a fixed width when you embed the icon in a page:
+
+```html
+<img src="assets/Icon.png" alt="Ryn logo" width="96">
+```
 
 ## Contributing
 
