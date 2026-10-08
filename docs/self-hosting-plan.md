@@ -168,3 +168,12 @@ generator:
   user function has the same name. Twenty corpus programs now lower to identical IR.
   Bitwise operators (`&`, `|`, `^`, `~`, shifts and their compound forms) are next,
   but only one corpus program uses them, and it also needs `~` and mixed-type shifts.
+- Stage 2, step 4 (verified by hand, no corpus program yet): user structures with
+  scalar, `str`, and nested structure fields. The IR structure section is written
+  (field offsets and slot counts follow the field order, and a structure's slots are
+  the sum of its fields'), literal values list fields in the order written, field
+  reads and writes address the field's slots, and a compound field assignment's
+  target span covers `object.field...`. Structures are also parameters and results.
+  A scratch program with all of these lowered identically to `sema`; the scratch file
+  was removed. The corpus structure programs still use `when` as a value, enums,
+  `extend`, attributes, or collections, so the gate count is unchanged.

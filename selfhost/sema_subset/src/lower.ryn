@@ -26,6 +26,21 @@ pub struct Signature {
     ret: String,
 }
 
+// A structure definition: field names and IR type words, and whether each field is public.
+pub struct StructInfo {
+    name: String,
+    field_names: Vec<String>,
+    field_types: Vec<String>,
+    field_public: Vec<u64>,
+}
+
+// A storage location a value can be read from or written to: a slot run and its type.
+pub struct Place {
+    slot: u64,
+    ty: String,
+    mutable: bool,
+}
+
 // The lowered statements of one branch, and whether control falls off its end.
 pub struct Block {
     items: Vec<String>,
@@ -43,6 +58,7 @@ pub struct Lowering {
     return_ty: String,
     loop_depth: u64,
     visible: u64,
+    structs: Vec<StructInfo>,
 }
 
 // Joins tokens with single spaces. A token may hold spaces itself, as a length-prefixed string does.
@@ -333,6 +349,17 @@ extend Lowering {
     // Allocates the slots a value of `ty` takes, as `sema` does: `str` takes a pointer and a
     // length, and each scalar takes one. Each allocation adds one addressed entry.
     fun allocate(mut self, ty: String) -> Result<u64, String> {
+        when struct_id_of(ty.clone()).is_some() {
+            id := struct_id_of(ty).unwrap()
+            base := self.next_slot
+            mut field: u64 = 0
+            while field < self.structs[id].field_types.len() {
+                field_ty := self.structs[id].field_types[field].clone()
+                allocated := self.allocate(field_ty)?
+                field += 1
+            }
+            return Result::Ok(base)
+        }
         slot := self.next_slot
         self.addressed += 1
         when ty == "I8" || ty == "U8" {
@@ -370,11 +397,210 @@ extend Lowering {
     }
 
     fun annotation(self, index: u64) -> Result<String, String> {
-        choose self.program.types[index] {
-            ast::TypeNode::Simple(word) => type_word(word),
-            _ => Result::Err(unsupported("type")),
+        return resolve_type(self.program.types[index], self.struct_names())
+    }
+
+    fun struct_names(self) -> Vec<String> {
+        mut names: Vec<String> = Vec()
+        mut id: u64 = 0
+        while id < self.structs.len() {
+            names.push(self.structs[id].name.clone())
+            id += 1
+        }
+        return names
+    }
+
+    fun struct_id(self, name: String) -> Result<u64, String> {
+        mut id: u64 = 0
+        while id < self.structs.len() {
+            when self.structs[id].name == name {
+                return Result::Ok(id)
+            }
+            id += 1
+        }
+        return Result::Err(unsupported("unknown structure"))
+    }
+
+    fun field_index(self, id: u64, name: String) -> Result<u64, String> {
+        mut field: u64 = 0
+        while field < self.structs[id].field_names.len() {
+            when self.structs[id].field_names[field] == name {
+                return Result::Ok(field)
+            }
+            field += 1
+        }
+        return Result::Err(unsupported("unknown field"))
+    }
+
+    // The slots a value of `ty` occupies: two for `str`, one for a scalar, and the sum for a structure.
+    fun slot_count(self, ty: String) -> u64 {
+        when ty == "Str" {
+            return 2
+        }
+        when struct_id_of(ty.clone()).is_some() {
+            id := struct_id_of(ty).unwrap()
+            mut total: u64 = 0
+            mut field: u64 = 0
+            while field < self.structs[id].field_types.len() {
+                total += self.slot_count(self.structs[id].field_types[field].clone())
+                field += 1
+            }
+            return total
+        }
+        return 1
+    }
+
+    fun field_offset(self, id: u64, field: u64) -> u64 {
+        mut offset: u64 = 0
+        mut earlier: u64 = 0
+        while earlier < field {
+            offset += self.slot_count(self.structs[id].field_types[earlier].clone())
+            earlier += 1
+        }
+        return offset
+    }
+
+    // The place a name, or a chain of field accesses on one, refers to.
+    fun name_place(self, name: String) -> Result<Place, String> {
+        index := self.find(name)?
+        return Result::Ok(Place { slot: self.locals[index].slot, ty: self.locals[index].ty.clone(), mutable: self.locals[index].mutable })
+    }
+
+    fun field_step(self, base: Place, name: String) -> Result<Place, String> {
+        id := struct_id_of(base.ty.clone()).unwrap_or(0)
+        when struct_id_of(base.ty.clone()).is_none() {
+            return Result::Err(unsupported("field of a value that is not a structure"))
+        }
+        field := self.field_index(id, name)?
+        offset := self.field_offset(id, field)
+        return Result::Ok(Place { slot: base.slot + offset, ty: self.structs[id].field_types[field].clone(), mutable: base.mutable })
+    }
+
+    fun place_of(self, index: u64) -> Result<Place, String> {
+        choose self.program.exprs[index] {
+            ast::Expr::NameRef(name, span) => self.name_place(name),
+            ast::Expr::FieldE(value, name, name_span, span) => self.field_of(value, name),
+            _ => Result::Err(unsupported("place")),
         }
     }
+
+    fun field_of(self, value: u64, name: String) -> Result<Place, String> {
+        base := self.place_of(value)?
+        return self.field_step(base, name)
+    }
+
+    // A field read is a read of its slots, with the span of the whole field expression.
+    fun field_type(self, value: u64, name: String) -> Result<String, String> {
+        place := self.field_of(value, name)?
+        return Result::Ok(place.ty)
+    }
+
+    fun struct_literal_type(self, name: String) -> Result<String, String> {
+        id := self.struct_id(name)?
+        return Result::Ok(struct_word(id))
+    }
+
+    fun field_read(self, value: u64, name: String, span: ast::Span, expected: String) -> Result<Lowered, String> {
+        place := self.field_of(value, name)?
+        when !expected.is_empty() && expected != place.ty {
+            return Result::Err(unsupported("field type where another type is expected"))
+        }
+        text := join(words5(String("Local"), num(place.slot), place.ty.clone(), num(span.start), num(span.end)))
+        return Result::Ok(Lowered { text: text, ty: place.ty })
+    }
+
+    // `Struct { name: value, ... }`: the fields in the order written, each with its index.
+    fun struct_literal(mut self, name: String, fields: Vec<u64>, expected: String) -> Result<Lowered, String> {
+        id := self.struct_id(name)?
+        ty := struct_word(id)
+        when !expected.is_empty() && expected != ty {
+            return Result::Err(unsupported("structure where another type is expected"))
+        }
+        when fields.len() != self.structs[id].field_names.len() {
+            return Result::Err(unsupported("structure literal fields"))
+        }
+        mut tokens: Vec<String> = Vec()
+        tokens.push(String("StructValue"))
+        tokens.push(num(id))
+        tokens.push(num(fields.len()))
+        mut position: u64 = 0
+        while position < fields.len() {
+            init := self.program.inits[fields[position]]
+            field := self.field_index(id, init.name)?
+            field_ty := self.structs[id].field_types[field].clone()
+            value := self.expression(init.value, field_ty.clone())?
+            when value.ty != field_ty {
+                return Result::Err(unsupported("structure field type"))
+            }
+            tokens.push(num(field))
+            tokens.push(value.text)
+            position += 1
+        }
+        return Result::Ok(Lowered { text: join(tokens), ty: ty })
+    }
+
+    // The IR records for the structure definitions, in source order.
+    fun struct_records(self) -> Vec<String> {
+        mut records: Vec<String> = Vec()
+        mut id: u64 = 0
+        while id < self.structs.len() {
+            field_count := self.structs[id].field_names.len()
+            mut tokens: Vec<String> = Vec()
+            tokens.push(length_prefixed(self.structs[id].name.clone()))
+            tokens.push(num(field_count))
+            mut field: u64 = 0
+            while field < field_count {
+                tokens.push(length_prefixed(self.structs[id].field_names[field].clone()))
+                tokens.push(self.structs[id].field_types[field].clone())
+                tokens.push(num(self.field_offset(id, field)))
+                tokens.push(num(self.structs[id].field_public[field]))
+                field += 1
+            }
+            tokens.push(num(self.slot_count(struct_word(id))))
+            tokens.push(String("0"))
+            tokens.push(String("-"))
+            tokens.push(String("0"))
+            tokens.push(String("0"))
+            tokens.push(String("0:"))
+            records.push(join(tokens))
+            id += 1
+        }
+        return records
+    }
+
+    // `place.field = value`, or `place.field op= value` with the target's span.
+    fun field_assign(mut self, object: String, names: Vec<String>, op: Option<String>, value: u64, span: ast::Span) -> Result<bool, String> {
+        mut place := self.name_place(object.clone())?
+        when !place.mutable {
+            return Result::Err(unsupported("assignment to an immutable local"))
+        }
+        mut target_len := object.len()
+        mut position: u64 = 0
+        while position < names.len() {
+            target_len += 1 + names[position].len()
+            place = self.field_step(place, names[position].clone())?
+            position += 1
+        }
+        when op.is_none() {
+            lowered := self.expression(value, place.ty.clone())?
+            when lowered.ty != place.ty {
+                return Result::Err(unsupported("field assignment type"))
+            }
+            self.statements.push(join(words4(String("FieldAssign"), num(place.slot), place.ty.clone(), lowered.text)))
+            return Result::Ok(false)
+        }
+        word := operator_word(op.unwrap())?
+        when !is_integer_word(place.ty.clone()) {
+            return Result::Err(unsupported("arithmetic on this type"))
+        }
+        rhs := self.expression(value, place.ty.clone())?
+        end := span.start + target_len
+        target := join(words5(String("Local"), num(place.slot), place.ty.clone(), num(span.start), num(end)))
+        binary := join(words5(String("Binary"), word, target, rhs.text, place.ty.clone()))
+        self.statements.push(join(words4(String("FieldAssign"), num(place.slot), place.ty.clone(), binary)))
+        return Result::Ok(false)
+    }
+
 
     // The type of an expression when it does not depend on context; "" when it does.
     fun infer(self, index: u64) -> Result<String, String> {
@@ -385,6 +611,8 @@ extend Lowering {
             ast::Expr::NotE(value, span) => Result::Ok(String("Bool")),
             ast::Expr::NegateE(value, span) => self.infer(value),
             ast::Expr::CastE(value, ty, span) => self.annotation(ty),
+            ast::Expr::FieldE(value, name, name_span, span) => self.field_type(value, name),
+            ast::Expr::StructLit(name, fields, span) => self.struct_literal_type(name),
             ast::Expr::IntLit(value, span) => Result::Ok(String("")),
             ast::Expr::StrLit(text, span) => Result::Ok(String("Str")),
             ast::Expr::CallE(name, type_arguments, arguments, span) => self.call_result_type(name),
@@ -438,6 +666,8 @@ extend Lowering {
             ast::Expr::NotE(value, span) => self.negation(value, expected),
             ast::Expr::NegateE(value, span) => self.arithmetic_negation(value, expected),
             ast::Expr::CastE(value, ty, span) => self.cast(value, ty, expected),
+            ast::Expr::FieldE(value, name, name_span, span) => self.field_read(value, name, span, expected),
+            ast::Expr::StructLit(name, fields, span) => self.struct_literal(name, fields, expected),
             ast::Expr::CallE(name, type_arguments, arguments, span) => self.call(name, type_arguments, arguments, expected),
             _ => Result::Err(unsupported("expression")),
         }
@@ -855,6 +1085,7 @@ extend Lowering {
             ast::Stmt::ReturnS(value, span) => self.return_statement(value, span),
             ast::Stmt::CallS(name, type_arguments, arguments, span) => self.call_statement(name, type_arguments, arguments),
             ast::Stmt::IfS(condition, then_body, else_body, span) => self.if_statement(condition, then_body, else_body),
+            ast::Stmt::FieldAssignS(object, names, spans, op, value, span) => self.field_assign(object, names, op, value, span),
             ast::Stmt::WhileS(condition, body, span) => self.while_statement(condition, body),
             ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => self.for_statement(name, start, end, inclusive, body),
             ast::Stmt::BreakS(span) => self.jump_statement(String("Break")),
@@ -948,22 +1179,82 @@ extend Lowering {
     }
 }
 
-// The IR word for the declared result type of a function.
-fun result_type_word(node: ast::TypeNode) -> Result<String, String> {
+fun struct_word(id: u64) -> String {
+    return join(words2(String("Struct"), num(id)))
+}
+
+// The struct id of a `Struct <id>` type word.
+fun struct_id_of(ty: String) -> Option<u64> {
+    when ty.len() <= 7 || ty.slice(0, 7) != "Struct " {
+        return Option::None
+    }
+    parsed := ty.slice(7, ty.len()).try_parse::<u64>()
+    when parsed.is_none() {
+        return Option::None
+    }
+    return Option::Some(parsed.unwrap())
+}
+
+fun struct_type_word(names: Vec<String>, name: String) -> Result<String, String> {
+    mut id: u64 = 0
+    while id < names.len() {
+        when names[id] == name {
+            return Result::Ok(struct_word(id))
+        }
+        id += 1
+    }
+    return Result::Err(unsupported("unknown type"))
+}
+
+// The IR word for a declared type: a scalar, `str`, or a named structure.
+fun resolve_type(node: ast::TypeNode, names: Vec<String>) -> Result<String, String> {
     choose node {
         ast::TypeNode::Simple(word) => type_word(word),
-        _ => Result::Err(unsupported("result type")),
+        ast::TypeNode::NamedTy(name, span) => struct_type_word(names, name),
+        _ => Result::Err(unsupported("type")),
     }
 }
 
 // Lowers the program's functions, in source order, and returns the complete IR text, or
 // `unsupported: ...` when the program is outside the subset.
 pub fun lower_program(program: ast::Program) -> Result<String, String> {
-    when !program.uses.is_empty() || !program.structs.is_empty() || !program.enums.is_empty() {
+    when !program.uses.is_empty() || !program.enums.is_empty() {
         return Result::Err(unsupported("items other than functions"))
     }
     when !program.type_aliases.is_empty() || !program.extends.is_empty() || !program.shapes.is_empty() {
         return Result::Err(unsupported("items other than functions"))
+    }
+    mut names: Vec<String> = Vec()
+    mut struct_position: u64 = 0
+    while struct_position < program.structs.len() {
+        definition := program.struct_defs[program.structs[struct_position]]
+        names.push(definition.name.clone())
+        struct_position += 1
+    }
+    mut structs: Vec<StructInfo> = Vec()
+    mut struct_index: u64 = 0
+    while struct_index < program.structs.len() {
+        definition := program.struct_defs[program.structs[struct_index]]
+        when !definition.type_parameters.is_empty() || definition.repr_c || definition.drop_function.is_some() || !definition.derives.is_empty() || !definition.module_path.is_empty() {
+            return Result::Err(unsupported("structure with generics, attributes, or a module path"))
+        }
+        mut field_names: Vec<String> = Vec()
+        mut field_types: Vec<String> = Vec()
+        mut field_public: Vec<u64> = Vec()
+        mut field_position: u64 = 0
+        while field_position < definition.fields.len() {
+            field := program.struct_fields[definition.fields[field_position]]
+            field_names.push(field.name)
+            field_types.push(resolve_type(program.types[field.ty], names.clone())?)
+            mut public: u64 = 0
+            when field.public {
+                public = 1
+            }
+            field_public.push(public)
+            field_position += 1
+        }
+        structs.push(StructInfo { name: definition.name, field_names: field_names, field_types: field_types, field_public: field_public })
+        struct_index += 1
     }
     count := program.functions.len()
     mut signatures: Vec<Signature> = Vec()
@@ -978,12 +1269,12 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         mut parameter_index: u64 = 0
         while parameter_index < definition.parameters.len() {
             parameter := program.parameters[definition.parameters[parameter_index]]
-            params.push(result_type_word(program.types[parameter.ty])?)
+            params.push(resolve_type(program.types[parameter.ty], names.clone())?)
             parameter_index += 1
         }
         mut ret := String("")
         when definition.return_type.is_some() {
-            ret = result_type_word(program.types[definition.return_type.unwrap()])?
+            ret = resolve_type(program.types[definition.return_type.unwrap()], names.clone())?
         }
         when definition.name == "main" {
             when !params.is_empty() {
@@ -1008,6 +1299,7 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         return_ty: String(""),
         loop_depth: 0,
         visible: 0,
+        structs: structs,
     }
     mut functions: Vec<String> = Vec()
     mut id: u64 = 0
@@ -1015,7 +1307,7 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         functions.push(lowering.function(id)?)
         id += 1
     }
-    return Result::Ok(assemble(main_index, functions, enum_records()))
+    return Result::Ok(assemble(main_index, lowering.struct_records(), functions, enum_records()))
 }
 
 extend Lowering {
@@ -1113,12 +1405,15 @@ extend Lowering {
 }
 
 // The whole IR text: header, builtin enums, and the functions in source order.
-fun assemble(main_index: u64, functions: Vec<String>, enums: Vec<String>) -> String {
+fun assemble(main_index: u64, structs: Vec<String>, functions: Vec<String>, enums: Vec<String>) -> String {
     mut tokens: Vec<String> = Vec()
     tokens.push(String("Ir"))
     tokens.push(num(main_index))
     tokens.push(String("-"))
-    tokens.push(String("0"))
+    tokens.push(num(structs.len()))
+    for record in structs {
+        tokens.push(record)
+    }
     tokens.push(num(enums.len()))
     for record in enums {
         tokens.push(record)
