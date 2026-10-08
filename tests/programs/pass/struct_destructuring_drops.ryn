@@ -1,0 +1,16 @@
+struct Row {
+    id: u64,
+    label: String,
+    tags: Vec<String>
+}
+
+fun main() {
+    mut index: u64 = 0
+    mut total: u64 = 0
+    while index < 50000 {
+        Row { id, label, tags } := Row { id: index, label: String("row"), tags: Vec<String>() }
+        total += id + label.char_count() as u64 + tags.len()
+        index += 1
+    }
+    echo total
+}

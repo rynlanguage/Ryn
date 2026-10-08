@@ -258,6 +258,50 @@ fun enc_some(code: String) -> String {
     return out
 }
 
+// The annotation and declarations of a destructuring pattern's body.
+struct PatternBody {
+    annotation: String,
+    group: StatementGroup
+}
+
+// Name of the temporary that holds a destructured value, unique per pattern start.
+fun destructure_temporary_name(start: u64) -> String {
+    mut name := String("__destructure_")
+    name.append(String(start))
+    return name
+}
+
+// Field name of the element at `index` in a tuple.
+fun tuple_field_name(index: u64) -> String {
+    mut name := String("_")
+    name.append(String(index))
+    return name
+}
+
+// `parent.field` as an encoded field access whose spans cover `start..end`.
+fun destructure_field_code(parent: String, field: String, start: u64, end: u64) -> String {
+    mut code := word("Field")
+    code.append(word("Name"))
+    code.append(enc_str(parent))
+    code.append(enc_span(start, end))
+    code.append(enc_str(field))
+    code.append(enc_span(start, end))
+    code.append(enc_span(start, end))
+    return code
+}
+
+// An encoded `Let` statement; statements begin with a newline like the others.
+fun destructure_let_code(name: String, mutable: bool, annotation: String, value: String, start: u64, end: u64) -> String {
+    mut code := String("\n")
+    code.append(word("Let"))
+    code.append(enc_str(name))
+    code.append(enc_bool(mutable))
+    code.append(annotation)
+    code.append(value)
+    code.append(enc_span(start, end))
+    return code
+}
+
 fun enc_list(count: u64, items: String) -> String {
     mut out := enc_uint(count)
     out.append(items)
@@ -2580,101 +2624,208 @@ extend Parser {
         when kind == lexer::Tk::IDENT && (next == lexer::Tk::DEFINE || is_assignment_kind(next)) {
             return true
         }
-        when self.tuple_destructuring_start() {
+        when self.destructure_declaration_start() {
             return true
         }
         return allow_call && kind == lexer::Tk::IDENT && (next == lexer::Tk::LPAREN || next == lexer::Tk::DOT)
     }
 
-    // `(a, mut b, _) := value` at a statement start, with at least two names.
-    fun tuple_destructuring_start(self) -> bool {
-        when self.peek_kind() != lexer::Tk::LPAREN {
+    // The index just past a destructuring pattern that starts at `index`: a
+    // binding, a tuple of at least two patterns, or `Name { field, field: pattern }`.
+    fun destructure_pattern_end(self, index: u64) -> Option<u64> {
+        kind := self.kind_at(index)
+        when kind == lexer::Tk::MUT {
+            when self.kind_at(index + 1) == lexer::Tk::IDENT {
+                return Option::Some(index + 2)
+            }
+            return Option::None
+        }
+        when kind == lexer::Tk::IDENT && self.kind_at(index + 1) != lexer::Tk::LBRACE {
+            return Option::Some(index + 1)
+        }
+        when kind == lexer::Tk::IDENT {
+            mut at := index + 2
+            while true {
+                when self.kind_at(at) == lexer::Tk::RBRACE {
+                    return Option::Some(at + 1)
+                }
+                when self.kind_at(at) == lexer::Tk::DOT_DOT && self.kind_at(at + 1) == lexer::Tk::RBRACE {
+                    return Option::Some(at + 2)
+                }
+                when self.kind_at(at) == lexer::Tk::MUT {
+                    at += 1
+                }
+                when self.kind_at(at) != lexer::Tk::IDENT {
+                    return Option::None
+                }
+                at += 1
+                when self.kind_at(at) == lexer::Tk::COLON {
+                    end := self.destructure_pattern_end(at + 1)
+                    when end.is_none() {
+                        return Option::None
+                    }
+                    at = end.unwrap()
+                }
+                after := self.kind_at(at)
+                when after == lexer::Tk::COMMA {
+                    at += 1
+                } else when after == lexer::Tk::RBRACE {
+                    return Option::Some(at + 1)
+                } else {
+                    return Option::None
+                }
+            }
+            return Option::None
+        }
+        when kind == lexer::Tk::LPAREN {
+            mut at := index + 1
+            mut count: u64 = 0
+            while true {
+                end := self.destructure_pattern_end(at)
+                when end.is_none() {
+                    return Option::None
+                }
+                at = end.unwrap()
+                count += 1
+                after := self.kind_at(at)
+                when after == lexer::Tk::COMMA {
+                    at += 1
+                } else when after == lexer::Tk::RPAREN && count >= 2 {
+                    return Option::Some(at + 1)
+                } else {
+                    return Option::None
+                }
+            }
+            return Option::None
+        }
+        return Option::None
+    }
+
+    // A tuple or structure pattern followed by `:=` at a statement start.
+    fun destructure_declaration_start(self) -> bool {
+        kind := self.peek_kind()
+        compound := kind == lexer::Tk::LPAREN || (kind == lexer::Tk::IDENT && self.kind_at(self.at + 1) == lexer::Tk::LBRACE)
+        when !compound {
             return false
         }
-        mut index := self.at + 1
-        mut names: u64 = 0
-        mut more := true
-        while more {
-            when self.kind_at(index) == lexer::Tk::MUT {
-                index += 1
-            }
-            when self.kind_at(index) != lexer::Tk::IDENT {
-                return false
-            }
-            names += 1
-            index += 1
-            kind := self.kind_at(index)
-            when kind == lexer::Tk::COMMA {
-                index += 1
-            } else when kind == lexer::Tk::RPAREN {
-                more = false
-            } else {
-                return false
-            }
+        end := self.destructure_pattern_end(self.at)
+        when end.is_none() {
+            return false
         }
-        return names >= 2 && self.kind_at(index + 1) == lexer::Tk::DEFINE
+        return self.kind_at(end.unwrap()) == lexer::Tk::DEFINE
     }
 
-    // Desugars `(a, mut b, _) := value` into a temporary holding `value` and one
-    // `:=` per named element that reads it with a tuple field access (`_0`, `_1`, ...).
-    fun tuple_destructuring(mut self) -> Result<StatementGroup, lexer::Diag> {
-        start := self.next().start
-        mut names := Vec<Name>()
-        mut mutables := Vec<bool>()
-        mut more := true
-        while more {
-            mutable := self.consume_if(lexer::Tk::MUT)
-            name := self.ident("expected a name in tuple destructuring")?
-            names.push(name)
-            mutables.push(mutable)
-            when self.peek_kind() == lexer::Tk::COMMA {
-                self.skip()
-            } else {
-                more = false
+    // Parses the tuple or structure pattern after `:=`'s left side. Each bound
+    // name becomes a declaration that reads its element of `temporary`; the
+    // annotation names the structure when the pattern names one.
+    fun destructure_body(mut self, temporary: String) -> Result<PatternBody, lexer::Diag> {
+        mut group := StatementGroup { code: String(), count: 0 }
+        mut annotation := enc_none()
+        when self.peek_kind() == lexer::Tk::LPAREN {
+            self.skip()
+            mut index: u64 = 0
+            mut more := true
+            while more {
+                element := self.destructure_element(temporary.clone(), tuple_field_name(index))?
+                group.code.append(element.code)
+                group.count += element.count
+                index += 1
+                when self.peek_kind() == lexer::Tk::COMMA {
+                    self.skip()
+                } else {
+                    more = false
+                }
             }
+            self.expect(lexer::Tk::RPAREN, "expected `)` after tuple destructuring names")?
+        } else {
+            name := self.ident("expected a structure name in destructuring")?
+            mut named := word("Named")
+            named.append(enc_str(name.text.clone()))
+            named.append(enc_span(name.start, name.end))
+            annotation = enc_some(named)
+            self.expect(lexer::Tk::LBRACE, "expected `{` after the structure name")?
+            mut more := true
+            while more && self.peek_kind() != lexer::Tk::RBRACE {
+                when self.peek_kind() == lexer::Tk::DOT_DOT {
+                    // `..` ignores the remaining fields.
+                    self.skip()
+                    more = false
+                } else {
+                    field := self.destructure_field(temporary.clone())?
+                    group.code.append(field.code)
+                    group.count += field.count
+                    when self.peek_kind() == lexer::Tk::COMMA {
+                        self.skip()
+                    } else {
+                        more = false
+                    }
+                }
+            }
+            self.expect(lexer::Tk::RBRACE, "expected `}` after structure destructuring fields")?
         }
-        self.expect(lexer::Tk::RPAREN, "expected `)` after tuple destructuring names")?
-        self.expect(lexer::Tk::DEFINE, "expected `:=` after tuple destructuring names")?
+        return Result::Ok(PatternBody { annotation: annotation, group: group })
+    }
+
+    // One field of a structure pattern: `name`, `mut name`, or `name: pattern`.
+    fun destructure_field(mut self, temporary: String) -> Result<StatementGroup, lexer::Diag> {
+        start := self.peek().start
+        mutable := self.consume_if(lexer::Tk::MUT)
+        name := self.ident("expected a field name in destructuring")?
+        when self.peek_kind() == lexer::Tk::COLON {
+            when mutable {
+                return Result::Err(lexer::diag("R0010", String("`mut` goes before the binding name in a destructuring field"), name.start, name.end))
+            }
+            self.skip()
+            return self.destructure_element(temporary, name.text)
+        }
+        name_end := name.end
+        value := destructure_field_code(temporary, name.text.clone(), start, name_end)
+        code := destructure_let_code(name.text, mutable, enc_none(), value, start, name_end)
+        return Result::Ok(StatementGroup { code: code, count: 1 })
+    }
+
+    // One element of a tuple or structure pattern, read from `parent.field`.
+    fun destructure_element(mut self, parent: String, field: String) -> Result<StatementGroup, lexer::Diag> {
+        start := self.peek().start
+        kind := self.peek_kind()
+        nested := kind == lexer::Tk::LPAREN || (kind == lexer::Tk::IDENT && self.kind_at(self.at + 1) == lexer::Tk::LBRACE)
+        when nested {
+            temporary := destructure_temporary_name(start)
+            body := self.destructure_body(temporary.clone())?
+            end := self.tokens[self.at - 1].end
+            value := destructure_field_code(parent, field, start, end)
+            mut code := destructure_let_code(temporary, false, body.annotation, value, start, end)
+            code.append(body.group.code)
+            return Result::Ok(StatementGroup { code: code, count: body.group.count + 1 })
+        }
+        mutable := self.consume_if(lexer::Tk::MUT)
+        name := self.ident("expected a name in destructuring")?
+        when name.text == "_" {
+            return Result::Ok(StatementGroup { code: String(), count: 0 })
+        }
+        name_end := name.end
+        value := destructure_field_code(parent, field, start, name_end)
+        code := destructure_let_code(name.text, mutable, enc_none(), value, start, name_end)
+        return Result::Ok(StatementGroup { code: code, count: 1 })
+    }
+
+    // `pattern := value` for a tuple or structure pattern: the value goes into a
+    // temporary, and each bound name is declared from one of its fields.
+    fun destructure_declaration(mut self) -> Result<StatementGroup, lexer::Diag> {
+        start := self.peek().start
+        temporary := destructure_temporary_name(start)
+        body := self.destructure_body(temporary.clone())?
+        self.expect(lexer::Tk::DEFINE, "expected `:=` after the destructuring pattern")?
         value := self.expression(0)?
-        mut temporary := String("__destructure_")
-        temporary.append(String(start))
-        mut out := String("\n")
-        out.append(word("Let"))
-        out.append(enc_str(temporary.clone()))
-        out.append(enc_bool(false))
-        out.append(enc_none())
-        out.append(value.code)
-        out.append(enc_span(start, value.end))
-        mut count: u64 = 1
-        mut index: u64 = 0
-        while index < names.len() {
-            name := names[index]
-            when name.text != "_" {
-                mut field := String("_")
-                field.append(String(index))
-                out.append(word("Let"))
-                out.append(enc_str(name.text.clone()))
-                out.append(enc_bool(mutables[index]))
-                out.append(enc_none())
-                out.append(word("Field"))
-                out.append(word("Name"))
-                out.append(enc_str(temporary.clone()))
-                out.append(enc_span(name.start, name.end))
-                out.append(enc_str(field))
-                out.append(enc_span(name.start, name.end))
-                out.append(enc_span(name.start, name.end))
-                out.append(enc_span(name.start, name.end))
-                count += 1
-            }
-            index += 1
-        }
-        return Result::Ok(StatementGroup { code: out, count: count })
+        value_end := value.end
+        mut code := destructure_let_code(temporary, false, body.annotation, value.code, start, value_end)
+        code.append(body.group.code)
+        return Result::Ok(StatementGroup { code: code, count: body.group.count + 1 })
     }
-
     // One statement, or the statements a tuple destructuring declaration expands to.
     fun statement_group(mut self) -> Result<StatementGroup, lexer::Diag> {
-        when self.tuple_destructuring_start() {
-            return self.tuple_destructuring()
+        when self.destructure_declaration_start() {
+            return self.destructure_declaration()
         }
         code := self.statement()?
         return Result::Ok(StatementGroup { code: code, count: 1 })

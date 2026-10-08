@@ -53,3 +53,36 @@ fn tuple_destructuring_binds_names_and_skips_underscores() {
         );
     }
 }
+
+fn assert_fixture_output(name: &str, expected: &str) {
+    for frontend in [None, Some("rust")] {
+        let result = run_fixture(name, frontend);
+        assert!(
+            result.status.success(),
+            "{name} should run with frontend {frontend:?}, stderr:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout),
+            expected,
+            "{name} output with frontend {frontend:?}"
+        );
+    }
+}
+
+#[test]
+fn struct_destructuring_binds_fields_with_renames_nesting_and_rest() {
+    // Shorthand and renamed fields, `mut` bindings, nested structure and tuple
+    // patterns, and `..` that ignores the remaining fields.
+    assert_fixture_output(
+        "struct_destructuring.ryn",
+        "7\n31\n3\ndeep\nbox\n24\n",
+    );
+}
+
+#[test]
+fn struct_destructuring_releases_owned_fields_on_every_iteration() {
+    // Each iteration moves a String and a Vec out of a temporary structure; repeated
+    // runs would crash or corrupt the total if a field were freed twice.
+    assert_fixture_output("struct_destructuring_drops.ryn", "1250125000\n");
+}

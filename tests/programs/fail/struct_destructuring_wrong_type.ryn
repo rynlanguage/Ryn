@@ -1,0 +1,15 @@
+struct Point {
+    x: i32,
+    y: i32
+}
+
+struct Size {
+    x: i32,
+    y: i32
+}
+
+fun main() {
+    point := Point { x: 3, y: 4 }
+    Size { x, y } := point
+    echo x + y
+}

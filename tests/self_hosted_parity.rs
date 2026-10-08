@@ -149,6 +149,11 @@ fn self_hosted_edge_cases_and_diagnostics() {
         "fun main() { x := 1 + 2 * 3 << 4 & 5 ^ 6 | 7 == 8 && !y || ~z as u8 >= 9 }",
         "fun main() { mut p := Point { x: 1, y: 2 } p.x += 1 p.inner.0 = 3 arr[2] = 4 counter <<= 1 }",
         "fun main() { x := sizeof(Point) + alignof(u64) io::println(\"hi\") list.push(1) }",
+        "fun main() { (a, mut b, _) := pair Point { x, y: mut py, .. } := p Outer { inner: Inner { z }, name } := o (q, Point { x: r }) := t }",
+        "fun main() { echo 1\n(count, label) := pair\nPoint { x } := make(1) (1, 2) }",
+        "fun main() { Point { x, y: mut z } := p }",
+        "fun main() { (a) := x }",
+        "fun main() { Point { x, } := p Point { .. } := p Point { x: } := p (a, b := c }",
         // Lexical errors.
         "fun main() { echo \"unterminated }",
         "fun main() { x := 1__2 + 0b102 + 0x + 1e + 1e999 + 18446744073709551616 }",

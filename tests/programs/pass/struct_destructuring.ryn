@@ -1,0 +1,31 @@
+struct Inner {
+    depth: i32,
+    label: String
+}
+
+struct Point {
+    x: i32,
+    y: i32
+}
+
+struct Crate {
+    origin: Point,
+    inner: Inner,
+    name: String
+}
+
+fun main() {
+    point := Point { x: 3, y: 4 }
+    Point { x, y } := point
+    echo x + y
+    Point { x: px, y: mut py } := Point { x: 10, y: 20 }
+    py += 1
+    echo px + py
+    crate_value := Crate { origin: Point { x: 1, y: 2 }, inner: Inner { depth: 5, label: String("deep") }, name: String("box") }
+    Crate { origin: Point { x: ox, y: oy }, inner: Inner { label, .. }, name } := crate_value
+    echo ox + oy
+    echo label
+    echo name
+    (pair_x, Point { x: nested_x, y: nested_y }) := (7, Point { x: 8, y: 9 })
+    echo pair_x as i32 + nested_x + nested_y
+}

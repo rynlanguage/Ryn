@@ -2269,90 +2269,255 @@ impl Parser<'_> {
                     self.tokens.get(self.at + 1).map(|t| &t.kind),
                     Some(TokenKind::LParen | TokenKind::Dot)
                 ))
-            || self.tuple_destructuring_start()
+            || self.destructure_declaration_start()
     }
 
-    /// `(a, mut b, _) := value` at a statement start, with at least two names.
-    fn tuple_destructuring_start(&self) -> bool {
-        if !matches!(self.peek().kind, TokenKind::LParen) {
-            return false;
+    /// The token index just past a destructuring pattern that starts at `index`.
+    /// A pattern is a binding, a tuple of at least two patterns, or a structure
+    /// pattern `Name { field, mut field, field: pattern }`.
+    fn destructure_pattern_end(&self, index: usize) -> Option<usize> {
+        let kind = |at: usize| self.tokens.get(at).map(|token| &token.kind);
+        match kind(index)? {
+            TokenKind::Ident(_) if !matches!(kind(index + 1), Some(TokenKind::LBrace)) => {
+                Some(index + 1)
+            }
+            TokenKind::Mut if matches!(kind(index + 1), Some(TokenKind::Ident(_))) => {
+                Some(index + 2)
+            }
+            TokenKind::Ident(_) => {
+                let mut at = index + 2;
+                loop {
+                    if matches!(kind(at), Some(TokenKind::RBrace)) {
+                        return Some(at + 1);
+                    }
+                    if matches!(kind(at), Some(TokenKind::DotDot))
+                        && matches!(kind(at + 1), Some(TokenKind::RBrace))
+                    {
+                        return Some(at + 2);
+                    }
+                    if matches!(kind(at), Some(TokenKind::Mut)) {
+                        at += 1;
+                    }
+                    if !matches!(kind(at), Some(TokenKind::Ident(_))) {
+                        return None;
+                    }
+                    at += 1;
+                    if matches!(kind(at), Some(TokenKind::Colon)) {
+                        at = self.destructure_pattern_end(at + 1)?;
+                    }
+                    match kind(at)? {
+                        TokenKind::Comma => at += 1,
+                        TokenKind::RBrace => return Some(at + 1),
+                        _ => return None,
+                    }
+                }
+            }
+            TokenKind::LParen => {
+                let mut at = index + 1;
+                let mut count = 0usize;
+                loop {
+                    at = self.destructure_pattern_end(at)?;
+                    count += 1;
+                    match kind(at)? {
+                        TokenKind::Comma => at += 1,
+                        TokenKind::RParen if count >= 2 => return Some(at + 1),
+                        _ => return None,
+                    }
+                }
+            }
+            _ => None,
         }
-        let mut index = self.at + 1;
-        let mut names = 0usize;
-        loop {
-            if matches!(self.tokens.get(index).map(|t| &t.kind), Some(TokenKind::Mut)) {
+    }
+
+    /// A tuple or structure pattern followed by `:=` at a statement start.
+    fn destructure_declaration_start(&self) -> bool {
+        let compound = match self.peek().kind {
+            TokenKind::LParen => true,
+            TokenKind::Ident(_) => matches!(
+                self.tokens.get(self.at + 1).map(|token| &token.kind),
+                Some(TokenKind::LBrace)
+            ),
+            _ => false,
+        };
+        compound
+            && self.destructure_pattern_end(self.at).is_some_and(|end| {
+                matches!(
+                    self.tokens.get(end).map(|token| &token.kind),
+                    Some(TokenKind::Define)
+                )
+            })
+    }
+
+    fn consume_mut(&mut self) -> bool {
+        if matches!(self.peek().kind, TokenKind::Mut) {
+            self.next();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Parses the tuple or structure pattern after `:=`'s left side. Every bound
+    /// name becomes a declaration that reads its element of `temporary`. Returns
+    /// the structure name when the pattern names one.
+    fn destructure_body(
+        &mut self,
+        temporary: &str,
+    ) -> Result<(Option<TypeName>, Vec<Statement>), Diagnostic> {
+        let mut annotation = None;
+        let mut statements = Vec::new();
+        if matches!(self.peek().kind, TokenKind::LParen) {
+            self.next();
+            let mut index = 0usize;
+            loop {
+                statements.extend(self.destructure_element(temporary, &format!("_{index}"))?);
                 index += 1;
+                if !matches!(self.peek().kind, TokenKind::Comma) {
+                    break;
+                }
+                self.next();
             }
-            if !matches!(self.tokens.get(index).map(|t| &t.kind), Some(TokenKind::Ident(_))) {
-                return false;
+            self.expect(
+                |kind| matches!(kind, TokenKind::RParen),
+                "expected `)` after tuple destructuring names",
+            )?;
+        } else {
+            let (name, span) = self.ident("expected a structure name in destructuring")?;
+            annotation = Some(TypeName::Named(name, span));
+            self.expect(
+                |kind| matches!(kind, TokenKind::LBrace),
+                "expected `{` after the structure name",
+            )?;
+            while !matches!(self.peek().kind, TokenKind::RBrace) {
+                if matches!(self.peek().kind, TokenKind::DotDot) {
+                    // `..` ignores the remaining fields.
+                    self.next();
+                    break;
+                }
+                statements.extend(self.destructure_field(temporary)?);
+                if !matches!(self.peek().kind, TokenKind::Comma) {
+                    break;
+                }
+                self.next();
             }
-            names += 1;
-            index += 1;
-            match self.tokens.get(index).map(|t| &t.kind) {
-                Some(TokenKind::Comma) => index += 1,
-                Some(TokenKind::RParen) => break,
-                _ => return false,
-            }
+            self.expect(
+                |kind| matches!(kind, TokenKind::RBrace),
+                "expected `}` after structure destructuring fields",
+            )?;
         }
-        names >= 2 && matches!(self.tokens.get(index + 1).map(|t| &t.kind), Some(TokenKind::Define))
+        Ok((annotation, statements))
     }
 
-    /// Desugars `(a, mut b, _) := value` into a temporary holding `value` and one
-    /// `:=` per named element that reads it with a tuple field access (`_0`, `_1`, ...).
-    fn tuple_destructuring(&mut self) -> Result<Vec<Statement>, Diagnostic> {
-        let start = self.next().span.start;
-        let mut elements = Vec::new();
-        loop {
-            let mutable = if matches!(self.peek().kind, TokenKind::Mut) {
-                self.next();
-                true
-            } else {
-                false
-            };
-            let (name, name_span) = self.ident("expected a name in tuple destructuring")?;
-            elements.push((elements.len(), name, mutable, name_span));
-            if matches!(self.peek().kind, TokenKind::Comma) {
-                self.next();
-            } else {
-                break;
+    /// One field of a structure pattern: `name`, `mut name`, or `name: pattern`.
+    fn destructure_field(&mut self, temporary: &str) -> Result<Vec<Statement>, Diagnostic> {
+        let start = self.peek().span.start;
+        let mutable = self.consume_mut();
+        let (field, field_span) = self.ident("expected a field name in destructuring")?;
+        if matches!(self.peek().kind, TokenKind::Colon) {
+            if mutable {
+                return Err(Diagnostic {
+                    code: "R0010",
+                    message: "`mut` goes before the binding name in a destructuring field".into(),
+                    span: field_span,
+                    help: None,
+                });
             }
+            self.next();
+            return self.destructure_element(temporary, &field);
         }
-        self.expect(
-            |kind| matches!(kind, TokenKind::RParen),
-            "expected `)` after tuple destructuring names",
-        )?;
+        let span = Span {
+            start,
+            end: field_span.end,
+        };
+        Ok(vec![Statement::Let {
+            name: field.clone(),
+            mutable,
+            annotation: None,
+            value: Self::destructure_field_access(temporary, &field, span),
+            span,
+        }])
+    }
+
+    /// One element of a tuple or structure pattern, read from `parent.field`.
+    fn destructure_element(
+        &mut self,
+        parent: &str,
+        field: &str,
+    ) -> Result<Vec<Statement>, Diagnostic> {
+        let start = self.peek().span.start;
+        let nested = matches!(self.peek().kind, TokenKind::LParen)
+            || (matches!(self.peek().kind, TokenKind::Ident(_))
+                && matches!(
+                    self.tokens.get(self.at + 1).map(|token| &token.kind),
+                    Some(TokenKind::LBrace)
+                ));
+        if nested {
+            let temporary = format!("__destructure_{start}");
+            let (annotation, mut statements) = self.destructure_body(&temporary)?;
+            let end = self.tokens[self.at - 1].span.end;
+            let span = Span { start, end };
+            statements.insert(
+                0,
+                Statement::Let {
+                    name: temporary.clone(),
+                    mutable: false,
+                    annotation,
+                    value: Self::destructure_field_access(parent, field, span),
+                    span,
+                },
+            );
+            return Ok(statements);
+        }
+        let mutable = self.consume_mut();
+        let (name, name_span) = self.ident("expected a name in destructuring")?;
+        if name == "_" {
+            return Ok(Vec::new());
+        }
+        let span = Span {
+            start,
+            end: name_span.end,
+        };
+        Ok(vec![Statement::Let {
+            name,
+            mutable,
+            annotation: None,
+            value: Self::destructure_field_access(parent, field, span),
+            span,
+        }])
+    }
+
+    /// `pattern := value` for a tuple or structure pattern. The value is stored in
+    /// a temporary, and each bound name is declared from one of its fields.
+    fn destructure_declaration(&mut self) -> Result<Vec<Statement>, Diagnostic> {
+        let start = self.peek().span.start;
+        let temporary = format!("__destructure_{start}");
+        let (annotation, mut statements) = self.destructure_body(&temporary)?;
         self.expect(
             |kind| matches!(kind, TokenKind::Define),
-            "expected `:=` after tuple destructuring names",
+            "expected `:=` after the destructuring pattern",
         )?;
         let value = self.expression(0)?;
         let end = value.span().end;
-        let temporary = format!("__destructure_{start}");
-        let mut statements = vec![Statement::Let {
-            name: temporary.clone(),
-            mutable: false,
-            annotation: None,
-            value,
-            span: Span { start, end },
-        }];
-        for (index, name, mutable, name_span) in elements {
-            if name == "_" {
-                continue;
-            }
-            statements.push(Statement::Let {
-                name,
-                mutable,
-                annotation: None,
-                value: Expression::Field {
-                    value: Box::new(Expression::Name(temporary.clone(), name_span)),
-                    name: format!("_{index}"),
-                    name_span,
-                    span: name_span,
-                },
-                span: name_span,
-            });
-        }
+        statements.insert(
+            0,
+            Statement::Let {
+                name: temporary,
+                mutable: false,
+                annotation,
+                value,
+                span: Span { start, end },
+            },
+        );
         Ok(statements)
+    }
+
+    fn destructure_field_access(parent: &str, field: &str, span: Span) -> Expression {
+        Expression::Field {
+            value: Box::new(Expression::Name(parent.to_string(), span)),
+            name: field.to_string(),
+            name_span: span,
+            span,
+        }
     }
 
     /// Whether the next token is on a later line than the token before it. A
@@ -2366,11 +2531,11 @@ impl Parser<'_> {
                 .is_some_and(|gap| gap.contains('\n'))
     }
 
-    /// Parses one statement and appends it; a tuple destructuring declaration
-    /// expands to several statements.
+    /// Parses one statement and appends it; a destructuring declaration expands
+    /// to several statements.
     fn statement_into(&mut self, statements: &mut Vec<Statement>) -> Result<(), Diagnostic> {
-        if self.tuple_destructuring_start() {
-            statements.extend(self.tuple_destructuring()?);
+        if self.destructure_declaration_start() {
+            statements.extend(self.destructure_declaration()?);
         } else {
             statements.push(self.statement()?);
         }
