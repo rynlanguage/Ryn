@@ -1,4 +1,4 @@
-use std::{io::Write, slice};
+use std::{io::Write, ptr, slice};
 
 type DropFn = unsafe extern "C" fn(*mut u8);
 type CloneFn = unsafe extern "C" fn(*const u8) -> *mut u8;
@@ -241,5 +241,28 @@ pub extern "C" fn ryn_enum_drop(pointer: *mut RynEnum) {
     if !pointer.is_null() {
         // SAFETY: Moves clear source handles, so each RynEnum owner is destroyed once.
         drop(unsafe { Box::from_raw(pointer) });
+    }
+}
+
+// A `Vec<enum>` slot holds one owning `RynEnum` pointer, so the element callbacks
+// take the slot address and forward to the enum entry points above.
+unsafe extern "C" fn ryn_vec_elem_enum_drop(slot: *mut u8) {
+    let pointer = unsafe { ptr::read(slot.cast::<*mut RynEnum>()) };
+    ryn_enum_drop(pointer);
+}
+
+unsafe extern "C" fn ryn_vec_elem_enum_clone(source: *const u8, output: *mut u8) {
+    let pointer = unsafe { ptr::read(source.cast::<*const RynEnum>()) };
+    unsafe { ptr::write(output.cast::<*mut RynEnum>(), ryn_enum_clone(pointer)) };
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_vec_enum_element(drop_out: *mut usize, clone_out: *mut usize) {
+    if drop_out.is_null() || clone_out.is_null() {
+        fail("null Vec<enum> callback output");
+    }
+    unsafe {
+        ptr::write(drop_out, ryn_vec_elem_enum_drop as usize);
+        ptr::write(clone_out, ryn_vec_elem_enum_clone as usize);
     }
 }

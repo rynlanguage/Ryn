@@ -72,7 +72,8 @@ generator:
   pass fixture and analysable example, and requires truncated or corrupted text to
   be rejected. The Ryn checker validates the format only; it does not build an IR
   data model yet, which is the next step.
-- Language gaps found while writing it: `Vec` of enums is rejected (`R0234`), so an
-  IR tree in Ryn is an index arena of structs with `Vec<u64>` children; closures are
-  not available; `choose` arms take expressions only; `Result::Ok` needs an expected
-  type inside `choose`.
+- Language gaps found while writing it: closures are not available; `choose` arms
+  take expressions only; `Result::Ok` needs an expected type inside `choose`.
+  `Vec` of enums was rejected (`R0234`) and is now supported, including
+  `Vec<Option<T>>`, with clone/drop callbacks (`tests/vec_of_enum.rs`), so the IR
+  data model can use enum node lists instead of an index arena of structs.

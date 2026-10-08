@@ -1,0 +1,33 @@
+enum Figure {
+    Dot,
+    Circle(i32),
+    Label(String)
+}
+
+fun describe(figure: Figure) -> String {
+    choose figure {
+        Figure::Dot => String("dot"),
+        Figure::Circle(radius) => String(radius),
+        Figure::Label(text) => text
+    }
+}
+
+fun main() {
+    mut figures: Vec<Figure> = Vec()
+    figures.push(Figure::Circle(2))
+    figures.push(Figure::Dot)
+    first: Option<Figure> = figures.first()
+    last: Option<Figure> = figures.last()
+    missing: Option<Figure> = figures.get(5)
+    echo choose first { Option::Some(f) => describe(f), Option::None => String("none") }
+    echo choose last { Option::Some(f) => describe(f), Option::None => String("none") }
+    echo choose missing { Option::Some(f) => describe(f), Option::None => String("none") }
+    for item in figures.clone() {
+        echo describe(item)
+    }
+    taken := figures.take(0)
+    echo describe(taken)
+    figures.insert(0, Figure::Label(String("x")))
+    echo figures.len()
+    echo describe(figures[0])
+}

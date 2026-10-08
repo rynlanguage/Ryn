@@ -7416,6 +7416,14 @@ impl<'a> Analyzer<'a> {
                     )
                     && vec_struct_fields_supported(&self.structs[id], self.structs)
             }
+            Type::Enum(_) => !contains_custom_drop(
+                elem,
+                self.structs,
+                self.enums,
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+                0,
+            ),
             _ => false,
         };
         if matches!(name.as_str(), "get" | "first" | "last") {
@@ -9590,14 +9598,15 @@ fn validate_vec_elem(elem: &Type, span: Span) -> Result<(), Diagnostic> {
         | Type::Char
         | Type::OwnedString
         | Type::Map(_)
-        | Type::Struct(_) => Ok(()),
+        | Type::Struct(_)
+        | Type::Enum(_) => Ok(()),
         other => Err(diag(
             "R0234",
             format!("`Vec<{}>` is not supported yet", type_name(*other)),
             span,
         )
         .with_help(
-            "supported element types are integers, floats, `bool`, `char`, and `String` for now",
+            "supported element types are integers, floats, `bool`, `char`, `String`, maps, structures, and enums for now",
         )),
     }
 }

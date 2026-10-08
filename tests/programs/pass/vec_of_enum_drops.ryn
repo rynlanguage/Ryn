@@ -1,0 +1,42 @@
+enum Figure {
+    Dot,
+    Circle(i32),
+    Label(String)
+}
+
+struct Board {
+    name: String,
+    figures: Vec<Figure>
+}
+
+fun build(count: i32) -> Vec<Figure> {
+    mut out: Vec<Figure> = Vec()
+    mut index: i32 = 0
+    while index < count {
+        out.push(Figure::Label(String("row")))
+        index += 1
+    }
+    out
+}
+
+fun main() {
+    mut total: u64 = 0
+    mut round: i32 = 0
+    while round < 200 {
+        mut figures := build(500)
+        copy := figures.clone()
+        figures.set(3, Figure::Circle(1))
+        total += figures.len() + copy.len()
+        round += 1
+    }
+    echo total
+    mut boards: i32 = 0
+    mut index: i32 = 0
+    while index < 100 {
+        board := Board { name: String("b"), figures: build(40) }
+        copied := board.figures.clone()
+        boards += copied.len() as i32
+        index += 1
+    }
+    echo boards
+}

@@ -772,6 +772,13 @@ fn declare_print_functions(
             &vec_string_element_signature,
         )
         .map_err(|error| error.to_string())?;
+    let vec_enum_element = module
+        .declare_function(
+            "ryn_vec_enum_element",
+            Linkage::Import,
+            &vec_string_element_signature,
+        )
+        .map_err(|error| error.to_string())?;
     let mut enum_drop_signature = module.make_signature();
     enum_drop_signature.call_conv = call_conv;
     enum_drop_signature.params.push(AbiParam::new(pointer_type));
@@ -853,6 +860,7 @@ fn declare_print_functions(
         enum_clear_word,
         vec_string_element,
         vec_map_element,
+        vec_enum_element,
         string,
         string_equals,
         integers,
@@ -1651,6 +1659,8 @@ fn define_function(
                 .declare_func_in_func(codegen_env.print_ids.vec_string_element, b.func),
             vec_map_element: module
                 .declare_func_in_func(codegen_env.print_ids.vec_map_element, b.func),
+            vec_enum_element: module
+                .declare_func_in_func(codegen_env.print_ids.vec_enum_element, b.func),
             string: module.declare_func_in_func(codegen_env.print_ids.string, b.func),
             string_equals: module.declare_func_in_func(codegen_env.print_ids.string_equals, b.func),
             integers: codegen_env
@@ -2143,6 +2153,7 @@ struct PrintFunctionIds {
     enum_clear_word: FuncId,
     vec_string_element: FuncId,
     vec_map_element: FuncId,
+    vec_enum_element: FuncId,
     string: FuncId,
     string_equals: FuncId,
     integers: [FuncId; 8],
@@ -2188,6 +2199,7 @@ struct PrintFunctions {
     enum_clear_word: FuncRef,
     vec_string_element: FuncRef,
     vec_map_element: FuncRef,
+    vec_enum_element: FuncRef,
     string: FuncRef,
     string_equals: FuncRef,
     integers: [FuncRef; 8],
@@ -5510,6 +5522,20 @@ fn emit_vec_call(
                     let clone_ptr = b.ins().load(pointer_type, MemFlagsData::new(), addr, 8);
                     (drop_ptr, clone_ptr)
                 }
+                Type::Enum(_) => {
+                    let slot = b.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        16,
+                        3,
+                    ));
+                    let addr = b.ins().stack_addr(pointer_type, slot, 0);
+                    let addr2 = b.ins().iadd_imm_s(addr, 8);
+                    b.ins()
+                        .call(env.print_functions.vec_enum_element, &[addr, addr2]);
+                    let drop_ptr = b.ins().load(pointer_type, MemFlagsData::new(), addr, 0);
+                    let clone_ptr = b.ins().load(pointer_type, MemFlagsData::new(), addr, 8);
+                    (drop_ptr, clone_ptr)
+                }
                 Type::Struct(struct_id) => {
                     if let Some((drop_callback, clone_callback)) =
                         env.vec_struct_callbacks[struct_id]
@@ -5938,6 +5964,9 @@ fn emit_elem_slot(
             b.ins().store(MemFlagsData::new(), v, addr, 0);
         }
         (Type::Map(_) | Type::Set(_), CompiledValue::Map { ptr: v, .. }) => {
+            b.ins().store(MemFlagsData::new(), v, addr, 0);
+        }
+        (Type::Enum(_), CompiledValue::Enum { ptr: v, .. }) => {
             b.ins().store(MemFlagsData::new(), v, addr, 0);
         }
         (
