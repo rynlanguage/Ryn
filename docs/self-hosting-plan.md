@@ -220,3 +220,10 @@ generator:
   example `enum_formatting` (unit, tuple, and string-payload variants, printing,
   templates, `choose` as a value) matches sema byte for byte, and one more corpus
   program is accepted (25 in total).
+- Stage 2, step 9 (verified by hand, no corpus program yet): `#[repr(C)]` structures
+  (the record's flag), and structures with owned fields (strings, enums, nested
+  structures with them). A local of such a structure is one owned part per owned field,
+  and its drop lists the parts last first; a field used by value is moved out of its
+  slot, and a whole structure that owns storage is moved as a unit. Structures with
+  `derive` are declined for now, because the IR also writes the functions that derive
+  generates; that needs its own step.

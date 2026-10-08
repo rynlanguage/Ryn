@@ -32,6 +32,9 @@ pub struct StructInfo {
     field_names: Vec<String>,
     field_types: Vec<String>,
     field_public: Vec<u64>,
+    repr_c: u64,
+    derives_clone: u64,
+    derives_hash: u64,
 }
 
 // A storage location a value can be read from or written to: a slot run and its type.
@@ -675,6 +678,46 @@ extend Lowering {
         return Result::Ok(items)
     }
 
+    // Whether a value of `ty` owns storage: an owned string, an enum, or a structure with one.
+    fun owns(self, ty: String) -> bool {
+        when is_owned_type(ty.clone()) {
+            return true
+        }
+        when struct_id_of(ty.clone()).is_some() {
+            id := struct_id_of(ty).unwrap()
+            mut field: u64 = 0
+            while field < self.structs[id].field_types.len() {
+                when self.owns(self.structs[id].field_types[field].clone()) {
+                    return true
+                }
+                field += 1
+            }
+        }
+        return false
+    }
+
+    // The owned parts of a value of `ty` stored at `base`, as (slot, owner type) pairs in slot order.
+    fun owned_parts(self, ty: String, base: u64) -> Vec<String> {
+        mut parts: Vec<String> = Vec()
+        when is_owned_type(ty.clone()) {
+            parts.push(num(base))
+            parts.push(ty)
+            return parts
+        }
+        when struct_id_of(ty.clone()).is_some() {
+            id := struct_id_of(ty).unwrap()
+            mut field: u64 = 0
+            while field < self.structs[id].field_types.len() {
+                inner := self.owned_parts(self.structs[id].field_types[field].clone(), base + self.field_offset(id, field))
+                for token in inner {
+                    parts.push(token)
+                }
+                field += 1
+            }
+        }
+        return parts
+    }
+
     // The first visible local of the innermost loop; 0 outside any loop.
     fun loop_floor(self) -> u64 {
         when self.loop_floors.is_empty() {
@@ -687,14 +730,27 @@ extend Lowering {
     fun moved_expression(mut self, index: u64, expected: String) -> Result<Lowered, String> {
         choose self.program.exprs[index] {
             ast::Expr::NameRef(name, span) => self.moved_name(index, name, expected),
+            ast::Expr::FieldE(value, name, name_span, span) => self.moved_field(value, name, span, expected),
             _ => self.expression(index, expected),
         }
+    }
+
+    // A field of a local that owns storage is moved out of its slot when used by value.
+    fun moved_field(mut self, value: u64, name: String, span: ast::Span, expected: String) -> Result<Lowered, String> {
+        place := self.field_of(value, name.clone())?
+        when !self.owns(place.ty.clone()) {
+            return self.field_read(value, name, span, expected)
+        }
+        when !expected.is_empty() && expected != place.ty {
+            return Result::Err(unsupported("owned field where another type is expected"))
+        }
+        return Result::Ok(Lowered { text: join(words3(String("Move"), num(place.slot), place.ty.clone())), ty: place.ty })
     }
 
     fun moved_name(mut self, expression: u64, name: String, expected: String) -> Result<Lowered, String> {
         index := self.find(name)?
         ty := self.locals[index].ty.clone()
-        when !is_owned_type(ty.clone()) {
+        when !self.owns(ty.clone()) {
             return self.expression(expression, expected)
         }
         when !expected.is_empty() && expected != ty {
@@ -925,10 +981,10 @@ extend Lowering {
                 field += 1
             }
             tokens.push(num(self.slot_count(struct_word(id))))
-            tokens.push(String("0"))
+            tokens.push(num(self.structs[id].repr_c))
             tokens.push(String("-"))
-            tokens.push(String("0"))
-            tokens.push(String("0"))
+            tokens.push(num(self.structs[id].derives_clone))
+            tokens.push(num(self.structs[id].derives_hash))
             tokens.push(String("0:"))
             records.push(join(tokens))
             id += 1
@@ -1498,9 +1554,14 @@ extend Lowering {
         mut index: u64 = self.visible
         while index > floor {
             index -= 1
-            when is_owned_type(self.locals[index].ty.clone()) {
-                slots.push(num(self.locals[index].slot))
-                slots.push(self.locals[index].ty.clone())
+            when self.owns(self.locals[index].ty.clone()) {
+                parts := self.owned_parts(self.locals[index].ty.clone(), self.locals[index].slot)
+                mut pair: u64 = parts.len() / 2
+                while pair > 0 {
+                    pair -= 1
+                    slots.push(parts[pair * 2].clone())
+                    slots.push(parts[pair * 2 + 1].clone())
+                }
             }
         }
         mut tokens: Vec<String> = Vec()
@@ -1754,8 +1815,23 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
     mut struct_index: u64 = 0
     while struct_index < program.structs.len() {
         definition := program.struct_defs[program.structs[struct_index]]
-        when !definition.type_parameters.is_empty() || definition.repr_c || definition.drop_function.is_some() || !definition.derives.is_empty() || !definition.module_path.is_empty() {
-            return Result::Err(unsupported("structure with generics, attributes, or a module path"))
+        // `derive` adds generated functions to the IR, which this subset does not write yet.
+        when !definition.type_parameters.is_empty() || definition.drop_function.is_some() || !definition.module_path.is_empty() || !definition.derives.is_empty() {
+            return Result::Err(unsupported("structure with generics, a destructor, derives, or a module path"))
+        }
+        mut repr: u64 = 0
+        when definition.repr_c {
+            repr = 1
+        }
+        mut clone_flag: u64 = 0
+        mut hash_flag: u64 = 0
+        for derive in definition.derives {
+            when derive == "Clone" {
+                clone_flag = 1
+            }
+            when derive == "Hash" {
+                hash_flag = 1
+            }
         }
         mut field_names: Vec<String> = Vec()
         mut field_types: Vec<String> = Vec()
@@ -1765,9 +1841,6 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
             field := program.struct_fields[definition.fields[field_position]]
             field_names.push(field.name)
             field_types.push(resolve_type(program.types[field.ty], type_names.clone(), type_words.clone())?)
-            when is_owned_type(field_types[field_position].clone()) {
-                return Result::Err(unsupported("structure with an owned field"))
-            }
             mut public: u64 = 0
             when field.public {
                 public = 1
@@ -1775,7 +1848,7 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
             field_public.push(public)
             field_position += 1
         }
-        structs.push(StructInfo { name: definition.name, field_names: field_names, field_types: field_types, field_public: field_public })
+        structs.push(StructInfo { name: definition.name, field_names: field_names, field_types: field_types, field_public: field_public, repr_c: repr, derives_clone: clone_flag, derives_hash: hash_flag })
         struct_index += 1
     }
     mut enums: Vec<EnumInfo> = Vec()
