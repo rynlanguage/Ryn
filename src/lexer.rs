@@ -21,6 +21,7 @@ pub enum TokenKind {
     Enum,
     TypeAlias,
     Choose,
+    Defer,
     Use,
     Namespace,
     Pub,
@@ -488,6 +489,7 @@ fn lex_all(text: &str, recovering: bool) -> (Vec<Token>, Vec<Diagnostic>) {
                     "shape" => TokenKind::Shape,
                     "const" => TokenKind::Const,
                     "choose" => TokenKind::Choose,
+                    "defer" => TokenKind::Defer,
                     other => TokenKind::Ident(other.into()),
                 }
             }

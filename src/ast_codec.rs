@@ -560,6 +560,11 @@ impl Encoder {
                 self.statements(body);
                 self.span(*span);
             }
+            Statement::Defer { body, span } => {
+                self.word("Defer");
+                self.statements(body);
+                self.span(*span);
+            }
             Statement::For {
                 name,
                 name_span,
@@ -1257,6 +1262,10 @@ impl<'a> Decoder<'a> {
             },
             "While" => Statement::While {
                 condition: self.expression()?,
+                body: self.statements()?,
+                span: self.span()?,
+            },
+            "Defer" => Statement::Defer {
                 body: self.statements()?,
                 span: self.span()?,
             },

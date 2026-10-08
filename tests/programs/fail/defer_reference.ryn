@@ -1,0 +1,10 @@
+fun first(values: &i32) -> &i32 {
+    defer {
+        echo "cleanup"
+    }
+    return values
+}
+
+fun main() -> i32 {
+    return 0
+}

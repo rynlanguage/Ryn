@@ -835,6 +835,24 @@ struct Binding {
     mutable: bool,
 }
 
+// A `defer` body with the names that were visible where it was written. It is lowered again
+// at every place it runs, always with that same name environment.
+#[derive(Clone)]
+struct DeferredBody {
+    body: Vec<Statement>,
+    names: HashMap<String, Binding>,
+}
+
+// An exit statement preceded by the `defer` bodies that it leaves; a plain exit when none.
+fn exit_after(leaving: Vec<IrStatement>, exit: IrStatement) -> IrStatement {
+    if leaving.is_empty() {
+        return exit;
+    }
+    let mut statements = leaving;
+    statements.push(exit);
+    IrStatement::Block(statements)
+}
+
 type LoweredMethod = Result<Option<(IrCallTarget, Vec<IrExpression>, Option<Type>)>, Diagnostic>;
 
 #[derive(Clone)]
@@ -2172,6 +2190,14 @@ struct Analyzer<'a> {
     function_visibility: &'a [bool],
     shapes: &'a ShapeTable,
     loop_depth: usize,
+    // `defer` blocks waiting for their enclosing block to end, one frame per open block.
+    defer_frames: Vec<Vec<DeferredBody>>,
+    // For each open loop, the index of the first frame that belongs to its body.
+    loop_defer_bases: Vec<usize>,
+    // Non-zero while a `defer` body is being lowered: control may not leave it.
+    defer_nesting: usize,
+    // True while the function's result expression is lowered, after its `defer` blocks were registered.
+    tail_defers_pending: bool,
     function_name: String,
     module_path: String,
     return_type: Option<Type>,
@@ -2209,6 +2235,10 @@ impl<'a> Analyzer<'a> {
             function_visibility,
             shapes,
             loop_depth: 0,
+            defer_frames: Vec::new(),
+            loop_defer_bases: Vec::new(),
+            defer_nesting: 0,
+            tail_defers_pending: false,
             function_name: String::new(),
             module_path: String::new(),
             return_type: None,
@@ -2304,8 +2334,14 @@ impl<'a> Analyzer<'a> {
             });
         }
         let (parameters, body_always_returns) = self.prepare_function(&function)?;
-        let statements = self.block(std::mem::take(&mut function.body))?;
-        self.finish_function(function, parameters, body_always_returns, statements)
+        let (statements, deferred) = self.lower_statements(std::mem::take(&mut function.body))?;
+        self.finish_function(
+            function,
+            parameters,
+            body_always_returns,
+            statements,
+            deferred,
+        )
     }
 
     fn function_recovering(
@@ -2319,14 +2355,15 @@ impl<'a> Analyzer<'a> {
             .prepare_function(&function)
             .map_err(|error| vec![error])?;
         self.recover_block_errors = true;
-        let (statements, top_level_declaration_failed) =
-            self.recover_block(std::mem::take(&mut function.body), true);
+        let (statements, top_level_declaration_failed, deferred) =
+            self.recover_statements(std::mem::take(&mut function.body), true);
         let mut diagnostics = std::mem::take(&mut self.recovery_diagnostics);
         if top_level_declaration_failed {
             diagnostics.sort_by_key(|diagnostic| diagnostic.span.start);
             return Err(diagnostics);
         }
-        let finished = self.finish_function(function, parameters, body_always_returns, statements);
+        let finished =
+            self.finish_function(function, parameters, body_always_returns, statements, deferred);
         diagnostics.extend(std::mem::take(&mut self.recovery_diagnostics));
         match finished {
             Ok(function) if diagnostics.is_empty() => Ok(function),
@@ -2416,9 +2453,11 @@ impl<'a> Analyzer<'a> {
         parameters: Vec<LocalBinding>,
         body_always_returns: bool,
         mut statements: Vec<IrStatement>,
+        deferred: Vec<DeferredBody>,
     ) -> Result<RynFunction, Diagnostic> {
         let return_type = self.return_type;
-        let return_value = match (return_type, function.return_value) {
+        self.tail_defers_pending = !deferred.is_empty();
+        let mut return_value = match (return_type, function.return_value) {
             (Some(expected), Some(value)) => {
                 let span = value.span();
                 let (value, actual) = self.expression(value, Some(expected))?;
@@ -2476,6 +2515,30 @@ impl<'a> Analyzer<'a> {
             }
             (None, None) => None,
         };
+        self.tail_defers_pending = false;
+        if !deferred.is_empty() {
+            // The result is computed first, so the deferred bodies run after it and cannot change it.
+            let leaving = self.lower_frame(deferred)?;
+            return_value = match return_value {
+                Some(value) => {
+                    let ty = return_type.expect("a function result has a declared type");
+                    let slot = self.allocate(ty);
+                    statements.push(IrStatement::Let {
+                        slot,
+                        ty,
+                        value,
+                        span: function.span,
+                    });
+                    Some(IrExpression::Local {
+                        slot,
+                        ty,
+                        span: function.span,
+                    })
+                }
+                None => None,
+            };
+            statements.extend(leaving);
+        }
         let mut returned_reference_parameters = Vec::new();
         collect_reference_returns(&statements, &parameters, &mut returned_reference_parameters);
         if let Some(value) = &return_value {
@@ -2607,12 +2670,37 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn enter_loop(&mut self) {
+        self.loop_depth += 1;
+        self.loop_defer_bases.push(self.defer_frames.len());
+    }
+
+    fn exit_loop(&mut self) {
+        self.loop_depth -= 1;
+        self.loop_defer_bases.pop();
+    }
+
     fn block(&mut self, body: Vec<Statement>) -> Result<Vec<IrStatement>, Diagnostic> {
         if !self.recover_block_errors {
-            return body.into_iter().map(|stmt| self.statement(stmt)).collect();
+            let (mut statements, frame) = self.lower_statements(body)?;
+            statements.extend(self.lower_frame(frame)?);
+            return Ok(statements);
         }
 
         Ok(self.recover_block(body, false).0)
+    }
+
+    // Lowers a block's statements inside a new `defer` frame and returns that frame unlowered,
+    // so the caller decides where its deferred bodies run.
+    fn lower_statements(
+        &mut self,
+        body: Vec<Statement>,
+    ) -> Result<(Vec<IrStatement>, Vec<DeferredBody>), Diagnostic> {
+        self.defer_frames.push(Vec::new());
+        let lowered: Result<Vec<IrStatement>, Diagnostic> =
+            body.into_iter().map(|stmt| self.statement(stmt)).collect();
+        let frame = self.defer_frames.pop().unwrap_or_default();
+        Ok((lowered?, frame))
     }
 
     fn recover_block(
@@ -2620,12 +2708,28 @@ impl<'a> Analyzer<'a> {
         body: Vec<Statement>,
         function_body: bool,
     ) -> (Vec<IrStatement>, bool) {
+        let (mut statements, stopped_on_declaration, frame) =
+            self.recover_statements(body, function_body);
+        match self.lower_frame(frame) {
+            Ok(deferred) => statements.extend(deferred),
+            Err(diagnostic) => self.recovery_diagnostics.push(diagnostic),
+        }
+        (statements, stopped_on_declaration)
+    }
+
+    fn recover_statements(
+        &mut self,
+        body: Vec<Statement>,
+        function_body: bool,
+    ) -> (Vec<IrStatement>, bool, Vec<DeferredBody>) {
+        self.defer_frames.push(Vec::new());
         let mut statements = Vec::with_capacity(body.len());
         let mut stopped_on_declaration = false;
         for statement in body {
             let names_before = self.names.clone();
             let local_type_count = self.local_types.len();
             let loop_depth = self.loop_depth;
+            let loop_bases = self.loop_defer_bases.len();
             let failed_declaration_blocks_recovery = matches!(
                 &statement,
                 Statement::Let { name, .. } if !self.names.contains_key(name)
@@ -2637,6 +2741,7 @@ impl<'a> Analyzer<'a> {
                     self.local_types.truncate(local_type_count);
                     self.owned_slot_types.truncate(local_type_count);
                     self.loop_depth = loop_depth;
+                    self.loop_defer_bases.truncate(loop_bases);
                     self.recovery_diagnostics.push(diagnostic);
                     if failed_declaration_blocks_recovery {
                         stopped_on_declaration = true;
@@ -2645,7 +2750,55 @@ impl<'a> Analyzer<'a> {
                 }
             }
         }
-        (statements, function_body && stopped_on_declaration)
+        let frame = self.defer_frames.pop().unwrap_or_default();
+        (
+            statements,
+            function_body && stopped_on_declaration,
+            frame,
+        )
+    }
+
+    // Lowers the deferred bodies of one frame in reverse registration order, which is the
+    // order they run when their block ends.
+    fn lower_frame(&mut self, frame: Vec<DeferredBody>) -> Result<Vec<IrStatement>, Diagnostic> {
+        let mut statements = Vec::new();
+        for deferred in frame.into_iter().rev() {
+            statements.extend(self.lower_deferred_body(deferred)?);
+        }
+        Ok(statements)
+    }
+
+    // The deferred bodies that run when control leaves the frames from `first_frame` onward:
+    // innermost frame first, and within a frame the most recently registered body first.
+    fn leaving_defers(&mut self, first_frame: usize) -> Result<Vec<IrStatement>, Diagnostic> {
+        let mut leaving = Vec::new();
+        for frame in self.defer_frames[first_frame.min(self.defer_frames.len())..]
+            .iter()
+            .rev()
+        {
+            leaving.extend(frame.iter().rev().cloned());
+        }
+        let mut statements = Vec::new();
+        for deferred in leaving {
+            statements.extend(self.lower_deferred_body(deferred)?);
+        }
+        Ok(statements)
+    }
+
+    fn lower_deferred_body(
+        &mut self,
+        deferred: DeferredBody,
+    ) -> Result<Vec<IrStatement>, Diagnostic> {
+        let outer_names = std::mem::replace(&mut self.names, deferred.names);
+        let outer_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
+        let outer_loop_bases = std::mem::take(&mut self.loop_defer_bases);
+        self.defer_nesting += 1;
+        let result = self.block(deferred.body);
+        self.defer_nesting -= 1;
+        self.loop_defer_bases = outer_loop_bases;
+        self.loop_depth = outer_loop_depth;
+        self.names = outer_names;
+        result
     }
 
     fn check_discarded_expression(&mut self, expression: Expression) {
@@ -2668,9 +2821,9 @@ impl<'a> Analyzer<'a> {
                 mutable: false,
             },
         );
-        self.loop_depth += 1;
+        self.enter_loop();
         let _ = self.block(body);
-        self.loop_depth -= 1;
+        self.exit_loop();
         self.names = outer_names;
     }
 
@@ -3521,9 +3674,9 @@ impl<'a> Analyzer<'a> {
                     Err(error) if self.recover_block_errors => {
                         self.pending_statements.clear();
                         let outer_names = self.names.clone();
-                        self.loop_depth += 1;
+                        self.enter_loop();
                         let _ = self.block(body);
-                        self.loop_depth -= 1;
+                        self.exit_loop();
                         self.names = outer_names;
                         return Err(error);
                     }
@@ -3539,17 +3692,17 @@ impl<'a> Analyzer<'a> {
                     .with_help("use a boolean expression, such as a comparison, for the condition");
                     if self.recover_block_errors {
                         let outer_names = self.names.clone();
-                        self.loop_depth += 1;
+                        self.enter_loop();
                         let _ = self.block(body);
-                        self.loop_depth -= 1;
+                        self.exit_loop();
                         self.names = outer_names;
                     }
                     return Err(error);
                 }
                 let outer_names = self.names.clone();
-                self.loop_depth += 1;
+                self.enter_loop();
                 let body = self.block(body);
-                self.loop_depth -= 1;
+                self.exit_loop();
                 let body = body?;
                 self.names = outer_names;
                 Ok(IrStatement::While {
@@ -3659,9 +3812,9 @@ impl<'a> Analyzer<'a> {
                         mutable: false,
                     },
                 );
-                self.loop_depth += 1;
+                self.enter_loop();
                 let body = self.block(body);
-                self.loop_depth -= 1;
+                self.exit_loop();
                 self.names = outer_names;
                 let body = body?;
                 Ok(with_setup(
@@ -3696,9 +3849,9 @@ impl<'a> Analyzer<'a> {
                             self.recovery_diagnostics.push(error);
                         }
                         let outer = self.names.clone();
-                        self.loop_depth += 1;
+                        self.enter_loop();
                         let _ = self.block(body);
-                        self.loop_depth -= 1;
+                        self.exit_loop();
                         self.names = outer;
                     }
                     return Err(error);
@@ -3736,9 +3889,9 @@ impl<'a> Analyzer<'a> {
                         mutable: false,
                     },
                 );
-                self.loop_depth += 1;
+                self.enter_loop();
                 let body = self.block(body);
-                self.loop_depth -= 1;
+                self.exit_loop();
                 self.names = outer_names;
                 let body = body?;
 
@@ -3849,25 +4002,64 @@ impl<'a> Analyzer<'a> {
                     ]),
                 ))
             }
+            Statement::Defer { body, span } => {
+                if matches!(self.return_type, Some(Type::Reference(_, _))) {
+                    return Err(diag(
+                        "R0269",
+                        "a function returning a reference cannot use `defer`",
+                        span,
+                    )
+                    .with_help("return an owned value, or move the cleanup to the caller"));
+                }
+                let deferred = DeferredBody {
+                    body,
+                    names: self.names.clone(),
+                };
+                // Lower the body now, so its own errors are reported where it is written.
+                self.lower_deferred_body(deferred.clone())?;
+                match self.defer_frames.last_mut() {
+                    Some(frame) => frame.push(deferred),
+                    None => {
+                        return Err(diag("R0270", "`defer` must be inside a block", span));
+                    }
+                }
+                Ok(IrStatement::Block(Vec::new()))
+            }
             Statement::Break(span) => {
                 if self.loop_depth == 0 {
+                    if self.defer_nesting > 0 {
+                        return Err(diag("R0268", "`break` cannot leave a `defer` block", span)
+                            .with_help("move the loop inside the `defer` block"));
+                    }
                     return Err(
                         diag("R0016", "`break` can only be used inside a loop", span)
                             .with_help("move `break` into the body of a `while` or `for` loop"),
                     );
                 }
-                Ok(IrStatement::Break)
+                let first_frame = self.loop_defer_bases.last().copied().unwrap_or(0);
+                let leaving = self.leaving_defers(first_frame)?;
+                Ok(exit_after(leaving, IrStatement::Break))
             }
             Statement::Continue(span) => {
                 if self.loop_depth == 0 {
+                    if self.defer_nesting > 0 {
+                        return Err(diag("R0268", "`continue` cannot leave a `defer` block", span)
+                            .with_help("move the loop inside the `defer` block"));
+                    }
                     return Err(
                         diag("R0017", "`continue` can only be used inside a loop", span)
                             .with_help("move `continue` into the body of a `while` or `for` loop"),
                     );
                 }
-                Ok(IrStatement::Continue)
+                let first_frame = self.loop_defer_bases.last().copied().unwrap_or(0);
+                let leaving = self.leaving_defers(first_frame)?;
+                Ok(exit_after(leaving, IrStatement::Continue))
             }
             Statement::Return { value, span } => {
+                if self.defer_nesting > 0 {
+                    return Err(diag("R0267", "`return` cannot leave a `defer` block", span)
+                        .with_help("return from the enclosing function after the `defer` block"));
+                }
                 let value = match (self.return_type, value) {
                     (None, Some(value)) => {
                         let error = diag(
@@ -3917,7 +4109,32 @@ impl<'a> Analyzer<'a> {
                         Some(value)
                     }
                 };
-                Ok(IrStatement::Return { value })
+                let leaving = self.leaving_defers(0)?;
+                let Some(value) = value else {
+                    return Ok(exit_after(
+                        leaving,
+                        IrStatement::Return { value: None },
+                    ));
+                };
+                if leaving.is_empty() {
+                    return Ok(IrStatement::Return { value: Some(value) });
+                }
+                // The value is computed before the `defer` blocks run, so they cannot change it.
+                let ty = self
+                    .return_type
+                    .expect("a returned value has a declared result type");
+                let slot = self.allocate(ty);
+                let mut statements = vec![IrStatement::Let {
+                    slot,
+                    ty,
+                    value,
+                    span,
+                }];
+                statements.extend(leaving);
+                statements.push(IrStatement::Return {
+                    value: Some(IrExpression::Local { slot, ty, span }),
+                });
+                Ok(IrStatement::Block(statements))
             }
         }
     }
@@ -4911,6 +5128,20 @@ impl<'a> Analyzer<'a> {
                 ))
             }
             Expression::Propagate(value, span) => {
+                if self.defer_nesting > 0 {
+                    return Err(diag("R0268", "`?` cannot leave a `defer` block", span)
+                        .with_help("handle the error inside the `defer` block"));
+                }
+                // Early returns from `?` do not run deferred bodies, so they are rejected while any
+                // `defer` is pending in this function.
+                if self.tail_defers_pending || self.defer_frames.iter().any(|frame| !frame.is_empty()) {
+                    return Err(diag(
+                        "R0266",
+                        "`?` cannot be used in a function with a `defer` block yet",
+                        span,
+                    )
+                    .with_help("move the `?` before the `defer` block, or handle the error with `choose`"));
+                }
                 let (value, input_type) = self.expression(*value, None)?;
                 let Type::Enum(input_enum) = input_type else {
                     return Err(diag(

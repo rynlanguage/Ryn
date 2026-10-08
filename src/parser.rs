@@ -2236,6 +2236,7 @@ impl Parser<'_> {
                 | TokenKind::Echo
                 | TokenKind::If
                 | TokenKind::While
+                | TokenKind::Defer
                 | TokenKind::For
                 | TokenKind::Break
                 | TokenKind::Continue
@@ -2386,6 +2387,7 @@ impl Parser<'_> {
             TokenKind::Echo => self.echo_statement(),
             TokenKind::If => self.if_statement(),
             TokenKind::While => self.while_statement(),
+            TokenKind::Defer => self.defer_statement(),
             TokenKind::For => self.for_statement(),
             TokenKind::Break => Ok(Statement::Break(self.next().span)),
             TokenKind::Continue => Ok(Statement::Continue(self.next().span)),
@@ -2699,6 +2701,20 @@ impl Parser<'_> {
             "expected `}` to close block",
         )?;
         Ok(statements)
+    }
+
+    fn defer_statement(&mut self) -> Result<Statement, Diagnostic> {
+        let start = self.next().span.start;
+        self.expect(
+            |kind| matches!(kind, TokenKind::LBrace),
+            "expected `{` after `defer`",
+        )?;
+        let body = self.block_statements_after_open()?;
+        let end = self.tokens[self.at - 1].span.end;
+        Ok(Statement::Defer {
+            body,
+            span: Span { start, end },
+        })
     }
 
     fn while_statement(&mut self) -> Result<Statement, Diagnostic> {

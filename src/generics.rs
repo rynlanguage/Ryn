@@ -674,6 +674,9 @@ fn substitute_statements(statements: &mut [Statement], substitutions: &HashMap<S
                 substitute_expression(condition, substitutions);
                 substitute_statements(body, substitutions);
             }
+            Statement::Defer { body, .. } => {
+                substitute_statements(body, substitutions);
+            }
             Statement::For {
                 start, end, body, ..
             } => {
@@ -1052,6 +1055,19 @@ fn rewrite_statements(
                 rewrite_statements(
                     body,
                     &mut loop_environment,
+                    caller,
+                    templates,
+                    functions,
+                    enum_definitions,
+                    specializations,
+                    pending,
+                )?;
+            }
+            Statement::Defer { body, .. } => {
+                let mut block_environment = environment.clone();
+                rewrite_statements(
+                    body,
+                    &mut block_environment,
                     caller,
                     templates,
                     functions,

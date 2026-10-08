@@ -132,3 +132,37 @@ fn inclusive_ranges_include_their_end_and_never_wrap() {
         assert_eq!(String::from_utf8_lossy(&result.stdout), expected);
     }
 }
+
+#[test]
+fn defer_runs_on_every_exit_in_reverse_order() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/programs/pass/defer_blocks.ryn"),
+    )
+    .expect("defer fixture exists");
+    let expected = "body\nsecond registered\nfirst registered\n7\ncleanup sees 99\n1\n0\n\
+                    end iteration\nend iteration\n2\nend iteration\nleft loop\n1\n";
+    for frontend in [None, Some("rust")] {
+        let result = run_program("defer-blocks", &source, frontend);
+        assert!(
+            result.status.success(),
+            "defer blocks should run with frontend {frontend:?}, stderr:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&result.stdout), expected);
+    }
+}
+
+#[test]
+fn defer_keeps_owned_values_alive_until_the_block_ends() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/programs/pass/defer_owned_values.ryn"),
+    )
+    .expect("owned defer fixture exists");
+    let result = run_program("defer-owned", &source, None);
+    assert!(
+        result.status.success(),
+        "owned defer program should run, stderr:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "body\nowned\n");
+}

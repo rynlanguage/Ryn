@@ -77,6 +77,7 @@ extend Tk {
     pub const DOT: u32 = 72
     pub const DOT_DOT: u32 = 73
     pub const DOT_DOT_EQUAL: u32 = 102
+    pub const DEFER: u32 = 103
     pub const EQUAL: u32 = 74
     pub const PLUS_EQUAL: u32 = 75
     pub const MINUS_EQUAL: u32 = 76
@@ -1019,6 +1020,7 @@ pub fun keyword_kind(word: String) -> u32 {
     when word == "when" { return Tk::WHEN }
     when word == "else" { return Tk::ELSE }
     when word == "while" { return Tk::WHILE }
+    when word == "defer" { return Tk::DEFER }
     when word == "for" { return Tk::FOR }
     when word == "in" { return Tk::IN }
     when word == "break" { return Tk::BREAK }

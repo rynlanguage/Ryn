@@ -58,6 +58,11 @@ fn fail_fixtures_are_rejected_with_the_expected_diagnostic_codes() {
         ("array_repeat_bad_length.ryn", "R0012"),
         ("pipe_bad_target.ryn", "R0265"),
         ("coalesce_not_option.ryn", "R0234"),
+        ("defer_return_inside.ryn", "R0267"),
+        ("defer_break_outside.ryn", "R0268"),
+        ("defer_propagate.ryn", "R0266"),
+        ("defer_reference.ryn", "R0269"),
+        ("defer_owned_moved.ryn", "R0240"),
     ];
     let failures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/fail");
 

@@ -438,6 +438,12 @@ pub enum Statement {
         body: Vec<Statement>,
         span: Span,
     },
+    // `defer { ... }` runs its block when the enclosing block is left, in reverse order of
+    // declaration, on normal exit, `return`, `break` and `continue`.
+    Defer {
+        body: Vec<Statement>,
+        span: Span,
+    },
     For {
         name: String,
         name_span: Span,

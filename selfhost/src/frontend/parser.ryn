@@ -2560,7 +2560,7 @@ extend Parser {
     fun starts_statement(self, allow_call: bool) -> bool {
         kind := self.peek_kind()
         when kind == lexer::Tk::MUT || kind == lexer::Tk::ECHO || kind == lexer::Tk::WHEN
-            || kind == lexer::Tk::WHILE || kind == lexer::Tk::FOR || kind == lexer::Tk::BREAK
+            || kind == lexer::Tk::WHILE || kind == lexer::Tk::DEFER || kind == lexer::Tk::FOR || kind == lexer::Tk::BREAK
             || kind == lexer::Tk::CONTINUE || kind == lexer::Tk::RETURN || kind == lexer::Tk::STAR {
             return true
         }
@@ -2716,6 +2716,9 @@ extend Parser {
         }
         when kind == lexer::Tk::WHILE {
             return self.while_statement()
+        }
+        when kind == lexer::Tk::DEFER {
+            return self.defer_statement()
         }
         when kind == lexer::Tk::FOR {
             return self.for_statement()
@@ -2937,6 +2940,17 @@ extend Parser {
         mut out := String("\n")
         out.append(word("While"))
         out.append(condition)
+        out.append(body)
+        out.append(enc_span(start, self.prev_end()))
+        return Result::Ok(out)
+    }
+    // `defer { ... }`: encoded as the tag the bootstrap parser writes for the same statement.
+    fun defer_statement(mut self) -> Result<String, lexer::Diag> {
+        start := self.next().start
+        self.expect(lexer::Tk::LBRACE, "expected `{` after `defer`")?
+        body := self.block_statements_after_open()?
+        mut out := String("\n")
+        out.append(word("Defer"))
         out.append(body)
         out.append(enc_span(start, self.prev_end()))
         return Result::Ok(out)

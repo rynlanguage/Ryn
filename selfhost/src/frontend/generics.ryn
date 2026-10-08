@@ -103,6 +103,7 @@ extend St {
     pub const BREAK: u32 = 15
     pub const CONTINUE: u32 = 16
     pub const RETURN: u32 = 17
+    pub const DEFER: u32 = 18
 }
 
 #[derive(Clone)]
@@ -797,6 +798,9 @@ extend Tree {
             node.kind = St::WHILE
             node.a = self.decode_expr()
             node.body = self.decode_stmts()
+        } else when tag == "Defer" {
+            node.kind = St::DEFER
+            node.body = self.decode_stmts()
         } else when tag == "For" || tag == "ForInclusive" {
             node.kind = St::FOR
             node.flag = tag == "ForInclusive"
@@ -1435,6 +1439,9 @@ extend Tree {
             out.append(word("While"))
             out.append(self.encode_expr(node.a))
             out.append(self.encode_stmts(node.body.clone()))
+        } else when kind == St::DEFER {
+            out.append(word("Defer"))
+            out.append(self.encode_stmts(node.body.clone()))
         } else when kind == St::FOR {
             // `flag` marks an inclusive `..=` range; the exclusive layout is unchanged.
             when node.flag {
@@ -1987,6 +1994,9 @@ extend Tree {
             node.body = new_body
             new_body2 := self.copy_stmts(node.body2.clone(), substitutions)
             node.body2 = new_body2
+        } else when kind == St::DEFER {
+            new_body := self.copy_stmts(node.body.clone(), substitutions)
+            node.body = new_body
         } else when kind == St::WHILE || kind == St::FOR_EACH {
             new_a := self.copy_expr(node.a, substitutions.clone())
             node.a = new_a
@@ -2610,6 +2620,8 @@ extend Tree {
             self.rewrite_expr(node.a, current.clone(), caller)?
             self.rewrite_stmts(node.body.clone(), current.clone(), caller)?
             self.rewrite_stmts(node.body2.clone(), current.clone(), caller)?
+        } else when kind == St::DEFER {
+            self.rewrite_stmts(node.body.clone(), current.clone(), caller)?
         } else when kind == St::WHILE {
             self.rewrite_expr(node.a, current.clone(), caller)?
             self.rewrite_stmts(node.body.clone(), current.clone(), caller)?
