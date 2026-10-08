@@ -65,3 +65,14 @@ generator:
   `match` arms are exhaustive, so a new IR variant cannot be dropped silently.
 - Stage 2, step 2 (not started): a Ryn implementation of the IR data types and
   the decoder, gated by equal re-encoding of the same corpus.
+- Stage 2, step 2a (done): `selfhost/ir` is a Ryn program that checks textual IR
+  against the grammar the Rust decoder accepts. It walks the same tokens in the
+  same order and reports the byte offset of the first mismatch.
+  `tests/ryn_ir_check.rs` builds it with the compiler under test, checks every
+  pass fixture and analysable example, and requires truncated or corrupted text to
+  be rejected. The Ryn checker validates the format only; it does not build an IR
+  data model yet, which is the next step.
+- Language gaps found while writing it: `Vec` of enums is rejected (`R0234`), so an
+  IR tree in Ryn is an index arena of structs with `Vec<u64>` children; closures are
+  not available; `choose` arms take expressions only; `Result::Ok` needs an expected
+  type inside `choose`.
