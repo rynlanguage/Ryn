@@ -157,3 +157,8 @@ generator:
   exclusive ranges, `continue`, and negative bounds lowered identically to `sema`; the
   scratch file was removed. The corpus programs that use `for` also use `u8`, which the
   subset does not model yet, so the gate count is unchanged.
+- Stage 2, step 3f (done): the subset gained the sized integer types `i8`, `i16`,
+  `u8`, `u16`, `u32`, and `u64` next to `i32` and `i64`. Each takes the local type
+  `sema` gives it (`U8` is an `I8` slot, `U32` an `I32` slot, and so on). Negation is
+  defined for signed types only, and a literal folds only when its magnitude is out of
+  range for a signed type. Nineteen corpus programs now lower to identical IR.

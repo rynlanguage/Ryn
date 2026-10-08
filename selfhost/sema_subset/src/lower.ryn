@@ -133,6 +133,12 @@ fun operator_word(op: String) -> Result<String, String> {
 // `-N` folds into one literal only when N alone is out of range for the type, as sema does for
 // the smallest value of a type. Otherwise the negation stays a separate node.
 fun needs_folding(value: u64, ty: String) -> bool {
+    when ty == "I8" {
+        return value > 127
+    }
+    when ty == "I16" {
+        return value > 32767
+    }
     when ty == "I32" {
         return value > 2147483647
     }
@@ -151,7 +157,11 @@ fun is_logical(op: String) -> bool {
 }
 
 fun is_integer_word(ty: String) -> bool {
-    return ty == "I32" || ty == "I64"
+    return ty == "I8" || ty == "I16" || ty == "I32" || ty == "I64" || ty == "U8" || ty == "U16" || ty == "U32" || ty == "U64"
+}
+
+fun is_signed_word(ty: String) -> bool {
+    return ty == "I8" || ty == "I16" || ty == "I32" || ty == "I64"
 }
 
 // The IR word for a simple type name in the subset.
@@ -159,8 +169,26 @@ fun type_word(word: String) -> Result<String, String> {
     when word == "i32" {
         return Result::Ok(String("I32"))
     }
+    when word == "i8" {
+        return Result::Ok(String("I8"))
+    }
+    when word == "i16" {
+        return Result::Ok(String("I16"))
+    }
     when word == "i64" {
         return Result::Ok(String("I64"))
+    }
+    when word == "u8" {
+        return Result::Ok(String("U8"))
+    }
+    when word == "u16" {
+        return Result::Ok(String("U16"))
+    }
+    when word == "u32" {
+        return Result::Ok(String("U32"))
+    }
+    when word == "u64" {
+        return Result::Ok(String("U64"))
     }
     when word == "str" {
         return Result::Ok(String("Str"))
@@ -307,12 +335,22 @@ extend Lowering {
     fun allocate(mut self, ty: String) -> Result<u64, String> {
         slot := self.next_slot
         self.addressed += 1
-        when ty == "I32" {
+        when ty == "I8" || ty == "U8" {
+            self.local_types.push(String("I8"))
+            self.next_slot += 1
+            return Result::Ok(slot)
+        }
+        when ty == "I16" || ty == "U16" {
+            self.local_types.push(String("I16"))
+            self.next_slot += 1
+            return Result::Ok(slot)
+        }
+        when ty == "I32" || ty == "U32" {
             self.local_types.push(String("I32"))
             self.next_slot += 1
             return Result::Ok(slot)
         }
-        when ty == "I64" {
+        when ty == "I64" || ty == "U64" {
             self.local_types.push(String("I64"))
             self.next_slot += 1
             return Result::Ok(slot)
@@ -457,7 +495,7 @@ extend Lowering {
         when ty.is_empty() {
             ty = String("I64")
         }
-        when !is_integer_word(ty.clone()) {
+        when !is_signed_word(ty.clone()) {
             return Result::Err(unsupported("negation of this type"))
         }
         operand := self.expression(value, ty.clone())?
