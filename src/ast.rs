@@ -196,6 +196,14 @@ pub enum Expression {
         name_span: Span,
         span: Span,
     },
+    /// `start..end` or `start..=end` as a value: a structure with `start`, `end`
+    /// and `inclusive` fields. A `for` loop header reads the bounds directly.
+    Range {
+        start: Box<Expression>,
+        end: Box<Expression>,
+        inclusive: bool,
+        span: Span,
+    },
     If {
         condition: Box<Expression>,
         then_value: Box<Expression>,
@@ -392,7 +400,7 @@ impl Expression {
             | Self::Dereference(_, span)
             | Self::Cast(_, _, span) => *span,
             Self::AddressOf { span, .. } => *span,
-            Self::LayoutOf { span, .. } => *span,
+            Self::LayoutOf { span, .. } | Self::Range { span, .. } => *span,
             Self::Binary { span, .. } => *span,
             Self::Call { span, .. } => *span,
             Self::MethodCall { span, .. } => *span,

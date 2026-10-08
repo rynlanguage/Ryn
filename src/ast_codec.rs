@@ -697,6 +697,18 @@ impl Encoder {
                 self.span(*name_span);
                 self.span(*span);
             }
+            Expression::Range {
+                start,
+                end,
+                inclusive,
+                span,
+            } => {
+                self.word("Range");
+                self.expression(start);
+                self.expression(end);
+                self.boolean(*inclusive);
+                self.span(*span);
+            }
             Expression::If {
                 condition,
                 then_value,
@@ -1382,6 +1394,12 @@ impl<'a> Decoder<'a> {
                 let span = self.span()?;
                 Expression::coalesce(value, fallback, span)
             }
+            "Range" => Expression::Range {
+                start: self.boxed_expression()?,
+                end: self.boxed_expression()?,
+                inclusive: self.boolean()?,
+                span: self.span()?,
+            },
             "OptionalField" => {
                 let value = self.expression()?;
                 let name = self.string()?;

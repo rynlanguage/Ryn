@@ -2236,6 +2236,46 @@ impl<'a> Analyzer<'a> {
         enum_id
     }
 
+    /// The structure that holds a range of `elem` values: `start`, `end` and
+    /// `inclusive`. It is created the first time the program builds such a range.
+    fn range_struct_for(&mut self, elem: Type) -> usize {
+        if let Some(struct_id) = self.structs.iter().position(|definition| {
+            definition.name.starts_with("$RynRange#")
+                && definition.fields.len() == 3
+                && definition.fields[0].ty == elem
+                && definition.fields[1].ty == elem
+                && definition.fields[2].ty == Type::Bool
+        }) {
+            return struct_id;
+        }
+        let mut slot_offset = 0;
+        let fields = [("start", elem), ("end", elem), ("inclusive", Type::Bool)]
+            .into_iter()
+            .map(|(name, ty)| {
+                let field = RynStructField {
+                    name: name.into(),
+                    ty,
+                    slot_offset,
+                    public: true,
+                };
+                slot_offset += storage_slot_width(ty, self.structs);
+                field
+            })
+            .collect();
+        let struct_id = self.structs.len();
+        self.structs.push(RynStruct {
+            name: format!("$RynRange#inferred{struct_id}"),
+            fields,
+            slot_count: slot_offset,
+            repr_c: false,
+            drop_function: None,
+            derives_clone: false,
+            derives_hash: false,
+            module_path: String::new(),
+        });
+        struct_id
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         signatures: &'a HashMap<String, FunctionSignature>,
@@ -3892,16 +3932,19 @@ impl<'a> Analyzer<'a> {
                     Type::Slice(elem_id) => vec_elem(elem_id),
                     Type::OwnedString => Type::Char,
                     Type::Str => Type::Char,
+                    Type::Struct(struct_id) if self.structs[struct_id].name.starts_with("$RynRange#") => {
+                        self.structs[struct_id].fields[0].ty
+                    }
                     _ => {
                         return Err(diag(
                             "R0206",
                             format!(
-                                "`for element in ...` requires a Vec, String, or str, found `{}`",
+                                "`for element in ...` requires a Vec, String, str, or range, found `{}`",
                                 type_name(collection_type)
                             ),
                             collection_span,
                         )
-                        .with_help("iterate a `Vec<T>`, `String`, or `str` directly, or use a numeric range with `..`"));
+                        .with_help("iterate a `Vec<T>`, `String`, `str`, or range value directly, or use a numeric range with `..`"));
                     }
                 };
                 let vector_slot = self.allocate(collection_type);
@@ -3928,6 +3971,64 @@ impl<'a> Analyzer<'a> {
                     ty: collection_type,
                     span: collection_span,
                 };
+                if let Type::Struct(struct_id) = collection_type
+                    && self.structs[struct_id].name.starts_with("$RynRange#")
+                {
+                    // A range value holds its bounds in fields. Its loop checks
+                    // `inclusive` when it starts, so `..` and `..=` each get a For.
+                    let range_value = IrExpression::Local {
+                        slot: vector_slot,
+                        ty: collection_type,
+                        span: collection_span,
+                    };
+                    let field = |field_index: usize, ty: Type| IrExpression::Field {
+                        value: Box::new(range_value.clone()),
+                        struct_id,
+                        field_index,
+                        ty,
+                        span: collection_span,
+                    };
+                    let cursor_slot = self.allocate(elem);
+                    let cursor_end_slot = self.allocate(elem);
+                    let item = IrStatement::Let {
+                        slot: item_slot,
+                        ty: elem,
+                        value: IrExpression::Local {
+                            slot: cursor_slot,
+                            ty: elem,
+                            span: collection_span,
+                        },
+                        span: name_span,
+                    };
+                    let mut loop_body = Vec::with_capacity(body.len() + 1);
+                    loop_body.push(item);
+                    loop_body.extend(body);
+                    let loop_for = |inclusive: bool, body: Vec<IrStatement>| IrStatement::For {
+                        slot: cursor_slot,
+                        end_slot: cursor_end_slot,
+                        ty: elem,
+                        start: field(0, elem),
+                        end: field(1, elem),
+                        inclusive,
+                        body,
+                    };
+                    return Ok(with_setup(
+                        setup,
+                        IrStatement::Block(vec![
+                            IrStatement::Let {
+                                slot: vector_slot,
+                                ty: collection_type,
+                                value: collection,
+                                span: collection_span,
+                            },
+                            IrStatement::If {
+                                condition: field(2, Type::Bool),
+                                then_body: vec![loop_for(true, loop_body.clone())],
+                                else_body: vec![loop_for(false, loop_body)],
+                            },
+                        ]),
+                    ));
+                }
                 let (length, item_value) = match collection_type {
                     Type::Vec(elem_id) => (
                         IrExpression::Call {
@@ -4435,6 +4536,49 @@ impl<'a> Analyzer<'a> {
                         ty: pointee,
                     },
                     pointee,
+                ))
+            }
+            Expression::Range {
+                start,
+                end,
+                inclusive,
+                span,
+            } => {
+                let (start_value, start_ty) = self.expression(*start, None)?;
+                if !is_integer(start_ty) {
+                    return Err(diag(
+                        "R0206",
+                        format!(
+                            "range bounds must be integers, found `{}`",
+                            type_name(start_ty)
+                        ),
+                        span,
+                    )
+                    .with_help("use integer bounds such as `0..10`"));
+                }
+                let (end_value, end_ty) = self.expression(*end, Some(start_ty))?;
+                if end_ty != start_ty {
+                    return Err(diag(
+                        "R0205",
+                        format!(
+                            "range end has type `{}` but the start has type `{}`",
+                            type_name(end_ty),
+                            type_name(start_ty)
+                        ),
+                        span,
+                    ));
+                }
+                let struct_id = self.range_struct_for(start_ty);
+                Ok((
+                    IrExpression::StructValue {
+                        struct_id,
+                        fields: vec![
+                            (0, start_value),
+                            (1, end_value),
+                            (2, IrExpression::Boolean(inclusive)),
+                        ],
+                    },
+                    Type::Struct(struct_id),
                 ))
             }
             Expression::Tuple(elements, span) => {

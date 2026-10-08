@@ -68,6 +68,9 @@ extend Ek {
     // `call()?` and `call()??`, which may stand alone as statements.
     pub const PROPAGATE_CALL: u32 = 4
     pub const PROPAGATE_NESTED: u32 = 5
+    // `start..end` and `start..=end`; `head` and `tail` hold the bounds' codes.
+    pub const RANGE: u32 = 6
+    pub const RANGE_INCLUSIVE: u32 = 7
 }
 
 // One type in the arena. `first` is the element, key, or function result;
@@ -3308,16 +3311,18 @@ extend Parser {
         first := self.expression(0)?
         mut code := enc_str(name.text)
         code.append(enc_span(name.start, name.end))
-        code.append(first.code)
         // Count 1 is a collection loop, 2 an exclusive range, 3 an inclusive range `..=`.
+        // A range expression supplies its bounds, which are its head and tail codes.
         mut count: u64 = 1
-        when self.peek_kind() == lexer::Tk::DOT_DOT || self.peek_kind() == lexer::Tk::DOT_DOT_EQUAL {
+        when first.kind == Ek::RANGE || first.kind == Ek::RANGE_INCLUSIVE {
             count = 2
-            when self.peek_kind() == lexer::Tk::DOT_DOT_EQUAL {
+            when first.kind == Ek::RANGE_INCLUSIVE {
                 count = 3
             }
-            self.skip()
-            code.append((self.expression(0)?).code)
+            code.append(first.head)
+            code.append(first.tail)
+        } else {
+            code.append(first.code)
         }
         when self.peek_kind() != lexer::Tk::LBRACE {
             return Result::Err(self.error("expected `{` to start block"))
@@ -4148,6 +4153,29 @@ extend Parser {
             }
             // `|>` and `??` bind loosest and are left-associative, like the bootstrap parser.
             // Both are sent as tagged nodes that ast_codec rewrites into calls and choose.
+            when kind == lexer::Tk::DOT_DOT || kind == lexer::Tk::DOT_DOT_EQUAL {
+                when min_precedence > 0 {
+                    break
+                }
+                inclusive := kind == lexer::Tk::DOT_DOT_EQUAL
+                self.skip()
+                right := self.expression(1)?
+                start_code := left.code.clone()
+                mut code := word("Range")
+                code.append(left.code)
+                code.append(right.code.clone())
+                code.append(enc_bool(inclusive))
+                code.append(enc_span(left.start, right.end))
+                mut range := plain_expr(code, left.start, right.end)
+                range.kind = Ek::RANGE
+                when inclusive {
+                    range.kind = Ek::RANGE_INCLUSIVE
+                }
+                range.head = start_code
+                range.tail = right.code
+                left = range
+                continue
+            }
             when kind == lexer::Tk::PIPE_GREATER || kind == lexer::Tk::QUESTION_QUESTION {
                 when min_precedence > 0 {
                     break

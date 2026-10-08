@@ -3028,18 +3028,19 @@ impl Parser<'_> {
                 |kind| matches!(kind, TokenKind::In),
                 "expected `in` after the `for` loop variable",
             )?;
-            let collection_or_start = self.expression(0)?;
-            if matches!(self.peek().kind, TokenKind::DotDot | TokenKind::DotDotEqual) {
-                let inclusive = matches!(self.peek().kind, TokenKind::DotDotEqual);
-                self.next();
-                let range_end = self.expression(0)?;
-                Ok((
+            // A range expression is a numeric loop; any other value is iterated.
+            match self.expression(0)? {
+                Expression::Range {
+                    start,
+                    end,
+                    inclusive,
+                    ..
+                } => Ok((
                     name,
                     name_span,
-                    ForHeader::Range(collection_or_start, range_end, inclusive),
-                ))
-            } else {
-                Ok((name, name_span, ForHeader::Each(collection_or_start)))
+                    ForHeader::Range(*start, *end, inclusive),
+                )),
+                collection => Ok((name, name_span, ForHeader::Each(collection))),
             }
         })();
         // A valid expression parser may stop before an unexpected token. Make
@@ -4481,6 +4482,28 @@ impl Parser<'_> {
                 )
             {
                 break;
+            }
+            // `start..end` and `start..=end` bind looser than arithmetic. The end side
+            // stops before another range, so `a..b..c` is `(a..b)..c`, which the range
+            // checks reject.
+            if matches!(self.peek().kind, TokenKind::DotDot | TokenKind::DotDotEqual) {
+                if min_precedence > 0 {
+                    break;
+                }
+                let inclusive = matches!(self.peek().kind, TokenKind::DotDotEqual);
+                self.next();
+                let end = self.expression(1)?;
+                let span = Span {
+                    start: left.span().start,
+                    end: end.span().end,
+                };
+                left = Expression::Range {
+                    start: Box::new(left),
+                    end: Box::new(end),
+                    inclusive,
+                    span,
+                };
+                continue;
             }
             // `|>` and `??` bind loosest, so `a || b ?? c` is `(a || b) ?? c`. Both are
             // left-associative: the right side stops before another `|>` or `??`.

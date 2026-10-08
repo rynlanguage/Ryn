@@ -754,6 +754,10 @@ fn substitute_expression(expression: &mut Expression, substitutions: &HashMap<St
             substitute_expression(left, substitutions);
             substitute_expression(right, substitutions);
         }
+        Expression::Range { start, end, .. } => {
+            substitute_expression(start, substitutions);
+            substitute_expression(end, substitutions);
+        }
         Expression::Cast(value, ty, _) => {
             substitute_expression(value, substitutions);
             substitute_type(ty, substitutions);
@@ -1416,6 +1420,28 @@ fn rewrite_expression(
                 pending,
             )?;
         }
+        Expression::Range { start, end, .. } => {
+            rewrite_expression(
+                start,
+                environment,
+                caller,
+                templates,
+                functions,
+                enum_definitions,
+                specializations,
+                pending,
+            )?;
+            rewrite_expression(
+                end,
+                environment,
+                caller,
+                templates,
+                functions,
+                enum_definitions,
+                specializations,
+                pending,
+            )?;
+        }
         Expression::Cast(value, _, _) => rewrite_expression(
             value,
             environment,
@@ -1578,6 +1604,7 @@ fn infer_type(
         Expression::Boolean(_, _) => Some(TypeName::Bool),
         Expression::Name(name, _) => environment.get(name).cloned(),
         Expression::Cast(_, ty, _) => Some(ty.clone()),
+        Expression::Range { .. } => None,
         Expression::LayoutOf { .. } => Some(TypeName::U64),
         Expression::VecConstructor { element, .. } => {
             Some(TypeName::Vec(Box::new(element.clone()), expression.span()))

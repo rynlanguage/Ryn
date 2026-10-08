@@ -66,6 +66,7 @@ fn fail_fixtures_are_rejected_with_the_expected_diagnostic_codes() {
         ("struct_destructuring_wrong_type.ryn", "R0205"),
         ("struct_destructuring_unknown_field.ryn", "R0225"),
         ("optional_field_on_struct.ryn", "R0234"),
+        ("range_mixed_types.ryn", "R0205"),
     ];
     let failures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/fail");
 

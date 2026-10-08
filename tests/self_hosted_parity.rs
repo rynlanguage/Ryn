@@ -157,6 +157,8 @@ fn self_hosted_edge_cases_and_diagnostics() {
         "fun main() { x := a?.b?.c y := f()?.g() z := (h()?).i w := arr[0]?.name v := t?.0 }",
         "fun main() { x := a?. }",
         "fun main() { x := a?.b(1)?.c::<T>() }",
+        "fun main() { r := 1..10 s := a..=b + 1 for i in 0..n {} for i in x..=y {} t := a..b..c }",
+        "fun main() { x := 1.. }",
         // Lexical errors.
         "fun main() { echo \"unterminated }",
         "fun main() { x := 1__2 + 0b102 + 0x + 1e + 1e999 + 18446744073709551616 }",

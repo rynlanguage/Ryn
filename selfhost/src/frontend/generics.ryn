@@ -78,6 +78,7 @@ extend Ex {
     pub const PROPAGATE: u32 = 27
     pub const ENUM: u32 = 28
     pub const CHOOSE: u32 = 29
+    pub const RANGE: u32 = 30
 }
 
 // Statement kinds.
@@ -607,6 +608,11 @@ extend Tree {
             node.text = self.word()
             node.a = self.decode_expr()
             node.b = self.decode_expr()
+        } else when tag == "Range" {
+            node.kind = Ex::RANGE
+            node.a = self.decode_expr()
+            node.b = self.decode_expr()
+            node.flag = self.boolean()
         } else when tag == "Negate" || tag == "Not" || tag == "BitNot" || tag == "Deref" || tag == "Propagate" {
             node.kind = when tag == "Negate" {
                 Ex::NEGATE
@@ -1255,6 +1261,11 @@ extend Tree {
             out.append(node.text.clone())
             out.append(self.encode_expr(node.a))
             out.append(self.encode_expr(node.b))
+        } else when kind == Ex::RANGE {
+            out = word("Range")
+            out.append(self.encode_expr(node.a))
+            out.append(self.encode_expr(node.b))
+            out.append(enc_bool(node.flag))
         } else when kind == Ex::NEGATE || kind == Ex::NOT || kind == Ex::BIT_NOT || kind == Ex::DEREF || kind == Ex::PROPAGATE {
             out = when kind == Ex::NEGATE {
                 word("Negate")
@@ -1896,7 +1907,7 @@ extend Tree {
             node.b = new_b
             new_c := self.copy_expr(node.c, substitutions)
             node.c = new_c
-        } else when kind == Ex::BINARY || kind == Ex::INDEX {
+        } else when kind == Ex::BINARY || kind == Ex::INDEX || kind == Ex::RANGE {
             new_a := self.copy_expr(node.a, substitutions.clone())
             node.a = new_a
             new_b := self.copy_expr(node.b, substitutions)
@@ -2227,6 +2238,9 @@ extend Tree {
             }
             return 0
         }
+        when kind == Ex::RANGE {
+            return 0
+        }
         when kind == Ex::BINARY {
             op := node.text
             when op == "Eq" || op == "Ne" || op == "Lt" || op == "Le" || op == "Gt" || op == "Ge" || op == "And" || op == "Or" {
@@ -2527,7 +2541,7 @@ extend Tree {
             self.rewrite_expr(node.b, environment.clone(), caller)?
             return self.rewrite_expr(node.c, environment, caller)
         }
-        when kind == Ex::BINARY || kind == Ex::INDEX {
+        when kind == Ex::BINARY || kind == Ex::INDEX || kind == Ex::RANGE {
             self.rewrite_expr(node.a, environment.clone(), caller)?
             return self.rewrite_expr(node.b, environment, caller)
         }
