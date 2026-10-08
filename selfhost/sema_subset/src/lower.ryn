@@ -41,6 +41,12 @@ pub struct Place {
     mutable: bool,
 }
 
+// A `defer` body, with the locals that were visible where it was written.
+pub struct Deferred {
+    body: Vec<u64>,
+    visible: u64,
+}
+
 // The lowered statements of one branch, and whether control falls off its end.
 pub struct Block {
     items: Vec<String>,
@@ -59,6 +65,10 @@ pub struct Lowering {
     loop_depth: u64,
     visible: u64,
     loop_floors: Vec<u64>,
+    defers: Vec<Deferred>,
+    defer_count: u64,
+    frame_marks: Vec<u64>,
+    loop_frames: Vec<u64>,
     structs: Vec<StructInfo>,
     type_names: Vec<String>,
     type_words: Vec<String>,
@@ -94,6 +104,21 @@ fun unsupported(what: str) -> String {
     mut out := String("unsupported: ")
     out.append(what)
     return out
+}
+
+fun no_items() -> Vec<String> {
+    return Vec()
+}
+
+// `Block <count> <statements>`: a nested block of statements, as the IR writes one.
+fun block_of(statements: Vec<String>) -> Vec<String> {
+    mut tokens: Vec<String> = Vec()
+    tokens.push(String("Block"))
+    tokens.push(num(statements.len()))
+    for statement in statements {
+        tokens.push(statement)
+    }
+    return tokens
 }
 
 fun words2(a: String, b: String) -> Vec<String> {
@@ -530,6 +555,69 @@ extend Lowering {
             return Result::Err(unsupported("branches of different types"))
         }
         return Result::Ok(Lowered { text: join(words5(String("If"), test.text, then_branch.text, else_branch.text, ty.clone())), ty: ty })
+    }
+
+    fun open_frame(mut self) {
+        self.frame_marks.push(self.defer_count)
+    }
+
+    // The first registered defer that belongs to frame `frame` or a later one.
+    fun frame_start(self, frame: u64) -> u64 {
+        when frame < self.frame_marks.len() {
+            return self.frame_marks[frame]
+        }
+        return self.defer_count
+    }
+
+    // Lowers the defers from `start` on, last registered first, each in the locals it saw.
+    fun run_defers(mut self, start: u64) -> Result<Vec<String>, String> {
+        mut items: Vec<String> = Vec()
+        mut index: u64 = self.defer_count
+        while index > start {
+            index -= 1
+            body := self.defers[index].body.clone()
+            outer_visible := self.visible
+            outer_depth := self.loop_depth
+            self.visible = self.defers[index].visible
+            self.loop_depth = 0
+            inline := self.inline(body)?
+            self.visible = outer_visible
+            self.loop_depth = outer_depth
+            for item in inline {
+                items.push(item)
+            }
+        }
+        return Result::Ok(items)
+    }
+
+    // Lowers a deferred body's statements as they are, without a scope of their own.
+    fun inline(mut self, body: Vec<u64>) -> Result<Vec<String>, String> {
+        start := self.statements.len()
+        mut position: u64 = 0
+        while position < body.len() {
+            self.statement(body[position])?
+            position += 1
+        }
+        mut reversed: Vec<String> = Vec()
+        while self.statements.len() > start {
+            reversed.push(self.statements.pop().unwrap())
+        }
+        mut items: Vec<String> = Vec()
+        mut index: u64 = reversed.len()
+        while index > 0 {
+            index -= 1
+            items.push(reversed[index].clone())
+        }
+        return Result::Ok(items)
+    }
+
+    // Closes the innermost frame: its defers, last registered first; they are forgotten after.
+    fun close_frame(mut self) -> Result<Vec<String>, String> {
+        mark := self.frame_marks[self.frame_marks.len() - 1]
+        items := self.run_defers(mark)?
+        self.defer_count = mark
+        self.frame_marks.pop()
+        return Result::Ok(items)
     }
 
     // The first visible local of the innermost loop; 0 outside any loop.
@@ -1022,11 +1110,20 @@ extend Lowering {
     fun block(mut self, body: Vec<u64>) -> Result<Block, String> {
         locals_before := self.visible
         start := self.statements.len()
+        self.open_frame()
         mut falls := true
         mut position: u64 = 0
         while position < body.len() && falls {
             falls = !self.statement(body[position])?
             position += 1
+        }
+        deferred := self.close_frame()?
+        // A body that does not fall through leaves the deferred bodies unreachable, and the
+        // guard drops statements after such a point.
+        when falls {
+            for item in deferred {
+                self.statements.push(item)
+            }
         }
         // The block's owned strings are dropped while still visible; then the block's names go
         // out of scope. Their slots are not reused.
@@ -1093,7 +1190,9 @@ extend Lowering {
         self.declare(Local { name: name, slot: variable_slot, ty: ty.clone(), mutable: false })
         self.loop_depth += 1
         self.loop_floors.push(visible_before)
+        self.loop_frames.push(self.frame_marks.len())
         body_block := self.block(body)?
+        self.loop_frames.pop()
         self.loop_floors.pop()
         self.loop_depth -= 1
         self.visible = visible_before
@@ -1117,6 +1216,22 @@ extend Lowering {
         return Result::Ok(false)
     }
 
+    fun defer_statement(mut self, body: Vec<u64>) -> Result<bool, String> {
+        when self.frame_marks.is_empty() {
+            return Result::Err(unsupported("defer outside a block"))
+        }
+        entry := Deferred { body: body, visible: self.visible }
+        when self.defer_count < self.defers.len() {
+            self.defers.set(self.defer_count, entry)
+        } else {
+            self.defers.push(entry)
+        }
+        self.defer_count += 1
+        // The placeholder is an empty block; the guard completes it with its drop.
+        self.statements.push(String("Block 1 Drop 0"))
+        return Result::Ok(false)
+    }
+
     fun while_statement(mut self, condition: u64, body: Vec<u64>) -> Result<bool, String> {
         test := self.expression(condition, String("Bool"))?
         when test.ty != "Bool" {
@@ -1124,7 +1239,9 @@ extend Lowering {
         }
         self.loop_depth += 1
         self.loop_floors.push(self.visible)
+        self.loop_frames.push(self.frame_marks.len())
         body_block := self.block(body)?
+        self.loop_frames.pop()
         self.loop_floors.pop()
         self.loop_depth -= 1
         mut tokens: Vec<String> = Vec()
@@ -1165,8 +1282,19 @@ extend Lowering {
         when self.loop_depth == 0 {
             return Result::Err(unsupported("break or continue outside a loop"))
         }
-        self.statements.push(self.owned_drop(self.loop_floor()))
-        self.statements.push(word)
+        leaving := self.run_defers(self.frame_start(self.loop_frames[self.loop_frames.len() - 1]))?
+        mut items: Vec<String> = Vec()
+        for item in leaving {
+            items.push(item)
+        }
+        items.push(self.owned_drop(self.loop_floor()))
+        items.push(word)
+        when items.len() == 2 {
+            self.statements.push(items[0].clone())
+            self.statements.push(items[1].clone())
+            return Result::Ok(true)
+        }
+        self.statements.push(join(block_of(items)))
         return Result::Ok(true)
     }
 
@@ -1197,6 +1325,7 @@ extend Lowering {
             ast::Stmt::WhileS(condition, body, span) => self.while_statement(condition, body),
             ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => self.for_statement(name, start, end, inclusive, body),
             ast::Stmt::BreakS(span) => self.jump_statement(String("Break")),
+            ast::Stmt::DeferS(body, span) => self.defer_statement(body),
             ast::Stmt::ContinueS(span) => self.jump_statement(String("Continue")),
             _ => Result::Err(unsupported("statement")),
         }
@@ -1275,14 +1404,37 @@ extend Lowering {
 
     fun return_statement(mut self, value: Option<u64>, span: ast::Span) -> Result<bool, String> {
         when value.is_none() {
-            self.statements.push(String("Return -"))
+            leaving := self.run_defers(self.frame_start(0))?
+            when leaving.is_empty() {
+                self.statements.push(String("Return -"))
+            } else {
+                mut items: Vec<String> = Vec()
+                for item in leaving {
+                    items.push(item)
+                }
+                items.push(String("Return -"))
+                self.statements.push(join(block_of(items)))
+            }
             return Result::Ok(true)
         }
         when self.return_ty.is_empty() {
             return Result::Err(unsupported("return value without a result type"))
         }
         lowered := self.moved_expression(value.unwrap(), self.return_ty.clone())?
-        self.statements.push(join(words3(String("Return"), String("+"), lowered.text)))
+        leaving := self.run_defers(self.frame_start(0))?
+        when leaving.is_empty() {
+            self.statements.push(join(words3(String("Return"), String("+"), lowered.text)))
+            return Result::Ok(true)
+        }
+        // The value is computed before the deferred bodies run, so they cannot change it.
+        slot := self.allocate(self.return_ty.clone())?
+        mut items: Vec<String> = Vec()
+        items.push(join(words6(String("Let"), num(slot), self.return_ty.clone(), lowered.text, num(span.start), num(span.end))))
+        for item in leaving {
+            items.push(item)
+        }
+        items.push(join(words3(String("Return"), String("+"), join(words5(String("Local"), num(slot), self.return_ty.clone(), num(span.start), num(span.end))))))
+        self.statements.push(join(block_of(items)))
         return Result::Ok(true)
     }
 }
@@ -1422,6 +1574,10 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         loop_depth: 0,
         visible: 0,
         loop_floors: Vec(),
+        defers: Vec(),
+        defer_count: 0,
+        frame_marks: Vec(),
+        loop_frames: Vec(),
         structs: structs,
         type_names: type_names,
         type_words: type_words,
@@ -1447,6 +1603,10 @@ extend Lowering {
         self.loop_depth = 0
         self.visible = 0
         self.loop_floors = Vec()
+        self.defer_count = 0
+        self.frame_marks = Vec()
+        self.loop_frames = Vec()
+        self.open_frame()
         definition := self.program.function_defs[self.program.functions[id]]
         mut parameters: Vec<String> = Vec()
         mut parameter_index: u64 = 0
@@ -1465,13 +1625,31 @@ extend Lowering {
             falls_through = !self.statement(definition.body[position])?
             position += 1
         }
+        // The function's own defers run after its body, and after the result is computed.
+        mut deferred := self.close_frame()?
+        when !falls_through {
+            deferred = no_items()
+        }
         when definition.return_value.is_some() {
             when self.return_ty.is_empty() {
                 return Result::Err(unsupported("result expression without a result type"))
             }
             lowered := self.expression(definition.return_value.unwrap(), self.return_ty.clone())?
-            self.statements.push(join(words3(String("Return"), String("+"), lowered.text)))
+            when deferred.is_empty() {
+                self.statements.push(join(words3(String("Return"), String("+"), lowered.text)))
+            } else {
+                slot := self.allocate(self.return_ty.clone())?
+                self.statements.push(join(words6(String("Let"), num(slot), self.return_ty.clone(), lowered.text, num(definition.span.start), num(definition.span.end))))
+                for item in deferred {
+                    self.statements.push(item)
+                }
+                self.statements.push(join(words3(String("Return"), String("+"), join(words5(String("Local"), num(slot), self.return_ty.clone(), num(definition.span.start), num(definition.span.end))))))
+            }
             falls_through = false
+        } else {
+            for item in deferred {
+                self.statements.push(item)
+            }
         }
         when !self.return_ty.is_empty() && falls_through {
             return Result::Err(unsupported("function must return a value"))

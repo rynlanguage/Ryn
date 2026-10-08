@@ -195,3 +195,13 @@ generator:
   an owned argument, and a moved local) lowered identically to `sema`. The corpus
   programs with owned strings also use `defer` or `String` methods, so the gate count is
   unchanged.
+- Stage 2, step 6 (done): `defer`. A `defer` registers its body with the locals it
+  saw and leaves the placeholder `Block 1 Drop 0` that the guard completes. A block runs
+  its own defers after its statements, and a `return` computes its value into a fresh
+  slot before the pending defers (last registered first) run, then returns it. `break`
+  and `continue` run the defers of the loop's frames inside a block with their drop. A
+  function's own defers run after its body, or after the result expression through a
+  `let`. Defers that follow a body that does not fall through are dropped, as the guard
+  drops unreachable statements. Two corpus programs now lower to identical IR (24 in
+  total), and a scratch program with `break`, `continue`, defers in a branch, and a tail
+  result matched sema.
