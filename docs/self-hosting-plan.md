@@ -143,3 +143,10 @@ generator:
   through, so an empty `else` is a single `Drop 0`, as `guard::check` produces.
   Declarations inside a branch are still declined, because they need scope handling.
   Ten corpus programs now lower to identical IR, including `conditions`.
+- Stage 2, step 3d (done): the subset gained `while`, `break`, and `continue`
+  (each `break`/`continue` is preceded by its `Drop 0`), integer negation, and
+  block-scoped declarations (a block's names go out of scope at its end, and its
+  slots are not reused). Statements after one that does not fall through are not
+  lowered, as sema omits them. `-N` folds into one literal only when N alone is out of
+  range for the type, which is how sema writes the smallest value of a type. Fifteen
+  corpus programs now lower to identical IR.

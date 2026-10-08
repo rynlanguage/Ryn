@@ -41,6 +41,8 @@ pub struct Lowering {
     next_slot: u64,
     statements: Vec<String>,
     return_ty: String,
+    loop_depth: u64,
+    visible: u64,
 }
 
 // Joins tokens with single spaces. A token may hold spaces itself, as a length-prefixed string does.
@@ -126,6 +128,18 @@ fun operator_word(op: String) -> Result<String, String> {
         return Result::Ok(op)
     }
     return Result::Err(unsupported("operator"))
+}
+
+// `-N` folds into one literal only when N alone is out of range for the type, as sema does for
+// the smallest value of a type. Otherwise the negation stays a separate node.
+fun needs_folding(value: u64, ty: String) -> bool {
+    when ty == "I32" {
+        return value > 2147483647
+    }
+    when ty == "I64" {
+        return value > 9223372036854775807
+    }
+    return false
 }
 
 fun is_comparison(op: String) -> bool {
@@ -255,8 +269,19 @@ fun enum_records() -> Vec<String> {
 }
 
 extend Lowering {
+    // Adds a local to the visible scope, reusing a hidden entry when one is there.
+    fun declare(mut self, local: Local) {
+        slot_index := self.visible
+        when slot_index < self.locals.len() {
+            self.locals.set(slot_index, local)
+        } else {
+            self.locals.push(local)
+        }
+        self.visible += 1
+    }
+
     fun find(self, name: String) -> Result<u64, String> {
-        mut index: u64 = self.locals.len()
+        mut index: u64 = self.visible
         while index > 0 {
             index -= 1
             when self.locals[index].name == name {
@@ -268,7 +293,7 @@ extend Lowering {
 
     fun declared(self, name: String) -> bool {
         mut index: u64 = 0
-        while index < self.locals.len() {
+        while index < self.visible {
             when self.locals[index].name == name {
                 return true
             }
@@ -320,6 +345,7 @@ extend Lowering {
             ast::Expr::BinaryE(op, left, right, span) => self.binary_result_type(op, left, right),
             ast::Expr::BoolLit(value, span) => Result::Ok(String("Bool")),
             ast::Expr::NotE(value, span) => Result::Ok(String("Bool")),
+            ast::Expr::NegateE(value, span) => self.infer(value),
             ast::Expr::IntLit(value, span) => Result::Ok(String("")),
             ast::Expr::StrLit(text, span) => Result::Ok(String("Str")),
             ast::Expr::CallE(name, type_arguments, arguments, span) => self.call_result_type(name),
@@ -371,6 +397,7 @@ extend Lowering {
             ast::Expr::BinaryE(op, left, right, span) => self.binary(op, left, right, expected),
             ast::Expr::BoolLit(value, span) => self.boolean_literal(value, expected),
             ast::Expr::NotE(value, span) => self.negation(value, expected),
+            ast::Expr::NegateE(value, span) => self.arithmetic_negation(value, expected),
             ast::Expr::CallE(name, type_arguments, arguments, span) => self.call(name, type_arguments, arguments, expected),
             _ => Result::Err(unsupported("expression")),
         }
@@ -410,6 +437,56 @@ extend Lowering {
             bit = 1
         }
         return Result::Ok(Lowered { text: join(words2(String("Boolean"), num(bit))), ty: String("Bool") })
+    }
+
+    fun arithmetic_negation(mut self, value: u64, expected: String) -> Result<Lowered, String> {
+        literal := self.literal_value(value)
+        when literal.is_some() {
+            mut literal_ty := expected.clone()
+            when literal_ty.is_empty() {
+                literal_ty = String("I64")
+            }
+            when needs_folding(literal.unwrap(), literal_ty) {
+                return self.negative_integer(literal.unwrap(), expected)
+            }
+        }
+        mut ty := expected.clone()
+        when ty.is_empty() {
+            ty = self.infer(value)?
+        }
+        when ty.is_empty() {
+            ty = String("I64")
+        }
+        when !is_integer_word(ty.clone()) {
+            return Result::Err(unsupported("negation of this type"))
+        }
+        operand := self.expression(value, ty.clone())?
+        when operand.ty != ty {
+            return Result::Err(unsupported("negation operand type"))
+        }
+        return Result::Ok(Lowered { text: join(words3(String("Negate"), operand.text, ty.clone())), ty: ty })
+    }
+
+    // The value of an integer literal expression, if it is one.
+    fun literal_value(self, index: u64) -> Option<u64> {
+        choose self.program.exprs[index] {
+            ast::Expr::IntLit(value, span) => Option::Some(value),
+            _ => Option::None,
+        }
+    }
+
+    // `-N` for a literal N is one literal with a negative value.
+    fun negative_integer(self, value: u64, expected: String) -> Result<Lowered, String> {
+        mut ty := expected.clone()
+        when ty.is_empty() {
+            ty = String("I64")
+        }
+        when !is_integer_word(ty.clone()) {
+            return Result::Err(unsupported("integer type"))
+        }
+        mut text := String("-")
+        text.append(String(value))
+        return Result::Ok(Lowered { text: join(words3(String("Integer"), text, ty.clone())), ty: ty })
     }
 
     fun negation(mut self, value: u64, expected: String) -> Result<Lowered, String> {
@@ -540,15 +617,16 @@ extend Lowering {
     // Lowers the statements of one branch. A branch that falls through ends with `Drop 0`,
     // as `guard::check` adds it to a nested block. Declarations are left to the later subset.
     fun block(mut self, body: Vec<u64>) -> Result<Block, String> {
-        locals_before := self.locals.len()
+        locals_before := self.visible
         start := self.statements.len()
         mut falls := true
-        for statement in body {
-            falls = !self.statement(statement)?
+        mut position: u64 = 0
+        while position < body.len() && falls {
+            falls = !self.statement(body[position])?
+            position += 1
         }
-        when self.locals.len() != locals_before {
-            return Result::Err(unsupported("declaration inside a branch"))
-        }
+        // Declarations in a block go out of scope when it ends; their slots are not reused.
+        self.visible = locals_before
         when falls {
             self.statements.push(String("Drop 0"))
         }
@@ -587,6 +665,37 @@ extend Lowering {
         return Result::Ok(!(then_block.falls || else_block.falls))
     }
 
+    fun while_statement(mut self, condition: u64, body: Vec<u64>) -> Result<bool, String> {
+        test := self.expression(condition, String("Bool"))?
+        when test.ty != "Bool" {
+            return Result::Err(unsupported("condition is not a boolean"))
+        }
+        self.loop_depth += 1
+        body_block := self.block(body)?
+        self.loop_depth -= 1
+        mut tokens: Vec<String> = Vec()
+        tokens.push(String("While"))
+        tokens.push(String("0"))
+        tokens.push(test.text)
+        tokens.push(num(body_block.items.len()))
+        for item in body_block.items {
+            tokens.push(item)
+        }
+        self.statements.push(join(tokens))
+        // A loop may run zero times, so control always continues after it.
+        return Result::Ok(false)
+    }
+
+    // `break` and `continue` leave their scopes, so `guard::check` emits a drop before each.
+    fun jump_statement(mut self, word: String) -> Result<bool, String> {
+        when self.loop_depth == 0 {
+            return Result::Err(unsupported("break or continue outside a loop"))
+        }
+        self.statements.push(String("Drop 0"))
+        self.statements.push(word)
+        return Result::Ok(true)
+    }
+
     fun template_part(mut self, index: u64) -> Result<String, String> {
         choose self.program.parts[index] {
             ast::TemplatePart::TextPart(text) => text_part(text),
@@ -610,6 +719,9 @@ extend Lowering {
             ast::Stmt::ReturnS(value, span) => self.return_statement(value, span),
             ast::Stmt::CallS(name, type_arguments, arguments, span) => self.call_statement(name, type_arguments, arguments),
             ast::Stmt::IfS(condition, then_body, else_body, span) => self.if_statement(condition, then_body, else_body),
+            ast::Stmt::WhileS(condition, body, span) => self.while_statement(condition, body),
+            ast::Stmt::BreakS(span) => self.jump_statement(String("Break")),
+            ast::Stmt::ContinueS(span) => self.jump_statement(String("Continue")),
             _ => Result::Err(unsupported("statement")),
         }
     }
@@ -631,7 +743,7 @@ extend Lowering {
             return Result::Err(unsupported("redeclared name"))
         }
         slot := self.allocate(ty.clone())?
-        self.locals.push(Local { name: name, slot: slot, ty: ty.clone(), mutable: mutable })
+        self.declare(Local { name: name, slot: slot, ty: ty.clone(), mutable: mutable })
         self.statements.push(join(words6(String("Let"), num(slot), ty, lowered.text, num(span.start), num(span.end))))
         return Result::Ok(false)
     }
@@ -757,6 +869,8 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         next_slot: 0,
         statements: Vec(),
         return_ty: String(""),
+        loop_depth: 0,
+        visible: 0,
     }
     mut functions: Vec<String> = Vec()
     mut id: u64 = 0
@@ -776,6 +890,8 @@ extend Lowering {
         self.next_slot = 0
         self.statements = Vec()
         self.return_ty = self.signatures[id].ret.clone()
+        self.loop_depth = 0
+        self.visible = 0
         definition := self.program.function_defs[self.program.functions[id]]
         mut parameters: Vec<String> = Vec()
         mut parameter_index: u64 = 0
@@ -783,14 +899,16 @@ extend Lowering {
             parameter := self.program.parameters[definition.parameters[parameter_index]]
             ty := self.signatures[id].params[parameter_index].clone()
             slot := self.allocate(ty.clone())?
-            self.locals.push(Local { name: parameter.name, slot: slot, ty: ty.clone(), mutable: false })
+            self.declare(Local { name: parameter.name, slot: slot, ty: ty.clone(), mutable: false })
             parameters.push(num(slot))
             parameters.push(ty)
             parameter_index += 1
         }
         mut falls_through := true
-        for statement in definition.body {
-            falls_through = !self.statement(statement)?
+        mut position: u64 = 0
+        while position < definition.body.len() && falls_through {
+            falls_through = !self.statement(definition.body[position])?
+            position += 1
         }
         when definition.return_value.is_some() {
             when self.return_ty.is_empty() {
