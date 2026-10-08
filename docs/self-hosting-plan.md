@@ -77,3 +77,21 @@ generator:
   `Vec` of enums was rejected (`R0234`) and is now supported, including
   `Vec<Option<T>>`, with clone/drop callbacks (`tests/vec_of_enum.rs`), so the IR
   data model can use enum node lists instead of an index arena of structs.
+- Stage 2, step 2 (done): `selfhost/ir_roundtrip` is a Ryn implementation of the
+  IR data model and its text decoder and encoder (`src/ir.ryn`). `decode_ir`
+  consumes the text in the order `src/ir_codec.rs` writes it, and `encode_ir`
+  writes it back. `tests/ryn_ir_roundtrip.rs` builds the tool with the compiler
+  under test and requires every analysable pass fixture and example to round-trip
+  byte for byte, and truncated, short, corrupted, and UTF-8-splitting texts to be
+  rejected. Recursive nodes live in flat arenas (`Program.exprs`, `stmts`, `types`,
+  `parts`, `arms`) and refer to each other by index.
+  Known simplifications, to be closed before the Ryn IR feeds semantic analysis:
+  operation names are kept as their text tokens, not typed enums; integer
+  literals are kept as their decimal text because the IR holds `i128`; the
+  decoder does not validate operation names (the Rust decoder still does).
+- Language gaps found while porting the decoder: a variant cannot hold a `Vec`
+  of its own enum (`R0234`), so recursive IR needs arenas; `choose` arms take
+  expressions only and `choose` cannot match `String` literals; a `choose` must
+  be the last expression of its function; assignment through a nested field
+  path (`self.a.b = x`) is rejected on a borrowed receiver, so records are built
+  as whole values instead.

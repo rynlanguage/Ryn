@@ -1,0 +1,10 @@
+name: ryn-ir-roundtrip
+version: 0.1.0
+owner: rynlanguage
+
+dependencies:
+
+build:
+  optimize: speed
+  debug: none
+  release: speed
