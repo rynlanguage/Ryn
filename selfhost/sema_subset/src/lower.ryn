@@ -41,6 +41,14 @@ pub struct Place {
     mutable: bool,
 }
 
+// An enum: its variant names and field counts, and every variant's field types in order.
+pub struct EnumInfo {
+    name: String,
+    variant_names: Vec<String>,
+    variant_counts: Vec<u64>,
+    field_types: Vec<String>,
+}
+
 // A `defer` body, with the locals that were visible where it was written.
 pub struct Deferred {
     body: Vec<u64>,
@@ -65,6 +73,8 @@ pub struct Lowering {
     loop_depth: u64,
     visible: u64,
     loop_floors: Vec<u64>,
+    owners: Vec<String>,
+    enums: Vec<EnumInfo>,
     defers: Vec<Deferred>,
     defer_count: u64,
     frame_marks: Vec<u64>,
@@ -202,6 +212,23 @@ fun is_logical(op: String) -> bool {
 
 fun is_integer_word(ty: String) -> bool {
     return ty == "I8" || ty == "I16" || ty == "I32" || ty == "I64" || ty == "U8" || ty == "U16" || ty == "U32" || ty == "U64"
+}
+
+// The enum id of an `Enum <id>` type word.
+fun enum_id_of(ty: String) -> Option<u64> {
+    when ty.len() <= 5 || ty.slice(0, 5) != "Enum " {
+        return Option::None
+    }
+    parsed := ty.slice(5, ty.len()).try_parse::<u64>()
+    when parsed.is_none() {
+        return Option::None
+    }
+    return Option::Some(parsed.unwrap())
+}
+
+// Types whose values own storage and are dropped at the end of their scope.
+fun is_owned_type(ty: String) -> bool {
+    return ty == "OwnedString" || enum_id_of(ty).is_some()
 }
 
 fun is_signed_word(ty: String) -> bool {
@@ -395,37 +422,51 @@ extend Lowering {
         self.addressed += 1
         when ty == "I8" || ty == "U8" {
             self.local_types.push(String("I8"))
+            self.owners.push(String(""))
             self.next_slot += 1
             return Result::Ok(slot)
         }
         when ty == "I16" || ty == "U16" {
             self.local_types.push(String("I16"))
+            self.owners.push(String(""))
             self.next_slot += 1
             return Result::Ok(slot)
         }
         when ty == "I32" || ty == "U32" {
             self.local_types.push(String("I32"))
+            self.owners.push(String(""))
             self.next_slot += 1
             return Result::Ok(slot)
         }
         when ty == "I64" || ty == "U64" {
             self.local_types.push(String("I64"))
+            self.owners.push(String(""))
             self.next_slot += 1
             return Result::Ok(slot)
         }
         when ty == "Bool" {
             self.local_types.push(String("I8"))
+            self.owners.push(String(""))
+            self.next_slot += 1
+            return Result::Ok(slot)
+        }
+        when enum_id_of(ty.clone()).is_some() {
+            self.local_types.push(String("OwnedPtr"))
+            self.owners.push(ty.clone())
             self.next_slot += 1
             return Result::Ok(slot)
         }
         when ty == "OwnedString" {
             self.local_types.push(String("OwnedPtr"))
+            self.owners.push(String("OwnedString"))
             self.next_slot += 1
             return Result::Ok(slot)
         }
         when ty == "Str" {
             self.local_types.push(String("Ptr"))
+            self.owners.push(String(""))
             self.local_types.push(String("I64"))
+            self.owners.push(String(""))
             self.next_slot += 2
             return Result::Ok(slot)
         }
@@ -639,7 +680,7 @@ extend Lowering {
     fun moved_name(mut self, expression: u64, name: String, expected: String) -> Result<Lowered, String> {
         index := self.find(name)?
         ty := self.locals[index].ty.clone()
-        when ty != "OwnedString" {
+        when !is_owned_type(ty.clone()) {
             return self.expression(expression, expected)
         }
         when !expected.is_empty() && expected != ty {
@@ -647,6 +688,101 @@ extend Lowering {
         }
         slot := self.locals[index].slot
         return Result::Ok(Lowered { text: join(words3(String("Move"), num(slot), ty.clone())), ty: ty })
+    }
+
+    fun enum_index(self, name: String) -> Result<u64, String> {
+        mut id: u64 = 0
+        while id < self.enums.len() {
+            when self.enums[id].name == name {
+                return Result::Ok(id)
+            }
+            id += 1
+        }
+        return Result::Err(unsupported("unknown enum"))
+    }
+
+    fun enum_type(self, name: String) -> Result<String, String> {
+        id := self.enum_index(name)?
+        return Result::Ok(join(words2(String("Enum"), num(id))))
+    }
+
+    fun variant_index(self, id: u64, name: String) -> Result<u64, String> {
+        mut variant: u64 = 0
+        while variant < self.enums[id].variant_names.len() {
+            when self.enums[id].variant_names[variant] == name {
+                return Result::Ok(variant)
+            }
+            variant += 1
+        }
+        return Result::Err(unsupported("unknown variant"))
+    }
+
+    // The index of a variant's first field among all the enum's fields.
+    fun variant_field_start(self, id: u64, variant: u64) -> u64 {
+        mut start: u64 = 0
+        mut earlier: u64 = 0
+        while earlier < variant {
+            start += self.enums[id].variant_counts[earlier]
+            earlier += 1
+        }
+        return start
+    }
+
+    // `Enum::Variant(args)`: an `EnumNew` call that owns the new value.
+    fun enum_construct(mut self, name: String, variant_name: String, arguments: Vec<u64>, expected: String) -> Result<Lowered, String> {
+        id := self.enum_index(name)?
+        variant := self.variant_index(id, variant_name)?
+        ty := join(words2(String("Enum"), num(id)))
+        when !expected.is_empty() && expected != ty {
+            return Result::Err(unsupported("enum where another type is expected"))
+        }
+        when arguments.len() != self.enums[id].variant_counts[variant] {
+            return Result::Err(unsupported("enum constructor arguments"))
+        }
+        start := self.variant_field_start(id, variant)
+        mut tokens: Vec<String> = Vec()
+        tokens.push(String("Call"))
+        tokens.push(String("EnumNew"))
+        tokens.push(num(id))
+        tokens.push(num(variant))
+        tokens.push(num(arguments.len()))
+        mut position: u64 = 0
+        while position < arguments.len() {
+            field_ty := self.enums[id].field_types[start + position].clone()
+            value := self.moved_expression(arguments[position], field_ty.clone())?
+            when value.ty != field_ty {
+                return Result::Err(unsupported("enum field type"))
+            }
+            tokens.push(value.text)
+            position += 1
+        }
+        tokens.push(ty.clone())
+        return Result::Ok(Lowered { text: join(tokens), ty: ty })
+    }
+
+    // The IR records for the program's enums, in source order.
+    fun user_enum_records(self) -> Vec<String> {
+        mut records: Vec<String> = Vec()
+        mut id: u64 = 0
+        while id < self.enums.len() {
+            mut tokens: Vec<String> = Vec()
+            tokens.push(length_prefixed(self.enums[id].name.clone()))
+            tokens.push(num(self.enums[id].variant_names.len()))
+            mut variant: u64 = 0
+            while variant < self.enums[id].variant_names.len() {
+                tokens.push(length_prefixed(self.enums[id].variant_names[variant].clone()))
+                tokens.push(num(self.enums[id].variant_counts[variant]))
+                mut field: u64 = 0
+                while field < self.enums[id].variant_counts[variant] {
+                    tokens.push(self.enums[id].field_types[self.variant_field_start(id, variant) + field].clone())
+                    field += 1
+                }
+                variant += 1
+            }
+            records.push(join(tokens))
+            id += 1
+        }
+        return records
     }
 
     fun field_type(self, value: u64, name: String) -> Result<String, String> {
@@ -772,6 +908,7 @@ extend Lowering {
             ast::Expr::CastE(value, ty, span) => self.annotation(ty),
             ast::Expr::FieldE(value, name, name_span, span) => self.field_type(value, name),
             ast::Expr::IfE(condition, then_value, else_value, span) => self.if_type(then_value, else_value),
+            ast::Expr::EnumE(enum_name, variant, arguments, span) => self.enum_type(enum_name),
             ast::Expr::StructLit(name, fields, span) => self.struct_literal_type(name),
             ast::Expr::IntLit(value, span) => Result::Ok(String("")),
             ast::Expr::StrLit(text, span) => Result::Ok(String("Str")),
@@ -828,6 +965,7 @@ extend Lowering {
             ast::Expr::CastE(value, ty, span) => self.cast(value, ty, expected),
             ast::Expr::FieldE(value, name, name_span, span) => self.field_read(value, name, span, expected),
             ast::Expr::IfE(condition, then_value, else_value, span) => self.if_expression(condition, then_value, else_value, expected),
+            ast::Expr::EnumE(enum_name, variant, arguments, span) => self.enum_construct(enum_name, variant, arguments, expected),
             ast::Expr::StructLit(name, fields, span) => self.struct_literal(name, fields, expected),
             ast::Expr::CallE(name, type_arguments, arguments, span) => self.call(name, type_arguments, arguments, expected),
             _ => Result::Err(unsupported("expression")),
@@ -1064,6 +1202,11 @@ extend Lowering {
             return Result::Err(unsupported("generic call"))
         }
         when self.signature_index(name.clone()).is_err() {
+            // `Enum::Variant(args)` is a call by name, and constructs the variant.
+            parts := name.split("::")
+            when parts.len() == 2 {
+                return self.enum_construct(parts[0].clone(), parts[1].clone(), arguments, expected)
+            }
             return self.builtin_call(name, arguments, expected)
         }
         id := self.signature_index(name)?
@@ -1263,7 +1406,7 @@ extend Lowering {
         mut index: u64 = self.visible
         while index > floor {
             index -= 1
-            when self.locals[index].ty == "OwnedString" {
+            when is_owned_type(self.locals[index].ty.clone()) {
                 slots.push(num(self.locals[index].slot))
                 slots.push(self.locals[index].ty.clone())
             }
@@ -1479,7 +1622,7 @@ fun resolve_type(node: ast::TypeNode, names: Vec<String>, words: Vec<String>) ->
 // Lowers the program's functions, in source order, and returns the complete IR text, or
 // `unsupported: ...` when the program is outside the subset.
 pub fun lower_program(program: ast::Program) -> Result<String, String> {
-    when !program.uses.is_empty() || !program.enums.is_empty() {
+    when !program.uses.is_empty() {
         return Result::Err(unsupported("items other than functions"))
     }
     when !program.extends.is_empty() || !program.shapes.is_empty() {
@@ -1493,6 +1636,16 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         type_names.push(definition.name.clone())
         type_words.push(struct_word(struct_position))
         struct_position += 1
+    }
+    mut enum_position: u64 = 0
+    while enum_position < program.enums.len() {
+        definition := program.enum_defs[program.enums[enum_position]]
+        when !definition.type_parameters.is_empty() || !definition.module_path.is_empty() {
+            return Result::Err(unsupported("generic or module enum"))
+        }
+        type_names.push(definition.name.clone())
+        type_words.push(join(words2(String("Enum"), num(enum_position))))
+        enum_position += 1
     }
     mut alias_position: u64 = 0
     while alias_position < program.type_aliases.len() {
@@ -1520,6 +1673,9 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
             field := program.struct_fields[definition.fields[field_position]]
             field_names.push(field.name)
             field_types.push(resolve_type(program.types[field.ty], type_names.clone(), type_words.clone())?)
+            when is_owned_type(field_types[field_position].clone()) {
+                return Result::Err(unsupported("structure with an owned field"))
+            }
             mut public: u64 = 0
             when field.public {
                 public = 1
@@ -1529,6 +1685,28 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         }
         structs.push(StructInfo { name: definition.name, field_names: field_names, field_types: field_types, field_public: field_public })
         struct_index += 1
+    }
+    mut enums: Vec<EnumInfo> = Vec()
+    mut enum_index: u64 = 0
+    while enum_index < program.enums.len() {
+        definition := program.enum_defs[program.enums[enum_index]]
+        mut variant_names: Vec<String> = Vec()
+        mut variant_counts: Vec<u64> = Vec()
+        mut field_types: Vec<String> = Vec()
+        mut variant_position: u64 = 0
+        while variant_position < definition.variants.len() {
+            variant := program.variant_defs[definition.variants[variant_position]]
+            variant_names.push(variant.name.clone())
+            variant_counts.push(variant.fields.len())
+            mut field_position: u64 = 0
+            while field_position < variant.fields.len() {
+                field_types.push(resolve_type(program.types[variant.fields[field_position]], type_names.clone(), type_words.clone())?)
+                field_position += 1
+            }
+            variant_position += 1
+        }
+        enums.push(EnumInfo { name: definition.name, variant_names: variant_names, variant_counts: variant_counts, field_types: field_types })
+        enum_index += 1
     }
     count := program.functions.len()
     mut signatures: Vec<Signature> = Vec()
@@ -1574,11 +1752,13 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         loop_depth: 0,
         visible: 0,
         loop_floors: Vec(),
+        owners: Vec(),
         defers: Vec(),
         defer_count: 0,
         frame_marks: Vec(),
         loop_frames: Vec(),
         structs: structs,
+        enums: enums,
         type_names: type_names,
         type_words: type_words,
     }
@@ -1588,7 +1768,11 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         functions.push(lowering.function(id)?)
         id += 1
     }
-    return Result::Ok(assemble(main_index, lowering.struct_records(), functions, enum_records()))
+    mut all_enums: Vec<String> = lowering.user_enum_records()
+    for record in enum_records() {
+        all_enums.push(record)
+    }
+    return Result::Ok(assemble(main_index, lowering.struct_records(), functions, all_enums))
 }
 
 extend Lowering {
@@ -1603,6 +1787,7 @@ extend Lowering {
         self.loop_depth = 0
         self.visible = 0
         self.loop_floors = Vec()
+        self.owners = Vec()
         self.defer_count = 0
         self.frame_marks = Vec()
         self.loop_frames = Vec()
@@ -1695,11 +1880,11 @@ extend Lowering {
         tokens.push(num(local_count))
         index = 0
         while index < local_count {
-            when self.local_types[index] == "OwnedPtr" {
-                tokens.push(String("+"))
-                tokens.push(String("OwnedString"))
-            } else {
+            when self.owners[index].is_empty() {
                 tokens.push(String("-"))
+            } else {
+                tokens.push(String("+"))
+                tokens.push(self.owners[index].clone())
             }
             index += 1
         }

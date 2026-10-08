@@ -205,3 +205,11 @@ generator:
   drops unreachable statements. Two corpus programs now lower to identical IR (24 in
   total), and a scratch program with `break`, `continue`, defers in a branch, and a tail
   result matched sema.
+- Stage 2, step 7 (verified by hand, no corpus program yet): user enums without
+  generics. Enum definitions come first in the IR's enum section, before the builtin
+  registry, with their variants and field types. A value of an enum is an owned slot
+  (`OwnedPtr` owned by `Enum <id>`), and `Enum::Variant(args)` lowers to `EnumNew` with
+  the variant's tag, its arguments (moved when they are owned), and the enum's type;
+  a bare `Enum::Variant` is the same with no arguments. Enum locals are dropped and
+  moved like owned strings. Pattern matching (`choose`) comes next. Two scratch programs
+  with unit and tuple variants, string payloads, printing, and a move matched sema.
