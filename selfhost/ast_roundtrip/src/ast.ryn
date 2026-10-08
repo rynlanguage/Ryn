@@ -1,0 +1,2362 @@
+// The syntax tree as Ryn data, and the reader and writer for its text form.
+//
+// The text is the one `ryn::ast_codec::encode_program` writes, as the self-hosted frontend
+// emits it. Recursive nodes live in flat arenas (`Program.types`, `exprs`, `stmts`, `parts`,
+// `arms`, `inits`) and refer to one another by index. Operators and other closed word sets
+// are kept as their text tokens, validated when read.
+//
+// The bootstrap decoder rewrites `|>`, `??`, and `?.` into ordinary calls and `choose`
+// expressions. This model keeps those three forms as their own nodes, so re-encoding gives
+// back the frontend's text; the rewrite belongs to the stage that lowers the tree.
+
+struct Span {
+    start: u64,
+    end: u64,
+}
+
+// A type. `Simple` holds the word such as `i32`, `String`, or `bool`.
+enum TypeNode {
+    Simple(String),
+    NamedTy(String, Span),
+    ParamTy(String, Span),
+    VecTy(u64, Span),
+    MapTy(u64, u64, Span),
+    SetTy(u64, Span),
+    ArrayTy(u64, u64, Span),
+    SliceTy(u64, Span),
+    RefTy(u64, bool, Span),
+    RawTy(u64, Span),
+    FnPtrTy(Vec<u64>, Option<u64>, bool, Span),
+}
+
+// A `choose` arm. `body` indexes `Program.exprs`.
+struct ChooseArm {
+    enum_name: Option<String>,
+    variant: Option<String>,
+    bindings: Vec<String>,
+    body: u64,
+    span: Span,
+}
+
+// A `Struct { name: value }` initializer, stored in `Program.inits`.
+struct FieldInit {
+    name: String,
+    value: u64,
+    span: Span,
+}
+
+// An expression. Child nodes are indices into `Program.exprs`; lists are `Vec<u64>`.
+enum Expr {
+    IntLit(u64, Span),
+    FloatLit(String, Span),
+    StrLit(String, Span),
+    CharLit(u64, Span),
+    BoolLit(bool, Span),
+    NameRef(String, Span),
+    CallE(String, Vec<u64>, Vec<u64>, Span),
+    MethodCallE(u64, String, Vec<u64>, Vec<u64>, Span),
+    StructLit(String, Vec<u64>, Span),
+    FieldE(u64, String, Span, Span),
+    RangeE(u64, u64, bool, Span),
+    IfE(u64, u64, u64, Span),
+    BinaryE(String, u64, u64, Span),
+    NegateE(u64, Span),
+    NotE(u64, Span),
+    BitNotE(u64, Span),
+    AddressOfE(bool, bool, u64, Span),
+    DerefE(u64, Span),
+    CastE(u64, u64, Span),
+    LayoutE(u64, bool, Span),
+    VecNewE(u64, Span),
+    MapNewE(u64, u64, Span),
+    SetNewE(u64, Span),
+    TupleE(Vec<u64>, Span),
+    ArrayE(Vec<u64>, Span),
+    RepeatE(u64, u64, Span),
+    IndexE(u64, u64, Span),
+    PropagateE(u64, Span),
+    EnumE(String, String, Vec<u64>, Span),
+    ChooseE(u64, Vec<u64>, Span),
+    PipeE(u64, u64, Span),
+    CoalesceE(u64, u64, Span),
+    OptionalFieldE(u64, String, Span, Span),
+}
+
+// A part of a `Template` print, stored in `Program.parts`.
+enum TemplatePart {
+    TextPart(String),
+    ValuePart(u64),
+}
+
+// A statement. Bodies and child nodes are indices into the arenas.
+enum Stmt {
+    LetS(String, bool, Option<u64>, u64, Span),
+    AssignS(String, u64, Span),
+    IndexAssignS(String, u64, u64, Span),
+    DerefAssignS(u64, u64, Span),
+    FieldAssignS(String, Vec<String>, Vec<u64>, Option<String>, u64, Span),
+    CompoundS(String, String, u64, Span),
+    PrintS(u64, Span),
+    TemplateS(Vec<u64>, Span),
+    CallS(String, Vec<u64>, Vec<u64>, Span),
+    MethodCallS(u64, String, Vec<u64>, Span),
+    IfS(u64, Vec<u64>, Vec<u64>, Span),
+    WhileS(u64, Vec<u64>, Span),
+    DeferS(Vec<u64>, Span),
+    ForS(String, Span, u64, u64, bool, Vec<u64>, Span),
+    ForEachS(String, Span, u64, Vec<u64>, Span),
+    BreakS(Span),
+    ContinueS(Span),
+    ReturnS(Option<u64>, Span),
+}
+
+struct Bound {
+    name: String,
+    traits: Vec<String>,
+}
+
+struct Parameter {
+    name: String,
+    ty: u64,
+    span: Span,
+}
+
+struct Function {
+    name: String,
+    extern_c: bool,
+    external_symbol: Option<String>,
+    type_parameters: Vec<String>,
+    type_parameter_bounds: Vec<u64>,
+    public: bool,
+    module_path: String,
+    parameters: Vec<u64>,
+    return_type: Option<u64>,
+    body: Vec<u64>,
+    return_value: Option<u64>,
+    span: Span,
+}
+
+struct ShapeMethod {
+    name: String,
+    parameters: Vec<u64>,
+    return_type: Option<u64>,
+    default_body: Option<Vec<u64>>,
+    default_value: Option<u64>,
+    span: Span,
+}
+
+struct ShapeDef {
+    name: String,
+    methods: Vec<u64>,
+    module_path: String,
+    span: Span,
+}
+
+struct ConstantDef {
+    name: String,
+    ty: u64,
+    value: u64,
+    public: bool,
+    span: Span,
+}
+
+struct ExtendDef {
+    type_name: u64,
+    as_shape: Option<String>,
+    functions: Vec<u64>,
+    constants: Vec<u64>,
+    module_path: String,
+    span: Span,
+}
+
+struct TypeAliasDef {
+    name: String,
+    type_parameters: Vec<String>,
+    ty: u64,
+    public: bool,
+    module_path: String,
+    span: Span,
+}
+
+struct VariantDef {
+    name: String,
+    fields: Vec<u64>,
+    span: Span,
+}
+
+struct EnumDef {
+    name: String,
+    type_parameters: Vec<String>,
+    variants: Vec<u64>,
+    public: bool,
+    module_path: String,
+    span: Span,
+}
+
+struct StructFieldDef {
+    name: String,
+    ty: u64,
+    public: bool,
+    span: Span,
+}
+
+struct StructDef {
+    name: String,
+    type_parameters: Vec<String>,
+    fields: Vec<u64>,
+    public: bool,
+    repr_c: bool,
+    drop_function: Option<String>,
+    derives: Vec<String>,
+    module_path: String,
+    span: Span,
+}
+
+struct UseDecl {
+    path: Vec<String>,
+    span: Span,
+}
+
+// Lists of structures are indices into the arenas below, so every `Result` carries
+// only scalars or `Vec<u64>`, which the compiler accepts.
+struct Program {
+    uses: Vec<u64>,
+    structs: Vec<u64>,
+    enums: Vec<u64>,
+    type_aliases: Vec<u64>,
+    extends: Vec<u64>,
+    shapes: Vec<u64>,
+    functions: Vec<u64>,
+    use_decls: Vec<UseDecl>,
+    struct_defs: Vec<StructDef>,
+    enum_defs: Vec<EnumDef>,
+    alias_defs: Vec<TypeAliasDef>,
+    extend_defs: Vec<ExtendDef>,
+    shape_defs: Vec<ShapeDef>,
+    function_defs: Vec<Function>,
+    struct_fields: Vec<StructFieldDef>,
+    variant_defs: Vec<VariantDef>,
+    bounds: Vec<Bound>,
+    parameters: Vec<Parameter>,
+    shape_methods: Vec<ShapeMethod>,
+    constant_defs: Vec<ConstantDef>,
+    types: Vec<TypeNode>,
+    exprs: Vec<Expr>,
+    stmts: Vec<Stmt>,
+    parts: Vec<TemplatePart>,
+    arms: Vec<ChooseArm>,
+    inits: Vec<FieldInit>,
+}
+// Reads the text form. Each function consumes the tokens of one production in the order
+// `ryn::ast_codec` writes them, and pushes its nodes to the arenas after their children.
+struct Decoder {
+    text: String,
+    at: u64,
+    use_decls: Vec<UseDecl>,
+    struct_defs: Vec<StructDef>,
+    enum_defs: Vec<EnumDef>,
+    alias_defs: Vec<TypeAliasDef>,
+    extend_defs: Vec<ExtendDef>,
+    shape_defs: Vec<ShapeDef>,
+    function_defs: Vec<Function>,
+    struct_fields: Vec<StructFieldDef>,
+    variant_defs: Vec<VariantDef>,
+    bounds: Vec<Bound>,
+    parameters: Vec<Parameter>,
+    shape_methods: Vec<ShapeMethod>,
+    constant_defs: Vec<ConstantDef>,
+    types: Vec<TypeNode>,
+    exprs: Vec<Expr>,
+    stmts: Vec<Stmt>,
+    parts: Vec<TemplatePart>,
+    arms: Vec<ChooseArm>,
+    inits: Vec<FieldInit>,
+}
+
+// ASCII whitespace, as `u8::is_ascii_whitespace` in the Rust decoder.
+fun is_space_byte(byte: u8) -> bool {
+    return byte == (32 as u8) || byte == (9 as u8) || byte == (10 as u8) || byte == (12 as u8) || byte == (13 as u8)
+}
+
+fun is_simple_type_word(word: String) -> bool {
+    return word == "i8" || word == "i16" || word == "i32" || word == "i64" || word == "u8" || word == "u16" || word == "u32" || word == "u64" || word == "f32" || word == "f64" || word == "str" || word == "String" || word == "char" || word == "bool"
+}
+
+fun is_binary_op_word(word: String) -> bool {
+    return word == "Add" || word == "Sub" || word == "Mul" || word == "Div" || word == "Rem" || word == "Eq" || word == "Ne" || word == "Lt" || word == "Le" || word == "Gt" || word == "Ge" || word == "BitAnd" || word == "BitXor" || word == "BitOr" || word == "Shl" || word == "Shr" || word == "And" || word == "Or"
+}
+
+extend Decoder {
+    fun skip_spaces(mut self) {
+        while self.at < self.text.len() && is_space_byte(self.text.byte_at(self.at)) {
+            self.at += 1
+        }
+    }
+
+    fun finish(mut self) -> Result<bool, String> {
+        self.skip_spaces()
+        when self.at != self.text.len() {
+            return Result::Err(String("trailing syntax tree text"))
+        }
+        return Result::Ok(true)
+    }
+
+    fun token(mut self) -> Result<String, String> {
+        self.skip_spaces()
+        start := self.at
+        while self.at < self.text.len() && !is_space_byte(self.text.byte_at(self.at)) {
+            self.at += 1
+        }
+        when start == self.at {
+            return Result::Err(String("unexpected end of syntax tree text"))
+        }
+        return Result::Ok(self.text.slice(start, self.at))
+    }
+
+    fun expect_word(mut self, expected: str) -> Result<bool, String> {
+        found := self.token()?
+        when found != expected {
+            return Result::Err(String("unexpected word in syntax tree text"))
+        }
+        return Result::Ok(true)
+    }
+
+    fun uint(mut self) -> Result<u64, String> {
+        token := self.token()?
+        parsed := token.try_parse::<u64>()
+        when parsed.is_none() {
+            return Result::Err(String("expected an unsigned integer"))
+        }
+        return Result::Ok(parsed.unwrap())
+    }
+
+    fun boolean(mut self) -> Result<bool, String> {
+        value := self.uint()?
+        when value == 0 {
+            return Result::Ok(false)
+        }
+        when value == 1 {
+            return Result::Ok(true)
+        }
+        return Result::Err(String("expected a boolean"))
+    }
+
+    // A length-prefixed string: `<byte length>:<bytes>`.
+    fun string(mut self) -> Result<String, String> {
+        self.skip_spaces()
+        digits_start := self.at
+        while self.at < self.text.len() && self.text.byte_at(self.at) >= (48 as u8) && self.text.byte_at(self.at) <= (57 as u8) {
+            self.at += 1
+        }
+        when digits_start == self.at || self.at >= self.text.len() || self.text.byte_at(self.at) != (58 as u8) {
+            return Result::Err(String("expected a length-prefixed string"))
+        }
+        length := self.text.slice(digits_start, self.at).try_parse::<u64>()
+        when length.is_none() {
+            return Result::Err(String("string length is out of range"))
+        }
+        self.at += 1
+        end := self.at + length.unwrap()
+        when end > self.text.len() {
+            return Result::Err(String("string extends past the end of the syntax tree text"))
+        }
+        // A byte in 0x80..=0xBF continues a UTF-8 character, so the end would split it.
+        when end < self.text.len() && self.text.byte_at(end) >= (128 as u8) && self.text.byte_at(end) < (192 as u8) {
+            return Result::Err(String("string length splits a UTF-8 character"))
+        }
+        value := self.text.slice(self.at, end)
+        self.at = end
+        return Result::Ok(value)
+    }
+
+    fun span(mut self) -> Result<Span, String> {
+        start := self.uint()?
+        end := self.uint()?
+        return Result::Ok(Span { start: start, end: end })
+    }
+
+    // A list is its length followed by the items.
+    fun count(mut self) -> Result<u64, String> {
+        return self.uint()
+    }
+
+    fun strings(mut self) -> Result<Vec<String>, String> {
+        total := self.count()?
+        mut items: Vec<String> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.string()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun optional_string(mut self) -> Result<Option<String>, String> {
+        word := self.token()?
+        when word == "-" {
+            return Result::Ok(Option::None)
+        }
+        when word == "+" {
+            value := self.string()?
+            return Result::Ok(Option::Some(value))
+        }
+        return Result::Err(String("expected an optional string"))
+    }
+
+    fun optional_type(mut self) -> Result<Option<u64>, String> {
+        word := self.token()?
+        when word == "-" {
+            return Result::Ok(Option::None)
+        }
+        when word == "+" {
+            value := self.type_name()?
+            return Result::Ok(Option::Some(value))
+        }
+        return Result::Err(String("expected an optional type"))
+    }
+
+    fun optional_expr(mut self) -> Result<Option<u64>, String> {
+        word := self.token()?
+        when word == "-" {
+            return Result::Ok(Option::None)
+        }
+        when word == "+" {
+            value := self.expression()?
+            return Result::Ok(Option::Some(value))
+        }
+        return Result::Err(String("expected an optional expression"))
+    }
+
+    fun optional_statements(mut self) -> Result<Option<Vec<u64>>, String> {
+        word := self.token()?
+        when word == "-" {
+            return Result::Ok(Option::None)
+        }
+        when word == "+" {
+            value := self.statement_list()?
+            return Result::Ok(Option::Some(value))
+        }
+        return Result::Err(String("expected an optional body"))
+    }
+
+    fun push_type(mut self, node: TypeNode) -> u64 {
+        index := self.types.len()
+        self.types.push(node)
+        return index
+    }
+
+    fun push_expr(mut self, node: Expr) -> u64 {
+        index := self.exprs.len()
+        self.exprs.push(node)
+        return index
+    }
+
+    fun push_stmt(mut self, node: Stmt) -> u64 {
+        index := self.stmts.len()
+        self.stmts.push(node)
+        return index
+    }
+
+    fun push_part(mut self, node: TemplatePart) -> u64 {
+        index := self.parts.len()
+        self.parts.push(node)
+        return index
+    }
+
+    fun push_arm(mut self, node: ChooseArm) -> u64 {
+        index := self.arms.len()
+        self.arms.push(node)
+        return index
+    }
+
+    fun push_init(mut self, node: FieldInit) -> u64 {
+        index := self.inits.len()
+        self.inits.push(node)
+        return index
+    }
+
+    fun binary_op(mut self) -> Result<String, String> {
+        word := self.token()?
+        when !is_binary_op_word(word.clone()) {
+            return Result::Err(String("unknown operator"))
+        }
+        return Result::Ok(word)
+    }
+
+    fun program(mut self) -> Result<Program, String> {
+        uses := self.use_list()?
+        structs := self.struct_list()?
+        enums := self.enum_list()?
+        type_aliases := self.alias_list()?
+        extends := self.extend_list()?
+        shapes := self.shape_list()?
+        functions := self.function_list()?
+        return Result::Ok(Program {
+            uses: uses,
+            structs: structs,
+            enums: enums,
+            type_aliases: type_aliases,
+            extends: extends,
+            shapes: shapes,
+            functions: functions,
+            use_decls: self.use_decls,
+            struct_defs: self.struct_defs,
+            enum_defs: self.enum_defs,
+            alias_defs: self.alias_defs,
+            extend_defs: self.extend_defs,
+            shape_defs: self.shape_defs,
+            function_defs: self.function_defs,
+            struct_fields: self.struct_fields,
+            variant_defs: self.variant_defs,
+            bounds: self.bounds,
+            parameters: self.parameters,
+            shape_methods: self.shape_methods,
+            constant_defs: self.constant_defs,
+            types: self.types,
+            exprs: self.exprs,
+            stmts: self.stmts,
+            parts: self.parts,
+            arms: self.arms,
+            inits: self.inits,
+        })
+    }
+
+    fun use_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.use_decl()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun use_decl(mut self) -> Result<u64, String> {
+        path := self.strings()?
+        span := self.span()?
+        index := self.use_decls.len()
+        self.use_decls.push(UseDecl { path: path, span: span })
+        return Result::Ok(index)
+    }
+
+    fun struct_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.struct_def()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun struct_def(mut self) -> Result<u64, String> {
+        name := self.string()?
+        type_parameters := self.strings()?
+        fields := self.struct_field_list()?
+        public := self.boolean()?
+        repr_c := self.boolean()?
+        drop_function := self.optional_string()?
+        derives := self.strings()?
+        module_path := self.string()?
+        span := self.span()?
+        index := self.struct_defs.len()
+        self.struct_defs.push(StructDef {
+            name: name,
+            type_parameters: type_parameters,
+            fields: fields,
+            public: public,
+            repr_c: repr_c,
+            drop_function: drop_function,
+            derives: derives,
+            module_path: module_path,
+            span: span,
+        })
+        return Result::Ok(index)
+    }
+
+    fun struct_field_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.struct_field()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun struct_field(mut self) -> Result<u64, String> {
+        name := self.string()?
+        ty := self.type_name()?
+        public := self.boolean()?
+        span := self.span()?
+        index := self.struct_fields.len()
+        self.struct_fields.push(StructFieldDef { name: name, ty: ty, public: public, span: span })
+        return Result::Ok(index)
+    }
+
+    fun enum_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.enum_def()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun enum_def(mut self) -> Result<u64, String> {
+        name := self.string()?
+        type_parameters := self.strings()?
+        variants := self.variant_list()?
+        public := self.boolean()?
+        module_path := self.string()?
+        span := self.span()?
+        index := self.enum_defs.len()
+        self.enum_defs.push(EnumDef { name: name, type_parameters: type_parameters, variants: variants, public: public, module_path: module_path, span: span })
+        return Result::Ok(index)
+    }
+
+    fun variant_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.variant()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun variant(mut self) -> Result<u64, String> {
+        name := self.string()?
+        fields := self.type_list()?
+        span := self.span()?
+        index := self.variant_defs.len()
+        self.variant_defs.push(VariantDef { name: name, fields: fields, span: span })
+        return Result::Ok(index)
+    }
+
+    fun alias_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.alias_def()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun alias_def(mut self) -> Result<u64, String> {
+        name := self.string()?
+        type_parameters := self.strings()?
+        ty := self.type_name()?
+        public := self.boolean()?
+        module_path := self.string()?
+        span := self.span()?
+        index := self.alias_defs.len()
+        self.alias_defs.push(TypeAliasDef { name: name, type_parameters: type_parameters, ty: ty, public: public, module_path: module_path, span: span })
+        return Result::Ok(index)
+    }
+
+    fun extend_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.extend_def()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun extend_def(mut self) -> Result<u64, String> {
+        type_name := self.type_name()?
+        as_shape := self.optional_string()?
+        functions := self.function_list()?
+        constants := self.constant_list()?
+        module_path := self.string()?
+        span := self.span()?
+        index := self.extend_defs.len()
+        self.extend_defs.push(ExtendDef { type_name: type_name, as_shape: as_shape, functions: functions, constants: constants, module_path: module_path, span: span })
+        return Result::Ok(index)
+    }
+
+    fun constant_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.constant_def()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun constant_def(mut self) -> Result<u64, String> {
+        name := self.string()?
+        ty := self.type_name()?
+        value := self.expression()?
+        public := self.boolean()?
+        span := self.span()?
+        index := self.constant_defs.len()
+        self.constant_defs.push(ConstantDef { name: name, ty: ty, value: value, public: public, span: span })
+        return Result::Ok(index)
+    }
+
+    fun shape_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.shape_def()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun shape_def(mut self) -> Result<u64, String> {
+        name := self.string()?
+        methods := self.shape_method_list()?
+        module_path := self.string()?
+        span := self.span()?
+        index := self.shape_defs.len()
+        self.shape_defs.push(ShapeDef { name: name, methods: methods, module_path: module_path, span: span })
+        return Result::Ok(index)
+    }
+
+    fun shape_method_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.shape_method()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun shape_method(mut self) -> Result<u64, String> {
+        name := self.string()?
+        parameters := self.parameter_list()?
+        return_type := self.optional_type()?
+        default_body := self.optional_statements()?
+        default_value := self.optional_expr()?
+        span := self.span()?
+        index := self.shape_methods.len()
+        self.shape_methods.push(ShapeMethod { name: name, parameters: parameters, return_type: return_type, default_body: default_body, default_value: default_value, span: span })
+        return Result::Ok(index)
+    }
+
+    fun function_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.function()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun function(mut self) -> Result<u64, String> {
+        name := self.string()?
+        extern_c := self.boolean()?
+        external_symbol := self.optional_string()?
+        type_parameters := self.strings()?
+        bounds := self.bound_list()?
+        public := self.boolean()?
+        module_path := self.string()?
+        parameters := self.parameter_list()?
+        return_type := self.optional_type()?
+        body := self.statement_list()?
+        return_value := self.optional_expr()?
+        span := self.span()?
+        index := self.function_defs.len()
+        self.function_defs.push(Function {
+            name: name,
+            extern_c: extern_c,
+            external_symbol: external_symbol,
+            type_parameters: type_parameters,
+            type_parameter_bounds: bounds,
+            public: public,
+            module_path: module_path,
+            parameters: parameters,
+            return_type: return_type,
+            body: body,
+            return_value: return_value,
+            span: span,
+        })
+        return Result::Ok(index)
+    }
+
+    fun bound_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.bound()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun bound(mut self) -> Result<u64, String> {
+        name := self.string()?
+        traits := self.strings()?
+        index := self.bounds.len()
+        self.bounds.push(Bound { name: name, traits: traits })
+        return Result::Ok(index)
+    }
+
+    fun parameter_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.parameter()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun parameter(mut self) -> Result<u64, String> {
+        name := self.string()?
+        ty := self.type_name()?
+        span := self.span()?
+        index := self.parameters.len()
+        self.parameters.push(Parameter { name: name, ty: ty, span: span })
+        return Result::Ok(index)
+    }
+
+    fun type_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.type_name()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun expression_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.expression()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun statement_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.statement()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun type_name(mut self) -> Result<u64, String> {
+        word := self.token()?
+        when is_simple_type_word(word.clone()) {
+            return Result::Ok(self.push_type(TypeNode::Simple(word)))
+        }
+        when word == "Named" {
+            name := self.string()?
+            span := self.span()?
+            return Result::Ok(self.push_type(TypeNode::NamedTy(name, span)))
+        }
+        when word == "Param" {
+            name := self.string()?
+            span := self.span()?
+            return Result::Ok(self.push_type(TypeNode::ParamTy(name, span)))
+        }
+        when word == "Vec" {
+            element := self.type_name()?
+            span := self.span()?
+            return Result::Ok(self.push_type(TypeNode::VecTy(element, span)))
+        }
+        when word == "Map" {
+            key := self.type_name()?
+            value := self.type_name()?
+            span := self.span()?
+            return Result::Ok(self.push_type(TypeNode::MapTy(key, value, span)))
+        }
+        when word == "Set" {
+            element := self.type_name()?
+            span := self.span()?
+            return Result::Ok(self.push_type(TypeNode::SetTy(element, span)))
+        }
+        when word == "Array" {
+            element := self.type_name()?
+            length := self.uint()?
+            span := self.span()?
+            return Result::Ok(self.push_type(TypeNode::ArrayTy(element, length, span)))
+        }
+        when word == "Slice" {
+            element := self.type_name()?
+            span := self.span()?
+            return Result::Ok(self.push_type(TypeNode::SliceTy(element, span)))
+        }
+        when word == "Ref" {
+            element := self.type_name()?
+            mutable := self.boolean()?
+            span := self.span()?
+            return Result::Ok(self.push_type(TypeNode::RefTy(element, mutable, span)))
+        }
+        when word == "Raw" {
+            element := self.type_name()?
+            span := self.span()?
+            return Result::Ok(self.push_type(TypeNode::RawTy(element, span)))
+        }
+        when word == "FnPtr" {
+            parameters := self.type_list()?
+            result := self.optional_type()?
+            extern_c := self.boolean()?
+            span := self.span()?
+            return Result::Ok(self.push_type(TypeNode::FnPtrTy(parameters, result, extern_c, span)))
+        }
+        return Result::Err(String("unknown type tag"))
+    }
+
+    fun template_part(mut self) -> Result<u64, String> {
+        word := self.token()?
+        when word == "T" {
+            text := self.string()?
+            return Result::Ok(self.push_part(TemplatePart::TextPart(text)))
+        }
+        when word == "V" {
+            value := self.expression()?
+            return Result::Ok(self.push_part(TemplatePart::ValuePart(value)))
+        }
+        return Result::Err(String("unknown template part"))
+    }
+
+    fun template_part_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.template_part()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun choose_arm_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            items.push(self.choose_arm()?)
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun choose_arm(mut self) -> Result<u64, String> {
+        enum_name := self.optional_string()?
+        variant := self.optional_string()?
+        bindings := self.strings()?
+        body := self.expression()?
+        span := self.span()?
+        return Result::Ok(self.push_arm(ChooseArm { enum_name: enum_name, variant: variant, bindings: bindings, body: body, span: span }))
+    }
+
+    fun field_init_list(mut self) -> Result<Vec<u64>, String> {
+        total := self.count()?
+        mut items: Vec<u64> = Vec()
+        mut index: u64 = 0
+        while index < total {
+            name := self.string()?
+            value := self.expression()?
+            span := self.span()?
+            items.push(self.push_init(FieldInit { name: name, value: value, span: span }))
+            index += 1
+        }
+        return Result::Ok(items)
+    }
+
+    fun statement(mut self) -> Result<u64, String> {
+        word := self.token()?
+        when word == "Let" {
+            name := self.string()?
+            mutable := self.boolean()?
+            annotation := self.optional_type()?
+            value := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::LetS(name, mutable, annotation, value, span)))
+        }
+        when word == "Assign" {
+            name := self.string()?
+            value := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::AssignS(name, value, span)))
+        }
+        when word == "IndexAssign" {
+            name := self.string()?
+            index := self.expression()?
+            value := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::IndexAssignS(name, index, value, span)))
+        }
+        when word == "DerefAssign" {
+            pointer := self.expression()?
+            value := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::DerefAssignS(pointer, value, span)))
+        }
+        when word == "FieldAssign" {
+            object := self.string()?
+            total := self.count()?
+            mut names: Vec<String> = Vec()
+            mut spans: Vec<u64> = Vec()
+            mut field: u64 = 0
+            while field < total {
+                names.push(self.string()?)
+                field_span := self.span()?
+                spans.push(field_span.start)
+                spans.push(field_span.end)
+                field += 1
+            }
+            op := self.optional_binary_op()?
+            value := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::FieldAssignS(object, names, spans, op, value, span)))
+        }
+        when word == "Compound" {
+            name := self.string()?
+            op := self.binary_op()?
+            value := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::CompoundS(name, op, value, span)))
+        }
+        when word == "Print" {
+            value := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::PrintS(value, span)))
+        }
+        when word == "Template" {
+            parts := self.template_part_list()?
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::TemplateS(parts, span)))
+        }
+        when word == "Call" {
+            name := self.string()?
+            type_arguments := self.type_list()?
+            arguments := self.expression_list()?
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::CallS(name, type_arguments, arguments, span)))
+        }
+        when word == "MethodCall" {
+            value := self.expression()?
+            name := self.string()?
+            arguments := self.expression_list()?
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::MethodCallS(value, name, arguments, span)))
+        }
+        when word == "If" {
+            condition := self.expression()?
+            then_body := self.statement_list()?
+            else_body := self.statement_list()?
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::IfS(condition, then_body, else_body, span)))
+        }
+        when word == "While" {
+            condition := self.expression()?
+            body := self.statement_list()?
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::WhileS(condition, body, span)))
+        }
+        when word == "Defer" {
+            body := self.statement_list()?
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::DeferS(body, span)))
+        }
+        when word == "For" || word == "ForInclusive" {
+            inclusive := word == "ForInclusive"
+            name := self.string()?
+            name_span := self.span()?
+            start := self.expression()?
+            end := self.expression()?
+            body := self.statement_list()?
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::ForS(name, name_span, start, end, inclusive, body, span)))
+        }
+        when word == "ForEach" {
+            name := self.string()?
+            name_span := self.span()?
+            collection := self.expression()?
+            body := self.statement_list()?
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::ForEachS(name, name_span, collection, body, span)))
+        }
+        when word == "Break" {
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::BreakS(span)))
+        }
+        when word == "Continue" {
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::ContinueS(span)))
+        }
+        when word == "Return" {
+            value := self.optional_expr()?
+            span := self.span()?
+            return Result::Ok(self.push_stmt(Stmt::ReturnS(value, span)))
+        }
+        return Result::Err(String("unknown statement tag"))
+    }
+
+    fun optional_binary_op(mut self) -> Result<Option<String>, String> {
+        word := self.token()?
+        when word == "-" {
+            return Result::Ok(Option::None)
+        }
+        when word == "+" {
+            value := self.binary_op()?
+            return Result::Ok(Option::Some(value))
+        }
+        return Result::Err(String("expected an optional operator"))
+    }
+
+    fun expression(mut self) -> Result<u64, String> {
+        word := self.token()?
+        when word == "Int" {
+            value := self.uint()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::IntLit(value, span)))
+        }
+        when word == "Float" {
+            text := self.token()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::FloatLit(text, span)))
+        }
+        when word == "Str" {
+            text := self.string()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::StrLit(text, span)))
+        }
+        when word == "Char" {
+            scalar := self.uint()?
+            span := self.span()?
+            when scalar > 1114111 || (scalar >= 55296 && scalar <= 57343) {
+                return Result::Err(String("invalid character"))
+            }
+            return Result::Ok(self.push_expr(Expr::CharLit(scalar, span)))
+        }
+        when word == "Bool" {
+            value := self.boolean()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::BoolLit(value, span)))
+        }
+        when word == "Name" {
+            name := self.string()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::NameRef(name, span)))
+        }
+        when word == "Call" {
+            name := self.string()?
+            type_arguments := self.type_list()?
+            arguments := self.expression_list()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::CallE(name, type_arguments, arguments, span)))
+        }
+        when word == "MethodCall" {
+            value := self.expression()?
+            name := self.string()?
+            type_arguments := self.type_list()?
+            arguments := self.expression_list()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::MethodCallE(value, name, type_arguments, arguments, span)))
+        }
+        when word == "Struct" {
+            name := self.string()?
+            fields := self.field_init_list()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::StructLit(name, fields, span)))
+        }
+        when word == "Field" {
+            value := self.expression()?
+            name := self.string()?
+            name_span := self.span()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::FieldE(value, name, name_span, span)))
+        }
+        when word == "If" {
+            condition := self.expression()?
+            then_value := self.expression()?
+            else_value := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::IfE(condition, then_value, else_value, span)))
+        }
+        when word == "Binary" {
+            op := self.binary_op()?
+            left := self.expression()?
+            right := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::BinaryE(op, left, right, span)))
+        }
+        when word == "Pipe" {
+            value := self.expression()?
+            target := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::PipeE(value, target, span)))
+        }
+        when word == "Coalesce" {
+            value := self.expression()?
+            fallback := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::CoalesceE(value, fallback, span)))
+        }
+        when word == "Range" {
+            start := self.expression()?
+            end := self.expression()?
+            inclusive := self.boolean()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::RangeE(start, end, inclusive, span)))
+        }
+        when word == "OptionalField" {
+            value := self.expression()?
+            name := self.string()?
+            name_span := self.span()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::OptionalFieldE(value, name, name_span, span)))
+        }
+        when word == "Negate" {
+            value := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::NegateE(value, span)))
+        }
+        when word == "Not" {
+            value := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::NotE(value, span)))
+        }
+        when word == "BitNot" {
+            value := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::BitNotE(value, span)))
+        }
+        when word == "AddressOf" {
+            mutable := self.boolean()?
+            raw := self.boolean()?
+            value := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::AddressOfE(mutable, raw, value, span)))
+        }
+        when word == "Deref" {
+            value := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::DerefE(value, span)))
+        }
+        when word == "Cast" {
+            value := self.expression()?
+            ty := self.type_name()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::CastE(value, ty, span)))
+        }
+        when word == "Layout" {
+            ty := self.type_name()?
+            alignment := self.boolean()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::LayoutE(ty, alignment, span)))
+        }
+        when word == "NewVec" {
+            element := self.type_name()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::VecNewE(element, span)))
+        }
+        when word == "NewMap" {
+            key := self.type_name()?
+            value := self.type_name()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::MapNewE(key, value, span)))
+        }
+        when word == "NewSet" {
+            element := self.type_name()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::SetNewE(element, span)))
+        }
+        when word == "Tuple" {
+            items := self.expression_list()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::TupleE(items, span)))
+        }
+        when word == "Array" {
+            items := self.expression_list()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::ArrayE(items, span)))
+        }
+        when word == "Repeat" {
+            value := self.expression()?
+            length := self.uint()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::RepeatE(value, length, span)))
+        }
+        when word == "Index" {
+            value := self.expression()?
+            index := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::IndexE(value, index, span)))
+        }
+        when word == "Propagate" {
+            value := self.expression()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::PropagateE(value, span)))
+        }
+        when word == "Enum" {
+            enum_name := self.string()?
+            variant := self.string()?
+            arguments := self.expression_list()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::EnumE(enum_name, variant, arguments, span)))
+        }
+        when word == "Choose" {
+            value := self.expression()?
+            arms := self.choose_arm_list()?
+            span := self.span()?
+            return Result::Ok(self.push_expr(Expr::ChooseE(value, arms, span)))
+        }
+        return Result::Err(String("unknown expression tag"))
+    }
+}
+
+// Decodes the text written by `ryn::ast_codec::encode_program` for a successful parse.
+pub fun decode_program(text: String) -> Result<Program, String> {
+    mut decoder := Decoder {
+        text: text,
+        at: 0,
+        use_decls: Vec(),
+        struct_defs: Vec(),
+        enum_defs: Vec(),
+        alias_defs: Vec(),
+        extend_defs: Vec(),
+        shape_defs: Vec(),
+        function_defs: Vec(),
+        struct_fields: Vec(),
+        variant_defs: Vec(),
+        bounds: Vec(),
+        parameters: Vec(),
+        shape_methods: Vec(),
+        constant_defs: Vec(),
+        types: Vec(),
+        exprs: Vec(),
+        stmts: Vec(),
+        parts: Vec(),
+        arms: Vec(),
+        inits: Vec(),
+    }
+    decoder.expect_word("Ok")?
+    program := decoder.program()?
+    decoder.finish()?
+    return Result::Ok(program)
+}
+
+// Writes the text form. The order mirrors `Decoder`, so decoding the output gives back the
+// same arenas, and writing it again gives the same text.
+struct Writer {
+    out: String,
+    program: Program,
+}
+
+extend Writer {
+    fun raw(mut self, text: String) {
+        self.out.append(" ")
+        self.out.append(text)
+    }
+
+    fun word(mut self, text: str) {
+        self.out.append(" ")
+        self.out.append(text)
+    }
+
+    fun uint(mut self, value: u64) {
+        self.out.append(" ")
+        self.out.append(String(value))
+    }
+
+    fun boolean(mut self, value: bool) {
+        when value {
+            self.uint(1)
+        } else {
+            self.uint(0)
+        }
+    }
+
+    fun string(mut self, value: String) {
+        self.out.append(" ")
+        self.out.append(String(value.len()))
+        self.out.append(":")
+        self.out.append(value)
+    }
+
+    fun strings(mut self, values: Vec<String>) {
+        self.uint(values.len())
+        for value in values {
+            self.string(value)
+        }
+    }
+
+    fun span(mut self, span: Span) {
+        self.uint(span.start)
+        self.uint(span.end)
+    }
+
+    fun optional_string(mut self, value: Option<String>) {
+        when value.is_none() {
+            self.word("-")
+        } else {
+            self.word("+")
+            self.string(value.unwrap())
+        }
+    }
+
+    fun optional_binary_op(mut self, value: Option<String>) {
+        when value.is_none() {
+            self.word("-")
+        } else {
+            self.word("+")
+            self.raw(value.unwrap())
+        }
+    }
+
+    fun optional_type(mut self, value: Option<u64>) {
+        when value.is_none() {
+            self.word("-")
+        } else {
+            self.word("+")
+            self.type_name(value.unwrap())
+        }
+    }
+
+    fun optional_expr(mut self, value: Option<u64>) {
+        when value.is_none() {
+            self.word("-")
+        } else {
+            self.word("+")
+            self.expression(value.unwrap())
+        }
+    }
+
+    fun optional_statements(mut self, value: Option<Vec<u64>>) {
+        when value.is_none() {
+            self.word("-")
+        } else {
+            self.word("+")
+            self.statement_list(value.unwrap())
+        }
+    }
+
+    // Each top-level list is preceded by a newline, and so is the end of the program.
+    fun program(mut self) {
+        self.out.append("\n")
+        self.use_list(self.program.uses.clone())
+        self.out.append("\n")
+        self.struct_list(self.program.structs.clone())
+        self.out.append("\n")
+        self.enum_list(self.program.enums.clone())
+        self.out.append("\n")
+        self.alias_list(self.program.type_aliases.clone())
+        self.out.append("\n")
+        self.extend_list(self.program.extends.clone())
+        self.out.append("\n")
+        self.shape_list(self.program.shapes.clone())
+        self.out.append("\n")
+        self.function_list(self.program.functions.clone())
+        self.out.append("\n")
+    }
+
+    fun use_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.use_decl(index)
+        }
+    }
+
+    fun use_decl(mut self, index: u64) {
+        self.out.append("\n")
+        decl := self.program.use_decls[index]
+        self.strings(decl.path)
+        self.span(decl.span)
+    }
+
+    fun struct_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.struct_def(index)
+        }
+    }
+
+    fun struct_def(mut self, index: u64) {
+        self.out.append("\n")
+        definition := self.program.struct_defs[index]
+        self.string(definition.name)
+        self.strings(definition.type_parameters)
+        self.struct_field_list(definition.fields)
+        self.boolean(definition.public)
+        self.boolean(definition.repr_c)
+        self.optional_string(definition.drop_function)
+        self.strings(definition.derives)
+        self.string(definition.module_path)
+        self.span(definition.span)
+    }
+
+    fun struct_field_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.struct_field(index)
+        }
+    }
+
+    fun struct_field(mut self, index: u64) {
+        field := self.program.struct_fields[index]
+        self.string(field.name)
+        self.type_name(field.ty)
+        self.boolean(field.public)
+        self.span(field.span)
+    }
+
+    fun enum_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.enum_def(index)
+        }
+    }
+
+    fun enum_def(mut self, index: u64) {
+        self.out.append("\n")
+        definition := self.program.enum_defs[index]
+        self.string(definition.name)
+        self.strings(definition.type_parameters)
+        self.variant_list(definition.variants)
+        self.boolean(definition.public)
+        self.string(definition.module_path)
+        self.span(definition.span)
+    }
+
+    fun variant_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.variant(index)
+        }
+    }
+
+    fun variant(mut self, index: u64) {
+        definition := self.program.variant_defs[index]
+        self.string(definition.name)
+        self.type_list(definition.fields)
+        self.span(definition.span)
+    }
+
+    fun alias_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.alias_def(index)
+        }
+    }
+
+    fun alias_def(mut self, index: u64) {
+        self.out.append("\n")
+        definition := self.program.alias_defs[index]
+        self.string(definition.name)
+        self.strings(definition.type_parameters)
+        self.type_name(definition.ty)
+        self.boolean(definition.public)
+        self.string(definition.module_path)
+        self.span(definition.span)
+    }
+
+    fun extend_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.extend_def(index)
+        }
+    }
+
+    fun extend_def(mut self, index: u64) {
+        self.out.append("\n")
+        definition := self.program.extend_defs[index]
+        self.type_name(definition.type_name)
+        self.optional_string(definition.as_shape)
+        self.function_list(definition.functions)
+        self.constant_list(definition.constants)
+        self.string(definition.module_path)
+        self.span(definition.span)
+    }
+
+    fun constant_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.constant_def(index)
+        }
+    }
+
+    fun constant_def(mut self, index: u64) {
+        definition := self.program.constant_defs[index]
+        self.string(definition.name)
+        self.type_name(definition.ty)
+        self.expression(definition.value)
+        self.boolean(definition.public)
+        self.span(definition.span)
+    }
+
+    fun shape_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.shape_def(index)
+        }
+    }
+
+    fun shape_def(mut self, index: u64) {
+        self.out.append("\n")
+        definition := self.program.shape_defs[index]
+        self.string(definition.name)
+        self.shape_method_list(definition.methods)
+        self.string(definition.module_path)
+        self.span(definition.span)
+    }
+
+    fun shape_method_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.shape_method(index)
+        }
+    }
+
+    fun shape_method(mut self, index: u64) {
+        method := self.program.shape_methods[index]
+        self.string(method.name)
+        self.parameter_list(method.parameters)
+        self.optional_type(method.return_type)
+        self.optional_statements(method.default_body)
+        self.optional_expr(method.default_value)
+        self.span(method.span)
+    }
+
+    fun function_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.function(index)
+        }
+    }
+
+    fun function(mut self, index: u64) {
+        self.out.append("\n")
+        definition := self.program.function_defs[index]
+        self.string(definition.name)
+        self.boolean(definition.extern_c)
+        self.optional_string(definition.external_symbol)
+        self.strings(definition.type_parameters)
+        self.bound_list(definition.type_parameter_bounds)
+        self.boolean(definition.public)
+        self.string(definition.module_path)
+        self.parameter_list(definition.parameters)
+        self.optional_type(definition.return_type)
+        self.statement_list(definition.body)
+        self.optional_expr(definition.return_value)
+        self.span(definition.span)
+    }
+
+    fun bound_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.bound(index)
+        }
+    }
+
+    fun bound(mut self, index: u64) {
+        definition := self.program.bounds[index]
+        self.string(definition.name)
+        self.strings(definition.traits)
+    }
+
+    fun parameter_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.parameter(index)
+        }
+    }
+
+    fun parameter(mut self, index: u64) {
+        parameter := self.program.parameters[index]
+        self.string(parameter.name)
+        self.type_name(parameter.ty)
+        self.span(parameter.span)
+    }
+
+    fun type_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.type_name(index)
+        }
+    }
+
+    fun expression_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.expression(index)
+        }
+    }
+
+    fun statement_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.statement(index)
+        }
+    }
+
+    fun template_part_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.template_part(index)
+        }
+    }
+
+    fun choose_arm_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            self.choose_arm(index)
+        }
+    }
+
+    fun choose_arm(mut self, index: u64) {
+        arm := self.program.arms[index]
+        self.optional_string(arm.enum_name)
+        self.optional_string(arm.variant)
+        self.strings(arm.bindings)
+        self.expression(arm.body)
+        self.span(arm.span)
+    }
+
+    fun field_init_list(mut self, items: Vec<u64>) {
+        self.uint(items.len())
+        for index in items {
+            field := self.program.inits[index]
+            self.string(field.name)
+            self.expression(field.value)
+            self.span(field.span)
+        }
+    }
+
+    fun binary_op_word(mut self, op: String) {
+        self.raw(op)
+    }
+
+    fun type_name(mut self, index: u64) -> bool {
+        choose self.program.types[index] {
+            TypeNode::Simple(word) => self.emit_type_node_simple(word),
+            TypeNode::NamedTy(name, span) => self.emit_type_node_named_ty(name, span),
+            TypeNode::ParamTy(name, span) => self.emit_type_node_param_ty(name, span),
+            TypeNode::VecTy(element, span) => self.emit_type_node_vec_ty(element, span),
+            TypeNode::MapTy(key, value, span) => self.emit_type_node_map_ty(key, value, span),
+            TypeNode::SetTy(element, span) => self.emit_type_node_set_ty(element, span),
+            TypeNode::ArrayTy(element, length, span) => self.emit_type_node_array_ty(element, length, span),
+            TypeNode::SliceTy(element, span) => self.emit_type_node_slice_ty(element, span),
+            TypeNode::RefTy(element, mutable, span) => self.emit_type_node_ref_ty(element, mutable, span),
+            TypeNode::RawTy(element, span) => self.emit_type_node_raw_ty(element, span),
+            TypeNode::FnPtrTy(parameters, result, extern_c, span) => self.emit_type_node_fn_ptr_ty(parameters, result, extern_c, span),
+        }
+    }
+
+    fun template_part(mut self, index: u64) -> bool {
+        choose self.program.parts[index] {
+            TemplatePart::TextPart(text) => self.emit_template_part_text_part(text),
+            TemplatePart::ValuePart(value) => self.emit_template_part_value_part(value),
+        }
+    }
+
+    fun statement(mut self, index: u64) -> bool {
+        self.out.append("\n")
+        choose self.program.stmts[index] {
+            Stmt::LetS(name, mutable, annotation, value, span) => self.emit_stmt_let_s(name, mutable, annotation, value, span),
+            Stmt::AssignS(name, value, span) => self.emit_stmt_assign_s(name, value, span),
+            Stmt::IndexAssignS(name, index, value, span) => self.emit_stmt_index_assign_s(name, index, value, span),
+            Stmt::DerefAssignS(pointer, value, span) => self.emit_stmt_deref_assign_s(pointer, value, span),
+            Stmt::FieldAssignS(object, names, spans, op, value, span) => self.emit_stmt_field_assign_s(object, names, spans, op, value, span),
+            Stmt::CompoundS(name, op, value, span) => self.emit_stmt_compound_s(name, op, value, span),
+            Stmt::PrintS(value, span) => self.emit_stmt_print_s(value, span),
+            Stmt::TemplateS(parts, span) => self.emit_stmt_template_s(parts, span),
+            Stmt::CallS(name, type_arguments, arguments, span) => self.emit_stmt_call_s(name, type_arguments, arguments, span),
+            Stmt::MethodCallS(value, name, arguments, span) => self.emit_stmt_method_call_s(value, name, arguments, span),
+            Stmt::IfS(condition, then_body, else_body, span) => self.emit_stmt_if_s(condition, then_body, else_body, span),
+            Stmt::WhileS(condition, body, span) => self.emit_stmt_while_s(condition, body, span),
+            Stmt::DeferS(body, span) => self.emit_stmt_defer_s(body, span),
+            Stmt::ForS(name, name_span, start, end, inclusive, body, span) => self.emit_stmt_for_s(name, name_span, start, end, inclusive, body, span),
+            Stmt::ForEachS(name, name_span, collection, body, span) => self.emit_stmt_for_each_s(name, name_span, collection, body, span),
+            Stmt::BreakS(span) => self.emit_stmt_break_s(span),
+            Stmt::ContinueS(span) => self.emit_stmt_continue_s(span),
+            Stmt::ReturnS(value, span) => self.emit_stmt_return_s(value, span),
+        }
+    }
+
+    fun expression(mut self, index: u64) -> bool {
+        choose self.program.exprs[index] {
+            Expr::IntLit(value, span) => self.emit_expr_int_lit(value, span),
+            Expr::FloatLit(text, span) => self.emit_expr_float_lit(text, span),
+            Expr::StrLit(text, span) => self.emit_expr_str_lit(text, span),
+            Expr::CharLit(scalar, span) => self.emit_expr_char_lit(scalar, span),
+            Expr::BoolLit(value, span) => self.emit_expr_bool_lit(value, span),
+            Expr::NameRef(name, span) => self.emit_expr_name_ref(name, span),
+            Expr::CallE(name, type_arguments, arguments, span) => self.emit_expr_call_e(name, type_arguments, arguments, span),
+            Expr::MethodCallE(value, name, type_arguments, arguments, span) => self.emit_expr_method_call_e(value, name, type_arguments, arguments, span),
+            Expr::StructLit(name, fields, span) => self.emit_expr_struct_lit(name, fields, span),
+            Expr::FieldE(value, name, name_span, span) => self.emit_expr_field_e(value, name, name_span, span),
+            Expr::RangeE(start, end, inclusive, span) => self.emit_expr_range_e(start, end, inclusive, span),
+            Expr::IfE(condition, then_value, else_value, span) => self.emit_expr_if_e(condition, then_value, else_value, span),
+            Expr::BinaryE(op, left, right, span) => self.emit_expr_binary_e(op, left, right, span),
+            Expr::NegateE(value, span) => self.emit_expr_negate_e(value, span),
+            Expr::NotE(value, span) => self.emit_expr_not_e(value, span),
+            Expr::BitNotE(value, span) => self.emit_expr_bit_not_e(value, span),
+            Expr::AddressOfE(mutable, raw, value, span) => self.emit_expr_address_of_e(mutable, raw, value, span),
+            Expr::DerefE(value, span) => self.emit_expr_deref_e(value, span),
+            Expr::CastE(value, ty, span) => self.emit_expr_cast_e(value, ty, span),
+            Expr::LayoutE(ty, alignment, span) => self.emit_expr_layout_e(ty, alignment, span),
+            Expr::VecNewE(element, span) => self.emit_expr_vec_new_e(element, span),
+            Expr::MapNewE(key, value, span) => self.emit_expr_map_new_e(key, value, span),
+            Expr::SetNewE(element, span) => self.emit_expr_set_new_e(element, span),
+            Expr::TupleE(items, span) => self.emit_expr_tuple_e(items, span),
+            Expr::ArrayE(items, span) => self.emit_expr_array_e(items, span),
+            Expr::RepeatE(value, length, span) => self.emit_expr_repeat_e(value, length, span),
+            Expr::IndexE(value, index, span) => self.emit_expr_index_e(value, index, span),
+            Expr::PropagateE(value, span) => self.emit_expr_propagate_e(value, span),
+            Expr::EnumE(enum_name, variant, arguments, span) => self.emit_expr_enum_e(enum_name, variant, arguments, span),
+            Expr::ChooseE(value, arms, span) => self.emit_expr_choose_e(value, arms, span),
+            Expr::PipeE(value, target, span) => self.emit_expr_pipe_e(value, target, span),
+            Expr::CoalesceE(value, fallback, span) => self.emit_expr_coalesce_e(value, fallback, span),
+            Expr::OptionalFieldE(value, name, name_span, span) => self.emit_expr_optional_field_e(value, name, name_span, span),
+        }
+    }
+}
+
+// Encodes a decoded program as `Ok <program>`, the form `ryn::ast_codec::encode_program` writes.
+pub fun encode_program(program: Program) -> String {
+    mut writer := Writer { out: String(""), program: program }
+    writer.word("Ok")
+    writer.program()
+    return writer.out
+}
+
+extend Writer {
+    fun emit_type_node_simple(mut self, word: String) -> bool {
+        self.raw(word)
+        return true
+    }
+
+    fun emit_type_node_named_ty(mut self, name: String, span: Span) -> bool {
+        self.word("Named")
+        self.string(name)
+        self.span(span)
+        return true
+    }
+
+    fun emit_type_node_param_ty(mut self, name: String, span: Span) -> bool {
+        self.word("Param")
+        self.string(name)
+        self.span(span)
+        return true
+    }
+
+    fun emit_type_node_vec_ty(mut self, element: u64, span: Span) -> bool {
+        self.word("Vec")
+        self.type_name(element)
+        self.span(span)
+        return true
+    }
+
+    fun emit_type_node_map_ty(mut self, key: u64, value: u64, span: Span) -> bool {
+        self.word("Map")
+        self.type_name(key)
+        self.type_name(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_type_node_set_ty(mut self, element: u64, span: Span) -> bool {
+        self.word("Set")
+        self.type_name(element)
+        self.span(span)
+        return true
+    }
+
+    fun emit_type_node_array_ty(mut self, element: u64, length: u64, span: Span) -> bool {
+        self.word("Array")
+        self.type_name(element)
+        self.uint(length)
+        self.span(span)
+        return true
+    }
+
+    fun emit_type_node_slice_ty(mut self, element: u64, span: Span) -> bool {
+        self.word("Slice")
+        self.type_name(element)
+        self.span(span)
+        return true
+    }
+
+    fun emit_type_node_ref_ty(mut self, element: u64, mutable: bool, span: Span) -> bool {
+        self.word("Ref")
+        self.type_name(element)
+        self.boolean(mutable)
+        self.span(span)
+        return true
+    }
+
+    fun emit_type_node_raw_ty(mut self, element: u64, span: Span) -> bool {
+        self.word("Raw")
+        self.type_name(element)
+        self.span(span)
+        return true
+    }
+
+    fun emit_type_node_fn_ptr_ty(mut self, parameters: Vec<u64>, result: Option<u64>, extern_c: bool, span: Span) -> bool {
+        self.word("FnPtr")
+        self.type_list(parameters)
+        self.optional_type(result)
+        self.boolean(extern_c)
+        self.span(span)
+        return true
+    }
+
+    fun emit_template_part_text_part(mut self, text: String) -> bool {
+        self.word("T")
+        self.string(text)
+        return true
+    }
+
+    fun emit_template_part_value_part(mut self, value: u64) -> bool {
+        self.word("V")
+        self.expression(value)
+        return true
+    }
+
+    fun emit_stmt_let_s(mut self, name: String, mutable: bool, annotation: Option<u64>, value: u64, span: Span) -> bool {
+        self.word("Let")
+        self.string(name)
+        self.boolean(mutable)
+        self.optional_type(annotation)
+        self.expression(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_assign_s(mut self, name: String, value: u64, span: Span) -> bool {
+        self.word("Assign")
+        self.string(name)
+        self.expression(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_index_assign_s(mut self, name: String, index: u64, value: u64, span: Span) -> bool {
+        self.word("IndexAssign")
+        self.string(name)
+        self.expression(index)
+        self.expression(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_deref_assign_s(mut self, pointer: u64, value: u64, span: Span) -> bool {
+        self.word("DerefAssign")
+        self.expression(pointer)
+        self.expression(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_field_assign_s(mut self, object: String, names: Vec<String>, spans: Vec<u64>, op: Option<String>, value: u64, span: Span) -> bool {
+        self.word("FieldAssign")
+        self.string(object)
+        self.uint(names.len())
+        mut at: u64 = 0
+        while at < names.len() {
+            self.string(names[at])
+            self.uint(spans[at * 2])
+            self.uint(spans[at * 2 + 1])
+            at += 1
+        }
+        self.optional_binary_op(op)
+        self.expression(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_compound_s(mut self, name: String, op: String, value: u64, span: Span) -> bool {
+        self.word("Compound")
+        self.string(name)
+        self.raw(op)
+        self.expression(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_print_s(mut self, value: u64, span: Span) -> bool {
+        self.word("Print")
+        self.expression(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_template_s(mut self, parts: Vec<u64>, span: Span) -> bool {
+        self.word("Template")
+        self.template_part_list(parts)
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_call_s(mut self, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: Span) -> bool {
+        self.word("Call")
+        self.string(name)
+        self.type_list(type_arguments)
+        self.expression_list(arguments)
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_method_call_s(mut self, value: u64, name: String, arguments: Vec<u64>, span: Span) -> bool {
+        self.word("MethodCall")
+        self.expression(value)
+        self.string(name)
+        self.expression_list(arguments)
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_if_s(mut self, condition: u64, then_body: Vec<u64>, else_body: Vec<u64>, span: Span) -> bool {
+        self.word("If")
+        self.expression(condition)
+        self.statement_list(then_body)
+        self.statement_list(else_body)
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_while_s(mut self, condition: u64, body: Vec<u64>, span: Span) -> bool {
+        self.word("While")
+        self.expression(condition)
+        self.statement_list(body)
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_defer_s(mut self, body: Vec<u64>, span: Span) -> bool {
+        self.word("Defer")
+        self.statement_list(body)
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_for_s(mut self, name: String, name_span: Span, start: u64, end: u64, inclusive: bool, body: Vec<u64>, span: Span) -> bool {
+        when inclusive {
+            self.word("ForInclusive")
+        } else {
+            self.word("For")
+        }
+        self.string(name)
+        self.span(name_span)
+        self.expression(start)
+        self.expression(end)
+        self.statement_list(body)
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_for_each_s(mut self, name: String, name_span: Span, collection: u64, body: Vec<u64>, span: Span) -> bool {
+        self.word("ForEach")
+        self.string(name)
+        self.span(name_span)
+        self.expression(collection)
+        self.statement_list(body)
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_break_s(mut self, span: Span) -> bool {
+        self.word("Break")
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_continue_s(mut self, span: Span) -> bool {
+        self.word("Continue")
+        self.span(span)
+        return true
+    }
+
+    fun emit_stmt_return_s(mut self, value: Option<u64>, span: Span) -> bool {
+        self.word("Return")
+        self.optional_expr(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_int_lit(mut self, value: u64, span: Span) -> bool {
+        self.word("Int")
+        self.uint(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_float_lit(mut self, text: String, span: Span) -> bool {
+        self.word("Float")
+        self.raw(text)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_str_lit(mut self, text: String, span: Span) -> bool {
+        self.word("Str")
+        self.string(text)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_char_lit(mut self, scalar: u64, span: Span) -> bool {
+        self.word("Char")
+        self.uint(scalar)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_bool_lit(mut self, value: bool, span: Span) -> bool {
+        self.word("Bool")
+        self.boolean(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_name_ref(mut self, name: String, span: Span) -> bool {
+        self.word("Name")
+        self.string(name)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_call_e(mut self, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: Span) -> bool {
+        self.word("Call")
+        self.string(name)
+        self.type_list(type_arguments)
+        self.expression_list(arguments)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_method_call_e(mut self, value: u64, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: Span) -> bool {
+        self.word("MethodCall")
+        self.expression(value)
+        self.string(name)
+        self.type_list(type_arguments)
+        self.expression_list(arguments)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_struct_lit(mut self, name: String, fields: Vec<u64>, span: Span) -> bool {
+        self.word("Struct")
+        self.string(name)
+        self.field_init_list(fields)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_field_e(mut self, value: u64, name: String, name_span: Span, span: Span) -> bool {
+        self.word("Field")
+        self.expression(value)
+        self.string(name)
+        self.span(name_span)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_range_e(mut self, start: u64, end: u64, inclusive: bool, span: Span) -> bool {
+        self.word("Range")
+        self.expression(start)
+        self.expression(end)
+        self.boolean(inclusive)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_if_e(mut self, condition: u64, then_value: u64, else_value: u64, span: Span) -> bool {
+        self.word("If")
+        self.expression(condition)
+        self.expression(then_value)
+        self.expression(else_value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_binary_e(mut self, op: String, left: u64, right: u64, span: Span) -> bool {
+        self.word("Binary")
+        self.raw(op)
+        self.expression(left)
+        self.expression(right)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_negate_e(mut self, value: u64, span: Span) -> bool {
+        self.word("Negate")
+        self.expression(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_not_e(mut self, value: u64, span: Span) -> bool {
+        self.word("Not")
+        self.expression(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_bit_not_e(mut self, value: u64, span: Span) -> bool {
+        self.word("BitNot")
+        self.expression(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_address_of_e(mut self, mutable: bool, raw: bool, value: u64, span: Span) -> bool {
+        self.word("AddressOf")
+        self.boolean(mutable)
+        self.boolean(raw)
+        self.expression(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_deref_e(mut self, value: u64, span: Span) -> bool {
+        self.word("Deref")
+        self.expression(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_cast_e(mut self, value: u64, ty: u64, span: Span) -> bool {
+        self.word("Cast")
+        self.expression(value)
+        self.type_name(ty)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_layout_e(mut self, ty: u64, alignment: bool, span: Span) -> bool {
+        self.word("Layout")
+        self.type_name(ty)
+        self.boolean(alignment)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_vec_new_e(mut self, element: u64, span: Span) -> bool {
+        self.word("NewVec")
+        self.type_name(element)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_map_new_e(mut self, key: u64, value: u64, span: Span) -> bool {
+        self.word("NewMap")
+        self.type_name(key)
+        self.type_name(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_set_new_e(mut self, element: u64, span: Span) -> bool {
+        self.word("NewSet")
+        self.type_name(element)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_tuple_e(mut self, items: Vec<u64>, span: Span) -> bool {
+        self.word("Tuple")
+        self.expression_list(items)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_array_e(mut self, items: Vec<u64>, span: Span) -> bool {
+        self.word("Array")
+        self.expression_list(items)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_repeat_e(mut self, value: u64, length: u64, span: Span) -> bool {
+        self.word("Repeat")
+        self.expression(value)
+        self.uint(length)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_index_e(mut self, value: u64, index: u64, span: Span) -> bool {
+        self.word("Index")
+        self.expression(value)
+        self.expression(index)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_propagate_e(mut self, value: u64, span: Span) -> bool {
+        self.word("Propagate")
+        self.expression(value)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_enum_e(mut self, enum_name: String, variant: String, arguments: Vec<u64>, span: Span) -> bool {
+        self.word("Enum")
+        self.string(enum_name)
+        self.string(variant)
+        self.expression_list(arguments)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_choose_e(mut self, value: u64, arms: Vec<u64>, span: Span) -> bool {
+        self.word("Choose")
+        self.expression(value)
+        self.choose_arm_list(arms)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_pipe_e(mut self, value: u64, target: u64, span: Span) -> bool {
+        self.word("Pipe")
+        self.expression(value)
+        self.expression(target)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_coalesce_e(mut self, value: u64, fallback: u64, span: Span) -> bool {
+        self.word("Coalesce")
+        self.expression(value)
+        self.expression(fallback)
+        self.span(span)
+        return true
+    }
+
+    fun emit_expr_optional_field_e(mut self, value: u64, name: String, name_span: Span, span: Span) -> bool {
+        self.word("OptionalField")
+        self.expression(value)
+        self.string(name)
+        self.span(name_span)
+        self.span(span)
+        return true
+    }
+
+}

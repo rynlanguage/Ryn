@@ -95,3 +95,13 @@ generator:
   be the last expression of its function; assignment through a nested field
   path (`self.a.b = x`) is rejected on a borrowed receiver, so records are built
   as whole values instead.
+- Stage 2, step 2b (done): `selfhost/ast_roundtrip` is the same kind of Ryn model for
+  the syntax tree that `ryn::ast_codec` writes (`src/ast.ryn`). Declarations, types,
+  statements, and expressions round-trip byte for byte, including the newlines the Rust
+  encoder places between items. `|>`, `??`, and `?.` stay as their own nodes, since the
+  bootstrap decoder rewrites them but the frontend's text names them; the rewrite belongs
+  to the lowering stage. `tests/ryn_ast_roundtrip.rs` checks the corpus and frontend output
+  with those forms. Operators and type words are kept as validated text tokens, and float
+  literals as the text the encoder wrote.
+  Porting note: `Result<Vec<T>>` is rejected for struct element types, so lists of
+  structures live in arenas and lists are `Vec<u64>` of indices.
