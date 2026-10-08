@@ -9,13 +9,13 @@
 // expressions. This model keeps those three forms as their own nodes, so re-encoding gives
 // back the frontend's text; the rewrite belongs to the stage that lowers the tree.
 
-struct Span {
-    start: u64,
-    end: u64,
+pub struct Span {
+    pub start: u64,
+    pub end: u64,
 }
 
 // A type. `Simple` holds the word such as `i32`, `String`, or `bool`.
-enum TypeNode {
+pub enum TypeNode {
     Simple(String),
     NamedTy(String, Span),
     ParamTy(String, Span),
@@ -30,23 +30,23 @@ enum TypeNode {
 }
 
 // A `choose` arm. `body` indexes `Program.exprs`.
-struct ChooseArm {
-    enum_name: Option<String>,
-    variant: Option<String>,
-    bindings: Vec<String>,
-    body: u64,
-    span: Span,
+pub struct ChooseArm {
+    pub enum_name: Option<String>,
+    pub variant: Option<String>,
+    pub bindings: Vec<String>,
+    pub body: u64,
+    pub span: Span,
 }
 
 // A `Struct { name: value }` initializer, stored in `Program.inits`.
-struct FieldInit {
-    name: String,
-    value: u64,
-    span: Span,
+pub struct FieldInit {
+    pub name: String,
+    pub value: u64,
+    pub span: Span,
 }
 
 // An expression. Child nodes are indices into `Program.exprs`; lists are `Vec<u64>`.
-enum Expr {
+pub enum Expr {
     IntLit(u64, Span),
     FloatLit(String, Span),
     StrLit(String, Span),
@@ -83,13 +83,13 @@ enum Expr {
 }
 
 // A part of a `Template` print, stored in `Program.parts`.
-enum TemplatePart {
+pub enum TemplatePart {
     TextPart(String),
     ValuePart(u64),
 }
 
 // A statement. Bodies and child nodes are indices into the arenas.
-enum Stmt {
+pub enum Stmt {
     LetS(String, bool, Option<u64>, u64, Span),
     AssignS(String, u64, Span),
     IndexAssignS(String, u64, u64, Span),
@@ -110,142 +110,142 @@ enum Stmt {
     ReturnS(Option<u64>, Span),
 }
 
-struct Bound {
-    name: String,
-    traits: Vec<String>,
+pub struct Bound {
+    pub name: String,
+    pub traits: Vec<String>,
 }
 
-struct Parameter {
-    name: String,
-    ty: u64,
-    span: Span,
+pub struct Parameter {
+    pub name: String,
+    pub ty: u64,
+    pub span: Span,
 }
 
-struct Function {
-    name: String,
-    extern_c: bool,
-    external_symbol: Option<String>,
-    type_parameters: Vec<String>,
-    type_parameter_bounds: Vec<u64>,
-    public: bool,
-    module_path: String,
-    parameters: Vec<u64>,
-    return_type: Option<u64>,
-    body: Vec<u64>,
-    return_value: Option<u64>,
-    span: Span,
+pub struct Function {
+    pub name: String,
+    pub extern_c: bool,
+    pub external_symbol: Option<String>,
+    pub type_parameters: Vec<String>,
+    pub type_parameter_bounds: Vec<u64>,
+    pub public: bool,
+    pub module_path: String,
+    pub parameters: Vec<u64>,
+    pub return_type: Option<u64>,
+    pub body: Vec<u64>,
+    pub return_value: Option<u64>,
+    pub span: Span,
 }
 
-struct ShapeMethod {
-    name: String,
-    parameters: Vec<u64>,
-    return_type: Option<u64>,
-    default_body: Option<Vec<u64>>,
-    default_value: Option<u64>,
-    span: Span,
+pub struct ShapeMethod {
+    pub name: String,
+    pub parameters: Vec<u64>,
+    pub return_type: Option<u64>,
+    pub default_body: Option<Vec<u64>>,
+    pub default_value: Option<u64>,
+    pub span: Span,
 }
 
-struct ShapeDef {
-    name: String,
-    methods: Vec<u64>,
-    module_path: String,
-    span: Span,
+pub struct ShapeDef {
+    pub name: String,
+    pub methods: Vec<u64>,
+    pub module_path: String,
+    pub span: Span,
 }
 
-struct ConstantDef {
-    name: String,
-    ty: u64,
-    value: u64,
-    public: bool,
-    span: Span,
+pub struct ConstantDef {
+    pub name: String,
+    pub ty: u64,
+    pub value: u64,
+    pub public: bool,
+    pub span: Span,
 }
 
-struct ExtendDef {
-    type_name: u64,
-    as_shape: Option<String>,
-    functions: Vec<u64>,
-    constants: Vec<u64>,
-    module_path: String,
-    span: Span,
+pub struct ExtendDef {
+    pub type_name: u64,
+    pub as_shape: Option<String>,
+    pub functions: Vec<u64>,
+    pub constants: Vec<u64>,
+    pub module_path: String,
+    pub span: Span,
 }
 
-struct TypeAliasDef {
-    name: String,
-    type_parameters: Vec<String>,
-    ty: u64,
-    public: bool,
-    module_path: String,
-    span: Span,
+pub struct TypeAliasDef {
+    pub name: String,
+    pub type_parameters: Vec<String>,
+    pub ty: u64,
+    pub public: bool,
+    pub module_path: String,
+    pub span: Span,
 }
 
-struct VariantDef {
-    name: String,
-    fields: Vec<u64>,
-    span: Span,
+pub struct VariantDef {
+    pub name: String,
+    pub fields: Vec<u64>,
+    pub span: Span,
 }
 
-struct EnumDef {
-    name: String,
-    type_parameters: Vec<String>,
-    variants: Vec<u64>,
-    public: bool,
-    module_path: String,
-    span: Span,
+pub struct EnumDef {
+    pub name: String,
+    pub type_parameters: Vec<String>,
+    pub variants: Vec<u64>,
+    pub public: bool,
+    pub module_path: String,
+    pub span: Span,
 }
 
-struct StructFieldDef {
-    name: String,
-    ty: u64,
-    public: bool,
-    span: Span,
+pub struct StructFieldDef {
+    pub name: String,
+    pub ty: u64,
+    pub public: bool,
+    pub span: Span,
 }
 
-struct StructDef {
-    name: String,
-    type_parameters: Vec<String>,
-    fields: Vec<u64>,
-    public: bool,
-    repr_c: bool,
-    drop_function: Option<String>,
-    derives: Vec<String>,
-    module_path: String,
-    span: Span,
+pub struct StructDef {
+    pub name: String,
+    pub type_parameters: Vec<String>,
+    pub fields: Vec<u64>,
+    pub public: bool,
+    pub repr_c: bool,
+    pub drop_function: Option<String>,
+    pub derives: Vec<String>,
+    pub module_path: String,
+    pub span: Span,
 }
 
-struct UseDecl {
-    path: Vec<String>,
-    span: Span,
+pub struct UseDecl {
+    pub path: Vec<String>,
+    pub span: Span,
 }
 
 // Lists of structures are indices into the arenas below, so every `Result` carries
 // only scalars or `Vec<u64>`, which the compiler accepts.
-struct Program {
-    uses: Vec<u64>,
-    structs: Vec<u64>,
-    enums: Vec<u64>,
-    type_aliases: Vec<u64>,
-    extends: Vec<u64>,
-    shapes: Vec<u64>,
-    functions: Vec<u64>,
-    use_decls: Vec<UseDecl>,
-    struct_defs: Vec<StructDef>,
-    enum_defs: Vec<EnumDef>,
-    alias_defs: Vec<TypeAliasDef>,
-    extend_defs: Vec<ExtendDef>,
-    shape_defs: Vec<ShapeDef>,
-    function_defs: Vec<Function>,
-    struct_fields: Vec<StructFieldDef>,
-    variant_defs: Vec<VariantDef>,
-    bounds: Vec<Bound>,
-    parameters: Vec<Parameter>,
-    shape_methods: Vec<ShapeMethod>,
-    constant_defs: Vec<ConstantDef>,
-    types: Vec<TypeNode>,
-    exprs: Vec<Expr>,
-    stmts: Vec<Stmt>,
-    parts: Vec<TemplatePart>,
-    arms: Vec<ChooseArm>,
-    inits: Vec<FieldInit>,
+pub struct Program {
+    pub uses: Vec<u64>,
+    pub structs: Vec<u64>,
+    pub enums: Vec<u64>,
+    pub type_aliases: Vec<u64>,
+    pub extends: Vec<u64>,
+    pub shapes: Vec<u64>,
+    pub functions: Vec<u64>,
+    pub use_decls: Vec<UseDecl>,
+    pub struct_defs: Vec<StructDef>,
+    pub enum_defs: Vec<EnumDef>,
+    pub alias_defs: Vec<TypeAliasDef>,
+    pub extend_defs: Vec<ExtendDef>,
+    pub shape_defs: Vec<ShapeDef>,
+    pub function_defs: Vec<Function>,
+    pub struct_fields: Vec<StructFieldDef>,
+    pub variant_defs: Vec<VariantDef>,
+    pub bounds: Vec<Bound>,
+    pub parameters: Vec<Parameter>,
+    pub shape_methods: Vec<ShapeMethod>,
+    pub constant_defs: Vec<ConstantDef>,
+    pub types: Vec<TypeNode>,
+    pub exprs: Vec<Expr>,
+    pub stmts: Vec<Stmt>,
+    pub parts: Vec<TemplatePart>,
+    pub arms: Vec<ChooseArm>,
+    pub inits: Vec<FieldInit>,
 }
 // Reads the text form. Each function consumes the tokens of one production in the order
 // `ryn::ast_codec` writes them, and pushes its nodes to the arenas after their children.

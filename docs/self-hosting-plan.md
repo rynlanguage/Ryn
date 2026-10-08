@@ -117,3 +117,15 @@ generator:
   expression forms, each behind the same IR-equality gate. The port is blocked on
   nothing in Ryn itself, but it is several thousand lines of Ryn and needs the
   checker's error paths reproduced too, so it spans multiple sessions.
+- Stage 2, step 3 (subset, done): `selfhost/sema_subset` lowers the syntax tree to the
+  textual IR for one function, `main`, with no parameters and an optional `-> i32`
+  result; `i32`, `i64`, and `str` locals; integer arithmetic; string literals; `echo`
+  and template prints; `let`; `=`; and compound assignment. It reproduces the
+  builtin enum registry of `sema.rs` (144 entries, `TryParseU64` skipped), the slot
+  layout (`str` takes two slots), the addressed and owned tables, the `Return` for a
+  result expression, and the `Drop 0` that `guard::check` adds at the end of a body
+  that falls through. `tests/ryn_sema_subset.rs` requires identical IR for every
+  accepted program and `unsupported` for the rest. Four corpus programs are accepted:
+  `hello`, `variables`, `exit_code`, `string_escapes`. Next: owned strings and drop
+  placement, comparisons and `if`/`while`/`for`, calls and parameters, then the
+  remaining expression forms, each behind the same gate.

@@ -1,0 +1,582 @@
+// Lowers the subset of programs that the syntax tree model can express into the textual IR
+// that `ryn::ir_codec::encode_ir` writes, as the bootstrap compiler's `sema` and `guard` do.
+//
+// The subset is one function, `main`, with no parameters and an optional `-> i32` result;
+// `i32`, `i64`, and `str` locals; integer arithmetic; string literals; `echo` and template
+// prints; `let`; `=`; and compound assignment. Anything else is reported as `unsupported`.
+
+use ast_roundtrip::ast
+
+pub struct Local {
+    name: String,
+    slot: u64,
+    ty: String,
+    mutable: bool,
+}
+
+pub struct Lowered {
+    text: String,
+    ty: String,
+}
+
+pub struct Lowering {
+    program: ast::Program,
+    locals: Vec<Local>,
+    local_types: Vec<String>,
+    addressed: u64,
+    next_slot: u64,
+    statements: Vec<String>,
+    return_ty: String,
+}
+
+// Joins tokens with single spaces. A token may hold spaces itself, as a length-prefixed string does.
+fun join(tokens: Vec<String>) -> String {
+    mut out := String("")
+    mut first := true
+    for token in tokens {
+        when !first {
+            out.append(" ")
+        }
+        out.append(token)
+        first = false
+    }
+    return out
+}
+
+fun num(value: u64) -> String {
+    return String(value)
+}
+
+// `<byte length>:<bytes>`, the form the IR uses for strings.
+fun length_prefixed(text: String) -> String {
+    mut out := String(text.len())
+    out.append(":")
+    out.append(text)
+    return out
+}
+
+fun unsupported(what: str) -> String {
+    mut out := String("unsupported: ")
+    out.append(what)
+    return out
+}
+
+fun words2(a: String, b: String) -> Vec<String> {
+    mut items: Vec<String> = Vec()
+    items.push(a)
+    items.push(b)
+    return items
+}
+
+fun words3(a: String, b: String, c: String) -> Vec<String> {
+    mut items: Vec<String> = Vec()
+    items.push(a)
+    items.push(b)
+    items.push(c)
+    return items
+}
+
+fun words4(a: String, b: String, c: String, d: String) -> Vec<String> {
+    mut items: Vec<String> = Vec()
+    items.push(a)
+    items.push(b)
+    items.push(c)
+    items.push(d)
+    return items
+}
+
+fun words5(a: String, b: String, c: String, d: String, e: String) -> Vec<String> {
+    mut items: Vec<String> = Vec()
+    items.push(a)
+    items.push(b)
+    items.push(c)
+    items.push(d)
+    items.push(e)
+    return items
+}
+
+fun words6(a: String, b: String, c: String, d: String, e: String, f: String) -> Vec<String> {
+    mut items: Vec<String> = Vec()
+    items.push(a)
+    items.push(b)
+    items.push(c)
+    items.push(d)
+    items.push(e)
+    items.push(f)
+    return items
+}
+
+// The IR word for a binary operator the subset supports.
+fun operator_word(op: String) -> Result<String, String> {
+    when op == "Add" || op == "Sub" || op == "Mul" || op == "Div" || op == "Rem" {
+        return Result::Ok(op)
+    }
+    return Result::Err(unsupported("operator"))
+}
+
+fun is_integer_word(ty: String) -> bool {
+    return ty == "I32" || ty == "I64"
+}
+
+// The IR word for a simple type name in the subset.
+fun type_word(word: String) -> Result<String, String> {
+    when word == "i32" {
+        return Result::Ok(String("I32"))
+    }
+    when word == "i64" {
+        return Result::Ok(String("I64"))
+    }
+    when word == "str" {
+        return Result::Ok(String("Str"))
+    }
+    return Result::Err(unsupported("type"))
+}
+
+fun ryn_preamble_words() -> Vec<String> {
+    mut items: Vec<String> = Vec()
+    items.push(String("I8"))
+    items.push(String("I16"))
+    items.push(String("I32"))
+    items.push(String("I64"))
+    items.push(String("U8"))
+    items.push(String("U16"))
+    items.push(String("U32"))
+    items.push(String("U64"))
+    items.push(String("F32"))
+    items.push(String("F64"))
+    items.push(String("OwnedString"))
+    return items
+}
+
+fun text_part(text: String) -> Result<String, String> {
+    return Result::Ok(join(words2(String("Text"), length_prefixed(text))))
+}
+
+// `$RynOption#<name>`: `Some(payload)` and `None`, as the bootstrap compiler registers it.
+fun option_record(name: String, payload: String) -> String {
+    mut tokens: Vec<String> = Vec()
+    tokens.push(length_prefixed(name))
+    tokens.push(String("2"))
+    tokens.push(String("4:Some"))
+    tokens.push(String("1"))
+    tokens.push(payload)
+    tokens.push(String("4:None"))
+    tokens.push(String("0"))
+    return join(tokens)
+}
+
+// `$RynResult#...`: `Ok(ok)` and `Err(err)`.
+fun result_record(name: String, ok: String, err: String) -> String {
+    mut tokens: Vec<String> = Vec()
+    tokens.push(length_prefixed(name))
+    tokens.push(String("2"))
+    tokens.push(String("2:Ok"))
+    tokens.push(String("1"))
+    tokens.push(ok)
+    tokens.push(String("3:Err"))
+    tokens.push(String("1"))
+    tokens.push(err)
+    return join(tokens)
+}
+
+// The generated enums every IR text starts with. `sema::analyze` registers them in this order,
+// skipping `TryParseU64` because `FindU64` already has a `u64` payload.
+fun builtin_enums() -> Vec<String> {
+    mut records: Vec<String> = Vec()
+    records.push(option_record(String("$RynOption#FindU64"), String("U64")))
+    records.push(option_record(String("$RynOption#FileString"), String("OwnedString")))
+    mut try_parse: Vec<String> = Vec()
+    try_parse.push(String("I8"))
+    try_parse.push(String("I16"))
+    try_parse.push(String("I32"))
+    try_parse.push(String("I64"))
+    try_parse.push(String("U8"))
+    try_parse.push(String("U16"))
+    try_parse.push(String("U32"))
+    try_parse.push(String("F32"))
+    try_parse.push(String("F64"))
+    try_parse.push(String("Bool"))
+    try_parse.push(String("Char"))
+    mut index: u64 = 0
+    while index < try_parse.len() {
+        mut name := String("$RynOption#TryParse")
+        name.append(try_parse[index].clone())
+        records.push(option_record(name, try_parse[index].clone()))
+        index += 1
+    }
+    primitive := ryn_preamble_words()
+    mut left: u64 = 0
+    while left < primitive.len() {
+        mut right: u64 = 0
+        while right < primitive.len() {
+            mut name := String("$RynResult#")
+            name.append(String(left))
+            name.append("#")
+            name.append(String(right))
+            records.push(result_record(name, primitive[left].clone(), primitive[right].clone()))
+            right += 1
+        }
+        left += 1
+    }
+    mut parse_index: u64 = 0
+    while parse_index < 10 {
+        mut name := String("$RynResult#Parse")
+        name.append(String(parse_index))
+        name.append("String")
+        records.push(result_record(name, primitive[parse_index].clone(), String("OwnedString")))
+        parse_index += 1
+    }
+    return records
+}
+
+extend Lowering {
+    fun find(self, name: String) -> Result<u64, String> {
+        mut index: u64 = self.locals.len()
+        while index > 0 {
+            index -= 1
+            when self.locals[index].name == name {
+                return Result::Ok(index)
+            }
+        }
+        return Result::Err(unsupported("unknown name"))
+    }
+
+    fun declared(self, name: String) -> bool {
+        mut index: u64 = 0
+        while index < self.locals.len() {
+            when self.locals[index].name == name {
+                return true
+            }
+            index += 1
+        }
+        return false
+    }
+
+    // Allocates the slots a value of `ty` takes, as `sema` does: `str` takes a pointer and a
+    // length, and each scalar takes one. Each allocation adds one addressed entry.
+    fun allocate(mut self, ty: String) -> Result<u64, String> {
+        slot := self.next_slot
+        self.addressed += 1
+        when ty == "I32" {
+            self.local_types.push(String("I32"))
+            self.next_slot += 1
+            return Result::Ok(slot)
+        }
+        when ty == "I64" {
+            self.local_types.push(String("I64"))
+            self.next_slot += 1
+            return Result::Ok(slot)
+        }
+        when ty == "Str" {
+            self.local_types.push(String("Ptr"))
+            self.local_types.push(String("I64"))
+            self.next_slot += 2
+            return Result::Ok(slot)
+        }
+        return Result::Err(unsupported("local type"))
+    }
+
+    fun annotation(self, index: u64) -> Result<String, String> {
+        choose self.program.types[index] {
+            ast::TypeNode::Simple(word) => type_word(word),
+            _ => Result::Err(unsupported("type")),
+        }
+    }
+
+    // The type of an expression when it does not depend on context; "" when it does.
+    fun infer(self, index: u64) -> Result<String, String> {
+        choose self.program.exprs[index] {
+            ast::Expr::NameRef(name, span) => self.local_type(name),
+            ast::Expr::BinaryE(op, left, right, span) => self.binary_type(left, right),
+            ast::Expr::IntLit(value, span) => Result::Ok(String("")),
+            ast::Expr::StrLit(text, span) => Result::Ok(String("Str")),
+            _ => Result::Err(unsupported("expression")),
+        }
+    }
+
+    fun local_type(self, name: String) -> Result<String, String> {
+        index := self.find(name)?
+        return Result::Ok(self.locals[index].ty.clone())
+    }
+
+    fun binary_type(self, left: u64, right: u64) -> Result<String, String> {
+        ty := self.infer(left)?
+        when !ty.is_empty() {
+            return Result::Ok(ty)
+        }
+        return self.infer(right)
+    }
+
+    fun expression(mut self, index: u64, expected: String) -> Result<Lowered, String> {
+        choose self.program.exprs[index] {
+            ast::Expr::IntLit(value, span) => self.integer(value, expected),
+            ast::Expr::StrLit(text, span) => self.string_literal(text),
+            ast::Expr::NameRef(name, span) => self.name(name, span),
+            ast::Expr::BinaryE(op, left, right, span) => self.binary(op, left, right, expected),
+            _ => Result::Err(unsupported("expression")),
+        }
+    }
+
+    fun integer(self, value: u64, expected: String) -> Result<Lowered, String> {
+        mut ty := expected.clone()
+        when ty.is_empty() {
+            ty = String("I64")
+        }
+        when !is_integer_word(ty.clone()) {
+            return Result::Err(unsupported("integer type"))
+        }
+        text := join(words3(String("Integer"), num(value), ty.clone()))
+        return Result::Ok(Lowered { text: text, ty: ty })
+    }
+
+    fun string_literal(self, text: String) -> Result<Lowered, String> {
+        tokens := join(words2(String("String"), length_prefixed(text)))
+        return Result::Ok(Lowered { text: tokens, ty: String("Str") })
+    }
+
+    fun name(self, name: String, span: ast::Span) -> Result<Lowered, String> {
+        index := self.find(name)?
+        slot := self.locals[index].slot
+        ty := self.locals[index].ty.clone()
+        text := join(words5(String("Local"), num(slot), ty.clone(), num(span.start), num(span.end)))
+        return Result::Ok(Lowered { text: text, ty: ty })
+    }
+
+    fun binary(mut self, op: String, left: u64, right: u64, expected: String) -> Result<Lowered, String> {
+        mut ty := expected.clone()
+        when ty.is_empty() {
+            ty = self.binary_type(left, right)?
+        }
+        when ty.is_empty() {
+            ty = String("I64")
+        }
+        when !is_integer_word(ty.clone()) {
+            return Result::Err(unsupported("arithmetic on this type"))
+        }
+        word := operator_word(op)?
+        lhs := self.expression(left, ty.clone())?
+        rhs := self.expression(right, ty.clone())?
+        when lhs.ty != ty || rhs.ty != ty {
+            return Result::Err(unsupported("mixed operand types"))
+        }
+        text := join(words5(String("Binary"), word, lhs.text, rhs.text, ty.clone()))
+        return Result::Ok(Lowered { text: text, ty: ty })
+    }
+
+    fun template_part(mut self, index: u64) -> Result<String, String> {
+        choose self.program.parts[index] {
+            ast::TemplatePart::TextPart(text) => text_part(text),
+            ast::TemplatePart::ValuePart(value) => self.value_part(value),
+        }
+    }
+
+    fun value_part(mut self, value: u64) -> Result<String, String> {
+        lowered := self.expression(value, String(""))?
+        return Result::Ok(join(words3(String("Value"), lowered.text, lowered.ty)))
+    }
+
+    // Each statement appends its IR tokens to `statements`; a return reports true.
+    fun statement(mut self, index: u64) -> Result<bool, String> {
+        choose self.program.stmts[index] {
+            ast::Stmt::LetS(name, mutable, annotation, value, span) => self.let_statement(name, mutable, annotation, value, span),
+            ast::Stmt::AssignS(name, value, span) => self.assign_statement(name, value, span),
+            ast::Stmt::CompoundS(name, op, value, span) => self.compound_statement(name, op, value, span),
+            ast::Stmt::PrintS(value, span) => self.print_statement(value),
+            ast::Stmt::TemplateS(parts, span) => self.template_statement(parts),
+            ast::Stmt::ReturnS(value, span) => self.return_statement(value, span),
+            _ => Result::Err(unsupported("statement")),
+        }
+    }
+
+    fun let_statement(mut self, name: String, mutable: bool, annotation: Option<u64>, value: u64, span: ast::Span) -> Result<bool, String> {
+        mut declared := String("")
+        when annotation.is_some() {
+            declared = self.annotation(annotation.unwrap())?
+        }
+        lowered := self.expression(value, declared.clone())?
+        mut ty := declared.clone()
+        when ty.is_empty() {
+            ty = lowered.ty.clone()
+        }
+        when ty != lowered.ty {
+            return Result::Err(unsupported("annotation does not match the value"))
+        }
+        when self.declared(name.clone()) {
+            return Result::Err(unsupported("redeclared name"))
+        }
+        slot := self.allocate(ty.clone())?
+        self.locals.push(Local { name: name, slot: slot, ty: ty.clone(), mutable: mutable })
+        self.statements.push(join(words6(String("Let"), num(slot), ty, lowered.text, num(span.start), num(span.end))))
+        return Result::Ok(false)
+    }
+
+    fun assign_statement(mut self, name: String, value: u64, span: ast::Span) -> Result<bool, String> {
+        index := self.find(name)?
+        when !self.locals[index].mutable {
+            return Result::Err(unsupported("assignment to an immutable local"))
+        }
+        slot := self.locals[index].slot
+        ty := self.locals[index].ty.clone()
+        lowered := self.expression(value, ty.clone())?
+        self.statements.push(join(words6(String("Assign"), num(slot), ty, lowered.text, num(span.start), num(span.end))))
+        return Result::Ok(false)
+    }
+
+    // `x op= value` is lowered as `x = x op value`; the name's span is the first `len(x)` bytes.
+    fun compound_statement(mut self, name: String, op: String, value: u64, span: ast::Span) -> Result<bool, String> {
+        index := self.find(name.clone())?
+        when !self.locals[index].mutable {
+            return Result::Err(unsupported("assignment to an immutable local"))
+        }
+        slot := self.locals[index].slot
+        ty := self.locals[index].ty.clone()
+        when !is_integer_word(ty.clone()) {
+            return Result::Err(unsupported("arithmetic on this type"))
+        }
+        word := operator_word(op)?
+        rhs := self.expression(value, ty.clone())?
+        end := span.start + name.len()
+        target := join(words5(String("Local"), num(slot), ty.clone(), num(span.start), num(end)))
+        binary := join(words5(String("Binary"), word, target, rhs.text, ty.clone()))
+        self.statements.push(join(words6(String("Assign"), num(slot), ty, binary, num(span.start), num(span.end))))
+        return Result::Ok(false)
+    }
+
+    fun print_statement(mut self, value: u64) -> Result<bool, String> {
+        lowered := self.expression(value, String(""))?
+        self.statements.push(join(words3(String("Print"), lowered.text, lowered.ty)))
+        return Result::Ok(false)
+    }
+
+    fun template_statement(mut self, parts: Vec<u64>) -> Result<bool, String> {
+        mut tokens: Vec<String> = Vec()
+        tokens.push(String("PrintTemplate"))
+        tokens.push(num(parts.len()))
+        for part in parts {
+            tokens.push(self.template_part(part)?)
+        }
+        self.statements.push(join(tokens))
+        return Result::Ok(false)
+    }
+
+    fun return_statement(mut self, value: Option<u64>, span: ast::Span) -> Result<bool, String> {
+        when value.is_none() {
+            self.statements.push(String("Return -"))
+            return Result::Ok(true)
+        }
+        when self.return_ty.is_empty() {
+            return Result::Err(unsupported("return value without a result type"))
+        }
+        lowered := self.expression(value.unwrap(), self.return_ty.clone())?
+        self.statements.push(join(words3(String("Return"), String("+"), lowered.text)))
+        return Result::Ok(true)
+    }
+}
+
+// Lowers `main` and returns the complete IR text, or `unsupported: ...`.
+pub fun lower_program(program: ast::Program) -> Result<String, String> {
+    when !program.uses.is_empty() || !program.structs.is_empty() || !program.enums.is_empty() {
+        return Result::Err(unsupported("items other than functions"))
+    }
+    when !program.type_aliases.is_empty() || !program.extends.is_empty() || !program.shapes.is_empty() {
+        return Result::Err(unsupported("items other than functions"))
+    }
+    when program.functions.len() != 1 {
+        return Result::Err(unsupported("more than one function"))
+    }
+    definition := program.function_defs[program.functions[0]]
+    when definition.name != "main" || !definition.parameters.is_empty() || !definition.type_parameters.is_empty() {
+        return Result::Err(unsupported("function other than a parameterless main"))
+    }
+    when definition.extern_c || definition.external_symbol.is_some() || !definition.type_parameter_bounds.is_empty() {
+        return Result::Err(unsupported("external or generic function"))
+    }
+    mut return_ty := String("")
+    mut return_word := String("-")
+    when definition.return_type.is_some() {
+        return_ty = result_type_word(program.types[definition.return_type.unwrap()])?
+        return_word = join(words2(String("+"), return_ty.clone()))
+    }
+    mut lowering := Lowering {
+        program: program,
+        locals: Vec(),
+        local_types: Vec(),
+        addressed: 0,
+        next_slot: 0,
+        statements: Vec(),
+        return_ty: return_ty.clone(),
+    }
+    mut falls_through := true
+    for statement in definition.body {
+        falls_through = !lowering.statement(statement)?
+    }
+    when definition.return_value.is_some() {
+        when return_ty.is_empty() {
+            return Result::Err(unsupported("result expression without a result type"))
+        }
+        lowered := lowering.expression(definition.return_value.unwrap(), return_ty.clone())?
+        lowering.statements.push(join(words3(String("Return"), String("+"), lowered.text)))
+        falls_through = false
+    }
+    when return_ty.is_empty() == false && falls_through {
+        return Result::Err(unsupported("function must return a value"))
+    }
+    when falls_through {
+        lowering.statements.push(String("Drop 0"))
+    }
+    return Result::Ok(assemble(lowering, return_word))
+}
+
+// The IR word for the declared result type of `main`.
+fun result_type_word(node: ast::TypeNode) -> Result<String, String> {
+    choose node {
+        ast::TypeNode::Simple(word) => type_word(word),
+        _ => Result::Err(unsupported("result type")),
+    }
+}
+
+// The whole IR text: header, builtin enums, the single function, and its local tables.
+fun assemble(lowering: Lowering, return_word: String) -> String {
+    mut tokens: Vec<String> = Vec()
+    tokens.push(String("Ir"))
+    tokens.push(String("0"))
+    tokens.push(String("-"))
+    tokens.push(String("0"))
+    enums := builtin_enums()
+    tokens.push(num(enums.len()))
+    for record in enums {
+        tokens.push(record)
+    }
+    tokens.push(String("1"))
+    tokens.push(String("0"))
+    tokens.push(String("-"))
+    tokens.push(return_word)
+    tokens.push(String("-"))
+    tokens.push(String("-"))
+    local_count := lowering.local_types.len()
+    addressed_count := lowering.addressed
+    tokens.push(num(lowering.statements.len()))
+    for statement in lowering.statements {
+        tokens.push(statement)
+    }
+    tokens.push(num(local_count))
+    for local in lowering.local_types {
+        tokens.push(local)
+    }
+    tokens.push(num(local_count))
+    mut owned: u64 = 0
+    while owned < local_count {
+        tokens.push(String("-"))
+        owned += 1
+    }
+    tokens.push(num(addressed_count))
+    mut addressed: u64 = 0
+    while addressed < addressed_count {
+        tokens.push(String("-"))
+        addressed += 1
+    }
+    // The bootstrap encoder writes a space before every word, including the first.
+    mut out := String(" ")
+    out.append(join(tokens))
+    return out
+}

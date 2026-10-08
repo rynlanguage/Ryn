@@ -1,8 +1,10 @@
-name: ast_roundtrip
+name: ryn-sema-subset
 version: 0.1.0
 owner: rynlanguage
 
 dependencies:
+  ast_roundtrip:
+    path: ../ast_roundtrip
 
 build:
   optimize: speed
