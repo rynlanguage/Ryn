@@ -162,3 +162,9 @@ generator:
   `sema` gives it (`U8` is an `I8` slot, `U32` an `I32` slot, and so on). Negation is
   defined for signed types only, and a literal folds only when its magnitude is out of
   range for a signed type. Nineteen corpus programs now lower to identical IR.
+- Stage 2, step 3g (done): integer casts `value as T` between integer types (a bare
+  literal takes the target type as its source, as the corpus shows), and the two
+  command-line builtins `arg_count()` and `arg(index)`, which are used only when no
+  user function has the same name. Twenty corpus programs now lower to identical IR.
+  Bitwise operators (`&`, `|`, `^`, `~`, shifts and their compound forms) are next,
+  but only one corpus program uses them, and it also needs `~` and mixed-type shifts.

@@ -384,6 +384,7 @@ extend Lowering {
             ast::Expr::BoolLit(value, span) => Result::Ok(String("Bool")),
             ast::Expr::NotE(value, span) => Result::Ok(String("Bool")),
             ast::Expr::NegateE(value, span) => self.infer(value),
+            ast::Expr::CastE(value, ty, span) => self.annotation(ty),
             ast::Expr::IntLit(value, span) => Result::Ok(String("")),
             ast::Expr::StrLit(text, span) => Result::Ok(String("Str")),
             ast::Expr::CallE(name, type_arguments, arguments, span) => self.call_result_type(name),
@@ -436,6 +437,7 @@ extend Lowering {
             ast::Expr::BoolLit(value, span) => self.boolean_literal(value, expected),
             ast::Expr::NotE(value, span) => self.negation(value, expected),
             ast::Expr::NegateE(value, span) => self.arithmetic_negation(value, expected),
+            ast::Expr::CastE(value, ty, span) => self.cast(value, ty, expected),
             ast::Expr::CallE(name, type_arguments, arguments, span) => self.call(name, type_arguments, arguments, expected),
             _ => Result::Err(unsupported("expression")),
         }
@@ -464,6 +466,32 @@ extend Lowering {
         ty := self.locals[index].ty.clone()
         text := join(words5(String("Local"), num(slot), ty.clone(), num(span.start), num(span.end)))
         return Result::Ok(Lowered { text: text, ty: ty })
+    }
+
+    // `value as T` between integer types. A bare literal takes the target type as its source.
+    fun cast(mut self, value: u64, target_index: u64, expected: String) -> Result<Lowered, String> {
+        target := self.annotation(target_index)?
+        when !is_integer_word(target.clone()) {
+            return Result::Err(unsupported("cast to this type"))
+        }
+        when !expected.is_empty() && expected != target {
+            return Result::Err(unsupported("cast where another type is expected"))
+        }
+        mut source := target.clone()
+        when self.literal_value(value).is_none() {
+            source = self.infer(value)?
+            when source.is_empty() {
+                return Result::Err(unsupported("cast of an untyped value"))
+            }
+        }
+        when !is_integer_word(source.clone()) {
+            return Result::Err(unsupported("cast from this type"))
+        }
+        operand := self.expression(value, source.clone())?
+        when operand.ty != source {
+            return Result::Err(unsupported("cast operand type"))
+        }
+        return Result::Ok(Lowered { text: join(words4(String("Cast"), operand.text, source, target.clone())), ty: target })
     }
 
     fun boolean_literal(self, value: bool, expected: String) -> Result<Lowered, String> {
@@ -609,9 +637,33 @@ extend Lowering {
         return Result::Ok(lowered)
     }
 
+    // The command-line builtins: `arg_count()` returns u32, and `arg(index)` takes a u32 and returns str.
+    fun builtin_call(mut self, name: String, arguments: Vec<u64>, expected: String) -> Result<Lowered, String> {
+        when name == "arg_count" {
+            when !arguments.is_empty() || (!expected.is_empty() && expected != "U32") {
+                return Result::Err(unsupported("arg_count shape"))
+            }
+            return Result::Ok(Lowered { text: join(words4(String("Call"), String("ArgumentCount"), String("0"), String("U32"))), ty: String("U32") })
+        }
+        when name == "arg" {
+            when arguments.len() != 1 || (!expected.is_empty() && expected != "Str") {
+                return Result::Err(unsupported("arg shape"))
+            }
+            index := self.expression(arguments[0], String("U32"))?
+            when index.ty != "U32" {
+                return Result::Err(unsupported("arg index type"))
+            }
+            return Result::Ok(Lowered { text: join(words5(String("Call"), String("Argument"), String("1"), index.text, String("Str"))), ty: String("Str") })
+        }
+        return Result::Err(unsupported("unknown function"))
+    }
+
     fun call(mut self, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, expected: String) -> Result<Lowered, String> {
         when !type_arguments.is_empty() {
             return Result::Err(unsupported("generic call"))
+        }
+        when self.signature_index(name.clone()).is_err() {
+            return self.builtin_call(name, arguments, expected)
         }
         id := self.signature_index(name)?
         ret := self.signatures[id].ret.clone()
