@@ -1331,7 +1331,7 @@ fn analyze_with_recovery(
     }
     let mut structs = resolve_struct_layouts(&program.structs, &struct_ids, &enum_ids)
         .map_err(|error| vec![error])?;
-    let enums = resolve_enum_layouts(&program.enums, &structs, &struct_ids, &enum_ids)
+    let mut enums = resolve_enum_layouts(&program.enums, &structs, &struct_ids, &enum_ids)
         .map_err(|error| vec![error])?;
     for definition in &structs {
         for field in &definition.fields {
@@ -1740,7 +1740,7 @@ fn analyze_with_recovery(
             &signatures,
             &mut structs,
             &struct_ids,
-            &enums,
+            &mut enums,
             &enum_ids,
             &function_module_paths,
             &function_visibility,
@@ -2186,7 +2186,7 @@ struct Analyzer<'a> {
     signatures: &'a HashMap<String, FunctionSignature>,
     structs: &'a mut Vec<RynStruct>,
     struct_ids: &'a HashMap<String, usize>,
-    enums: &'a [RynEnum],
+    enums: &'a mut Vec<RynEnum>,
     enum_ids: &'a HashMap<String, usize>,
     function_module_paths: &'a [String],
     function_visibility: &'a [bool],
@@ -2209,12 +2209,39 @@ struct Analyzer<'a> {
 }
 
 impl<'a> Analyzer<'a> {
+    /// The `Option<payload>` enum. It is created the first time the program
+    /// uses a payload type without an expected `Option` type.
+    fn option_enum_for(&mut self, payload: Type) -> usize {
+        if let Some(enum_id) = self
+            .enums
+            .iter()
+            .position(|definition| is_option_of(definition, payload))
+        {
+            return enum_id;
+        }
+        let enum_id = self.enums.len();
+        self.enums.push(RynEnum {
+            name: format!("$RynOption#inferred{enum_id}"),
+            variants: vec![
+                RynEnumVariant {
+                    name: "Some".into(),
+                    fields: vec![payload],
+                },
+                RynEnumVariant {
+                    name: "None".into(),
+                    fields: Vec::new(),
+                },
+            ],
+        });
+        enum_id
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         signatures: &'a HashMap<String, FunctionSignature>,
         structs: &'a mut Vec<RynStruct>,
         struct_ids: &'a HashMap<String, usize>,
-        enums: &'a [RynEnum],
+        enums: &'a mut Vec<RynEnum>,
         enum_ids: &'a HashMap<String, usize>,
         function_module_paths: &'a [String],
         function_visibility: &'a [bool],
@@ -5042,7 +5069,18 @@ impl<'a> Analyzer<'a> {
                     }
                     _ => None,
                 });
-                let enum_id = self.scoped_enum_id(&enum_name).or(expected_generic_id);
+                let mut inferred_payload = None;
+                let enum_id = match self.scoped_enum_id(&enum_name).or(expected_generic_id) {
+                    Some(enum_id) => Some(enum_id),
+                    // Without an expected type, `Option::Some(value)` takes its
+                    // `Option<T>` from the payload's type.
+                    None if enum_name == "Option" && variant == "Some" && arguments.len() == 1 => {
+                        let (value, payload) = self.expression(arguments[0].clone(), None)?;
+                        inferred_payload = Some((value, payload));
+                        Some(self.option_enum_for(payload))
+                    }
+                    None => None,
+                };
                 let Some(enum_id) = enum_id else {
                     // `Type::CONSTANT` lowers to a zero-argument function; the
                     // parser sees the same `Type::Name` path as enum variants.
@@ -5059,7 +5097,7 @@ impl<'a> Analyzer<'a> {
                             "declare the enum before constructing it"
                         }));
                 };
-                let definition = &self.enums[enum_id];
+                let definition = self.enums[enum_id].clone();
                 let Some(variant_index) = definition
                     .variants
                     .iter()
@@ -5102,6 +5140,15 @@ impl<'a> Analyzer<'a> {
                 let mut lowered = Vec::new();
                 for (index, argument) in arguments.into_iter().enumerate() {
                     let field_ty = variant_definition.fields[index];
+                    if index == 0
+                        && let Some((value, payload)) = inferred_payload.take()
+                    {
+                        // The inferred enum was built from this payload type, so it
+                        // was lowered once already.
+                        debug_assert_eq!(payload, field_ty);
+                        lowered.push(value);
+                        continue;
+                    }
                     let (value, actual) = self.expression(argument, Some(field_ty))?;
                     if actual != field_ty {
                         return Err(diag(
@@ -5276,7 +5323,7 @@ impl<'a> Analyzer<'a> {
                     return Err(diag("R0234", "`choose` requires an enum value", span)
                         .with_help("match one of this enum's variants over a value of enum type"));
                 };
-                let definition = &self.enums[enum_id];
+                let definition = self.enums[enum_id].clone();
                 let mut covered = vec![false; definition.variants.len()];
                 let mut has_wildcard = false;
                 for arm in &arms {

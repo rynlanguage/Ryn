@@ -1382,6 +1382,13 @@ impl<'a> Decoder<'a> {
                 let span = self.span()?;
                 Expression::coalesce(value, fallback, span)
             }
+            "OptionalField" => {
+                let value = self.expression()?;
+                let name = self.string()?;
+                let name_span = self.span()?;
+                let span = self.span()?;
+                Expression::optional_field(value, name, name_span, span)
+            }
             "Negate" => Expression::Negate(self.boxed_expression()?, self.span()?),
             "Not" => Expression::Not(self.boxed_expression()?, self.span()?),
             "BitNot" => Expression::BitNot(self.boxed_expression()?, self.span()?),

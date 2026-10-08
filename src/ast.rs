@@ -337,6 +337,47 @@ impl Expression {
         }
     }
 
+    /// Rewrites `value?.name` into a `choose` over `Option`: a `Some` payload is
+    /// read through `name` and wrapped again, and `None` stays `None`.
+    pub fn optional_field(value: Expression, name: String, name_span: Span, span: Span) -> Expression {
+        let bound = "$chain".to_owned();
+        Expression::Choose {
+            value: Box::new(value),
+            arms: vec![
+                ChooseArm {
+                    enum_name: Some("Option".to_owned()),
+                    variant: Some("Some".to_owned()),
+                    bindings: vec![bound.clone()],
+                    body: Expression::EnumConstruct {
+                        enum_name: "Option".to_owned(),
+                        variant: "Some".to_owned(),
+                        arguments: vec![Expression::Field {
+                            value: Box::new(Expression::Name(bound, name_span)),
+                            name,
+                            name_span,
+                            span: name_span,
+                        }],
+                        span,
+                    },
+                    span,
+                },
+                ChooseArm {
+                    enum_name: Some("Option".to_owned()),
+                    variant: Some("None".to_owned()),
+                    bindings: Vec::new(),
+                    body: Expression::EnumConstruct {
+                        enum_name: "Option".to_owned(),
+                        variant: "None".to_owned(),
+                        arguments: Vec::new(),
+                        span,
+                    },
+                    span,
+                },
+            ],
+            span,
+        }
+    }
+
     pub fn span(&self) -> Span {
         match self {
             Self::Integer(_, span)

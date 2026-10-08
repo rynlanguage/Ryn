@@ -154,6 +154,9 @@ fn self_hosted_edge_cases_and_diagnostics() {
         "fun main() { Point { x, y: mut z } := p }",
         "fun main() { (a) := x }",
         "fun main() { Point { x, } := p Point { .. } := p Point { x: } := p (a, b := c }",
+        "fun main() { x := a?.b?.c y := f()?.g() z := (h()?).i w := arr[0]?.name v := t?.0 }",
+        "fun main() { x := a?. }",
+        "fun main() { x := a?.b(1)?.c::<T>() }",
         // Lexical errors.
         "fun main() { echo \"unterminated }",
         "fun main() { x := 1__2 + 0b102 + 0x + 1e + 1e999 + 18446744073709551616 }",

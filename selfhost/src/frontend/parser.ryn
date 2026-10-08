@@ -1799,14 +1799,14 @@ extend Parser {
     }
 
     fun shape_def(mut self) -> Result<String, lexer::Diag> {
-        start := self.expect(lexer::Tk::SHAPE, "expected `shape`")?.start
+        start := (self.expect(lexer::Tk::SHAPE, "expected `shape`")?).start
         shape_name := self.ident("expected shape name")?
         name := self.qualified_declaration_name(shape_name.text)
         self.expect(lexer::Tk::LBRACE, "expected `{` after shape name")?
         mut methods := String()
         mut method_count: u64 = 0
         while self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
-            fun_start := self.expect(lexer::Tk::FUN, "expected `fun` in shape")?.start
+            fun_start := (self.expect(lexer::Tk::FUN, "expected `fun` in shape")?).start
             method_name := self.ident("expected method name")?
             self.expect(lexer::Tk::LPAREN, "expected `(` after method name")?
             mut parameters := String()
@@ -1876,7 +1876,7 @@ extend Parser {
             methods.append(enc_span(fun_start, self.peek().start))
             method_count += 1
         }
-        end := self.expect(lexer::Tk::RBRACE, "expected `}` after shape methods")?.end
+        end := (self.expect(lexer::Tk::RBRACE, "expected `}` after shape methods")?).end
         mut out := String("\n")
         out.append(enc_str(name))
         out.append(enc_list(method_count, methods))
@@ -1888,7 +1888,7 @@ extend Parser {
     // Parses an `extend` block. Its methods and constants become functions
     // that the program loop collects from `pending_methods`.
     fun extend_def(mut self) -> Result<String, lexer::Diag> {
-        start := self.expect(lexer::Tk::EXTEND, "expected `extend`")?.start
+        start := (self.expect(lexer::Tk::EXTEND, "expected `extend`")?).start
         when self.peek_kind() == lexer::Tk::LESS {
             return Result::Err(self.error("generic `extend` blocks are not supported yet"))
         }
@@ -1925,7 +1925,7 @@ extend Parser {
                 return Result::Err(self.error("expected `fun` or `const` inside `extend`"))
             }
         }
-        end := self.expect(lexer::Tk::RBRACE, "expected `}` after extend members")?.end
+        end := (self.expect(lexer::Tk::RBRACE, "expected `}` after extend members")?).end
         methods.append(constants)
         self.pending_methods = methods
         self.pending_method_count = method_count + constant_count
@@ -1942,7 +1942,7 @@ extend Parser {
     // A constant inside `extend` becomes a parameterless function that
     // returns its value.
     fun constant_def(mut self, public: bool, type_name: String) -> Result<String, lexer::Diag> {
-        start := self.expect(lexer::Tk::CONST, "expected `const`")?.start
+        start := (self.expect(lexer::Tk::CONST, "expected `const`")?).start
         name := self.ident("expected constant name")?
         self.expect(lexer::Tk::COLON, "expected `:` after constant name")?
         ty := self.type_name()?
@@ -1972,7 +1972,7 @@ extend Parser {
     }
 
     fun use_decl(mut self) -> Result<String, lexer::Diag> {
-        start := self.expect(lexer::Tk::USE, "expected `use`")?.start
+        start := (self.expect(lexer::Tk::USE, "expected `use`")?).start
         first := self.ident("expected module path after `use`")?
         mut path := Vec<String>()
         path.push(first.text)
@@ -2069,7 +2069,7 @@ extend Parser {
             return Result::Err(self.error("expected `drop` in destructor attribute"))
         }
         self.expect(lexer::Tk::LPAREN, "expected `(` after `drop`")?
-        mut function := self.ident("expected destructor function name")?.text
+        mut function := (self.ident("expected destructor function name")?).text
         while self.peek_kind() == lexer::Tk::COLON_COLON {
             self.skip()
             segment := self.ident("expected destructor path segment after `::`")?
@@ -2165,7 +2165,7 @@ extend Parser {
                 break
             }
         }
-        end := self.expect(lexer::Tk::RBRACE, "expected `}` after structure fields")?.end
+        end := (self.expect(lexer::Tk::RBRACE, "expected `}` after structure fields")?).end
         self.forget_type_parameters(type_parameters.clone())
         when has_drop && !type_parameters.is_empty() {
             return Result::Err(self.error("generic structures cannot yet define custom destructors"))
@@ -2285,7 +2285,7 @@ extend Parser {
                 break
             }
         }
-        end := self.expect(lexer::Tk::RBRACE, "expected `}` after enum variants")?.end
+        end := (self.expect(lexer::Tk::RBRACE, "expected `}` after enum variants")?).end
         self.forget_type_parameters(type_parameters.clone())
         when !type_parameters.is_empty() {
             when !self.recovering && self.generic_enum_templates.contains_key(name.clone()) {
@@ -2397,7 +2397,7 @@ extend Parser {
     // `has_self` marks an `extend` method whose receiver has type `receiver`;
     // `prefix` qualifies its name with the extended type.
     fun function(mut self, public: bool, extern_c: bool, has_self: bool, receiver: u64, has_prefix: bool, prefix: String) -> Result<String, lexer::Diag> {
-        start := self.expect(lexer::Tk::FUN, "expected `fun`")?.start
+        start := (self.expect(lexer::Tk::FUN, "expected `fun`")?).start
         name_token := self.next()
         when name_token.kind != lexer::Tk::IDENT {
             return Result::Err(self.error("expected function name"))
@@ -2527,7 +2527,7 @@ extend Parser {
             when !type_parameters.is_empty() {
                 return Result::Err(self.error("generic `extern \"C\"` functions are not supported"))
             }
-            end := self.expect(lexer::Tk::SEMICOLON, "expected `;` after the external function signature")?.end
+            end := (self.expect(lexer::Tk::SEMICOLON, "expected `;` after the external function signature")?).end
             head.append(enc_some(enc_str(external_symbol)))
             head.append(enc_uint(0))
             head.append(enc_uint(0))
@@ -2586,7 +2586,7 @@ extend Parser {
                 break
             }
         }
-        end := self.expect(lexer::Tk::RBRACE, "expected `}` to close function")?.end
+        end := (self.expect(lexer::Tk::RBRACE, "expected `}` to close function")?).end
         self.forget_type_parameters(type_parameters.clone())
         when extern_c {
             head.append(enc_some(enc_str(external_symbol)))
@@ -2829,6 +2829,20 @@ extend Parser {
         }
         code := self.statement()?
         return Result::Ok(StatementGroup { code: code, count: 1 })
+    }
+
+    // At `?` in `?.name` where no call follows the name: an optional field access.
+    // `?.name(...)` and `?.name::<T>(...)` keep the propagation meaning.
+    fun optional_field_follows(self) -> bool {
+        when self.kind_at(self.at + 1) != lexer::Tk::DOT {
+            return false
+        }
+        field := self.kind_at(self.at + 2)
+        when field != lexer::Tk::IDENT && field != lexer::Tk::INTEGER {
+            return false
+        }
+        after := self.kind_at(self.at + 3)
+        return after != lexer::Tk::LPAREN && after != lexer::Tk::COLON_COLON
     }
 
     // Whether the next token is on a later line than the token before it. A `(`
@@ -3303,7 +3317,7 @@ extend Parser {
                 count = 3
             }
             self.skip()
-            code.append(self.expression(0)?.code)
+            code.append((self.expression(0)?).code)
         }
         when self.peek_kind() != lexer::Tk::LBRACE {
             return Result::Err(self.error("expected `{` to start block"))
@@ -3439,7 +3453,7 @@ extend Parser {
             }
             mut end := token.end
             when grouped {
-                end = self.expect(lexer::Tk::RPAREN, "expected `)` after echo template")?.end
+                end = (self.expect(lexer::Tk::RPAREN, "expected `)` after echo template")?).end
             }
             mut out := String("\n")
             out.append(word("Template"))
@@ -3640,7 +3654,7 @@ extend Parser {
         mut count: u64 = 0
         when self.peek_kind() != closing {
             while true {
-                code.append(self.expression(0)?.code)
+                code.append((self.expression(0)?).code)
                 count += 1
                 when self.peek_kind() == lexer::Tk::COMMA {
                     self.skip()
@@ -3860,7 +3874,7 @@ extend Parser {
             when name == "Set" {
                 self.expect_type_greater("expected `>` after Set element type")?
                 self.expect(lexer::Tk::LPAREN, "expected `()` after Set<T>")?
-                end := self.expect(lexer::Tk::RPAREN, "expected empty `()` after Set<T>")?.end
+                end := (self.expect(lexer::Tk::RPAREN, "expected empty `()` after Set<T>")?).end
                 mut code := word("NewSet")
                 code.append(self.encode_type(key))
                 code.append(enc_span(start, end))
@@ -3873,7 +3887,7 @@ extend Parser {
             self.expect_type_greater("expected `>` after Map key and value types")?
             self.ensure_map_option_specialization(value, token.start, token.end)
             self.expect(lexer::Tk::LPAREN, "expected `()` after `Map<K, V>`")?
-            end := self.expect(lexer::Tk::RPAREN, "expected empty `()` after `Map<K, V>`")?.end
+            end := (self.expect(lexer::Tk::RPAREN, "expected empty `()` after `Map<K, V>`")?).end
             mut code := word("NewMap")
             code.append(self.encode_type(key))
             code.append(self.encode_type(value))
@@ -3882,7 +3896,7 @@ extend Parser {
         } else when kind == lexer::Tk::IDENT && (name == "sizeof" || name == "alignof") && self.peek_kind() == lexer::Tk::LPAREN {
             self.skip()
             ty := self.type_name()?
-            end := self.expect(lexer::Tk::RPAREN, "expected `)` after layout type")?.end
+            end := (self.expect(lexer::Tk::RPAREN, "expected `)` after layout type")?).end
             mut code := word("Layout")
             code.append(self.encode_type(ty))
             code.append(enc_bool(name == "alignof"))
@@ -3896,7 +3910,7 @@ extend Parser {
                 return Result::Err(self.error("expected `()` after `Vec<T>` to construct an empty vector"))
             }
             self.skip()
-            end := self.expect(lexer::Tk::RPAREN, "expected `()`, e.g. `Vec<i32>()`")?.end
+            end := (self.expect(lexer::Tk::RPAREN, "expected `()`, e.g. `Vec<i32>()`")?).end
             mut code := word("NewVec")
             code.append(self.encode_type(element))
             code.append(enc_span(start, end))
@@ -3910,7 +3924,7 @@ extend Parser {
             arguments := self.call_arguments()?
             mut end := self.closing_end
             when !self.closing_consumed {
-                end = self.expect(lexer::Tk::RPAREN, "expected `)` after arguments")?.end
+                end = (self.expect(lexer::Tk::RPAREN, "expected `)` after arguments")?).end
             }
             when name == "read_file_result" {
                 self.result_specialization(Ty::STRING as u64, Ty::I32 as u64, start, end)
@@ -3922,7 +3936,7 @@ extend Parser {
             fields := self.recovering_struct_literal_fields()?
             mut end := self.closing_end
             when !self.closing_consumed {
-                end = self.expect(lexer::Tk::RBRACE, "expected `}` after structure literal")?.end
+                end = (self.expect(lexer::Tk::RBRACE, "expected `}` after structure literal")?).end
             }
             mut code := word("Struct")
             code.append(enc_str(name))
@@ -3975,10 +3989,10 @@ extend Parser {
                     when self.peek_kind() == lexer::Tk::RPAREN {
                         break
                     }
-                    values.append(self.expression(0)?.code)
+                    values.append((self.expression(0)?).code)
                     count += 1
                 }
-                end := self.expect(lexer::Tk::RPAREN, "expected `)` after tuple elements")?.end
+                end := (self.expect(lexer::Tk::RPAREN, "expected `)` after tuple elements")?).end
                 mut code := word("Tuple")
                 code.append(enc_list(count, values))
                 code.append(enc_span(start, end))
@@ -4011,12 +4025,28 @@ extend Parser {
                 postfix_depth += 1
                 self.skip()
                 index := self.expression(0)?
-                end := self.expect(lexer::Tk::RBRACKET, "expected `]` after index")?.end
+                end := (self.expect(lexer::Tk::RBRACKET, "expected `]` after index")?).end
                 mut code := word("Index")
                 code.append(left.code)
                 code.append(index.code)
                 code.append(enc_span(left.start, end))
                 left = plain_expr(code, left.start, end)
+                continue
+            }
+            when kind == lexer::Tk::QUESTION && self.optional_field_follows() {
+                when postfix_depth >= Limits::EXPRESSION_DEPTH {
+                    return Result::Err(self.nesting_error("optional field access"))
+                }
+                postfix_depth += 1
+                self.skip()
+                self.skip()
+                field := self.field_name_after_dot()?
+                mut code := word("OptionalField")
+                code.append(left.code)
+                code.append(enc_str(field.text))
+                code.append(enc_span(field.start, field.end))
+                code.append(enc_span(left.start, field.end))
+                left = plain_expr(code, left.start, field.end)
                 continue
             }
             when kind == lexer::Tk::QUESTION {
@@ -4063,14 +4093,14 @@ extend Parser {
                     mut arguments := String()
                     mut count: u64 = 0
                     while self.peek_kind() != lexer::Tk::RPAREN && self.peek_kind() != lexer::Tk::EOF {
-                        arguments.append(self.expression(0)?.code)
+                        arguments.append((self.expression(0)?).code)
                         count += 1
                         when self.peek_kind() != lexer::Tk::COMMA {
                             break
                         }
                         self.skip()
                     }
-                    end := self.expect(lexer::Tk::RPAREN, "expected `)` after method arguments")?.end
+                    end := (self.expect(lexer::Tk::RPAREN, "expected `)` after method arguments")?).end
                     mut head := left.code
                     head.append(enc_str(field.text))
                     tail := enc_list(count, arguments)
@@ -4193,7 +4223,7 @@ extend Parser {
                     String("write `[value; 4]`; the length cannot be an expression")
                 ))
             }
-            end := self.expect(lexer::Tk::RBRACKET, "expected `]` after array repeat")?.end
+            end := (self.expect(lexer::Tk::RBRACKET, "expected `]` after array repeat")?).end
             mut code := word("Repeat")
             code.append(first.code)
             code.append(enc_uint(length.value))
@@ -4208,14 +4238,14 @@ extend Parser {
                 when self.peek_kind() == lexer::Tk::RBRACKET {
                     break
                 }
-                elements.append(self.expression(0)?.code)
+                elements.append((self.expression(0)?).code)
                 count += 1
                 when self.peek_kind() != lexer::Tk::COMMA {
                     break
                 }
             }
         }
-        end := self.expect(lexer::Tk::RBRACKET, "expected `]` after array elements")?.end
+        end := (self.expect(lexer::Tk::RBRACKET, "expected `]` after array elements")?).end
         mut code := word("Array")
         code.append(enc_list(count, elements))
         code.append(enc_span(start, end))
@@ -4244,13 +4274,13 @@ extend Parser {
                 self.expect_type_greater("expected `>` after generic call arguments")?
                 break
             }
-            path.push(self.ident("expected path segment after `::`")?.text)
+            path.push((self.ident("expected path segment after `::`")?).text)
         }
         when !type_arguments.is_empty() && self.peek_kind() == lexer::Tk::COLON_COLON
             && self.generic_enum_templates.contains_key(join(path.clone(), "::")) {
             specialized := self.specialize_generic_enum(join(path.clone(), "::"), type_arguments.clone(), token.start, token.end)?
             self.skip()
-            variant := self.ident("expected variant after generic enum type")?.text
+            variant := (self.ident("expected variant after generic enum type")?).text
             path = Vec<String>()
             path.push(specialized)
             path.push(variant)
@@ -4265,7 +4295,7 @@ extend Parser {
         when self.peek_kind() == lexer::Tk::LPAREN && !self.at_line_start() {
             self.skip()
             arguments := self.expressions_until(lexer::Tk::RPAREN)?
-            end := self.expect(lexer::Tk::RPAREN, "expected `)` after enum variant arguments")?.end
+            end := (self.expect(lexer::Tk::RPAREN, "expected `)` after enum variant arguments")?).end
             types := self.encode_types(type_arguments)
             return Result::Ok(self.call_expression(join(path, "::"), types, arguments, start, end))
         }
@@ -4276,7 +4306,7 @@ extend Parser {
             when self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
                 fields = self.struct_literal_fields(true)?
             }
-            end := self.expect(lexer::Tk::RBRACE, "expected `}` after structure literal")?.end
+            end := (self.expect(lexer::Tk::RBRACE, "expected `}` after structure literal")?).end
             mut code := word("Struct")
             code.append(enc_str(join(path, "::")))
             code.append(enc_list(fields.count, fields.code))
@@ -4325,7 +4355,7 @@ extend Parser {
                 break
             }
         }
-        end := self.expect(lexer::Tk::RBRACE, "expected `}` after choose arms")?.end
+        end := (self.expect(lexer::Tk::RBRACE, "expected `}` after choose arms")?).end
         mut code := word("Choose")
         code.append(value.code)
         code.append(enc_list(arm_count, arms))
@@ -4363,13 +4393,13 @@ extend Parser {
                     self.expect_type_greater("expected `>` after generic enum pattern arguments")?
                     break
                 }
-                path.push(self.ident("expected pattern path segment after `::`")?.text)
+                path.push((self.ident("expected pattern path segment after `::`")?).text)
             }
             when !type_arguments.is_empty() && self.peek_kind() == lexer::Tk::COLON_COLON
                 && self.generic_enum_templates.contains_key(join(path.clone(), "::")) {
                 specialized := self.specialize_generic_enum(join(path.clone(), "::"), type_arguments, arm_token.start, arm_token.end)?
                 self.skip()
-                variant := self.ident("expected variant after generic enum type")?.text
+                variant := (self.ident("expected variant after generic enum type")?).text
                 path = Vec<String>()
                 path.push(specialized)
                 path.push(variant)
@@ -4383,7 +4413,7 @@ extend Parser {
                 self.skip()
                 when self.peek_kind() != lexer::Tk::RPAREN {
                     while true {
-                        bindings.push(self.ident("expected binding name")?.text)
+                        bindings.push((self.ident("expected binding name")?).text)
                         when self.peek_kind() == lexer::Tk::COMMA {
                             self.skip()
                         } else {

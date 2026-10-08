@@ -2520,6 +2520,21 @@ impl Parser<'_> {
         }
     }
 
+    /// At `?` in `?.name`, where no call follows the name: an optional field
+    /// access. `?.name(...)` and `?.name::<T>(...)` keep the propagation meaning.
+    fn optional_field_follows(&self) -> bool {
+        matches!(
+            self.tokens.get(self.at + 1).map(|token| &token.kind),
+            Some(TokenKind::Dot)
+        ) && matches!(
+            self.tokens.get(self.at + 2).map(|token| &token.kind),
+            Some(TokenKind::Ident(_) | TokenKind::Integer(_))
+        ) && !matches!(
+            self.tokens.get(self.at + 3).map(|token| &token.kind),
+            Some(TokenKind::LParen | TokenKind::ColonColon)
+        )
+    }
+
     /// Whether the next token is on a later line than the token before it. A
     /// `(` in that position starts a new statement instead of calling the
     /// expression above it.
@@ -4346,6 +4361,21 @@ impl Parser<'_> {
                     index: Box::new(index),
                     span: Span { start, end },
                 };
+                continue;
+            }
+            if matches!(self.peek().kind, TokenKind::Question) && self.optional_field_follows() {
+                if postfix_depth >= MAX_EXPRESSION_DEPTH {
+                    return Err(self.nesting_error("optional field access"));
+                }
+                postfix_depth += 1;
+                self.next();
+                self.next();
+                let (name, name_span) = self.field_name_after_dot()?;
+                let span = Span {
+                    start: left.span().start,
+                    end: name_span.end,
+                };
+                left = Expression::optional_field(left, name, name_span, span);
                 continue;
             }
             if matches!(self.peek().kind, TokenKind::Question) {
