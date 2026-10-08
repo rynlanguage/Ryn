@@ -105,3 +105,15 @@ generator:
   literals as the text the encoder wrote.
   Porting note: `Result<Vec<T>>` is rejected for struct element types, so lists of
   structures live in arenas and lists are `Vec<u64>` of indices.
+- Stage 2 inventory for the `sema` port (not started). Every IR text begins with a
+  fixed block of generated enums: built-in `$RynOption#...`, `$RynResult#<i>#<j>` for
+  every pair of numeric types, and `$RynResult#Parse<i>String`, written by
+  `src/sema.rs` around lines 950-1100. Programs that use other generic instances add
+  more, through the parser's `$Ryn<Name>#<n>` names and `src/generics.rs`
+  (`examples/maps.ryn` has 146 generated enums, most programs 144). Porting order:
+  (1) the built-in registry, gated by the shared prefix of the corpus IR; (2) type
+  checking and slot allocation for programs that use only `main`, scalar locals,
+  `echo`, and arithmetic; (3) functions and calls; (4) the rest of the statement and
+  expression forms, each behind the same IR-equality gate. The port is blocked on
+  nothing in Ryn itself, but it is several thousand lines of Ryn and needs the
+  checker's error paths reproduced too, so it spans multiple sessions.
