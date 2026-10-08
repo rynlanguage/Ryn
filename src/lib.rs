@@ -10,6 +10,7 @@ pub mod codegen;
 pub mod filesystem_ops;
 pub mod frontend;
 pub mod generics;
+pub mod ir_codec;
 mod guard;
 pub mod lexer;
 pub mod lockfile;

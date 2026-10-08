@@ -52,3 +52,16 @@ generator:
   stage 1, and checks stage 2 and stage 3 are identical.
 - Releases ship a compiler built by the previous release; the Rust sources
   remain only as a reference until they are removed.
+
+## Progress log
+
+- Stage 2, step 1 (done): `src/ir_codec.rs` writes the typed IR produced by
+  `sema::analyze` as text and reads it back. Types are written by content (an
+  array is its element and length, a function pointer its signature), so the
+  registry indices do not leak into the text. `tests/ir_codec.rs` checks that
+  every `tests/programs/pass` fixture round-trips and that at least half of the
+  examples do (`encode(decode(encode(ir))) == encode(ir)`). Operation enums are
+  named through tables generated from their definitions, and the encoder's
+  `match` arms are exhaustive, so a new IR variant cannot be dropped silently.
+- Stage 2, step 2 (not started): a Ryn implementation of the IR data types and
+  the decoder, gated by equal re-encoding of the same corpus.
