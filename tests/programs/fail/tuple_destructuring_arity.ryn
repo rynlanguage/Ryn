@@ -1,0 +1,5 @@
+fun main() {
+    pair := (1, 2)
+    (a, b, c) := pair
+    echo a + b + c
+}

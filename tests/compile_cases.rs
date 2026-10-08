@@ -62,6 +62,7 @@ fn fail_fixtures_are_rejected_with_the_expected_diagnostic_codes() {
         ("defer_break_outside.ryn", "R0268"),
         ("defer_reference.ryn", "R0269"),
         ("defer_owned_moved.ryn", "R0240"),
+        ("tuple_destructuring_arity.ryn", "R0225"),
     ];
     let failures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/fail");
 

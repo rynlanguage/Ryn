@@ -1,0 +1,25 @@
+fun split(total: i32) -> (i32, String) {
+    (total / 2, String("half"))
+}
+
+fun main() {
+    pair := (3, String("x"))
+    echo pair.0
+    (count, label) := pair
+    echo count
+    echo label
+
+    (mut left, _, right) := (1, 2, String("r"))
+    left += 10
+    echo left
+    echo right
+
+    (half, word) := split(9)
+    echo half
+    echo word
+
+    when half > 0 {
+        (first, _, last) := (1, String("skip"), 3)
+        echo first + last
+    }
+}

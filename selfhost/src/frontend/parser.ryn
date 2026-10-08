@@ -105,6 +105,13 @@ struct Name {
     end: u64
 }
 
+// The encoded statements for one source statement; a tuple destructuring
+// declaration yields several.
+struct StatementGroup {
+    code: String,
+    count: u64
+}
+
 struct FieldTemplate {
     name: String,
     ty: u64,
@@ -1799,10 +1806,11 @@ extend Parser {
                 mut body_count: u64 = 0
                 while self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
                     statement_start := self.at
-                    statement := self.statement()
+                    statement := self.statement_group()
                     when statement.is_ok() {
-                        body.append(statement.unwrap())
-                        body_count += 1
+                        group := statement.unwrap()
+                        body.append(group.code)
+                        body_count += group.count
                     } else {
                         when !self.recovering {
                             return Result::Err(statement.unwrap_err())
@@ -2500,10 +2508,11 @@ extend Parser {
                 is_tail_when = self.if_expression_reaches_function_end()
             }
             when starts && !is_tail_when {
-                statement := self.statement()
+                statement := self.statement_group()
                 when statement.is_ok() {
-                    body.append(statement.unwrap())
-                    body_count += 1
+                    group := statement.unwrap()
+                    body.append(group.code)
+                    body_count += group.count
                 } else {
                     when !self.recovering {
                         return Result::Err(statement.unwrap_err())
@@ -2571,7 +2580,121 @@ extend Parser {
         when kind == lexer::Tk::IDENT && (next == lexer::Tk::DEFINE || is_assignment_kind(next)) {
             return true
         }
+        when self.tuple_destructuring_start() {
+            return true
+        }
         return allow_call && kind == lexer::Tk::IDENT && (next == lexer::Tk::LPAREN || next == lexer::Tk::DOT)
+    }
+
+    // `(a, mut b, _) := value` at a statement start, with at least two names.
+    fun tuple_destructuring_start(self) -> bool {
+        when self.peek_kind() != lexer::Tk::LPAREN {
+            return false
+        }
+        mut index := self.at + 1
+        mut names: u64 = 0
+        mut more := true
+        while more {
+            when self.kind_at(index) == lexer::Tk::MUT {
+                index += 1
+            }
+            when self.kind_at(index) != lexer::Tk::IDENT {
+                return false
+            }
+            names += 1
+            index += 1
+            kind := self.kind_at(index)
+            when kind == lexer::Tk::COMMA {
+                index += 1
+            } else when kind == lexer::Tk::RPAREN {
+                more = false
+            } else {
+                return false
+            }
+        }
+        return names >= 2 && self.kind_at(index + 1) == lexer::Tk::DEFINE
+    }
+
+    // Desugars `(a, mut b, _) := value` into a temporary holding `value` and one
+    // `:=` per named element that reads it with a tuple field access (`_0`, `_1`, ...).
+    fun tuple_destructuring(mut self) -> Result<StatementGroup, lexer::Diag> {
+        start := self.next().start
+        mut names := Vec<Name>()
+        mut mutables := Vec<bool>()
+        mut more := true
+        while more {
+            mutable := self.consume_if(lexer::Tk::MUT)
+            name := self.ident("expected a name in tuple destructuring")?
+            names.push(name)
+            mutables.push(mutable)
+            when self.peek_kind() == lexer::Tk::COMMA {
+                self.skip()
+            } else {
+                more = false
+            }
+        }
+        self.expect(lexer::Tk::RPAREN, "expected `)` after tuple destructuring names")?
+        self.expect(lexer::Tk::DEFINE, "expected `:=` after tuple destructuring names")?
+        value := self.expression(0)?
+        mut temporary := String("__destructure_")
+        temporary.append(String(start))
+        mut out := String("\n")
+        out.append(word("Let"))
+        out.append(enc_str(temporary.clone()))
+        out.append(enc_bool(false))
+        out.append(enc_none())
+        out.append(value.code)
+        out.append(enc_span(start, value.end))
+        mut count: u64 = 1
+        mut index: u64 = 0
+        while index < names.len() {
+            name := names[index]
+            when name.text != "_" {
+                mut field := String("_")
+                field.append(String(index))
+                out.append(word("Let"))
+                out.append(enc_str(name.text.clone()))
+                out.append(enc_bool(mutables[index]))
+                out.append(enc_none())
+                out.append(word("Field"))
+                out.append(word("Name"))
+                out.append(enc_str(temporary.clone()))
+                out.append(enc_span(name.start, name.end))
+                out.append(enc_str(field))
+                out.append(enc_span(name.start, name.end))
+                out.append(enc_span(name.start, name.end))
+                out.append(enc_span(name.start, name.end))
+                count += 1
+            }
+            index += 1
+        }
+        return Result::Ok(StatementGroup { code: out, count: count })
+    }
+
+    // One statement, or the statements a tuple destructuring declaration expands to.
+    fun statement_group(mut self) -> Result<StatementGroup, lexer::Diag> {
+        when self.tuple_destructuring_start() {
+            return self.tuple_destructuring()
+        }
+        code := self.statement()?
+        return Result::Ok(StatementGroup { code: code, count: 1 })
+    }
+
+    // Whether the next token is on a later line than the token before it. A `(`
+    // in that position starts a new statement instead of calling the expression above.
+    fun at_line_start(self) -> bool {
+        when self.at == 0 {
+            return false
+        }
+        mut index := self.tokens[self.at - 1].end
+        end := self.tokens[self.at].start
+        while index < end {
+            when self.src.byte_at(index) == 10 {
+                return true
+            }
+            index += 1
+        }
+        return false
     }
 
     fun field_assignment_start(self) -> bool {
@@ -2913,10 +3036,11 @@ extend Parser {
         mut count: u64 = 0
         while self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
             statement_start := self.at
-            statement := self.statement()
+            statement := self.statement_group()
             when statement.is_ok() {
-                statements.append(statement.unwrap())
-                count += 1
+                group := statement.unwrap()
+                statements.append(group.code)
+                count += group.count
             } else {
                 when !self.recovering {
                     return Result::Err(statement.unwrap_err())
@@ -3630,7 +3754,7 @@ extend Parser {
             left = self.path_expression(name, token)?
         } else when kind == lexer::Tk::CHOOSE {
             left = self.choose_expression(start)?
-        } else when kind == lexer::Tk::IDENT && self.peek_kind() == lexer::Tk::LPAREN {
+        } else when kind == lexer::Tk::IDENT && self.peek_kind() == lexer::Tk::LPAREN && !self.at_line_start() {
             self.skip()
             arguments := self.call_arguments()?
             mut end := self.closing_end
@@ -3783,7 +3907,7 @@ extend Parser {
                     }
                     self.expect_type_greater("expected `>` after generic method arguments")?
                 }
-                when self.peek_kind() == lexer::Tk::LPAREN {
+                when self.peek_kind() == lexer::Tk::LPAREN && !self.at_line_start() {
                     self.skip()
                     mut arguments := String()
                     mut count: u64 = 0
@@ -3987,7 +4111,7 @@ extend Parser {
             path = Vec<String>()
             path.push(specialized)
         }
-        when self.peek_kind() == lexer::Tk::LPAREN {
+        when self.peek_kind() == lexer::Tk::LPAREN && !self.at_line_start() {
             self.skip()
             arguments := self.expressions_until(lexer::Tk::RPAREN)?
             end := self.expect(lexer::Tk::RPAREN, "expected `)` after enum variant arguments")?.end

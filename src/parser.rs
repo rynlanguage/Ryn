@@ -542,8 +542,8 @@ impl Parser<'_> {
                 let mut body = Vec::new();
                 while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
                     let statement_start = self.at;
-                    match self.statement() {
-                        Ok(statement) => body.push(statement),
+                    match self.statement_into(&mut body) {
+                        Ok(()) => {}
                         Err(diagnostic) if self.recovering => {
                             self.recovery_diagnostics.push(diagnostic);
                             self.synchronize_statement(statement_start, true);
@@ -1474,8 +1474,8 @@ impl Parser<'_> {
                 && matches!(self.peek().kind, TokenKind::If)
                 && self.if_expression_reaches_function_end();
             if starts_statement && !is_tail_if_expression {
-                match self.statement() {
-                    Ok(statement) => body.push(statement),
+                match self.statement_into(&mut body) {
+                    Ok(()) => {}
                     Err(diagnostic) if self.recovering => {
                         self.recovery_diagnostics.push(diagnostic);
                         self.synchronize_statement(statement_start, return_type.is_none());
@@ -2269,6 +2269,112 @@ impl Parser<'_> {
                     self.tokens.get(self.at + 1).map(|t| &t.kind),
                     Some(TokenKind::LParen | TokenKind::Dot)
                 ))
+            || self.tuple_destructuring_start()
+    }
+
+    /// `(a, mut b, _) := value` at a statement start, with at least two names.
+    fn tuple_destructuring_start(&self) -> bool {
+        if !matches!(self.peek().kind, TokenKind::LParen) {
+            return false;
+        }
+        let mut index = self.at + 1;
+        let mut names = 0usize;
+        loop {
+            if matches!(self.tokens.get(index).map(|t| &t.kind), Some(TokenKind::Mut)) {
+                index += 1;
+            }
+            if !matches!(self.tokens.get(index).map(|t| &t.kind), Some(TokenKind::Ident(_))) {
+                return false;
+            }
+            names += 1;
+            index += 1;
+            match self.tokens.get(index).map(|t| &t.kind) {
+                Some(TokenKind::Comma) => index += 1,
+                Some(TokenKind::RParen) => break,
+                _ => return false,
+            }
+        }
+        names >= 2 && matches!(self.tokens.get(index + 1).map(|t| &t.kind), Some(TokenKind::Define))
+    }
+
+    /// Desugars `(a, mut b, _) := value` into a temporary holding `value` and one
+    /// `:=` per named element that reads it with a tuple field access (`_0`, `_1`, ...).
+    fn tuple_destructuring(&mut self) -> Result<Vec<Statement>, Diagnostic> {
+        let start = self.next().span.start;
+        let mut elements = Vec::new();
+        loop {
+            let mutable = if matches!(self.peek().kind, TokenKind::Mut) {
+                self.next();
+                true
+            } else {
+                false
+            };
+            let (name, name_span) = self.ident("expected a name in tuple destructuring")?;
+            elements.push((elements.len(), name, mutable, name_span));
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        self.expect(
+            |kind| matches!(kind, TokenKind::RParen),
+            "expected `)` after tuple destructuring names",
+        )?;
+        self.expect(
+            |kind| matches!(kind, TokenKind::Define),
+            "expected `:=` after tuple destructuring names",
+        )?;
+        let value = self.expression(0)?;
+        let end = value.span().end;
+        let temporary = format!("__destructure_{start}");
+        let mut statements = vec![Statement::Let {
+            name: temporary.clone(),
+            mutable: false,
+            annotation: None,
+            value,
+            span: Span { start, end },
+        }];
+        for (index, name, mutable, name_span) in elements {
+            if name == "_" {
+                continue;
+            }
+            statements.push(Statement::Let {
+                name,
+                mutable,
+                annotation: None,
+                value: Expression::Field {
+                    value: Box::new(Expression::Name(temporary.clone(), name_span)),
+                    name: format!("_{index}"),
+                    name_span,
+                    span: name_span,
+                },
+                span: name_span,
+            });
+        }
+        Ok(statements)
+    }
+
+    /// Whether the next token is on a later line than the token before it. A
+    /// `(` in that position starts a new statement instead of calling the
+    /// expression above it.
+    fn at_line_start(&self) -> bool {
+        self.at > 0
+            && self
+                .source
+                .get(self.tokens[self.at - 1].span.end..self.peek().span.start)
+                .is_some_and(|gap| gap.contains('\n'))
+    }
+
+    /// Parses one statement and appends it; a tuple destructuring declaration
+    /// expands to several statements.
+    fn statement_into(&mut self, statements: &mut Vec<Statement>) -> Result<(), Diagnostic> {
+        if self.tuple_destructuring_start() {
+            statements.extend(self.tuple_destructuring()?);
+        } else {
+            statements.push(self.statement()?);
+        }
+        Ok(())
     }
 
     fn starts_expression(&self) -> bool {
@@ -2687,8 +2793,8 @@ impl Parser<'_> {
         let mut statements = Vec::new();
         while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
             let statement_start = self.at;
-            match self.statement() {
-                Ok(statement) => statements.push(statement),
+            match self.statement_into(&mut statements) {
+                Ok(()) => {}
                 Err(diagnostic) if self.recovering => {
                     self.recovery_diagnostics.push(diagnostic);
                     self.synchronize_statement(statement_start, true);
@@ -3520,7 +3626,7 @@ impl Parser<'_> {
                         span,
                     )?];
                 }
-                if matches!(self.peek().kind, TokenKind::LParen) {
+                if matches!(self.peek().kind, TokenKind::LParen) && !self.at_line_start() {
                     self.next();
                     let mut arguments = Vec::new();
                     if !matches!(self.peek().kind, TokenKind::RParen) {
@@ -3751,7 +3857,7 @@ impl Parser<'_> {
             Token {
                 kind: TokenKind::Ident(name),
                 span,
-            } if matches!(self.peek().kind, TokenKind::LParen) => {
+            } if matches!(self.peek().kind, TokenKind::LParen) && !self.at_line_start() => {
                 self.next();
                 let mut arguments = Vec::new();
                 let mut closing_consumed = None;
@@ -4118,7 +4224,7 @@ impl Parser<'_> {
                     start: left.span().start,
                     end: field_span.end,
                 };
-                left = if matches!(self.peek().kind, TokenKind::LParen) {
+                left = if matches!(self.peek().kind, TokenKind::LParen) && !self.at_line_start() {
                     self.next();
                     let mut arguments = Vec::new();
                     while !matches!(self.peek().kind, TokenKind::RParen | TokenKind::Eof) {
