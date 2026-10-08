@@ -213,3 +213,10 @@ generator:
   a bare `Enum::Variant` is the same with no arguments. Enum locals are dropped and
   moved like owned strings. Pattern matching (`choose`) comes next. Two scratch programs
   with unit and tuple variants, string payloads, printing, and a move matched sema.
+- Stage 2, step 8 (done): `choose` over user enums. Each arm's bindings get fresh slots
+  in arm order and are visible only in that arm's body; `_` is the default arm; the
+  first arm gives the result type when the context does not. Calls by name that Rust
+  treats as constructors and builtins also get their result types from `infer`. The
+  example `enum_formatting` (unit, tuple, and string-payload variants, printing,
+  templates, `choose` as a value) matches sema byte for byte, and one more corpus
+  program is accepted (25 in total).

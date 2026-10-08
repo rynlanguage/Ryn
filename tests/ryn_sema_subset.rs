@@ -108,7 +108,7 @@ fn ryn_sema_subset_matches_the_bootstrap_ir_for_every_program_it_accepts() {
         }
     }
     assert!(
-        accepted >= 24,
-        "expected the subset to accept at least twenty-four corpus programs, got {accepted}"
+        accepted >= 25,
+        "expected the subset to accept at least twenty-five corpus programs, got {accepted}"
     );
 }

@@ -116,6 +116,20 @@ fun unsupported(what: str) -> String {
     return out
 }
 
+// `EnumMatch <value> <enum> <arm count> <arms> <type>`; the arms' tokens are already joined.
+fun choose_tokens(value: String, id: u64, arm_count: u64, arms: Vec<String>, ty: String) -> Vec<String> {
+    mut tokens: Vec<String> = Vec()
+    tokens.push(String("EnumMatch"))
+    tokens.push(value)
+    tokens.push(num(id))
+    tokens.push(num(arm_count))
+    for token in arms {
+        tokens.push(token)
+    }
+    tokens.push(ty)
+    return tokens
+}
+
 fun no_items() -> Vec<String> {
     return Vec()
 }
@@ -760,6 +774,65 @@ extend Lowering {
         return Result::Ok(Lowered { text: join(tokens), ty: ty })
     }
 
+    // `choose value { Enum::Variant(names) => body, ... }`. Each arm declares its bindings in
+    // slots of their own, in arm order, and they are visible in its body only. The first arm
+    // gives the result type when the context does not.
+    fun choose_expression(mut self, value: u64, arms: Vec<u64>, expected: String) -> Result<Lowered, String> {
+        scrutinee := self.moved_expression(value, String(""))?
+        id := enum_id_of(scrutinee.ty.clone()).unwrap_or(0)
+        when enum_id_of(scrutinee.ty.clone()).is_none() {
+            return Result::Err(unsupported("choose on a value that is not an enum"))
+        }
+        when arms.is_empty() {
+            return Result::Err(unsupported("choose without arms"))
+        }
+        mut ty := expected.clone()
+        mut tokens: Vec<String> = Vec()
+        mut position: u64 = 0
+        while position < arms.len() {
+            arm := self.program.arms[arms[position]]
+            mut arm_tokens: Vec<String> = Vec()
+            visible_before := self.visible
+            mut tag: u64 = 0
+            when arm.variant.is_some() {
+                tag = self.variant_index(id, arm.variant.unwrap())?
+                arm_tokens.push(String("+"))
+                arm_tokens.push(num(tag))
+            } else {
+                arm_tokens.push(String("-"))
+            }
+            start := self.variant_field_start(id, tag)
+            arm_tokens.push(num(arm.bindings.len()))
+            mut binding: u64 = 0
+            while binding < arm.bindings.len() {
+                field_ty := self.enums[id].field_types[start + binding].clone()
+                slot := self.allocate(field_ty.clone())?
+                self.declare(Local { name: arm.bindings[binding].clone(), slot: slot, ty: field_ty.clone(), mutable: false })
+                arm_tokens.push(num(slot))
+                arm_tokens.push(field_ty)
+                arm_tokens.push(num(binding))
+                binding += 1
+            }
+            when ty.is_empty() {
+                let_first := self.moved_expression(arm.body, String(""))?
+                ty = let_first.ty.clone()
+                arm_tokens.push(let_first.text)
+            } else {
+                body := self.moved_expression(arm.body, ty.clone())?
+                when body.ty != ty {
+                    return Result::Err(unsupported("choose arms of different types"))
+                }
+                arm_tokens.push(body.text)
+            }
+            self.visible = visible_before
+            for token in arm_tokens {
+                tokens.push(token)
+            }
+            position += 1
+        }
+        return Result::Ok(Lowered { text: join(choose_tokens(scrutinee.text, id, arms.len(), tokens, ty.clone())), ty: ty })
+    }
+
     // The IR records for the program's enums, in source order.
     fun user_enum_records(self) -> Vec<String> {
         mut records: Vec<String> = Vec()
@@ -909,6 +982,7 @@ extend Lowering {
             ast::Expr::FieldE(value, name, name_span, span) => self.field_type(value, name),
             ast::Expr::IfE(condition, then_value, else_value, span) => self.if_type(then_value, else_value),
             ast::Expr::EnumE(enum_name, variant, arguments, span) => self.enum_type(enum_name),
+            ast::Expr::ChooseE(value, arms, span) => Result::Err(unsupported("choose type")),
             ast::Expr::StructLit(name, fields, span) => self.struct_literal_type(name),
             ast::Expr::IntLit(value, span) => Result::Ok(String("")),
             ast::Expr::StrLit(text, span) => Result::Ok(String("Str")),
@@ -917,9 +991,26 @@ extend Lowering {
         }
     }
 
+    // The result type of a call, from its signature, an enum constructor, or a builtin.
     fun call_result_type(self, name: String) -> Result<String, String> {
-        id := self.signature_index(name)?
-        return Result::Ok(self.signatures[id].ret.clone())
+        when self.signature_index(name.clone()).is_ok() {
+            id := self.signature_index(name)?
+            return Result::Ok(self.signatures[id].ret.clone())
+        }
+        parts := name.split("::")
+        when parts.len() == 2 {
+            return self.enum_type(parts[0].clone())
+        }
+        when name == "String" {
+            return Result::Ok(String("OwnedString"))
+        }
+        when name == "arg_count" {
+            return Result::Ok(String("U32"))
+        }
+        when name == "arg" {
+            return Result::Ok(String("Str"))
+        }
+        return Result::Err(unsupported("unknown function"))
     }
 
     fun signature_index(self, name: String) -> Result<u64, String> {
@@ -966,6 +1057,7 @@ extend Lowering {
             ast::Expr::FieldE(value, name, name_span, span) => self.field_read(value, name, span, expected),
             ast::Expr::IfE(condition, then_value, else_value, span) => self.if_expression(condition, then_value, else_value, expected),
             ast::Expr::EnumE(enum_name, variant, arguments, span) => self.enum_construct(enum_name, variant, arguments, expected),
+            ast::Expr::ChooseE(value, arms, span) => self.choose_expression(value, arms, expected),
             ast::Expr::StructLit(name, fields, span) => self.struct_literal(name, fields, expected),
             ast::Expr::CallE(name, type_arguments, arguments, span) => self.call(name, type_arguments, arguments, expected),
             _ => Result::Err(unsupported("expression")),
