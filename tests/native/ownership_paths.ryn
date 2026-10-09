@@ -1,0 +1,61 @@
+extern "C" fun ryn_native_live_allocations() -> u64;
+extern "C" fun ryn_native_live_bytes() -> u64;
+struct Span { start: u64, end: u64 }
+struct WithSpan { name: String, span: Span }
+fun span_value() -> WithSpan { return WithSpan { name: String("temporary field"), span: Span { start: 3, end: 5 } } }
+fun jumps() {
+    mut i: u64 = 0
+    while i < 3 {
+        s := String("iteration")
+        i += 1
+        when i == 1 { continue }
+        when i == 2 { break }
+    }
+}
+struct Pair { name: String, count: u64 }
+struct Outer { inner: Pair, label: String }
+fun copy_inner(value: &Outer) -> Pair { return value.inner }
+fun number() -> Result<String, String> { return Result::Ok(String("ok")) }
+fun extract() -> Result<String, String> { value := number()? return Result::Ok(value) }
+fun missing() -> Result<String, String> { return Result::Err(String("missing")) }
+fun early_temporary() -> Result<String, String> { value := named_text().concat(missing()?) return Result::Ok(value) }
+fun named_text() -> String { return String("text") }
+fun transient() {
+    mut v: Vec<String> = Vec()
+    v.push(String("old"))
+    v.set(0, String("new"))
+    v.clear()
+    mut m: Map<String, String> = Map<String, String>()
+    m.insert(String("key"), String("first"))
+    m.insert(String("key"), String("second"))
+    m.remove(String("key"))
+    m.insert(String("key"), String("after remove"))
+    m.clear()
+    mut s := String("before")
+    pointer := &mut s
+    *pointer = String("after")
+    mut out := String("")
+    out.append(String("temporary"))
+    combined := named_text().concat(named_text())
+    when named_text() == named_text() { out.append("equal") }
+    opt := Option::Some(String("kept"))
+    selected := opt.unwrap_or(String("unused"))
+    failed := early_temporary()
+    r := extract()
+    result := r.unwrap()
+    outer := Outer { inner: Pair { name: String("inner"), count: 7 }, label: String("outer") }
+    copied := copy_inner(&outer)
+    when copied.name != outer.inner.name { exit(9) }
+    jumps()
+    span := span_value().span
+    pair := Pair { name: String("field"), count: 3 }
+    n := pair.count
+}
+fun main() {
+    before := ryn_native_live_allocations()
+    bytes := ryn_native_live_bytes()
+    mut i: u64 = 0
+    while i < 1000 { transient() i += 1 }
+    echo ryn_native_live_allocations() - before
+    echo ryn_native_live_bytes() - bytes
+}

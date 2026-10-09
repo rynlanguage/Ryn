@@ -27,7 +27,7 @@ fun if_text(keys: bool, key_text: bool, value_text: bool) -> bool {
 
 // Whether the freestanding runtime has a routine for the C function `name`.
 fun rt_provides(name: String) -> bool {
-    return name == "malloc" || name == "free" || name == "realloc" || name == "calloc" || name == "memcpy" || name == "memmove" || name == "strlen" || name == "fopen" || name == "fseek" || name == "ftell" || name == "fread" || name == "fwrite" || name == "fclose" || name == "strerror" || name == "__errno_location" || name == "putchar" || name == "chmod"
+    return name == "ryn_native_live_allocations" || name == "ryn_native_live_bytes" || name == "malloc" || name == "free" || name == "realloc" || name == "calloc" || name == "memcpy" || name == "memmove" || name == "strlen" || name == "fopen" || name == "fseek" || name == "ftell" || name == "fread" || name == "fwrite" || name == "fclose" || name == "strerror" || name == "__errno_location" || name == "putchar" || name == "chmod"
 }
 
 // The 64-bit pattern of an integer literal's text (a leading `-` negates it).
@@ -205,6 +205,7 @@ pub struct Gen {
     // The argument expressions that are read from a frame cell instead of being evaluated: a temporary that a builtin call borrows.
     temp_exprs: Vec<u64>,
     temp_cells: Vec<u64>,
+    temp_ready: Vec<bool>,
 }
 
 // The literals that the runtime routines and `echo` use, in the order their indices are fixed.
@@ -289,7 +290,7 @@ fun build(program: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8
         shadow_images: Vec(),
         shadow_ids: Vec(),
         freestanding: false,
-        rt: rt::Labels { malloc: 0, free: 0, realloc: 0, calloc: 0, memcpy: 0, memmove: 0, strlen: 0, fopen: 0, fseek: 0, ftell: 0, fread: 0, fwrite: 0, fclose: 0, strerror: 0, errno_location: 0, putchar: 0, chmod: 0, sigreturn: 0, state: 0 },
+        rt: rt::Labels { malloc: 0, free: 0, realloc: 0, calloc: 0, memcpy: 0, memmove: 0, strlen: 0, fopen: 0, fseek: 0, ftell: 0, fread: 0, fwrite: 0, fclose: 0, strerror: 0, errno_location: 0, putchar: 0, chmod: 0, sigreturn: 0, live_allocations: 0, live_bytes: 0, state: 0 },
         enum_clone_ids: Vec(),
         enum_clone_labels: Vec(),
         glue_kinds: Vec(),
@@ -316,6 +317,7 @@ fun build(program: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8
         drop_value_ascending: Vec(),
         temp_exprs: Vec(),
         temp_cells: Vec(),
+        temp_ready: Vec(),
     }
     // Symbol 0 is the entry point `main`, which the C runtime calls; its size is set when the object is made.
     gen.freestanding = !libc
@@ -331,6 +333,8 @@ fun build(program: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8
     }
     gen.arguments_symbol = gen.symbol(String("ryn_arguments"), elf::Where::BSS, 0, 16, false)
     gen.rt.state = gen.symbol(String("ryn_runtime"), elf::Where::BSS, 16, rt::state_size(), false)
+    gen.rt.live_allocations = asm.new_label()
+    gen.rt.live_bytes = asm.new_label()
     gen.rt.malloc = asm.new_label()
     gen.rt.free = asm.new_label()
     gen.rt.realloc = asm.new_label()
@@ -814,6 +818,14 @@ extend Gen {
         // The frame holds the locals and the scratch cells; its size is patched in once the body is generated.
         asm.alu_ri(5, x64::Reg::RSP, 0)
         frame_at := asm.code.len() - 4
+        // Scratch owners may be live on an early return or absent on another branch.
+        // Zero the whole frame before loading parameters, including scratch cells allocated below.
+        asm.mov_rr(x64::Reg::RDI, x64::Reg::RSP)
+        asm.mov_ri(x64::Reg::RAX, 0)
+        asm.mov_ri(x64::Reg::RCX, 0)
+        asm.alu_ri(0, x64::Reg::RCX, 0)
+        zero_at := asm.code.len() - 4
+        asm.rep_stosb()
         self.scratch_base = definition.local_types.len()
         self.scratch_used = 0
         self.shadow_slots = Vec()
@@ -868,7 +880,9 @@ extend Gen {
         when !self.body(asm, definition.statements.clone()) {
             return false
         }
-        asm.patch32(frame_at, ((self.scratch_base + self.scratch_used) * 8 + 15) / 16 * 16)
+        bytes := ((self.scratch_base + self.scratch_used) * 8 + 15) / 16 * 16
+        asm.patch32(frame_at, bytes)
+        asm.patch32(zero_at, bytes)
         asm.mov_rr(x64::Reg::RSP, x64::Reg::RBP)
         asm.pop(x64::Reg::RBP)
         asm.ret()
@@ -1192,8 +1206,8 @@ extend Gen {
         }
         return choose self.program.types[ty] {
             ir::IrTy::VecOf(element) => self.emit_vec_free(asm, element),
-            ir::IrTy::MapOf(key, value) => self.emit_map_free(asm, key, value),
-            ir::IrTy::SetOf(key, value) => self.emit_map_free(asm, key, value),
+            ir::IrTy::MapOf(key, value) => self.emit_map_free(asm, key, value, true),
+            ir::IrTy::SetOf(key, value) => self.emit_map_free(asm, key, value, true),
             ir::IrTy::EnumTy(id) => self.emit_enum_free(asm, id),
             _ => self.fail("a handle of this kind"),
         }
@@ -1241,7 +1255,7 @@ extend Gen {
 
     // A map's handle: {buckets, bucket count, length, ...}, and each bucket a chain of nodes {next, hash, key, value}. Every node's
     // owned key and value are dropped, then the node is freed; then the buckets and the header.
-    fun emit_map_free(mut self, asm: &mut x64::Asm, key: u64, value: u64) -> bool {
+    fun emit_map_free(mut self, asm: &mut x64::Asm, key: u64, value: u64, header: bool) -> bool {
         keys := self.owner_pairs(key).len() > 0
         values := self.owner_pairs(value).len() > 0
         asm.push(x64::Reg::RBP)
@@ -1297,8 +1311,10 @@ extend Gen {
         asm.load(8, false, x64::Reg::RDI, x64::Reg::RBP, (0 as i64) - 8)
         asm.load(8, false, x64::Reg::RDI, x64::Reg::RDI, 0)
         self.aligned_call(asm, String("free"))
+        when header {
         asm.load(8, false, x64::Reg::RDI, x64::Reg::RBP, (0 as i64) - 8)
         self.aligned_call(asm, String("free"))
+        }
         asm.mov_rr(x64::Reg::RSP, x64::Reg::RBP)
         asm.pop(x64::Reg::RBP)
         asm.ret()
@@ -1553,6 +1569,15 @@ extend Gen {
         self.null_owners(asm, slot, self.struct_type(id))
     }
 
+    fun string_type(self) -> u64 {
+        mut ty: u64 = 0
+        while ty < self.program.types.len() {
+            when self.is_string(ty) { return ty }
+            ty += 1
+        }
+        return 0
+    }
+
     fun is_string(self, ty: u64) -> bool {
         return choose self.program.types[ty] {
             ir::IrTy::Scalar(word) => word == "OwnedString",
@@ -1661,6 +1686,16 @@ extend Gen {
 
     // A value written by `echo` or a template: a string literal as its text, a scalar through its printer.
     fun printed(mut self, asm: &mut x64::Asm, value: u64, ty: u64) -> bool {
+        mut arguments: Vec<u64> = Vec()
+        arguments.push(value)
+        temps := self.borrowed_temporaries(arguments.clone(), 0)
+        when !self.begin_temporaries(asm, temps.clone(), arguments.clone()) { return false }
+        ok := self.printed_inner(asm, value, ty)
+        self.end_temporaries(asm, temps, arguments)
+        return ok
+    }
+
+    fun printed_inner(mut self, asm: &mut x64::Asm, value: u64, ty: u64) -> bool {
         literal := self.string_literal(value)
         when literal.is_some() {
             return self.text_part(asm, literal.unwrap())
@@ -2113,6 +2148,12 @@ extend Gen {
     fun temporary_type(self, index: u64) -> Option<u64> {
         found := choose self.program.exprs[index] {
             ir::IrExpr::CallExpr(target, arguments, ty) => Option::Some(ty),
+            ir::IrExpr::MoveRef(slot, ty) => Option::Some(ty),
+            ir::IrExpr::IfExpr(condition, yes, no, ty) => Option::Some(ty),
+            ir::IrExpr::EnumMatch(value, id, arms, ty) => Option::Some(ty),
+            ir::IrExpr::FieldRead(value, id, field, ty, span) => self.field_temporary_type(index, ty),
+            ir::IrExpr::StringAsStr(inner) => self.temporary_type(inner),
+            ir::IrExpr::ReferenceFieldRead(pointer, id, field, ty, span, borrowed) => self.reference_temporary_type(ty, borrowed),
             _ => Option::None,
         }
         when found.is_none() {
@@ -2124,21 +2165,27 @@ extend Gen {
         return Option::None
     }
 
+    fun reference_temporary_type(self, ty: u64, borrowed: bool) -> Option<u64> {
+        when borrowed { return Option::None }
+        return Option::Some(ty)
+    }
+
+    fun field_temporary_type(self, index: u64, ty: u64) -> Option<u64> {
+        when self.place_of(index).is_some() || self.is_memory_place(index) { return Option::None }
+        return Option::Some(ty)
+    }
+
     // The temporaries among the arguments of a builtin that the builtin only borrows, as positions. A position whose bit is set
     // in `kept` is an argument the builtin stores, so it is not dropped. A temporary after an argument that may have effects is
-    // not taken: it would be evaluated before that argument.
+    // evaluated when the builtin first reads it, preserving argument order.
     fun borrowed_temporaries(self, arguments: Vec<u64>, kept: u64) -> Vec<u64> {
         mut found: Vec<u64> = Vec()
         mut position: u64 = 0
-        mut pure_before: bool = true
         while position < arguments.len() {
             index := arguments[position]
             keeps := bit_set(kept, position)
-            when pure_before && !keeps && self.temporary_type(index).is_some() {
+            when !keeps && self.temporary_type(index).is_some() {
                 found.push(position)
-            }
-            when !self.is_pure(index) {
-                pure_before = false
             }
             position += 1
         }
@@ -2160,14 +2207,16 @@ extend Gen {
     fun begin_temporaries(mut self, asm: &mut x64::Asm, temps: Vec<u64>, arguments: Vec<u64>) -> bool {
         mut at: u64 = 0
         while at < temps.len() {
-            index := arguments[temps[at]]
-            when !self.expr(asm, index) {
-                return false
-            }
+            original := arguments[temps[at]]
+            index := choose self.program.exprs[original] { ir::IrExpr::StringAsStr(inner) => inner, _ => original }
             cell := self.scratch(1)
+            asm.mov_ri(x64::Reg::RAX, 0)
             asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(cell))
             self.temp_exprs.push(index)
             self.temp_cells.push(cell)
+            self.temp_ready.push(false)
+            self.owner_slots.push(cell)
+            self.owner_types.push(self.temporary_type(original).unwrap())
             at += 1
         }
         return true
@@ -2183,6 +2232,7 @@ extend Gen {
             ty := self.temporary_type(index).unwrap()
             cell := self.temp_cells.pop().unwrap()
             self.temp_exprs.pop()
+            self.temp_ready.pop()
             skip := asm.new_label()
             asm.push(x64::Reg::RAX)
             asm.push(x64::Reg::RDX)
@@ -2194,6 +2244,8 @@ extend Gen {
             label := self.handle_drop_routine(asm, ty)
             asm.call_label(label)
             asm.bind(skip)
+            asm.mov_ri(x64::Reg::R11, 0)
+            asm.store(8, x64::Reg::R11, x64::Reg::RBP, slot_disp(cell))
             asm.pop(x64::Reg::RCX)
             asm.pop(x64::Reg::RSI)
             asm.pop(x64::Reg::RDX)
@@ -2308,7 +2360,7 @@ extend Gen {
             ir::CallTarget::Func(id) => self.call_for_effect(asm, id, arguments),
             ir::CallTarget::StringOp(op) => self.guarded_string(asm, op, arguments),
             ir::CallTarget::VecOp(op, ty) => self.guarded_vec(asm, op, ty, arguments, true),
-            ir::CallTarget::SystemOp(op) => self.system_call(asm, op, arguments),
+            ir::CallTarget::SystemOp(op) => self.guarded_system(asm, op, arguments),
             ir::CallTarget::EnumNew(id, variant) => self.enum_new(asm, id, variant, arguments),
             ir::CallTarget::MapOp(op, key, value) => self.guarded_map(asm, op, key, value, arguments),
             ir::CallTarget::SetOp(op, key, value) => self.guarded_map(asm, op, key, value, arguments),
@@ -2583,6 +2635,7 @@ extend Gen {
         when !self.load_cell(asm, ty, x64::Reg::RSP, self.pushed_field_disp(id, field)) {
             return false
         }
+        self.drop_field_remainder(asm, id, field, ty)
         asm.alu_ri(0, x64::Reg::RSP, (8 * count) as i64)
         return true
     }
@@ -2660,7 +2713,7 @@ extend Gen {
         }
         return choose self.program.exprs[index] {
             ir::IrExpr::LocalRef(slot, ty, span) => self.load_string_local(asm, slot, ty),
-            ir::IrExpr::MoveRef(slot, ty) => self.load_string_local(asm, slot, ty),
+            ir::IrExpr::MoveRef(slot, ty) => self.moved_string_parts(asm, index, slot, ty),
             ir::IrExpr::CallExpr(target, arguments, cty) => self.call_string_parts(asm, index, cty),
             ir::IrExpr::FieldRead(value, id, field, fty, span) => self.load_field_string(asm, index, fty),
             ir::IrExpr::ReferenceFieldRead(pointer, id, field, fty, span, borrowed) => self.load_field_string(asm, index, fty),
@@ -2693,6 +2746,14 @@ extend Gen {
         when !self.expr(asm, index) {
             return false
         }
+        asm.load(8, false, x64::Reg::RSI, x64::Reg::RAX, 0)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RAX, 8)
+        return true
+    }
+
+    fun moved_string_parts(mut self, asm: &mut x64::Asm, index: u64, slot: u64, ty: u64) -> bool {
+        when self.is_str(ty) { return self.load_string_local(asm, slot, ty) }
+        when !self.expr(asm, index) { return false }
         asm.load(8, false, x64::Reg::RSI, x64::Reg::RAX, 0)
         asm.load(8, false, x64::Reg::RDX, x64::Reg::RAX, 8)
         return true
@@ -2768,6 +2829,7 @@ extend Gen {
             return true
         }
         when op == "Clear" && arguments.len() == 1 {
+            cells := self.cells_of(element)
             when !self.expr(asm, arguments[0]) {
                 return false
             }
@@ -2826,8 +2888,32 @@ extend Gen {
             return true
         }
         when op == "Clear" && arguments.len() == 1 {
+            cells := self.cells_of(element)
             when !self.expr(asm, arguments[0]) {
                 return false
+            }
+            when self.has_owners(element) {
+                asm.push(x64::Reg::RAX)
+                asm.load(8, false, x64::Reg::RCX, x64::Reg::RAX, 8)
+                asm.push(x64::Reg::RCX)
+                top := asm.new_label()
+                done := asm.new_label()
+                asm.bind(top)
+                asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 0)
+                asm.test_rr(x64::Reg::RCX, x64::Reg::RCX)
+                asm.jcc(x64::Cc::EQUAL, done)
+                asm.alu_ri(5, x64::Reg::RCX, 1)
+                asm.store(8, x64::Reg::RCX, x64::Reg::RSP, 0)
+                asm.load(8, false, x64::Reg::RAX, x64::Reg::RSP, 8)
+                asm.load(8, false, x64::Reg::RDI, x64::Reg::RAX, 0)
+                self.scale_bytes(asm, x64::Reg::RCX, 8 * cells)
+                asm.alu_rr(1, x64::Reg::RDI, x64::Reg::RCX)
+                asm.alu_ri(0, x64::Reg::RDI, (8 * (cells - 1)) as i64)
+                asm.call_label(self.value_drop_routine(asm, element, false))
+                asm.jmp(top)
+                asm.bind(done)
+                asm.alu_ri(0, x64::Reg::RSP, 8)
+                asm.pop(x64::Reg::RAX)
             }
             asm.mov_ri(x64::Reg::RCX, 0)
             asm.store(8, x64::Reg::RCX, x64::Reg::RAX, 8)
@@ -3378,6 +3464,11 @@ extend Gen {
             return self.copy_local_to_box(asm, place.unwrap(), offset, self.program.structs[id].slot_count)
         }
         when self.is_memory_place(value) && self.struct_destructor_cells(id).len() == 0 {
+            when !self.memory_borrowed(value) && self.has_owners(self.struct_type(id)) {
+                saved := self.scratch(self.program.structs[id].slot_count)
+                when !self.store_struct(asm, value, saved, id) { return false }
+                return self.copy_local_to_box(asm, saved, offset, self.program.structs[id].slot_count)
+            }
             when !self.memory_address(asm, value) {
                 return false
             }
@@ -3600,13 +3691,24 @@ extend Gen {
         total := self.program.structs[outer_id].slot_count
         count := self.program.structs[inner_id].slot_count
         offset := self.program.structs[outer_id].fields[field].slot_offset
+        saved := self.scratch(count)
         mut cell: u64 = 0
         while cell < count {
             asm.load(8, false, x64::Reg::RAX, x64::Reg::RSP, (8 * (total - 1 - offset - cell)) as i64)
-            asm.store(8, x64::Reg::RAX, x64::Reg::RSP, (8 * (total - 1 - cell)) as i64)
+            asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(saved + cell))
             cell += 1
         }
-        asm.alu_ri(0, x64::Reg::RSP, (8 * (total - count)) as i64)
+        owners := self.owner_pairs(self.struct_type(inner_id))
+        mut at: u64 = 0
+        while at < owners.len() {
+            asm.mov_ri(x64::Reg::RAX, 0)
+            asm.store(8, x64::Reg::RAX, x64::Reg::RSP, (8 * (total - 1 - offset - owners[at])) as i64)
+            at += 2
+        }
+        asm.lea(x64::Reg::RDI, x64::Reg::RSP, (8 * (total - 1)) as i64)
+        asm.call_label(self.value_drop_routine(asm, self.struct_type(outer_id), false))
+        asm.alu_ri(0, x64::Reg::RSP, (8 * total) as i64)
+        when !self.push_local_cells(asm, saved, count) { return false }
         return true
     }
 
@@ -3664,6 +3766,12 @@ extend Gen {
         self.scale_bytes(asm, x64::Reg::R8, 8 * cells)
         asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, 0)
         asm.alu_rr(1, x64::Reg::R8, x64::Reg::RDI)
+        when self.has_owners(element) {
+            asm.push(x64::Reg::R8)
+            asm.lea(x64::Reg::RDI, x64::Reg::R8, (8 * (cells - 1)) as i64)
+            asm.call_label(self.value_drop_routine(asm, element, false))
+            asm.pop(x64::Reg::R8)
+        }
         self.copy_block(asm, x64::Reg::RSP, x64::Reg::R8, cells)
         asm.alu_ri(0, x64::Reg::RSP, (8 * (cells + 2)) as i64)
         return true
@@ -4878,16 +4986,17 @@ extend Gen {
             return self.map_collect(asm, arguments[0], op == "Keys", if_text(op == "Keys", self.is_string(key), self.is_string(value)), self.is_handle_struct(value))
         }
         when op == "Clear" && arguments.len() == 1 {
-            when !self.expr(asm, arguments[0]) {
-                return false
-            }
-            when self.handle_destructor(value).is_some() {
-                label := self.glue_routine(asm, 1, value)
-                asm.push(x64::Reg::RAX)
-                asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
-                asm.call_label(label)
-                asm.pop(x64::Reg::RAX)
-            }
+            clear := asm.new_label()
+            skip := asm.new_label()
+            asm.jmp(skip)
+            asm.bind(clear)
+            when !self.emit_map_free(asm, key, value, false) { return false }
+            asm.bind(skip)
+            when !self.expr(asm, arguments[0]) { return false }
+            asm.push(x64::Reg::RAX)
+            asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
+            asm.call_label(clear)
+            asm.pop(x64::Reg::RAX)
             asm.push(x64::Reg::RAX)
             asm.mov_ri(x64::Reg::RDI, 8)
             asm.mov_ri(x64::Reg::RSI, 8)
@@ -5178,6 +5287,18 @@ extend Gen {
             asm.alu_ri(0, x64::Reg::RSP, 8)
             asm.pop(x64::Reg::RAX)
         }
+        when self.handle_destructor(self.map_value_type).is_none() && self.has_owners(self.map_value_type) {
+            asm.push(x64::Reg::RAX)
+            asm.lea(x64::Reg::RDI, x64::Reg::RAX, 24)
+            asm.call_label(self.value_drop_routine(asm, self.map_value_type, false))
+            asm.pop(x64::Reg::RAX)
+        }
+        when text {
+            asm.push(x64::Reg::RAX)
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 16)
+            asm.call_label(self.handle_drop_routine(asm, self.string_type()))
+            asm.pop(x64::Reg::RAX)
+        }
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 0)
         asm.store(8, x64::Reg::RCX, x64::Reg::RAX, 24)
         asm.mov_ri(x64::Reg::RAX, 1)
@@ -5340,6 +5461,18 @@ extend Gen {
             asm.call_label(self.labels[fid])
             asm.alu_ri(0, x64::Reg::RSP, 8)
         }
+        when self.handle_destructor(self.map_value_type).is_none() && self.has_owners(self.map_value_type) {
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 0)
+            asm.alu_ri(0, x64::Reg::RDI, 24)
+            asm.call_label(self.value_drop_routine(asm, self.map_value_type, false))
+        }
+        when text {
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 0)
+            asm.alu_ri(0, x64::Reg::RDI, 16)
+            asm.call_label(self.value_drop_routine(asm, self.string_type(), false))
+        }
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 0)
+        self.aligned_call(asm, String("free"))
         asm.mov_ri(x64::Reg::RAX, 1)
         asm.alu_ri(0, x64::Reg::RSP, 24)
         asm.jmp(done)
@@ -7015,6 +7148,8 @@ extend Gen {
     }
 
     fun runtime_label(self, name: String) -> Option<u64> {
+        when name == "ryn_native_live_allocations" { return Option::Some(self.rt.live_allocations) }
+        when name == "ryn_native_live_bytes" { return Option::Some(self.rt.live_bytes) }
         when name == "malloc" { return Option::Some(self.rt.malloc) }
         when name == "free" { return Option::Some(self.rt.free) }
         when name == "realloc" { return Option::Some(self.rt.realloc) }
@@ -7036,6 +7171,14 @@ extend Gen {
     }
 
     // The stream builtins: a write sends a string to standard output or error, and a flush has nothing to do.
+    fun guarded_system(mut self, asm: &mut x64::Asm, op: String, arguments: Vec<u64>) -> bool {
+        temps := self.borrowed_temporaries(arguments.clone(), 0)
+        when !self.begin_temporaries(asm, temps.clone(), arguments.clone()) { return false }
+        ok := self.system_call(asm, op, arguments.clone())
+        self.end_temporaries(asm, temps, arguments)
+        return ok
+    }
+
     fun system_call(mut self, asm: &mut x64::Asm, op: String, arguments: Vec<u64>) -> bool {
         when op == "FlushStdout" || op == "FlushStderr" {
             return true
@@ -7331,6 +7474,12 @@ extend Gen {
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RAX, 0)
         asm.alu_ri(7, x64::Reg::RCX, tag as i64)
         asm.jcc(x64::Cc::NOT_EQUAL, fallback)
+        when self.has_owners(ty) && !self.is_local_expr(arguments[1]) {
+            asm.push(x64::Reg::RAX)
+            asm.mov_rr(x64::Reg::RDI, x64::Reg::RDX)
+            asm.call_label(self.handle_drop_routine(asm, ty))
+            asm.pop(x64::Reg::RAX)
+        }
         asm.load(8, false, x64::Reg::RAX, x64::Reg::RAX, 8)
         when copy == 1 {
             copies := self.owned_cells(ty).unwrap()
@@ -7353,6 +7502,8 @@ extend Gen {
     fun is_local_expr(self, index: u64) -> bool {
         return choose self.program.exprs[index] {
             ir::IrExpr::LocalRef(slot, ty, span) => true,
+            ir::IrExpr::FieldRead(value, id, field, ty, span) => self.place_of(index).is_some(),
+            ir::IrExpr::ReferenceFieldRead(pointer, id, field, ty, span, borrowed) => borrowed,
             _ => false,
         }
     }
@@ -7360,33 +7511,51 @@ extend Gen {
     // `unwrap_or` of a string or structure payload: the payload's cells are pushed, as a call returns them, or else the
     // fallback is. The fallback is evaluated only on the fallback path, so it must be pure to keep the program's meaning.
     fun enum_unwrap_or_aggregate(mut self, asm: &mut x64::Asm, ty: u64, tag: u64, arguments: Vec<u64>) -> bool {
-        when self.has_destructor(ty) {
-            return self.fail("an unwrap of a payload with a destructor")
-        }
-        when !self.is_pure(arguments[1]) {
-            return self.fail("an unwrap with a fallback that is not pure")
-        }
-        when !self.expr(asm, arguments[0]) {
-            return false
-        }
+        when self.has_destructor(ty) { return self.fail("an unwrap of a payload with a destructor") }
+        box := self.scratch(1)
+        count := self.aggregate_cells(ty)
+        default := self.scratch(count)
+        when !self.expr(asm, arguments[0]) { return false }
+        asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(box))
+        when !self.push_value(asm, arguments[1], ty) { return false }
+        when !self.store_pushed(asm, default, count) { return false }
         fallback := asm.new_label()
         done := asm.new_label()
+        asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, slot_disp(box))
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RAX, 0)
         asm.alu_ri(7, x64::Reg::RCX, tag as i64)
         asm.jcc(x64::Cc::NOT_EQUAL, fallback)
-        count := self.aggregate_cells(ty)
+        when !self.is_local_expr(arguments[1]) { self.drop_slot(asm, default, ty) }
+        asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, slot_disp(box))
         mut cell: u64 = 0
         while cell < count {
             asm.load(8, false, x64::Reg::RCX, x64::Reg::RAX, (8 * (1 + cell)) as i64)
             asm.push(x64::Reg::RCX)
             cell += 1
         }
+        when !self.clone_stack_value(asm, ty) { return false }
         asm.jmp(done)
         asm.bind(fallback)
-        when !self.push_value(asm, arguments[1], ty) {
-            return false
+        when !self.push_local_cells(asm, default, count) { return false }
+        when self.is_local_expr(arguments[1]) {
+            when !self.clone_stack_value(asm, ty) { return false }
         }
         asm.bind(done)
+        return true
+    }
+
+    // Replaces each owning cell of a pushed value with an independent copy.
+    fun clone_stack_value(mut self, asm: &mut x64::Asm, ty: u64) -> bool {
+        copies := self.owned_cells(ty)
+        when copies.is_none() { return self.fail("a copy of this payload") }
+        list := copies.unwrap()
+        mut at: u64 = 0
+        while at < list.len() {
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, list[at] as i64)
+            asm.call_label(self.copy_routine(asm, list[at + 1], list[at + 2]))
+            asm.store(8, x64::Reg::RAX, x64::Reg::RSP, list[at] as i64)
+            at += 3
+        }
         return true
     }
 
@@ -7571,6 +7740,9 @@ extend Gen {
             }
             result := self.push_memory_cells(asm, self.program.structs[id].slot_count)
             self.copy_ty_id = 0
+            when result && !self.memory_borrowed(value) {
+                return self.clone_stack_value(asm, self.struct_type(id))
+            }
             return result
         }
         return choose self.program.exprs[value] {
@@ -8339,11 +8511,20 @@ extend Gen {
         mut at: u64 = 0
         while at < self.temp_exprs.len() {
             when self.temp_exprs[at] == index {
+                when !self.temp_ready[at] {
+                    self.temp_ready.set(at, true)
+                    when !self.expr_inner(asm, index) { return false }
+                    asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(self.temp_cells[at]))
+                }
                 asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, slot_disp(self.temp_cells[at]))
                 return true
             }
             at += 1
         }
+        return self.expr_inner(asm, index)
+    }
+
+    fun expr_inner(mut self, asm: &mut x64::Asm, index: u64) -> bool {
         return choose self.program.exprs[index] {
             ir::IrExpr::IntegerLit(text, ty) => self.integer(asm, text, ty),
             ir::IrExpr::BoolLit(value) => self.boolean(asm, value),
@@ -8389,7 +8570,13 @@ extend Gen {
         when !self.propagate_box(asm, value, failure_type, success_variant, output_failure_variant, deferred) {
             return false
         }
+        asm.push(x64::Reg::RAX)
         asm.load(8, false, x64::Reg::RAX, x64::Reg::RAX, 8)
+        asm.push(x64::Reg::RAX)
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 8)
+        self.aligned_call(asm, String("free"))
+        asm.pop(x64::Reg::RAX)
+        asm.alu_ri(0, x64::Reg::RSP, 8)
         return true
     }
 
@@ -8425,6 +8612,11 @@ extend Gen {
                 cell += 1
             }
         }
+        // The payload has moved into the output box; release only the input shell.
+        asm.push(x64::Reg::RAX)
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 8)
+        self.aligned_call(asm, String("free"))
+        asm.pop(x64::Reg::RAX)
         asm.alu_ri(0, x64::Reg::RSP, 8)
         // The box survives the `defer` bodies, which clobber the registers.
         asm.push(x64::Reg::RAX)
@@ -8448,6 +8640,8 @@ extend Gen {
         when !self.propagate_box(asm, value, failure_type, success_variant, output_failure_variant, deferred) {
             return false
         }
+        held := self.scratch(1)
+        asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(held))
         count := self.program.structs[id].slot_count
         mut cell: u64 = 0
         while cell < count {
@@ -8455,6 +8649,8 @@ extend Gen {
             asm.push(x64::Reg::RCX)
             cell += 1
         }
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RBP, slot_disp(held))
+        self.aligned_call(asm, String("free"))
         return true
     }
 
@@ -8473,6 +8669,8 @@ extend Gen {
             asm.store(8, x64::Reg::RCX, x64::Reg::RBP, slot_disp(base + cell))
             cell += 1
         }
+        asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
+        self.aligned_call(asm, String("free"))
         return true
     }
 
@@ -8630,6 +8828,9 @@ extend Gen {
             return self.copy_cells(asm, place.unwrap(), base, self.program.structs[id].slot_count)
         }
         when self.is_memory_place(value) && self.struct_destructor_cells(id).len() == 0 {
+            when !self.memory_borrowed(value) && self.has_owners(self.struct_type(id)) {
+                return self.store_aggregate_result(asm, value, base, self.program.structs[id].slot_count, self.struct_type(id))
+            }
             when !self.memory_address(asm, value) {
                 return false
             }
@@ -8727,6 +8928,7 @@ extend Gen {
         when !self.load_cell(asm, ty, x64::Reg::RSP, self.pushed_field_disp(id, field)) {
             return false
         }
+        self.drop_field_remainder(asm, id, field, ty)
         asm.alu_ri(0, x64::Reg::RSP, (8 * count) as i64)
         return true
     }
@@ -8782,6 +8984,14 @@ extend Gen {
             ir::IrExpr::FieldRead(value, id, field, ty, span) => self.is_memory_place(value),
             ir::IrExpr::Dereference(pointer, ty) => true,
             _ => false,
+        }
+    }
+
+    fun memory_borrowed(self, index: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ir::IrExpr::ReferenceFieldRead(pointer, id, field, ty, span, borrowed) => borrowed,
+            ir::IrExpr::FieldRead(value, id, field, ty, span) => self.memory_borrowed(value),
+            _ => true,
         }
     }
 
@@ -8943,8 +9153,24 @@ extend Gen {
         when !self.local_field(asm, slot, id, field, ty) {
             return false
         }
-        self.null_owners(asm, slot, structure)
+        asm.push(x64::Reg::RAX)
+        self.null_owners(asm, slot + self.program.structs[id].fields[field].slot_offset, ty)
+        self.drop_slot(asm, slot, structure)
+        asm.pop(x64::Reg::RAX)
         return true
+    }
+
+    // A field taken from a temporary leaves its owner alive and drops the other fields.
+    fun drop_field_remainder(mut self, asm: &mut x64::Asm, id: u64, field: u64, ty: u64) {
+        count := self.program.structs[id].slot_count
+        asm.push(x64::Reg::RAX)
+        when self.has_owners(ty) {
+            asm.mov_ri(x64::Reg::RCX, 0)
+            asm.store(8, x64::Reg::RCX, x64::Reg::RSP, 8 + self.pushed_field_disp(id, field))
+        }
+        asm.lea(x64::Reg::RDI, x64::Reg::RSP, (8 * count) as i64)
+        asm.call_label(self.value_drop_routine(asm, self.struct_type(id), false))
+        asm.pop(x64::Reg::RAX)
     }
 
     fun local_field(mut self, asm: &mut x64::Asm, slot: u64, id: u64, field: u64, ty: u64) -> bool {
@@ -9004,6 +9230,12 @@ extend Gen {
                 when !self.expr(asm, pointer) {
                     return false
                 }
+                when self.has_owners(ty) {
+                    asm.push(x64::Reg::RAX)
+                    asm.lea(x64::Reg::RDI, x64::Reg::RAX, displacement + (8 * (count - 1)) as i64)
+                    asm.call_label(self.value_drop_routine(asm, ty, false))
+                    asm.pop(x64::Reg::RAX)
+                }
                 mut cell: u64 = 0
                 while cell < count {
                     asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, (8 * (count - 1 - cell)) as i64)
@@ -9021,6 +9253,12 @@ extend Gen {
         asm.push(x64::Reg::RAX)
         when !self.expr(asm, pointer) {
             return false
+        }
+        when self.has_owners(ty) {
+            asm.push(x64::Reg::RAX)
+            asm.lea(x64::Reg::RDI, x64::Reg::RAX, displacement)
+            asm.call_label(self.value_drop_routine(asm, ty, false))
+            asm.pop(x64::Reg::RAX)
         }
         asm.pop(x64::Reg::RCX)
         return self.store_cell(asm, ty, x64::Reg::RCX, x64::Reg::RAX, displacement)
@@ -9430,6 +9668,17 @@ extend Gen {
     // Equality of two Strings or two `str`s: the lengths are compared, and then the bytes, one at a time. `negate` gives
     // the inequality.
     fun text_equal(mut self, asm: &mut x64::Asm, negate: bool, left: u64, right: u64, owned: bool) -> bool {
+        mut arguments: Vec<u64> = Vec()
+        arguments.push(left)
+        arguments.push(right)
+        temps := self.borrowed_temporaries(arguments.clone(), 0)
+        when !self.begin_temporaries(asm, temps.clone(), arguments.clone()) { return false }
+        ok := self.text_equal_inner(asm, negate, left, right, owned)
+        self.end_temporaries(asm, temps, arguments)
+        return ok
+    }
+
+    fun text_equal_inner(mut self, asm: &mut x64::Asm, negate: bool, left: u64, right: u64, owned: bool) -> bool {
         when !self.text_parts(asm, left, owned) {
             return false
         }
@@ -9584,7 +9833,7 @@ extend Gen {
             ir::CallTarget::Func(id) => self.call(asm, id, arguments),
             ir::CallTarget::StringOp(op) => self.guarded_string(asm, op, arguments),
             ir::CallTarget::VecOp(op, ty) => self.guarded_vec(asm, op, ty, arguments, false),
-            ir::CallTarget::SystemOp(op) => self.system_call(asm, op, arguments),
+            ir::CallTarget::SystemOp(op) => self.guarded_system(asm, op, arguments),
             ir::CallTarget::EnumNew(id, variant) => self.enum_new(asm, id, variant, arguments),
             ir::CallTarget::EnumPredicate(op, id) => self.guarded_predicate(asm, op, id, arguments),
             ir::CallTarget::EnumUnwrapOr(id, ty) => self.guarded_unwrap_or(asm, id, ty, arguments),

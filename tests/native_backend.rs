@@ -85,7 +85,7 @@ fn expectations(source: &Path) -> (String, i32) {
     (output, status)
 }
 
-fn link_and_run(object: &[u8], directory: &Path) -> (String, i32) {
+fn link_object(object: &[u8], directory: &Path) -> PathBuf {
     let object_path = directory.join("program.o");
     fs::write(&object_path, object).expect("object is written");
     let executable = directory.join("program");
@@ -103,6 +103,11 @@ fn link_and_run(object: &[u8], directory: &Path) -> (String, i32) {
         "cc failed: {}",
         String::from_utf8_lossy(&link.stderr)
     );
+    executable
+}
+
+fn link_and_run(object: &[u8], directory: &Path) -> (String, i32) {
+    let executable = link_object(object, directory);
     let run = Command::new(&executable).output().expect("the program runs");
     (
         String::from_utf8_lossy(&run.stdout).into_owned(),
@@ -168,7 +173,7 @@ fn scalar_programs_run_as_objects_built_by_the_ryn_backend() {
         "tests/suite/output/echo_char_utf8.ryn",
         "tests/suite/comptime/const_char.ryn",
         "tests/suite/raii/native_drop_order_and_moves.ryn",
-        "tests/suite/raii/native_nested_result_ownership.ryn",
+        "tests/native/nested_result_ownership.ryn",
         "tests/suite/raii/drop_on_early_return.ryn",
         "tests/suite/raii/reassignment_drops_previous.ryn",
         "tests/suite/raii/w8_recursion_100k_frames_drop_on_unwind.ryn",
@@ -297,4 +302,44 @@ fn a_program_outside_the_subset_is_declined_with_its_reason() {
     let reason = object_of(&ir).expect_err("replacing an empty pattern is outside the subset");
     assert_eq!(reason, "NOT HANDLED: a replace of an empty pattern");
     let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn native_ownership_paths_leave_no_live_allocations() {
+    let directory = temp_dir("ownership-paths");
+    let ir = ir_of(&repository("tests/native/ownership_paths.ryn"), &directory);
+    let object = object_of(&ir).expect("ownership paths compile");
+    assert_eq!(link_and_run(&object, &directory), ("0\n0\n".into(), 0));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn thirty_million_temporary_allocations_fit_in_one_gibibyte() {
+    let directory = temp_dir("ownership-30m");
+    let ir = ir_of(&repository("tests/native/ownership_30m.ryn"), &directory);
+    let object = object_of(&ir).expect("allocation stress compiles");
+    let executable = link_object(&object, &directory);
+    let run = Command::new("bash")
+        .args(["-c", "ulimit -v 1048576; exec \"$1\"", "ryn-memory-limit"])
+        .arg(executable)
+        .output().expect("limited stress runs");
+    assert!(run.status.success(), "allocation stress failed: {:?}: {}", run.status, String::from_utf8_lossy(&run.stderr));
+    assert_eq!(run.stdout, b"480000000\n0\n0\n");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn freestanding_allocator_traps_on_double_free() {
+    use std::os::unix::process::ExitStatusExt;
+    let directory = temp_dir("double-free");
+    let source = directory.join("double_free.ryn");
+    fs::write(&source, "extern \"C\" fun malloc(size: u64) -> *u8;\nextern \"C\" fun free(p: *u8);\nfun main() { p := malloc(16 as u64) free(p) free(p) }\n").unwrap();
+    let ir = ir_of(&source, &directory);
+    let object = object_of(&ir).expect("allocator detector probe compiles");
+    let executable = link_object(&object, &directory);
+    let run = Command::new(executable).output().unwrap();
+    assert_eq!(run.status.signal(), Some(4), "double free must trap with SIGILL");
+    fs::remove_dir_all(directory).unwrap();
 }
