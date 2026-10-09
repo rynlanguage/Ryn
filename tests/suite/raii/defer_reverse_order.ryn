@@ -1,0 +1,9 @@
+// test: run
+// out: body
+// out: second
+// out: first
+fun main() {
+    defer { echo "first" }
+    defer { echo "second" }
+    echo "body"
+}

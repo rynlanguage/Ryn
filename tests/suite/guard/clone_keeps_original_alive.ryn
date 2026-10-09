@@ -1,0 +1,9 @@
+// test: run
+// out: a
+// out: a
+fun main() {
+    a := String("a")
+    b := a.clone()
+    echo a
+    echo b
+}

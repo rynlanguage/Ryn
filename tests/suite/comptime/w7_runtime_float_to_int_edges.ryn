@@ -1,0 +1,28 @@
+// test: run
+// out: 0
+// out: 0
+// out: 127
+// out: -128
+// out: 0
+// out: 9223372036854775807
+// out: -9223372036854775808
+// out: 4294967295
+// out: 0
+// out: 2147483647
+fun main() {
+    mut zero: f64 = 0.0
+    nan := zero / zero
+    inf := 1.0 / zero
+    ninf := -1.0 / zero
+    echo nan as i16
+    echo nan as u64
+    echo inf as i8
+    echo ninf as i8
+    echo ninf as u32
+    big: f64 = 1e300
+    echo big as i64
+    echo (-big) as i64
+    echo 4294967295.5 as u32
+    echo (-0.5) as i32
+    echo 2147483647.9 as i32
+}

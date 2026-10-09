@@ -1,0 +1,35 @@
+// test: run
+// out: 0
+// out: true
+// out: 3000000000000
+// out: 3
+// out: 16
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(p: *u8);
+extern "C" fun memcpy(dst: *u8, src: *u8, n: u64) -> *u8;
+extern "C" fun memcmp(a: *u8, b: *u8, n: u64) -> i32;
+#[repr(C)]
+struct Item { key: i32, weight: i64 }
+fun store(address: u64, key: i32, weight: i64) {
+    p := address as *Item
+    *p = Item { key: key, weight: weight }
+}
+fun main() {
+    src := malloc(48 as u64)
+    dst := malloc(48 as u64)
+    s := src as u64
+    d := dst as u64
+    store(s, 1, 1000000000000)
+    store(s + 16 as u64, 2, 2000000000000)
+    store(s + 32 as u64, 3, 3000000000000)
+    memcpy(dst, src, 48 as u64)
+    echo memcmp(src, dst, 48 as u64)
+    echo memcmp(src, dst, 48 as u64) == 0
+    back := (d + 32 as u64) as *Item
+    last := *back
+    echo last.weight
+    echo last.key
+    echo sizeof(Item)
+    free(src)
+    free(dst)
+}

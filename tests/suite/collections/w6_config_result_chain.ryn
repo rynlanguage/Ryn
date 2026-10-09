@@ -1,0 +1,145 @@
+// test: run
+// out: A
+// out:   connection code 80802
+// out: B
+// out:   connection error: missing port
+// out: C
+// out:   connection error: port out of range
+// out: D
+// out:   load error: bad digit
+// out: E
+// out:   load error: missing key
+// out: F
+// out:   connection code 213
+// out: G
+// out:   load error: no '=' in line
+// Config loader: "key=value" lines, errors propagated with ? from parsing up to the connection check.
+struct Entry { key: String, value: i64 }
+struct Config { entries: Vec<Entry> }
+
+fun parse_int(s: String) -> Result<i64, String> {
+    n := s.char_count()
+    when n == 0 {
+        return Result::Err(String("empty number"))
+    }
+    mut v: i64 = 0
+    for i in 0..n {
+        c := s.char_at(i)
+        when c < '0' || c > '9' {
+            return Result::Err(String("bad digit"))
+        }
+        v = v * 10 + ((c as i64) - ('0' as i64))
+    }
+    return Result::Ok(v)
+}
+
+fun find_eq(line: String) -> Result<u64, String> {
+    n := line.char_count()
+    for i in 0..n {
+        when line.char_at(i) == '=' {
+            return Result::Ok(i)
+        }
+    }
+    return Result::Err(String("no '=' in line"))
+}
+
+fun parse_entry(line: String) -> Result<Entry, String> {
+    n := line.char_count()
+    eq := find_eq(line.clone())?
+    key := line.substring(0, eq)
+    when key.char_count() == 0 {
+        return Result::Err(String("missing key"))
+    }
+    value := parse_int(line.substring(eq + 1, n))?
+    return Result::Ok(Entry { key: key, value: value })
+}
+
+fun load(lines: Vec<String>) -> Result<Config, String> {
+    mut cfg := Config { entries: Vec() }
+    for i in 0..lines.len() {
+        e := parse_entry(lines.index(i))?
+        cfg.entries.push(e)
+    }
+    return Result::Ok(cfg)
+}
+
+extend Config {
+    fun get(self, key: String) -> Option<i64> {
+        for i in 0..self.entries.len() {
+            e := self.entries.index(i)
+            when e.key == key {
+                return Option::Some(e.value)
+            }
+        }
+        return Option::None
+    }
+    fun require(self, key: String) -> Result<i64, String> {
+        found := self.get(key.clone())
+        return choose found {
+            Option::Some(v) => Result::Ok(v),
+            Option::None => Result::Err(String("missing ").concat(key))
+        }
+    }
+    fun connection(self) -> Result<i64, String> {
+        port := self.require(String("port"))?
+        when port > 65535 {
+            return Result::Err(String("port out of range"))
+        }
+        retries := self.get(String("retries")) ?? 3
+        return Result::Ok(port * 10 + retries)
+    }
+}
+
+fun check(label: String, lines: Vec<String>) {
+    echo label
+    r := load(lines)
+    when r.is_err() {
+        e := r.unwrap_err()
+        echo "  load error: {e}"
+        return
+    }
+    cfg := r.unwrap()
+    c := cfg.connection()
+    when c.is_ok() {
+        v := c.unwrap()
+        echo "  connection code {v}"
+    } else {
+        e := c.unwrap_err()
+        echo "  connection error: {e}"
+    }
+}
+
+fun main() {
+    mut a: Vec<String> = Vec()
+    a.push(String("port=8080"))
+    a.push(String("retries=2"))
+    a.push(String("timeout=30"))
+    check(String("A"), a)
+
+    mut b: Vec<String> = Vec()
+    b.push(String("retries=5"))
+    check(String("B"), b)
+
+    mut c: Vec<String> = Vec()
+    c.push(String("port=70000"))
+    check(String("C"), c)
+
+    mut d: Vec<String> = Vec()
+    d.push(String("port=80"))
+    d.push(String("x=12a"))
+    check(String("D"), d)
+
+    mut e: Vec<String> = Vec()
+    e.push(String("port=443"))
+    e.push(String("=5"))
+    check(String("E"), e)
+
+    mut f: Vec<String> = Vec()
+    f.push(String("port=21"))
+    check(String("F"), f)
+
+    mut g: Vec<String> = Vec()
+    g.push(String("port=22"))
+    g.push(String("bogus"))
+    check(String("G"), g)
+}

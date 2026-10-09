@@ -1,0 +1,33 @@
+// test: run
+// out: beta
+// out: changed
+// out: red
+// out: green
+// out: 2
+// out: 2
+// exit: 0
+struct Tag {
+    name: String,
+    weight: i64,
+}
+
+fun main() {
+    mut names: Vec<String> = Vec()
+    names.push(String("alpha"))
+    names.push(String("beta"))
+    names.push(String("gamma"))
+    mut copied := names.clone()
+    copied.set(1, String("changed"))
+    echo names.index(1)
+    echo copied.index(1)
+
+    mut tags: Vec<Tag> = Vec()
+    tags.push(Tag { name: String("red"), weight: 1 })
+    tags.push(Tag { name: String("blue"), weight: 2 })
+    mut tags_copy := tags.clone()
+    tags_copy.set(0, Tag { name: String("green"), weight: 9 })
+    echo tags.index(0).name
+    echo tags_copy.index(0).name
+    echo tags_copy.index(1).weight
+    echo tags_copy.len()
+}

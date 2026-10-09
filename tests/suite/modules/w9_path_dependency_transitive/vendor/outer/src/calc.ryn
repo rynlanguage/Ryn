@@ -1,0 +1,4 @@
+use inner::core
+pub fun total() -> i32 {
+    return core::base() + 12
+}

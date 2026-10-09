@@ -1,0 +1,13 @@
+// test: run
+// out: 7
+// out: 9
+fun ok() -> Result<i32, String> {
+    return Result::Ok(7)
+}
+fun err() -> Result<i32, String> {
+    return Result::Err(String("e"))
+}
+fun main() {
+    echo ok().unwrap_or(9)
+    echo err().unwrap_or(9)
+}

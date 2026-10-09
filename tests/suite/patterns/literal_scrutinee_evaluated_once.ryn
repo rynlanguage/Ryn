@@ -1,0 +1,17 @@
+// test: run
+// out: 10
+// out: 1
+fun next(counter: &mut i32) -> i32 {
+    *counter = *counter + 1
+    return *counter
+}
+fun main() {
+    mut calls: i32 = 0
+    v := choose next(&mut calls) {
+        1 => 10,
+        2 => 20,
+        _ => 0
+    }
+    echo v
+    echo calls
+}

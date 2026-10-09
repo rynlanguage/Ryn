@@ -1,0 +1,18 @@
+// test: run
+// out: 2
+// out: 3
+// out: true
+// out: false
+// out: 8
+// out: 4
+struct P { x: i32, y: i32 }
+struct Q { p: P, z: bool }
+enum E { A, B, C }
+fun main() {
+    echo field_count::<Q>()
+    echo variant_count::<E>()
+    echo has_field::<P>("y")
+    echo has_field::<P>("q")
+    echo sizeof(P)
+    echo alignof(P)
+}

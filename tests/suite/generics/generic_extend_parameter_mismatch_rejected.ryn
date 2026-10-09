@@ -1,0 +1,9 @@
+// test: fail
+// code: R0243
+struct Box<T> { value: T }
+extend<T> Box<U> {
+    pub fun get(self) -> T { return self.value }
+}
+fun main() {
+    echo 1
+}

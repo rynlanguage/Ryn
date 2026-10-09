@@ -1,0 +1,17 @@
+// test: run
+// out: 4
+// out: -4
+// out: 99
+enum Outcome<T> { Value(T), Empty }
+fun f(o: Outcome<(i32, bool)>) -> i32 {
+    choose o {
+        Outcome::Value((n, true)) => n,
+        Outcome::Value((n, false)) => 0 - n,
+        Outcome::Empty => 99
+    }
+}
+fun main() {
+    echo f(Outcome::Value((4 as i32, true)))
+    echo f(Outcome::Value((4 as i32, false)))
+    echo f(Outcome::Empty)
+}

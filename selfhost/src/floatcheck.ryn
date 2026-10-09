@@ -1,0 +1,136 @@
+// Checks `middle::floatlib` against the runtime's own conversions over many doubles: the text of each, and the bits read back
+// from that text and from shortened and lengthened copies of it. Prints `ok <count>` or the first disagreement.
+//
+//     ryn run selfhost/src/floatcheck.ryn -- <count>
+
+use middle::floatlib
+
+fun from_bits(bits: u64) -> f64 {
+    mut copy: u64 = bits
+    pointer := &raw mut copy
+    wide := pointer as *f64
+    return *wide
+}
+
+fun to_bits(value: f64) -> u64 {
+    mut copy: f64 = value
+    pointer := &raw mut copy
+    wide := pointer as *u64
+    return *wide
+}
+
+fun check(bits: u64) -> bool {
+    value := from_bits(bits)
+    expected := String(value)
+    found := floatlib::format_f64(bits)
+    when expected != found {
+        echo "format {bits}: runtime {expected} library {found}"
+        return false
+    }
+    // The text reads back as the same number (NaN has no text to read back).
+    when value - value == 0.0 {
+        back := floatlib::parse_f64(expected.clone())
+        when back.is_none() {
+            echo "parse {expected}: nothing"
+            return false
+        }
+        when back.unwrap() != bits && bits != 9223372036854775808 {
+            read := back.unwrap()
+            echo "parse {expected}: bits {read} expected {bits}"
+            return false
+        }
+    }
+    return true
+}
+
+// The library and the runtime read a text that is not the shortest one: digits dropped or added.
+fun check_text(text: String) -> bool {
+    runtime := text.try_to_f64()
+    library := floatlib::parse_f64(text.clone())
+    when runtime.is_none() {
+        when library.is_some() {
+            echo "text {text}: runtime rejects it"
+            return false
+        }
+        return true
+    }
+    when library.is_none() {
+        echo "text {text}: library rejects it"
+        return false
+    }
+    expected := to_bits(runtime.unwrap())
+    when expected != library.unwrap() {
+        got := library.unwrap()
+        echo "text {text}: library {got} runtime {expected}"
+        return false
+    }
+    return true
+}
+
+fun main() -> i32 {
+    count := String(arg(0)).to_u64()
+    mut state: u64 = 88172645463325252
+    mut i: u64 = 0
+    // Some fixed values first: the extremes, the neighbours of powers of two, and the halves of the smallest numbers.
+    mut fixed: Vec<u64> = Vec()
+    fixed.push(0)
+    fixed.push(1)
+    fixed.push(2)
+    fixed.push(4503599627370495)
+    fixed.push(4503599627370496)
+    fixed.push(4503599627370497)
+    fixed.push(9218868437227405311)
+    fixed.push(4607182418800017408)
+    fixed.push(4607182418800017409)
+    fixed.push(4607182418800017407)
+    fixed.push(9223372036854775808)
+    fixed.push(9218868437227405312)
+    fixed.push(18442240474082181120)
+    for bits in fixed {
+        when !check(bits) {
+            return 1
+        }
+    }
+    // Every power of two and its neighbours.
+    mut power: u64 = 1
+    while power < 2047 {
+        base := power << (52 as u32)
+        when !check(base) || !check(base + 1) || !check(base - 1) || !check(base + 4503599627370495) {
+            return 1
+        }
+        power += 1
+    }
+    while i < count {
+        state = state ^ (state << (13 as u32))
+        state = state ^ (state >> (7 as u32))
+        state = state ^ (state << (17 as u32))
+        // A mix of wild bit patterns and numbers of everyday size.
+        mut bits: u64 = state
+        when i % 3 == 1 {
+            bits = (bits & 9223372036854775807)
+            bits = (bits & 4503599627370495) | ((((bits >> (52 as u32)) % 100) + 1000) << (52 as u32))
+        }
+        when (bits >> (52 as u32)) & 2047 == 2047 {
+            bits = bits & 18442240474082181119
+        }
+        when !check(bits) {
+            return 1
+        }
+        text := String(from_bits(bits))
+        when text.len() > 4 && i % 5 == 0 {
+            when !check_text(text.slice(0, text.len() - 1)) {
+                return 1
+            }
+        }
+        when i % 7 == 0 {
+            mut longer := text.clone()
+            longer.append("0000000000000000000001")
+            when !check_text(longer) {
+                return 1
+            }
+        }
+        i += 1
+    }
+    echo "ok {count}"
+    return 0
+}

@@ -1,0 +1,10 @@
+// test: fail
+// code: R0461
+fun noisy() -> i32 {
+    echo "side effect"
+    return 1
+}
+const BAD: i32 = noisy()
+fun main() {
+    echo BAD
+}

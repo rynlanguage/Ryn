@@ -1,0 +1,14 @@
+// test: run
+// out: 3
+shape Show {
+    fun show(self) -> i32
+    fun twice(self) -> i32 { self.show() }
+}
+struct P { v: i32 }
+extend P as Show {
+    fun show(self) -> i32 { self.v }
+}
+fun main() {
+    p := P { v: 3 }
+    echo p.twice()
+}

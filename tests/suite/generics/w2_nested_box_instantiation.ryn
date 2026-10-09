@@ -1,0 +1,10 @@
+// test: run
+// out: 7
+// out: 8
+struct Box<T> { v: T }
+fun unwrap<T>(b: Box<T>) -> T { return b.v }
+fun main() {
+    bb := Box::<Box<i32>> { v: Box::<i32> { v: 7 } }
+    echo unwrap(unwrap(bb))
+    echo unwrap(bb).v + 1
+}

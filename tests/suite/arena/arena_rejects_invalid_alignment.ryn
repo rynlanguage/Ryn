@@ -1,0 +1,13 @@
+// test: run
+// out: true
+// out: true
+// out: 0
+use std::arena
+fun main() {
+    mut a := arena::Arena::with_capacity(32 as u64)
+    odd := a.alloc_bytes(8 as u64, 3 as u64)
+    zero := a.alloc_bytes(8 as u64, 0 as u64)
+    echo pointer_is_null(odd)
+    echo pointer_is_null(zero)
+    echo a.used()
+}

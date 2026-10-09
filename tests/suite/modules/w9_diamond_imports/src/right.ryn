@@ -1,0 +1,4 @@
+use base
+pub fun bump() -> i32 {
+    return base::next(11)
+}

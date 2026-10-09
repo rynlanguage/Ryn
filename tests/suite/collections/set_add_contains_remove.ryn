@@ -1,0 +1,15 @@
+// test: run
+// out: 2
+// out: true
+// out: true
+// out: false
+fun main() {
+    mut s: Set<i32> = Set<i32>()
+    s.add(5)
+    s.add(8)
+    s.add(5)
+    echo s.len()
+    echo s.contains(8)
+    echo s.remove(8)
+    echo s.contains(8)
+}

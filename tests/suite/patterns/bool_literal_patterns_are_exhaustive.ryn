@@ -1,0 +1,13 @@
+// test: run
+// out: 1
+// out: 0
+fun word(b: bool) -> i32 {
+    choose b {
+        true => 1,
+        false => 0
+    }
+}
+fun main() {
+    echo word(true)
+    echo word(false)
+}

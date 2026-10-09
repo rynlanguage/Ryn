@@ -1,0 +1,4 @@
+use ring::two
+pub fun f() -> i32 {
+    return two::g()
+}

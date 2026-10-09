@@ -29,7 +29,9 @@ fn dump_ir_text_for_the_ryn_checker() {
             let name = format!(
                 "{}_{}.ir",
                 directory.replace('/', "_"),
-                path.file_stem().expect("program has a name").to_string_lossy()
+                path.file_stem()
+                    .expect("program has a name")
+                    .to_string_lossy()
             );
             fs::write(output.join(name), ir_codec::encode_ir(&ir)).expect("IR text is written");
         }

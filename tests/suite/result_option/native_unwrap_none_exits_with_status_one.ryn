@@ -1,0 +1,9 @@
+// test: run
+// out: before
+// exit: 1
+// err: called Option.unwrap() on None
+fun main() {
+    print("before")
+    a: Option<i32> = Option::None
+    echo a.unwrap()
+}

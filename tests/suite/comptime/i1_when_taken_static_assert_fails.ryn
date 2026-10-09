@@ -1,0 +1,11 @@
+// test: fail
+// msg: static assertion failed: debug only
+// code: R0460
+const DEBUG: bool = true
+fun main() {
+    when DEBUG {
+        static_assert(1 == 2, "debug only")
+    } else {
+        echo "ok"
+    }
+}

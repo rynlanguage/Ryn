@@ -1,0 +1,7 @@
+// test: run
+// out: 5
+const LIMIT: i32 = 5
+fun main() {
+    LIMIT_COPY := LIMIT
+    echo LIMIT_COPY
+}

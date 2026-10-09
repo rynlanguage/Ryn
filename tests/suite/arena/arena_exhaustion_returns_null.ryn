@@ -1,0 +1,13 @@
+// test: run
+// out: false
+// out: true
+// out: 4
+use std::arena
+fun main() {
+    mut a := arena::Arena::with_capacity(16 as u64)
+    ok := a.alloc_bytes(12 as u64, 4 as u64)
+    big := a.alloc_bytes(12 as u64, 4 as u64)
+    echo pointer_is_null(ok)
+    echo pointer_is_null(big)
+    echo a.remaining()
+}

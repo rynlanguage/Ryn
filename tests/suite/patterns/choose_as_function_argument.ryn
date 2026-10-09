@@ -1,0 +1,10 @@
+// test: run
+// out: 8
+enum E { A(i32), B }
+fun show(n: i32) {
+    echo n
+}
+fun main() {
+    e := E::A(8)
+    show(choose e { E::A(n) => n, E::B => 0 })
+}

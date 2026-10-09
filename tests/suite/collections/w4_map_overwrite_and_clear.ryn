@@ -1,0 +1,16 @@
+// test: run
+// out: 2
+// out: 2
+// out: 0
+// out: true
+fun main() {
+    mut m := Map<String, i32>()
+    m.insert(String("k"), 1)
+    m.insert(String("k"), 2)
+    m.insert(String("j"), 3)
+    echo m.len()
+    echo choose m.get(String("k")) { Option::Some(v) => v, Option::None => -1 }
+    m.clear()
+    echo m.len()
+    echo m.is_empty()
+}

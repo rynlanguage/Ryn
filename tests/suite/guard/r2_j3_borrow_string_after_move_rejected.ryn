@@ -1,0 +1,12 @@
+// test: fail
+// code: R0240
+// msg: use of a moved value
+fun eat(s: String) {
+    echo s
+}
+fun main() {
+    s := String("a")
+    eat(s)
+    r := &s
+    echo r.char_count()
+}

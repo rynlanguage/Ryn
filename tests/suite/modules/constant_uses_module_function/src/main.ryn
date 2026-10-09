@@ -1,0 +1,6 @@
+// test: run
+// out: 81
+use calc
+fun main() {
+    echo calc::AREA
+}

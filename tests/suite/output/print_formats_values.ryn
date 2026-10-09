@@ -1,0 +1,8 @@
+// test: run
+// out: n=7 ok=true name=Ryn f=1.5
+fun main() {
+    n := 7 as i32
+    ok := true
+    name := String("Ryn")
+    print("n={} ok={} name={} f={}", n, ok, name, 1.5 as f64)
+}

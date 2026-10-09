@@ -1,0 +1,9 @@
+// test: run
+// out: 5
+// out: 9000000000
+extern "C" fun abs(value: i32) -> i32;
+extern "C" fun labs(value: i64) -> i64;
+fun main() {
+    echo abs(-5)
+    echo labs(-9000000000)
+}

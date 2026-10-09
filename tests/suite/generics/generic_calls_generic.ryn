@@ -1,0 +1,11 @@
+// test: run
+// out: 8
+fun id<T>(v: T) -> T {
+    v
+}
+fun twice<T>(v: T) -> T {
+    id(id(v))
+}
+fun main() {
+    echo twice(8 as i32)
+}

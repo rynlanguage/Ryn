@@ -1,0 +1,10 @@
+// test: run
+// out: abc
+fun pass<T>(v: T) -> T {
+    v
+}
+fun main() {
+    s := String("abc")
+    t := pass(s)
+    echo t
+}

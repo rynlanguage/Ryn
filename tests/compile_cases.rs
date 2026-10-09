@@ -67,6 +67,22 @@ fn fail_fixtures_are_rejected_with_the_expected_diagnostic_codes() {
         ("struct_destructuring_unknown_field.ryn", "R0225"),
         ("optional_field_on_struct.ryn", "R0234"),
         ("range_mixed_types.ryn", "R0205"),
+        ("w5_choose_missing_variant.ryn", "R0235"),
+        ("w5_choose_literal_no_wildcard.ryn", "R0235"),
+        ("w5_choose_unknown_variant.ryn", "R0233"),
+        ("w5_unknown_enum_variant.ryn", "R0233"),
+        ("w5_missing_struct_field.ryn", "R0229"),
+        ("w5_duplicate_struct_field.ryn", "R0228"),
+        ("w5_missing_return_value.ryn", "R0213"),
+        ("w5_main_wrong_return.ryn", "R0208"),
+        ("w5_duplicate_main.ryn", "R0201"),
+        ("w5_argument_count.ryn", "R0211"),
+        ("w5_argument_type.ryn", "R0212"),
+        ("w5_use_after_move.ryn", "R0240"),
+        ("w5_unsigned_negation.ryn", "R0206"),
+        ("w5_recursive_struct.ryn", "R0232"),
+        ("w5_unknown_type.ryn", "R0230"),
+        ("shape_bound_unknown_shape.ryn", "R0452"),
     ];
     let failures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/programs/fail");
 

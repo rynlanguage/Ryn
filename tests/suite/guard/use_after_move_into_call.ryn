@@ -1,0 +1,10 @@
+// test: fail
+// code: R0240
+fun eat(s: String) {
+    echo s
+}
+fun main() {
+    a := String("a")
+    eat(a)
+    echo a
+}

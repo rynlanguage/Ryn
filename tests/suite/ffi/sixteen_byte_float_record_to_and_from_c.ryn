@@ -1,0 +1,17 @@
+// test: run
+// out: 5
+// out: 1.5
+// out: -2.5
+#[repr(C)]
+struct Complex {
+    re: f64,
+    im: f64
+}
+extern "C" fun cabs(z: Complex) -> f64;
+extern "C" fun conj(z: Complex) -> Complex;
+fun main() {
+    echo cabs(Complex { re: 3.0, im: 4.0 })
+    c := conj(Complex { re: 1.5, im: 2.5 })
+    echo c.re
+    echo c.im
+}

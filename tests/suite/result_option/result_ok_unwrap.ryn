@@ -1,0 +1,8 @@
+// test: run
+// out: 41
+fun make() -> Result<i32, String> {
+    return Result::Ok(41)
+}
+fun main() {
+    echo make().unwrap()
+}

@@ -1,0 +1,20 @@
+// test: run
+// out: 100000
+// out: 100000
+#[drop(bump)]
+struct Counter { h: *i64 }
+fun bump(c: Counter) {
+    *c.h = *c.h + 1
+}
+fun walk(n: i64, p: *i64) -> i64 {
+    when n == 0 {
+        return 0
+    }
+    c := Counter { h: p }
+    return 1 + walk(n - 1, p)
+}
+fun main() {
+    mut hits: i64 = 0
+    echo walk(100000, &raw mut hits)
+    echo hits
+}

@@ -34,6 +34,15 @@ pub(crate) fn owned_slots(ty: Type, slot: usize, structs: &[RynStruct]) -> Vec<(
     }
 }
 
+/// Whether a place is read through a reference: `*r`, or a field path rooted in it.
+fn rooted_in_dereference(expression: &IrExpression) -> bool {
+    match expression {
+        IrExpression::Dereference { .. } => true,
+        IrExpression::Field { value, .. } => rooted_in_dereference(value),
+        _ => false,
+    }
+}
+
 pub(crate) fn check(ir: &mut RynIr) -> Result<(), Diagnostic> {
     let reference_return_parameters = ir
         .functions
@@ -53,10 +62,12 @@ pub(crate) fn check(ir: &mut RynIr) -> Result<(), Diagnostic> {
             borrowed: vec![0; function.local_types.len()],
             scopes: vec![Vec::new()],
             reference_scopes: vec![Vec::new()],
+            slot_depth: vec![1; function.local_types.len()],
             loops: Vec::new(),
             slot_types: vec![None; function.local_types.len()],
             reference_origins: vec![None; function.local_types.len()],
             reference_mutability: vec![None; function.local_types.len()],
+            raw_origins: vec![None; function.local_types.len()],
         };
         for parameter in &function.parameters {
             if let Type::Reference(_, mutable) = parameter.ty {
@@ -86,6 +97,22 @@ pub(crate) fn check(ir: &mut RynIr) -> Result<(), Diagnostic> {
                 && matches!(ty, Type::Struct(id) if ir.structs[id].drop_function.is_some())
             {
                 function.owned_slot_types[slot] = Some(ty);
+                // The destructor consumes the whole value and releases its
+                // remaining owned fields itself, so the holder must not drop
+                // them a second time.
+                if let Type::Struct(id) = ty
+                    && !(is_destructor && ir.structs[id].drop_function == Some(function_id))
+                {
+                    for field in &ir.structs[id].fields {
+                        let start = slot + field.slot_offset;
+                        let width = crate::sema::storage_slot_width(field.ty, &ir.structs);
+                        for nested in start..start + width {
+                            if nested != slot {
+                                function.owned_slot_types[nested] = None;
+                            }
+                        }
+                    }
+                }
             }
         }
         if is_destructor {
@@ -102,11 +129,39 @@ pub(crate) fn check(ir: &mut RynIr) -> Result<(), Diagnostic> {
     Ok(())
 }
 
+/// A reference stored into a longer-lived binding or field, from a local that dies first.
+fn reference_escape(span: Span) -> Diagnostic {
+    Diagnostic {
+        code: "R0251",
+        message: "a reference to a local value would outlive its block".into(),
+        span,
+        help: Some(
+            "keep the reference within the block that declares the value, or declare the value in the outer block"
+                .into(),
+        ),
+    }
+}
+
+/// A raw pointer copied, or stored into a longer-lived place, from a local that dies first.
+fn raw_pointer_escape(span: Span) -> Diagnostic {
+    Diagnostic {
+        code: "R0252",
+        message: "a raw pointer to a local value would outlive its block".into(),
+        span,
+        help: Some(
+            "keep the pointer within the block that declares the value, or declare the value in the outer block"
+                .into(),
+        ),
+    }
+}
+
 struct LoopState {
     depth: usize,
     entry: Vec<bool>,
     breaks: Vec<Vec<bool>>,
     continues: Vec<Vec<bool>>,
+    /// Raw pointer origins at each `break` and `continue` of this loop.
+    raw_exits: Vec<Vec<Option<usize>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,13 +178,110 @@ struct Guard<'a> {
     borrowed: Vec<usize>,
     scopes: Vec<Vec<usize>>,
     reference_scopes: Vec<Vec<usize>>,
+    /// The block depth at which each local was declared.
+    slot_depth: Vec<usize>,
     loops: Vec<LoopState>,
     slot_types: Vec<Option<Type>>,
     reference_origins: Vec<Option<usize>>,
     reference_mutability: Vec<Option<bool>>,
+    /// For each raw pointer local, the local whose storage it may point into.
+    raw_origins: Vec<Option<usize>>,
 }
 
 impl Guard<'_> {
+    /// The local whose storage a raw pointer value may point into, when known.
+    fn raw_pointer_origin(&self, expression: &IrExpression) -> Option<usize> {
+        if let IrExpression::AddressOf {
+            slot,
+            pointer_type: Type::RawPointer(_),
+            ..
+        } = expression
+        {
+            return Some(*slot);
+        }
+        let (slot, ty, _) = self.local(expression)?;
+        matches!(ty, Type::RawPointer(_))
+            .then(|| self.raw_origins[slot])
+            .flatten()
+    }
+
+    /// Appends the slot offset of every raw pointer stored in a value of structure type `id`.
+    fn raw_pointer_offsets(&self, id: usize, base: usize, out: &mut Vec<usize>) {
+        for field in &self.structs[id].fields {
+            match field.ty {
+                Type::RawPointer(_) => out.push(base + field.slot_offset),
+                Type::Struct(inner) => {
+                    self.raw_pointer_offsets(inner, base + field.slot_offset, out)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// For a structure value, the local each stored raw pointer may point into, as
+    /// `(slot offset, origin)`. Only literals and copies of locals are understood.
+    fn struct_raw_origins(
+        &self,
+        expression: &IrExpression,
+        ty: Type,
+        base: usize,
+        out: &mut Vec<(usize, Option<usize>)>,
+    ) {
+        let Type::Struct(id) = ty else {
+            return;
+        };
+        match expression {
+            IrExpression::StructValue { struct_id, fields } => {
+                for (field_index, value) in fields {
+                    let field = &self.structs[*struct_id].fields[*field_index];
+                    match field.ty {
+                        Type::RawPointer(_) => {
+                            out.push((base + field.slot_offset, self.raw_pointer_origin(value)));
+                        }
+                        Type::Struct(_) => {
+                            self.struct_raw_origins(value, field.ty, base + field.slot_offset, out);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            IrExpression::Local { slot, .. } => {
+                let mut offsets = Vec::new();
+                self.raw_pointer_offsets(id, 0, &mut offsets);
+                for offset in offsets {
+                    if let Some(origin) = self.raw_origins.get(slot + offset) {
+                        out.push((base + offset, *origin));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a value pointing into `origin` would outlive that local when stored in `target`.
+    fn outlives_origin(&self, origin: Option<usize>, target: usize) -> bool {
+        origin.is_some_and(|origin| self.slot_depth[origin] > self.slot_depth[target])
+    }
+
+    fn merge_raw(&self, left: &[Option<usize>], right: &[Option<usize>]) -> Vec<Option<usize>> {
+        left.iter()
+            .zip(right)
+            .map(|(left, right)| self.join_raw_origin(*left, *right))
+            .collect()
+    }
+
+    /// Joins two possible raw pointer origins, keeping the deeper local because it dies first.
+    fn join_raw_origin(&self, left: Option<usize>, right: Option<usize>) -> Option<usize> {
+        match (left, right) {
+            (Some(left), Some(right)) => Some(if self.slot_depth[right] > self.slot_depth[left] {
+                right
+            } else {
+                left
+            }),
+            (origin, None) | (None, origin) => origin,
+        }
+    }
+
     fn expression_span(&self, expression: &IrExpression) -> Span {
         match expression {
             IrExpression::Local { span, .. } | IrExpression::Field { span, .. } => *span,
@@ -151,6 +303,18 @@ impl Guard<'_> {
             .any(|(slot, origin)| {
                 self.reference_mutability[slot].is_some()
                     && (*origin == Some(target) || origin.is_none())
+            })
+    }
+
+    /// Whether a mutable reference held in some other local still points at `target`.
+    fn mutably_borrowed(&self, target: usize) -> bool {
+        self.reference_origins
+            .iter()
+            .enumerate()
+            .any(|(slot, origin)| {
+                slot != target
+                    && self.reference_mutability[slot] == Some(true)
+                    && *origin == Some(target)
             })
     }
 
@@ -260,6 +424,18 @@ impl Guard<'_> {
         }
     }
 
+    /// The slot of the custom-destructor value that contains this field access.
+    fn destructor_unit(&self, expression: &IrExpression) -> Option<usize> {
+        let IrExpression::Field { value, .. } = expression else {
+            return None;
+        };
+        let (slot, ty, _) = self.local(value)?;
+        if matches!(ty, Type::Struct(id) if self.structs[id].drop_function.is_some()) {
+            return Some(slot);
+        }
+        self.destructor_unit(value)
+    }
+
     fn local(&self, expression: &IrExpression) -> Option<(usize, Type, Span)> {
         match expression {
             IrExpression::Local { slot, ty, span } => Some((*slot, *ty, *span)),
@@ -281,12 +457,92 @@ impl Guard<'_> {
         }
     }
 
+    /// A raw pointer read after the value it points into was moved out of its owner.
+    fn check_raw_target(&self, expression: &IrExpression) -> Result<(), Diagnostic> {
+        let IrExpression::Local {
+            slot,
+            ty: Type::RawPointer(_),
+            span,
+        } = expression
+        else {
+            return Ok(());
+        };
+        match self.raw_origins[*slot] {
+            Some(origin) if self.slot_types[origin].is_some() && !self.available[origin] => {
+                Err(Diagnostic {
+                    code: "R0240",
+                    message: "use of a raw pointer to a moved value".into(),
+                    span: *span,
+                    help: Some(
+                        "the pointer's target was moved out; point at the new owner, or reassign the value before using the pointer"
+                            .into(),
+                    ),
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn expression(
         &mut self,
         expression: &mut IrExpression,
         consume: bool,
     ) -> Result<(), Diagnostic> {
+        // Moving a value out of a reference would leave the owner and the reference both
+        // holding it: only a copy (`.clone()`) may leave the borrowed content.
+        if let IrExpression::Dereference { ty, .. } = expression
+            && consume
+            && !owned_slots(*ty, 0, self.structs).is_empty()
+        {
+            return Err(Diagnostic {
+                code: "R0240",
+                message: "cannot move a value out of a reference".into(),
+                span: self.expression_span(expression),
+                help: Some("clone the value explicitly with `.clone()`".into()),
+            });
+        }
         if let Some((slot, ty, span)) = self.local(expression) {
+            if let IrExpression::Local { slot, ty, span } = expression
+                && !matches!(ty, Type::Reference(_, _))
+                && self.mutably_borrowed(*slot)
+            {
+                return Err(Diagnostic {
+                    code: "R0249",
+                    message: "cannot use a value while a mutable reference to it is active".into(),
+                    span: *span,
+                    help: Some(
+                        "use the reference instead, or end its scope before using the value".into(),
+                    ),
+                });
+            }
+            self.check_raw_target(expression)?;
+            // A field of a custom-destructor value is not an owner of its own:
+            // the whole value is the unit that moves and is dropped.
+            if let Some(unit) = self.destructor_unit(expression) {
+                if !self.available[unit] {
+                    return Err(Diagnostic {
+                        code: "R0240",
+                        message: "use of a moved value".into(),
+                        span,
+                        help: Some(
+                            "use `.clone()` before transferring ownership if both values are needed"
+                                .into(),
+                        ),
+                    });
+                }
+                if consume && !owned_slots(ty, slot, self.structs).is_empty() {
+                    return Err(Diagnostic {
+                        code: "R0255",
+                        message:
+                            "cannot move an owned field out of a value with a custom destructor"
+                                .into(),
+                        span,
+                        help: Some("use `.clone()` to copy the field instead".into()),
+                    });
+                }
+                *expression = IrExpression::Local { slot, ty, span };
+                return Ok(());
+            }
             let owners = owned_slots(ty, slot, self.structs);
             if owners.iter().any(|(slot, _)| !self.available[*slot]) {
                 return Err(Diagnostic {
@@ -349,12 +605,36 @@ impl Guard<'_> {
                 self.expression(slice, false)?;
                 self.expression(index, false)?;
             }
-            IrExpression::Field { value, .. } => {
+            IrExpression::Field { value, ty, .. } => {
                 let custom_owner = matches!(
                     self.local(value).map(|(_, ty, _)| ty),
                     Some(Type::Struct(id)) if self.structs[id].drop_function.is_some()
                 );
-                self.expression(value, !custom_owner)?;
+                // Reading a copy field through a reference moves nothing; only an owned field
+                // taken out of borrowed content is a move.
+                let through_reference = rooted_in_dereference(value);
+                let owned_field = !owned_slots(*ty, 0, self.structs).is_empty();
+                self.expression(
+                    value,
+                    !custom_owner && (!through_reference || (consume && owned_field)),
+                )?;
+            }
+            IrExpression::AddressOf { slot, ty, span, .. } => {
+                // Borrowing a value whose owned parts were moved would alias the new owner.
+                if owned_slots(*ty, *slot, self.structs)
+                    .iter()
+                    .any(|(owner, _)| !self.available[*owner])
+                {
+                    return Err(Diagnostic {
+                        code: "R0240",
+                        message: "use of a moved value".into(),
+                        span: *span,
+                        help: Some(
+                            "use `.clone()` before transferring ownership if both values are needed"
+                                .into(),
+                        ),
+                    });
+                }
             }
             IrExpression::ReferenceField { pointer, .. } => {
                 self.expression(pointer, false)?;
@@ -391,7 +671,24 @@ impl Guard<'_> {
             IrExpression::EnumMatch {
                 value, arms, ty, ..
             } => {
-                self.expression(value, true)?;
+                // Matching a value read through a reference moves out of it only when an arm
+                // binds an owned payload.
+                let binds_owned = arms.iter().any(|arm| {
+                    arm.bindings
+                        .iter()
+                        .any(|binding| !owned_slots(binding.ty, 0, self.structs).is_empty())
+                });
+                if binds_owned && rooted_in_dereference(value) {
+                    return Err(Diagnostic {
+                        code: "R0240",
+                        message: "cannot move an owned payload out of a reference".into(),
+                        span: self.expression_span(value),
+                        help: Some(
+                            "bind only copy payloads when matching through a reference".into(),
+                        ),
+                    });
+                }
+                self.expression(value, !rooted_in_dereference(value))?;
                 let before_arms = self.available.clone();
                 let origins_before_arms = self.reference_origins.clone();
                 let result_owns = !owned_slots(*ty, 0, self.structs).is_empty();
@@ -447,13 +744,16 @@ impl Guard<'_> {
                 let borrowed = self.borrowed.clone();
                 let reference_origins = self.reference_origins.clone();
                 let reference_mutability = self.reference_mutability.clone();
+                let raw_origins = self.raw_origins.clone();
                 let (checked, _) = self.block(std::mem::take(deferred), false)?;
                 *deferred = checked;
                 self.available = available;
                 self.borrowed = borrowed;
                 self.reference_origins = reference_origins;
                 self.reference_mutability = reference_mutability;
+                self.raw_origins = raw_origins;
             }
+            IrExpression::Dereference { pointer, .. } => self.check_raw_target(pointer)?,
             IrExpression::StringAsStr(value) => self.expression(value, false)?,
             IrExpression::Binary { left, right, .. } => {
                 self.expression(left, false)?;
@@ -732,6 +1032,30 @@ impl Guard<'_> {
                     span,
                 } => {
                     self.expression(value, true)?;
+                    // Every slot of the value takes the depth of its declaration, so a field
+                    // store into this value can be checked against it.
+                    let depth = self.scopes.len();
+                    let width = crate::sema::storage_slot_width(*ty, self.structs).max(1);
+                    let end = (*slot + width).min(self.slot_depth.len());
+                    for declared in &mut self.slot_depth[*slot..end] {
+                        *declared = depth;
+                    }
+                    if let Type::RawPointer(_) = ty {
+                        let origin = self.raw_pointer_origin(value);
+                        if self.outlives_origin(origin, *slot) {
+                            return Err(raw_pointer_escape(*span));
+                        }
+                        self.raw_origins[*slot] = origin;
+                    }
+                    if let Type::Struct(_) = ty {
+                        let mut origins = Vec::new();
+                        self.struct_raw_origins(value, *ty, 0, &mut origins);
+                        for (offset, origin) in origins {
+                            if let Some(entry) = self.raw_origins.get_mut(*slot + offset) {
+                                *entry = origin;
+                            }
+                        }
+                    }
                     if let Type::Reference(_, mutable) = ty {
                         let Some(origin) = self.reference_origin(value) else {
                             return Err(Diagnostic {
@@ -757,6 +1081,23 @@ impl Guard<'_> {
                     value,
                     span,
                 } => {
+                    if let IrExpression::AddressOf {
+                        slot: origin,
+                        pointer_type: Type::RawPointer(_),
+                        ..
+                    } = &*value
+                        && self.slot_depth[*origin] > self.slot_depth[*slot]
+                    {
+                        return Err(Diagnostic {
+                            code: "R0248",
+                            message: "a raw pointer to a local value would outlive its block"
+                                .into(),
+                            span: *span,
+                            help: Some(
+                                "declare the value in the block where the pointer is used".into(),
+                            ),
+                        });
+                    }
                     self.expression(value, true)?;
                     if !matches!(ty, Type::Reference(_, _)) && self.has_active_reference(*slot) {
                         return Err(Diagnostic {
@@ -767,8 +1108,34 @@ impl Guard<'_> {
                         });
                     }
                     if let Type::Reference(_, mutable) = ty {
-                        self.reference_origins[*slot] = self.reference_origin(value);
+                        let origin = self.reference_origin(value);
+                        if self.outlives_origin(origin, *slot) {
+                            return Err(reference_escape(*span));
+                        }
+                        self.reference_origins[*slot] = origin;
                         self.reference_mutability[*slot] = Some(*mutable);
+                    }
+                    if let Type::RawPointer(_) = ty {
+                        let origin = self.raw_pointer_origin(value);
+                        // A direct `&raw` of an inner local is already rejected above as R0248.
+                        if !matches!(value, IrExpression::AddressOf { .. })
+                            && self.outlives_origin(origin, *slot)
+                        {
+                            return Err(raw_pointer_escape(*span));
+                        }
+                        self.raw_origins[*slot] = origin;
+                    }
+                    if let Type::Struct(_) = ty {
+                        let mut origins = Vec::new();
+                        self.struct_raw_origins(value, *ty, 0, &mut origins);
+                        for (offset, origin) in origins {
+                            if self.outlives_origin(origin, *slot) {
+                                return Err(raw_pointer_escape(*span));
+                            }
+                            if let Some(entry) = self.raw_origins.get_mut(*slot + offset) {
+                                *entry = origin;
+                            }
+                        }
                     }
                     for (owner, leaf_ty) in owned_slots(*ty, *slot, self.structs) {
                         self.available[owner] = true;
@@ -786,6 +1153,19 @@ impl Guard<'_> {
                             span: self.expression_span(value),
                             help: Some("replace the whole value so Ryn Guard can run its destructor first".into()),
                         });
+                    }
+                    let value_span = self.expression_span(value);
+                    if let Type::Reference(_, _) = ty
+                        && self.outlives_origin(self.reference_origin(value), *slot)
+                    {
+                        return Err(reference_escape(value_span));
+                    }
+                    if let Type::RawPointer(_) = ty {
+                        let origin = self.raw_pointer_origin(value);
+                        if self.outlives_origin(origin, *slot) {
+                            return Err(raw_pointer_escape(value_span));
+                        }
+                        self.raw_origins[*slot] = origin;
                     }
                     self.expression(value, true)?;
                     for (owner, leaf_ty) in owned_slots(*ty, *slot, self.structs) {
@@ -862,12 +1242,15 @@ impl Guard<'_> {
                     self.expression(condition, false)?;
                     let before = self.available.clone();
                     let origins_before = self.reference_origins.clone();
+                    let raw_before = self.raw_origins.clone();
                     let (then_result, then_falls) = self.block(std::mem::take(then_body), true)?;
                     *then_body = then_result;
                     let then_state = self.available.clone();
                     let then_origins = self.reference_origins.clone();
+                    let then_raw = self.raw_origins.clone();
                     self.available = before;
                     self.reference_origins = origins_before.clone();
+                    self.raw_origins = raw_before;
                     let (else_result, else_falls) = self.block(std::mem::take(else_body), true)?;
                     *else_body = else_result;
                     let else_origins = self.reference_origins.clone();
@@ -878,9 +1261,11 @@ impl Guard<'_> {
                             .zip(&else_origins)
                             .map(|(left, right)| if left == right { *left } else { None })
                             .collect();
+                        self.raw_origins = self.merge_raw(&then_raw, &self.raw_origins.clone());
                     } else if then_falls {
                         self.available = then_state;
                         self.reference_origins = then_origins;
+                        self.raw_origins = then_raw;
                     } else if else_falls {
                         self.reference_origins = else_origins;
                     }
@@ -909,6 +1294,8 @@ impl Guard<'_> {
                     let index = self.loops.len() - 1;
                     let state = self.available.clone();
                     let depth = self.loops[index].depth;
+                    let raw_state = self.raw_origins.clone();
+                    self.loops[index].raw_exits.push(raw_state);
                     if matches!(statement, IrStatement::Break) {
                         self.loops[index].breaks.push(state);
                     } else {
@@ -919,6 +1306,35 @@ impl Guard<'_> {
                 }
                 IrStatement::Return { value } => {
                     if let Some(value) = value {
+                        let returned = match &*value {
+                            IrExpression::StructValue { struct_id, .. } => {
+                                Some(Type::Struct(*struct_id))
+                            }
+                            IrExpression::Local {
+                                ty: ty @ Type::Struct(_),
+                                ..
+                            } => Some(*ty),
+                            _ => None,
+                        };
+                        if let Some(ty) = returned {
+                            let mut origins = Vec::new();
+                            self.struct_raw_origins(value, ty, 0, &mut origins);
+                            if origins.iter().any(|(_, origin)| origin.is_some()) {
+                                return Err(Diagnostic {
+                                    code: "R0248",
+                                    message: "a raw pointer to a local value would outlive its function".into(),
+                                    span: match &*value {
+                                        IrExpression::StructValue { fields, .. } => fields
+                                            .iter()
+                                            .map(|(_, field)| self.expression_span(field))
+                                            .find(|span| span.end > 0)
+                                            .unwrap_or_else(|| self.expression_span(value)),
+                                        _ => self.expression_span(value),
+                                    },
+                                    help: Some("return a pointer to memory that outlives the call, such as an allocation or a parameter".into()),
+                                });
+                            }
+                        }
                         self.expression(value, true)?;
                     }
                     // The returned expression must be evaluated before cleanup.
@@ -946,11 +1362,13 @@ impl Guard<'_> {
     ) -> Result<Vec<IrStatement>, Diagnostic> {
         let entry = self.available.clone();
         let entry_origins = self.reference_origins.clone();
+        let entry_raw = self.raw_origins.clone();
         self.loops.push(LoopState {
             depth: self.scopes.len(),
             entry: backedge,
             breaks: Vec::new(),
             continues: Vec::new(),
+            raw_exits: Vec::new(),
         });
         let (body, falls) = self.block(body, true)?;
         let state = self.loops.pop().unwrap();
@@ -960,6 +1378,16 @@ impl Guard<'_> {
         for continuation in &state.continues {
             self.backedge(continuation, &state.entry)?;
         }
+        // The body may run zero times, and any `break` or `continue` may leave it, so the
+        // raw pointer origins after the loop join all of those states.
+        let mut raw_after = entry_raw;
+        if falls {
+            raw_after = self.merge_raw(&raw_after, &self.raw_origins.clone());
+        }
+        for exit in &state.raw_exits {
+            raw_after = self.merge_raw(&raw_after, exit);
+        }
+        self.raw_origins = raw_after;
         self.available = entry;
         for (current, before) in self.reference_origins.iter_mut().zip(entry_origins) {
             if *current != before {

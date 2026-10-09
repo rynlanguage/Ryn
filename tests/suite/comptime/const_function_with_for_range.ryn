@@ -1,0 +1,13 @@
+// test: run
+// out: 100
+fun cubes(n: i32) -> i32 {
+    mut total: i32 = 0
+    for i in 1..=n {
+        total += i * i * i
+    }
+    return total
+}
+const SUM: i32 = cubes(4)
+fun main() {
+    echo SUM
+}

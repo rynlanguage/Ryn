@@ -78,14 +78,26 @@ fn ryn_ir_checker_accepts_every_encoded_program_and_rejects_damaged_text() {
         texts.len()
     );
     for text in &texts {
-        assert!(accepts(&checker, text), "the checker should accept this IR text");
+        assert!(
+            accepts(&checker, text),
+            "the checker should accept this IR text"
+        );
     }
 
     let sample = &texts[0];
     let truncated = &sample[..sample.len() - 6];
-    assert!(!accepts(&checker, truncated), "truncated IR must be rejected");
-    assert!(!accepts(&checker, "Ir 0 - 1 0 0 0"), "short IR must be rejected");
+    assert!(
+        !accepts(&checker, truncated),
+        "truncated IR must be rejected"
+    );
+    assert!(
+        !accepts(&checker, "Ir 0 - 1 0 0 0"),
+        "short IR must be rejected"
+    );
     let corrupted = sample.replacen(" Return ", " Retrn ", 1);
     assert_ne!(&corrupted, sample, "the corruption must change the text");
-    assert!(!accepts(&checker, &corrupted), "unknown statement tags must be rejected");
+    assert!(
+        !accepts(&checker, &corrupted),
+        "unknown statement tags must be rejected"
+    );
 }

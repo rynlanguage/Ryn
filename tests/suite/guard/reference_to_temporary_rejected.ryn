@@ -1,0 +1,10 @@
+// test: fail
+// code: R0206
+fun main() {
+    mut r: &i32 = &0
+    when true {
+        x: i32 = 5
+        r = &x
+    }
+    echo *r
+}

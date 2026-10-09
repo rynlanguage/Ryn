@@ -1,0 +1,28 @@
+// test: run
+// out: 80
+// out: xyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxyxy
+// out: start0123456789abcdefghijklmnopqrstuvwxyz
+// out: start0123456789abcdefghijklmnopqrstuvwxyz
+// out: start0123456789abcdefghijklmnopqrstuvwxyz!
+// out: 41
+// out: 42
+fun main() {
+    mut s := String("")
+    mut i: i32 = 0
+    while i < 40 {
+        s.append("xy")
+        s.append("")
+        i += 1
+    }
+    echo s.len()
+    echo s
+    mut t := String("start")
+    t.append("0123456789abcdefghijklmnopqrstuvwxyz")
+    echo t
+    copy := t.clone()
+    t.append("!")
+    echo copy
+    echo t
+    echo copy.len()
+    echo t.len()
+}

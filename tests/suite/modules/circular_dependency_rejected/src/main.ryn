@@ -1,0 +1,7 @@
+// test: fail
+// msg: circular module dependency
+// code: R0427
+use a
+fun main() {
+    echo a::fa()
+}

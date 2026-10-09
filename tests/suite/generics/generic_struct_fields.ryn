@@ -1,0 +1,14 @@
+// test: run
+// out: 42
+// out: ryn-lang
+struct Pair<T> {
+    first: T,
+    second: T
+}
+fun main() {
+    p := Pair::<i32> { first: 20, second: 22 }
+    echo p.first + p.second
+    mut q := Pair::<String> { first: String("ryn"), second: String("lang") }
+    q.first.append("-")
+    echo q.first.concat(q.second)
+}

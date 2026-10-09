@@ -1,0 +1,9 @@
+// test: run
+// out: 42
+fun both(a: &i32, b: &i32) -> i32 {
+    return *a + *b
+}
+fun main() {
+    x: i32 = 21
+    echo both(&x, &x)
+}

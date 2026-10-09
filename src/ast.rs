@@ -1,6 +1,6 @@
 use crate::source::Span;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Program {
     pub uses: Vec<UseDecl>,
     pub structs: Vec<StructDef>,
@@ -28,10 +28,19 @@ pub struct ShapeMethod {
     pub default_value: Option<Expression>,
     pub span: Span,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct UseDecl {
     pub path: Vec<String>,
+    /// `use a::b as c` makes the module available as `c` instead of `b`.
+    pub alias: Option<String>,
     pub span: Span,
+}
+
+impl UseDecl {
+    /// The name the importing code uses for the module: the alias, or the last path segment.
+    pub fn local_name(&self) -> Option<&String> {
+        self.alias.as_ref().or_else(|| self.path.last())
+    }
 }
 #[derive(Clone, Debug)]
 pub struct TypeAliasDef {
@@ -67,6 +76,9 @@ pub struct StructDef {
     pub drop_function: Option<String>,
     pub derives: Vec<String>,
     pub module_path: String,
+    /// For an instance of a generic structure (`Box<i32>`): its readable name before the
+    /// type arguments are replaced by their own instance names. Empty otherwise.
+    pub display: String,
     pub span: Span,
 }
 #[derive(Clone, Debug)]
@@ -347,7 +359,12 @@ impl Expression {
 
     /// Rewrites `value?.name` into a `choose` over `Option`: a `Some` payload is
     /// read through `name` and wrapped again, and `None` stays `None`.
-    pub fn optional_field(value: Expression, name: String, name_span: Span, span: Span) -> Expression {
+    pub fn optional_field(
+        value: Expression,
+        name: String,
+        name_span: Span,
+        span: Span,
+    ) -> Expression {
         let bound = "$chain".to_owned();
         Expression::Choose {
             value: Box::new(value),

@@ -1,0 +1,13 @@
+// test: fail
+// code: R0450
+shape Sized {
+    fun size(self) -> i32
+}
+struct Box<T> { value: T, n: i32 }
+extend<T> Box<T> as Sized {
+    pub fun other(self) -> i32 { return 1 }
+}
+fun main() {
+    b := Box::<i32> { value: 1, n: 3 }
+    echo b.other()
+}

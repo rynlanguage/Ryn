@@ -1,0 +1,14 @@
+// test: run
+// out: 1
+// out: 2
+enum Shape { Dot, Box(i32) }
+fun g(s: Shape) -> i32 {
+    choose s {
+        Shape::Dot => 1,
+        rest => 2
+    }
+}
+fun main() {
+    echo g(Shape::Dot)
+    echo g(Shape::Box(3))
+}

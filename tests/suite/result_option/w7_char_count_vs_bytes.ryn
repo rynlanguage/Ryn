@@ -1,0 +1,27 @@
+// test: run
+// out: 7
+// out: 3
+// out: 🦀
+// out: 🦀
+// out: é
+// out: a
+// out: 240
+// out: é
+// out: a🦀é
+// out: é
+// exit: 1
+// err: UTF-8 byte boundaries
+fun main() {
+    s := String("a🦀é")
+    echo s.len()
+    echo s.char_count()
+    echo s.substring(1, 2)
+    echo s.slice(1, 5)
+    echo s.slice(5, 7)
+    echo s.slice(0, 1)
+    echo s.byte_at(1)
+    echo s.char_at(2)
+    echo s.slice_chars(0, 3)
+    echo s.substring(2, 3)
+    echo s.slice(0, 2)
+}

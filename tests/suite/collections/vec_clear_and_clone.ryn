@@ -1,0 +1,12 @@
+// test: run
+// out: 2
+// out: 0
+fun main() {
+    mut v: Vec<i32> = Vec()
+    v.push(1)
+    v.push(2)
+    mut copy := v.clone()
+    copy.clear()
+    echo v.len()
+    echo copy.len()
+}

@@ -1,0 +1,13 @@
+// test: fail
+// code: R0252
+fun main() {
+    mut p: *i32 = (0 as u64) as *i32
+    mut i: i32 = 0
+    while i < 2 {
+        mut x: i32 = i
+        q := &raw mut x
+        p = q
+        i += 1
+    }
+    echo 1
+}

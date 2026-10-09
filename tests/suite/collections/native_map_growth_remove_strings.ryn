@@ -1,0 +1,56 @@
+// test: run
+// out: 3000
+// out: 1522756
+// out: -1
+// out: 1500
+// out: false
+// out: true
+// out: 1501
+// out: 5
+// out: false
+// out: 500
+// out: 321
+// out: -1
+// out: true
+// out: false
+// out: 499
+// out: true
+fun main() {
+    mut m := Map<i64, i64>()
+    mut i: i64 = 0
+    while i < 3000 {
+        m.insert(i * 7, i * i)
+        i += 1
+    }
+    echo m.len()
+    echo choose m.get(7 * 1234) { Option::Some(v) => v, Option::None => -1 }
+    echo choose m.get(5) { Option::Some(v) => v, Option::None => -1 }
+    mut j: i64 = 0
+    while j < 3000 {
+        when j % 2 == 0 {
+            m.remove(j * 7)
+        }
+        j += 1
+    }
+    echo m.len()
+    echo m.contains_key(14)
+    echo m.contains_key(21)
+    m.insert(14, 5)
+    echo m.len()
+    echo choose m.get(14) { Option::Some(v) => v, Option::None => -1 }
+    echo m.is_empty()
+    mut s := Map<String, i32>()
+    mut k: i64 = 0
+    while k < 500 {
+        s.insert(String(k), k as i32)
+        k += 1
+    }
+    echo s.len()
+    echo choose s.get(String(321)) { Option::Some(v) => v, Option::None => -1 }
+    echo choose s.get(String(999)) { Option::Some(v) => v, Option::None => -1 }
+    echo s.remove(String(100))
+    echo s.contains_key(String(100))
+    echo s.len()
+    s.clear()
+    echo s.is_empty()
+}

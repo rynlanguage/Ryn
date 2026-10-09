@@ -1,0 +1,8 @@
+// test: fail
+// code: R0460
+// msg: x exists
+struct P { x: i32, y: i32 }
+fun main() {
+    static_assert(field_count::<P>() == 2, "P has two fields")
+    static_assert(!has_field::<P>("x"), "x exists")
+}

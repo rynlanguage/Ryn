@@ -1,0 +1,78 @@
+// A bump-pointer arena: one block of memory, handed out in order, reclaimed all at once.
+//
+// `Arena::with_capacity(bytes)` reserves the block. `alloc_bytes(size, align)` returns the next
+// suitably aligned chunk, or a null pointer when the block is exhausted or the alignment is not
+// a power of two. `reset()` reclaims every chunk at once; dropping the arena releases the block.
+//
+// The arena stores plain data. It never runs destructors, so move owning values out before a
+// reset. Pointers it returns are raw: they dangle after `reset` and after the arena is dropped,
+// and Ryn Guard does not track them.
+
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(block: *u8);
+
+#[drop(release_arena)]
+pub struct Arena {
+    pub base: *u8,
+    capacity: u64,
+    used: u64,
+    allocations: u64,
+}
+
+fun release_arena(arena: Arena) {
+    when !pointer_is_null(arena.base) {
+        free(arena.base)
+    }
+}
+
+extend Arena {
+    pub fun with_capacity(bytes: u64) -> Arena {
+        return Arena { base: malloc(bytes), capacity: bytes, used: 0 as u64, allocations: 0 as u64 }
+    }
+
+    pub fun capacity(self) -> u64 {
+        return self.capacity
+    }
+
+    pub fun used(self) -> u64 {
+        return self.used
+    }
+
+    pub fun remaining(self) -> u64 {
+        return self.capacity - self.used
+    }
+
+    pub fun count(self) -> u64 {
+        return self.allocations
+    }
+
+    pub fun alloc_bytes(mut self, size: u64, align: u64) -> *u8 {
+        when pointer_is_null(self.base) || align == 0 || (align & (align - 1)) != 0 {
+            return (0 as u64) as *u8
+        }
+        start := self.base as u64
+        padding := (align - ((start + self.used) & (align - 1))) & (align - 1)
+        remaining := self.capacity - self.used
+        when padding > remaining || size > remaining - padding {
+            return (0 as u64) as *u8
+        }
+        aligned := start + self.used + padding
+        self.used = self.used + padding + size
+        self.allocations += 1
+        return aligned as *u8
+    }
+
+    pub fun reset(mut self) {
+        self.used = 0
+        self.allocations = 0
+    }
+}
+
+pub fun alloc<T>(arena: &mut Arena, value: T) -> *T {
+    raw := arena.alloc_bytes(sizeof(T), alignof(T))
+    typed := raw as *T
+    when !pointer_is_null(raw) {
+        *typed = value
+    }
+    return typed
+}

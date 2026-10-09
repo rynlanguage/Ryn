@@ -1,0 +1,161 @@
+// test: run
+// out: sorts agree: true
+// out: smallest 54 largest 938
+// out: lower bound 500 -> 13
+// out: all present: 24
+// out: contains 1000: false
+// out: contains smallest+1: false
+// out: 54
+// out: 81
+// out: 87
+// out: 112
+// out: 116
+// out: 205
+// out: 227
+// out: 227
+// out: 262
+// out: 327
+// out: 333
+// out: 450
+// out: 465
+// out: 521
+// out: 571
+// out: 640
+// out: 646
+// out: 700
+// out: 717
+// out: 767
+// out: 796
+// out: 880
+// out: 906
+// out: 938
+// Insertion sort, merge sort, and binary search over a deterministic pseudo-random sequence.
+struct Ints { items: Vec<i64> }
+
+extend Ints {
+    fun get(self, i: u64) -> i64 {
+        return self.items.index(i)
+    }
+    fun swap_at(mut self, i: u64, j: u64) {
+        a := self.items.index(i)
+        b := self.items.index(j)
+        self.items.set(i, b)
+        self.items.set(j, a)
+    }
+    fun insertion_sort(mut self) {
+        n := self.items.len()
+        for i in 1..n {
+            mut j := i
+            while j > 0 && self.get(j - 1) > self.get(j) {
+                self.swap_at(j - 1, j)
+                j -= 1
+            }
+        }
+    }
+    fun merge_range(mut self, lo: u64, mid: u64, hi: u64) {
+        mut merged: Vec<i64> = Vec()
+        mut i := lo
+        mut j := mid
+        while i < mid && j < hi {
+            when self.get(i) <= self.get(j) {
+                merged.push(self.get(i))
+                i += 1
+            } else {
+                merged.push(self.get(j))
+                j += 1
+            }
+        }
+        while i < mid {
+            merged.push(self.get(i))
+            i += 1
+        }
+        while j < hi {
+            merged.push(self.get(j))
+            j += 1
+        }
+        for k in 0..merged.len() {
+            self.items.set(lo + k, merged.index(k))
+        }
+    }
+    fun merge_sort_range(mut self, lo: u64, hi: u64) {
+        when hi - lo < 2 {
+            return
+        }
+        mid := lo + (hi - lo) / 2
+        self.merge_sort_range(lo, mid)
+        self.merge_sort_range(mid, hi)
+        self.merge_range(lo, mid, hi)
+    }
+    fun merge_sort(mut self) {
+        n := self.items.len()
+        self.merge_sort_range(0, n)
+    }
+    // Index of the first element >= target, or the length when none is.
+    fun lower_bound(self, target: i64) -> u64 {
+        mut lo: u64 = 0
+        mut hi := self.items.len()
+        while lo < hi {
+            mid := lo + (hi - lo) / 2
+            when self.get(mid) < target {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        return lo
+    }
+    fun contains(self, target: i64) -> bool {
+        idx := self.lower_bound(target)
+        return idx < self.items.len() && self.get(idx) == target
+    }
+}
+
+fun sequence(count: u64, seed: i64) -> Vec<i64> {
+    mut out: Vec<i64> = Vec()
+    mut x := seed
+    for _ in 0..count {
+        x = (x * 1103515245 + 12345) % 2147483648
+        out.push(x % 1000)
+    }
+    return out
+}
+
+fun copy_of(v: Vec<i64>) -> Ints {
+    return Ints { items: v }
+}
+
+fun main() {
+    base := sequence(24, 7)
+    mut a := copy_of(sequence(24, 7))
+    mut b := copy_of(base)
+    a.insertion_sort()
+    b.merge_sort()
+    mut same := true
+    for i in 0..a.items.len() {
+        when a.get(i) != b.get(i) {
+            same = false
+        }
+    }
+    echo "sorts agree: {same}"
+    smallest := a.get(0)
+    largest := a.get(23)
+    echo "smallest {smallest} largest {largest}"
+    bound := a.lower_bound(500)
+    echo "lower bound 500 -> {bound}"
+    mut found := 0
+    for i in 0..a.items.len() {
+        probe := a.get(i)
+        when a.contains(probe) {
+            found += 1
+        }
+    }
+    echo "all present: {found}"
+    missing := a.contains(1000)
+    echo "contains 1000: {missing}"
+    next := smallest + 1
+    has_next := a.contains(next)
+    echo "contains smallest+1: {has_next}"
+    for i in 0..a.items.len() {
+        echo a.get(i)
+    }
+}

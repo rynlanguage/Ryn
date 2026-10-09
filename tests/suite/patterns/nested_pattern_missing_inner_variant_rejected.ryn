@@ -1,0 +1,13 @@
+// test: fail
+// code: R0235
+enum Inner { Data(i32), Nothing }
+enum Outer { Nested(Inner), Direct(i32) }
+fun f(o: Outer) -> i32 {
+    choose o {
+        Outer::Nested(Inner::Data(n)) => n,
+        Outer::Direct(x) => x
+    }
+}
+fun main() {
+    echo f(Outer::Direct(1))
+}

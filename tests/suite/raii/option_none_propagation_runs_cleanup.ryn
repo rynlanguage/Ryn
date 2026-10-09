@@ -1,0 +1,20 @@
+// test: run
+// out: drop 3
+// out: true
+#[drop(rel)]
+struct R { h: *i32, id: i32 }
+fun rel(r: R) { echo "drop {r.id}" }
+fun mk(id: i32, p: *i32) -> R { return R { h: p, id: id } }
+fun inner() -> Option<i32> {
+    return Option::None
+}
+fun outer(p: *i32) -> Option<i32> {
+    guard := mk(3, p)
+    v := inner()?
+    return Option::Some(v)
+}
+fun main() {
+    mut x: i32 = 0
+    r := outer(&raw mut x)
+    echo r.is_none()
+}

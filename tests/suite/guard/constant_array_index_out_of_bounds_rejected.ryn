@@ -1,0 +1,6 @@
+// test: fail
+// code: R0257
+fun main() {
+    a: [i32; 3] = [1, 2, 3]
+    echo a[5]
+}

@@ -1,0 +1,13 @@
+// test: run
+// out: 5
+// out: 7
+fun first_or<T>(o: Option<T>, d: T) -> T {
+    choose o {
+        Option::Some(v) => v,
+        Option::None => d
+    }
+}
+fun main() {
+    echo first_or(Option::Some(5 as i32), 0 as i32)
+    echo first_or(Option::Some(7 as i32), 0 as i32)
+}

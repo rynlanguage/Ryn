@@ -74,10 +74,7 @@ fn assert_fixture_output(name: &str, expected: &str) {
 fn struct_destructuring_binds_fields_with_renames_nesting_and_rest() {
     // Shorthand and renamed fields, `mut` bindings, nested structure and tuple
     // patterns, and `..` that ignores the remaining fields.
-    assert_fixture_output(
-        "struct_destructuring.ryn",
-        "7\n31\n3\ndeep\nbox\n24\n",
-    );
+    assert_fixture_output("struct_destructuring.ryn", "7\n31\n3\ndeep\nbox\n24\n");
 }
 
 #[test]

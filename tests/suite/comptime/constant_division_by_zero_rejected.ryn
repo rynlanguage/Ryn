@@ -1,0 +1,7 @@
+// test: fail
+// msg: division by zero
+// code: R0464
+const BAD: i32 = 1 / 0
+fun main() {
+    echo BAD
+}

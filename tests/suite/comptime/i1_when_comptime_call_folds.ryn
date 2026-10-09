@@ -1,0 +1,12 @@
+// test: run
+// out: comptime taken
+fun probe() -> bool {
+    return true
+}
+fun main() {
+    when comptime(probe()) {
+        echo "comptime taken"
+    } else {
+        missing_thing()
+    }
+}

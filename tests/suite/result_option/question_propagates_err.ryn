@@ -1,0 +1,22 @@
+// test: run
+// out: first
+// out: failed
+fun inner(fail: bool) -> Result<i32, String> {
+    when fail {
+        return Result::Err(String("failed"))
+    }
+    return Result::Ok(1)
+}
+fun outer(fail: bool) -> Result<i32, String> {
+    value := inner(fail)?
+    echo "first"
+    return Result::Ok(value + 1)
+}
+fun main() {
+    a := outer(false)
+    b := outer(true)
+    echo choose b {
+        Result::Ok(v) => String("none"),
+        Result::Err(m) => m
+    }
+}

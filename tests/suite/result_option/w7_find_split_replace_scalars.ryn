@@ -1,0 +1,30 @@
+// test: run
+// out: 2
+// out: 1
+// out: -7
+// out: 3
+// out: x🦀y🦀z
+// out: 3
+// out: bbbbbb
+fun main() {
+    s := String("a🦀é")
+    echo choose s.find("é") {
+        Option::Some(i) => i as i64,
+        Option::None => -1
+    }
+    echo choose s.find("🦀") {
+        Option::Some(i) => i as i64,
+        Option::None => -1
+    }
+    echo choose String("zzz").find("q") {
+        Option::Some(i) => i as i64,
+        Option::None => -7
+    }
+    t := String("x→y→z")
+    parts := t.split("→")
+    echo parts.len()
+    echo t.replace("→", "🦀")
+    gaps := String("a,,b").split(",")
+    echo gaps.len()
+    echo String("aaa").replace("a", "bb")
+}

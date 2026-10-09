@@ -1,0 +1,10 @@
+// test: fail
+// code: R0203
+// msg: id::<i32>(...)
+fun id<T>(x: T) -> T {
+    x
+}
+fun main() {
+    y := id<i32>(1)
+    echo y
+}

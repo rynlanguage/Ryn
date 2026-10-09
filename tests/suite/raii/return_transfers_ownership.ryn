@@ -1,0 +1,18 @@
+// test: run
+// out: built
+// out: received
+// out: drop 5
+#[drop(rel)]
+struct R { h: *i32, id: i32 }
+fun rel(r: R) { echo "drop {r.id}" }
+fun mk(id: i32, p: *i32) -> R { return R { h: p, id: id } }
+fun build(p: *i32) -> R {
+    r := mk(5, p)
+    echo "built"
+    return r
+}
+fun main() {
+    mut x: i32 = 0
+    got := build(&raw mut x)
+    echo "received"
+}

@@ -1,0 +1,12 @@
+// test: run
+// out: 11
+fun inner() -> Result<i32, String> {
+    return Result::Ok(10)
+}
+fun outer() -> Result<i32, String> {
+    v := inner()?
+    return Result::Ok(v + 1)
+}
+fun main() {
+    echo outer().unwrap()
+}

@@ -1,0 +1,7 @@
+// test: fail
+// code: R0229
+// msg: missing field `x`
+struct E { x: i32 }
+fun main() {
+    e := E {}
+}

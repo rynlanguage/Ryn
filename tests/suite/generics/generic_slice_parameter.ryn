@@ -1,0 +1,12 @@
+// test: run
+// out: 5
+// out: 9
+fun first_value<T>(items: &[T]) -> T {
+    items[0]
+}
+fun main() {
+    echo first_value([5 as i32, 6 as i32])
+    mut v: Vec<i32> = Vec()
+    v.push(9)
+    echo first_value(v.as_slice())
+}

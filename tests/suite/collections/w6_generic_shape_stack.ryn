@@ -1,0 +1,100 @@
+// test: run
+// out: rects: 3 top area 1
+// out: largest rect 20
+// out: rect total 27
+// out: tri total 21
+// out: empty pop is none: true
+// A generic stack whose element type must implement the Area shape.
+shape Area {
+    fun area(self) -> i64
+}
+
+struct Rect { w: i64, h: i64 }
+struct Tri { base: i64, height: i64 }
+
+extend Rect as Area {
+    fun area(self) -> i64 {
+        return self.w * self.h
+    }
+}
+
+extend Tri as Area {
+    fun area(self) -> i64 {
+        return self.base * self.height / 2
+    }
+}
+
+struct Stack<T> { items: Vec<T> }
+
+extend<T> Stack<T> {
+    pub fun push(mut self, v: T) {
+        self.items.push(v)
+    }
+    pub fun pop(mut self) -> Option<T> {
+        n := self.items.len()
+        when n == 0 {
+            return Option::None
+        }
+        return Option::Some(self.items.take(n - 1))
+    }
+    pub fun size(self) -> u64 {
+        return self.items.len()
+    }
+    pub fun top(self) -> T {
+        return self.items.index(self.items.len() - 1)
+    }
+}
+
+fun sum_areas<T: Area>(s: Stack<T>) -> i64 {
+    mut rest := s
+    mut total: i64 = 0
+    while rest.size() > 0 {
+        top := rest.pop()
+        x := top.unwrap()
+        total += x.area()
+    }
+    return total
+}
+
+fun largest_area<T: Area>(s: Stack<T>) -> i64 {
+    mut best: i64 = 0
+    for i in 0..s.size() {
+        x := s.items.index(i)
+        when x.area() > best {
+            best = x.area()
+        }
+    }
+    return best
+}
+
+fun rect_stack() -> Stack<Rect> {
+    mut s := Stack::<Rect> { items: Vec() }
+    s.push(Rect { w: 2, h: 3 })
+    s.push(Rect { w: 4, h: 5 })
+    s.push(Rect { w: 1, h: 1 })
+    return s
+}
+
+fun tri_stack() -> Stack<Tri> {
+    mut s := Stack::<Tri> { items: Vec() }
+    s.push(Tri { base: 4, height: 5 })
+    s.push(Tri { base: 3, height: 3 })
+    s.push(Tri { base: 7, height: 2 })
+    return s
+}
+
+fun main() {
+    rects := rect_stack()
+    count := rects.size()
+    top := rects.top().area()
+    echo "rects: {count} top area {top}"
+    largest := largest_area(rect_stack())
+    echo "largest rect {largest}"
+    rect_sum := sum_areas(rect_stack())
+    echo "rect total {rect_sum}"
+    tri_sum := sum_areas(tri_stack())
+    echo "tri total {tri_sum}"
+    mut empty := Stack::<Tri> { items: Vec() }
+    missing := empty.pop().is_none()
+    echo "empty pop is none: {missing}"
+}

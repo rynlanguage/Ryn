@@ -1,0 +1,5 @@
+// test: run
+// out: {literal}
+fun main() {
+    echo "{{literal}}"
+}

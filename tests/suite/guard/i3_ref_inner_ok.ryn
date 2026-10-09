@@ -1,0 +1,13 @@
+// test: run
+// out: 5
+// out: 1
+fun main() {
+    a: i32 = 1
+    mut r: &i32 = &a
+    when true {
+        b: i32 = 5
+        q: &i32 = &b
+        echo *q
+    }
+    echo *r
+}

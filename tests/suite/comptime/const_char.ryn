@@ -1,0 +1,6 @@
+// test: run
+// out: q
+const LETTER: char = 'q'
+fun main() {
+    echo LETTER
+}

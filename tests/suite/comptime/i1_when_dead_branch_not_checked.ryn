@@ -1,0 +1,11 @@
+// test: run
+// out: release
+const DEBUG: bool = false
+fun main() {
+    when DEBUG {
+        echo no_such_function_here()
+        x: i32 = "text"
+    } else {
+        echo "release"
+    }
+}

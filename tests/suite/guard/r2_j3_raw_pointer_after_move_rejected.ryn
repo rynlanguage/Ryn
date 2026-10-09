@@ -1,0 +1,11 @@
+// test: fail
+// code: R0240
+// msg: use of a raw pointer to a moved value
+fun main() {
+    mut v: Vec<i32> = Vec()
+    v.push(3)
+    p := &raw mut v
+    w := v
+    echo w.len()
+    echo pointer_is_null(p as *u8)
+}

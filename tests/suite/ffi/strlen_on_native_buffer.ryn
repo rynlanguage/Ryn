@@ -1,0 +1,26 @@
+// test: run
+// out: 2
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(p: *u8);
+extern "C" fun strlen(s: *u8) -> u64;
+fun poke8(address: u64, value: u8) {
+    p := address as *u8
+    *p = value
+}
+fun poke32(address: u64, value: i32) {
+    p := address as *i32
+    *p = value
+}
+fun peek32(address: u64) -> i32 {
+    p := address as *i32
+    return *p
+}
+fun main() {
+    buf := malloc(8 as u64)
+    base := buf as u64
+    poke8(base, 104 as u8)
+    poke8(base + 1 as u64, 105 as u8)
+    poke8(base + 2 as u64, 0 as u8)
+    echo strlen(buf)
+    free(buf)
+}

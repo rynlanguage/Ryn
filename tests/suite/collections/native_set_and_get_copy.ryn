@@ -1,0 +1,26 @@
+// test: run
+// out: a
+// out: a!
+// out: false
+// out: true
+// out: true
+// out: true
+// out: false
+// out: 0
+// out: true
+fun main() {
+    mut m := Map<i32, String>()
+    m.insert(1, String("a"))
+    mut got := choose m.get(1) { Option::Some(v) => v, Option::None => String("none") }
+    got.append("!")
+    echo choose m.get(1) { Option::Some(v) => v, Option::None => String("none") }
+    echo got
+    mut s := Set<i64>()
+    echo s.add(3)
+    echo s.add(3)
+    echo s.contains(3)
+    echo s.remove(3)
+    echo s.remove(3)
+    echo s.len()
+    echo s.is_empty()
+}

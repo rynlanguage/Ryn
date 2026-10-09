@@ -1,0 +1,11 @@
+// test: run
+// out: alpha 1
+// out: beta 2
+// out: 3
+use alpha::util
+use beta::helpers
+fun main() {
+    echo util::label()
+    echo helpers::label()
+    echo util::value() + helpers::value()
+}

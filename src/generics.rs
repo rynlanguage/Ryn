@@ -4,19 +4,285 @@
 //! function for each inferred type-argument tuple and substitutes its
 //! signatures and local annotations before semantic analysis.
 
-use std::collections::HashMap;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
 use crate::{
-    ast::{BinaryOp, EnumDef, Expression, Function, PrintPart, Program, Statement, TypeName},
+    ast::{
+        BinaryOp, EnumDef, Expression, Function, PrintPart, Program, Statement, StructDef,
+        StructField, TypeName, VariantDef,
+    },
     source::{Diagnostic, Span},
 };
 
 const MAX_SPECIALIZATIONS: usize = 256;
 
+const STRUCT_PLACEHOLDER: &str = "$RynStructParam#";
+const STRUCT_INSTANCE: &str = "$RynStruct#";
+const ENUM_PLACEHOLDER: &str = "$RynEnumParam#";
+const ENUM_INSTANCE: &str = "$RynEnum#";
+const TUPLE_PREFIX: &str = "$RynTuple#";
+const OPTION_PREFIX: &str = "$RynOption#";
+
+thread_local! {
+    /// The structure declarations of the program being specialized, for unifying a generic
+    /// structure written with type parameters against a concrete instance. Tuple types the
+    /// specialization needs are added here as well.
+    static STRUCTS: RefCell<Vec<StructDef>> = const { RefCell::new(Vec::new()) };
+    /// Enum declarations created while specializing (the `Option` instances of constructor
+    /// arguments). They are appended to the program's enums.
+    static NEW_ENUMS: RefCell<Vec<EnumDef>> = const { RefCell::new(Vec::new()) };
+}
+
+fn find_struct(name: &str) -> Option<StructDef> {
+    STRUCTS.with(|structs| structs.borrow().iter().find(|s| s.name == name).cloned())
+}
+
+/// Finds an enum among the program's enums or among those created while specializing.
+fn find_enum_definition(name: &str, enum_definitions: &[EnumDef]) -> Option<EnumDef> {
+    enum_definitions
+        .iter()
+        .find(|definition| definition.name == name)
+        .cloned()
+        .or_else(|| {
+            NEW_ENUMS.with(|enums| {
+                enums
+                    .borrow()
+                    .iter()
+                    .find(|definition| definition.name == name)
+                    .cloned()
+            })
+        })
+}
+
+/// The tuple structure with the given element types, registered on first use. Its name and
+/// layout match the parser's tuple types, so semantic analysis reuses it.
+fn tuple_type(fields: Vec<TypeName>, span: Span) -> TypeName {
+    let key = fields.iter().map(type_key).collect::<Vec<_>>().join(",");
+    let name = format!("{TUPLE_PREFIX}{key}");
+    STRUCTS.with(|structs| {
+        let mut structs = structs.borrow_mut();
+        if !structs.iter().any(|definition| definition.name == name) {
+            structs.push(StructDef {
+                derives: Vec::new(),
+                name: name.clone(),
+                type_parameters: Vec::new(),
+                fields: fields
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, ty)| StructField {
+                        name: format!("_{index}"),
+                        ty,
+                        public: false,
+                        span,
+                    })
+                    .collect(),
+                public: false,
+                repr_c: false,
+                drop_function: None,
+                module_path: String::new(),
+                display: String::new(),
+                span,
+            });
+        }
+    });
+    TypeName::Named(name, span)
+}
+
+/// The `Option` instance whose `Some` payload is `payload`, created when the program has none.
+fn option_type(payload: TypeName, span: Span, enum_definitions: &[EnumDef]) -> TypeName {
+    let is_instance = |definition: &EnumDef| {
+        definition.name.starts_with(OPTION_PREFIX)
+            && definition.variants.len() == 2
+            && definition.variants[0].name == "Some"
+            && definition.variants[0].fields.len() == 1
+            && type_key(&definition.variants[0].fields[0]) == type_key(&payload)
+            && definition.variants[1].name == "None"
+            && definition.variants[1].fields.is_empty()
+    };
+    if let Some(definition) = enum_definitions
+        .iter()
+        .find(|definition| is_instance(definition))
+    {
+        return TypeName::Named(definition.name.clone(), span);
+    }
+    let name = NEW_ENUMS.with(|enums| {
+        let mut enums = enums.borrow_mut();
+        if let Some(definition) = enums.iter().find(|definition| is_instance(definition)) {
+            return definition.name.clone();
+        }
+        let name = format!("{OPTION_PREFIX}generic{}", enums.len());
+        enums.push(EnumDef {
+            name: name.clone(),
+            type_parameters: Vec::new(),
+            variants: vec![
+                VariantDef {
+                    name: "Some".into(),
+                    fields: vec![payload.clone()],
+                    span,
+                },
+                VariantDef {
+                    name: "None".into(),
+                    fields: Vec::new(),
+                    span,
+                },
+            ],
+            public: false,
+            module_path: String::new(),
+            span,
+        });
+        name
+    });
+    TypeName::Named(name, span)
+}
+
+/// The instance of a generic user enum that a constructor call `Enum::Variant(payload)` builds,
+/// found through the enum's placeholder (`$RynEnumParam#<Enum>#<n>`). The placeholder's
+/// parameters are inferred from the payload; the instance is reused or created.
+fn generic_enum_instance(
+    enum_name: &str,
+    variant: &str,
+    payload: &[TypeName],
+    span: Span,
+    enum_definitions: &[EnumDef],
+) -> Option<TypeName> {
+    let placeholder_prefix = format!("{ENUM_PLACEHOLDER}{enum_name}#");
+    let placeholder = enum_definitions.iter().find(|definition| {
+        definition.name.starts_with(&placeholder_prefix)
+            && definition
+                .variants
+                .iter()
+                .any(|candidate| candidate.name == variant)
+    })?;
+    let fields = &placeholder
+        .variants
+        .iter()
+        .find(|candidate| candidate.name == variant)?
+        .fields;
+    if fields.len() != payload.len() {
+        return None;
+    }
+    let mut substitutions = HashMap::new();
+    for (pattern, actual) in fields.iter().zip(payload) {
+        let mut additions = HashMap::new();
+        unify(pattern, actual, &mut additions, enum_definitions, span).ok()?;
+        merge_substitutions(&mut substitutions, additions, span).ok()?;
+    }
+    let variants = placeholder
+        .variants
+        .iter()
+        .map(|candidate| VariantDef {
+            name: candidate.name.clone(),
+            fields: candidate
+                .fields
+                .iter()
+                .map(|field| {
+                    let mut ty = field.clone();
+                    substitute_type(&mut ty, &substitutions);
+                    ty
+                })
+                .collect(),
+            span,
+        })
+        .collect::<Vec<_>>();
+    if variants
+        .iter()
+        .any(|candidate| candidate.fields.iter().any(type_has_parameter))
+    {
+        return None;
+    }
+    let instance_prefix = format!("{ENUM_INSTANCE}{enum_name}#");
+    let same_variants = |definition: &EnumDef| {
+        definition.name.starts_with(&instance_prefix)
+            && definition.variants.len() == variants.len()
+            && definition
+                .variants
+                .iter()
+                .zip(&variants)
+                .all(|(left, right)| {
+                    left.name == right.name
+                        && left.fields.len() == right.fields.len()
+                        && left
+                            .fields
+                            .iter()
+                            .zip(&right.fields)
+                            .all(|(left, right)| type_key(left) == type_key(right))
+                })
+    };
+    if let Some(definition) = enum_definitions
+        .iter()
+        .chain(&NEW_ENUMS.with(|enums| enums.borrow().clone()))
+        .find(|definition| same_variants(definition))
+    {
+        return Some(TypeName::Named(definition.name.clone(), span));
+    }
+    let name = NEW_ENUMS.with(|enums| {
+        let mut enums = enums.borrow_mut();
+        let name = format!("{instance_prefix}generic{}", enums.len());
+        enums.push(EnumDef {
+            name: name.clone(),
+            type_parameters: Vec::new(),
+            variants: variants.clone(),
+            public: false,
+            module_path: String::new(),
+            span,
+        });
+        name
+    });
+    Some(TypeName::Named(name, span))
+}
+
+/// Whether a tuple structure still mentions type parameters. Such tuples are templates for
+/// generic functions and are not emitted.
+fn is_tuple_template(definition: &StructDef) -> bool {
+    definition.name.starts_with(TUPLE_PREFIX)
+        && definition
+            .fields
+            .iter()
+            .any(|field| type_has_parameter(&field.ty))
+}
+
+/// Whether an enum placeholder of a generic user enum (`$RynEnumParam#<Template>#<n>`) stands
+/// for the concrete instance `$RynEnum#<Template>#<k>`.
+fn enum_placeholder_matches(pattern: &str, actual: &str) -> bool {
+    let (Some(pattern), Some(actual)) = (
+        pattern.strip_prefix(ENUM_PLACEHOLDER),
+        actual.strip_prefix(ENUM_INSTANCE),
+    ) else {
+        return false;
+    };
+    let template = |name: &str| {
+        name.rsplit_once('#')
+            .map(|(template, _)| template.to_owned())
+    };
+    template(pattern).is_some() && template(pattern) == template(actual)
+}
+
 /// Specializes every generic function for the type arguments its call sites
 /// infer and removes the generic templates. A program without generic
 /// functions is returned unchanged.
-pub fn monomorphize(mut program: Program) -> Result<Program, Diagnostic> {
+pub fn monomorphize(program: Program) -> Result<Program, Diagnostic> {
+    STRUCTS.with(|structs| *structs.borrow_mut() = program.structs.clone());
+    NEW_ENUMS.with(|enums| enums.borrow_mut().clear());
+    let result = specialize_program(program);
+    let structs = STRUCTS.with(|structs| std::mem::take(&mut *structs.borrow_mut()));
+    let mut program = result?;
+    program.structs = structs
+        .into_iter()
+        .filter(|definition| {
+            !definition.name.starts_with(STRUCT_PLACEHOLDER) && !is_tuple_template(definition)
+        })
+        .collect();
+    // Enum placeholders serve only the specializer's unification, like struct placeholders.
+    program
+        .enums
+        .retain(|definition| !definition.name.starts_with(ENUM_PLACEHOLDER));
+    Ok(program)
+}
+
+fn specialize_program(mut program: Program) -> Result<Program, Diagnostic> {
     let enum_definitions = program.enums.clone();
     let generic_functions = program
         .functions
@@ -28,6 +294,9 @@ pub fn monomorphize(mut program: Program) -> Result<Program, Diagnostic> {
     if generic_functions.is_empty() {
         return Ok(program);
     }
+    for (_, function) in &generic_functions {
+        check_bounded_method_calls(function, &program.shapes)?;
+    }
 
     let mut templates = HashMap::<String, Function>::new();
     for (_, function) in &generic_functions {
@@ -35,7 +304,7 @@ pub fn monomorphize(mut program: Program) -> Result<Program, Diagnostic> {
     }
     for import in &program.uses {
         let module_path = import.path.join("::");
-        let Some(alias) = import.path.last() else {
+        let Some(alias) = import.local_name() else {
             continue;
         };
         let prefix = format!("{module_path}::");
@@ -138,8 +407,160 @@ pub fn monomorphize(mut program: Program) -> Result<Program, Diagnostic> {
     program.functions = concrete_functions;
     program
         .enums
-        .retain(|definition| !enum_has_type_parameters(definition));
+        .extend(NEW_ENUMS.with(|enums| std::mem::take(&mut *enums.borrow_mut())));
+    program.enums.retain(|definition| {
+        !enum_has_type_parameters(definition) && !definition.name.starts_with(ENUM_PLACEHOLDER)
+    });
     Ok(program)
+}
+
+/// A generic body is analyzed only after it has been specialized, when `T` has become a concrete
+/// type that may have more methods than the shape it is bounded by. Check the body against the
+/// bound here: a method called on a parameter of type `T` must belong to a shape of `T`'s bound.
+fn check_bounded_method_calls(
+    function: &Function,
+    shapes: &[crate::ast::ShapeDef],
+) -> Result<(), Diagnostic> {
+    // parameter name -> (type parameter, allowed methods, shape names)
+    let mut bounded = HashMap::<String, (String, HashSet<String>, Vec<String>)>::new();
+    for parameter in &function.parameters {
+        let TypeName::Parameter(type_parameter, _) = &parameter.ty else {
+            continue;
+        };
+        let Some((_, bounds)) = function
+            .type_parameter_bounds
+            .iter()
+            .find(|(name, _)| name == type_parameter)
+        else {
+            continue;
+        };
+        let mut allowed = HashSet::new();
+        let mut known = true;
+        for bound in bounds {
+            let Some(shape) = shapes.iter().find(|shape| {
+                shape.name == *bound
+                    || shape.name.rsplit("::").next()
+                        == Some(bound.rsplit("::").next().unwrap_or(bound))
+            }) else {
+                known = false;
+                break;
+            };
+            allowed.extend(shape.methods.iter().map(|method| method.name.clone()));
+        }
+        if known && !bounds.is_empty() {
+            bounded.insert(
+                parameter.name.clone(),
+                (type_parameter.clone(), allowed, bounds.clone()),
+            );
+        }
+    }
+    if bounded.is_empty() {
+        return Ok(());
+    }
+    // A local that reuses a parameter's name is no longer the bounded value.
+    let mut body = function.body.clone();
+    let mut rebound = HashSet::<String>::new();
+    fn collect_lets(list: &[Statement], names: &mut HashSet<String>) {
+        for statement in list {
+            match statement {
+                Statement::Let { name, .. } => {
+                    names.insert(name.clone());
+                }
+                Statement::For { name, body, .. } | Statement::ForEach { name, body, .. } => {
+                    names.insert(name.clone());
+                    collect_lets(body, names);
+                }
+                Statement::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    collect_lets(then_body, names);
+                    collect_lets(else_body, names);
+                }
+                Statement::While { body, .. } | Statement::Defer { body, .. } => {
+                    collect_lets(body, names);
+                }
+                _ => {}
+            }
+        }
+    }
+    collect_lets(&body, &mut rebound);
+    let violation = |value: &Expression, method: &str, span: Span| -> Option<Diagnostic> {
+        let Expression::Name(name, _) = value else {
+            return None;
+        };
+        if rebound.contains(name) {
+            return None;
+        }
+        let (type_parameter, allowed, shapes) = bounded.get(name)?;
+        if allowed.contains(method) {
+            return None;
+        }
+        Some(Diagnostic {
+            code: "R0450",
+            message: format!(
+                "method `{method}` is not part of the bound `{}` of type parameter `{type_parameter}`",
+                shapes.join(" + ")
+            ),
+            span,
+            help: Some(format!(
+                "a generic function may only call the methods its shape bound declares; add `{method}` to the shape"
+            )),
+        })
+    };
+    let mut found: Option<Diagnostic> = None;
+    fn statement_calls(
+        list: &[Statement],
+        check: &dyn Fn(&Expression, &str, Span) -> Option<Diagnostic>,
+        found: &mut Option<Diagnostic>,
+    ) {
+        for statement in list {
+            match statement {
+                Statement::MethodCall {
+                    value, name, span, ..
+                } => {
+                    if found.is_none() {
+                        *found = check(value, name, *span);
+                    }
+                }
+                Statement::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    statement_calls(then_body, check, found);
+                    statement_calls(else_body, check, found);
+                }
+                Statement::While { body, .. }
+                | Statement::Defer { body, .. }
+                | Statement::For { body, .. }
+                | Statement::ForEach { body, .. } => statement_calls(body, check, found),
+                _ => {}
+            }
+        }
+    }
+    statement_calls(&body, &violation, &mut found);
+    let mut visit = |expression: &mut Expression| -> Result<(), Diagnostic> {
+        if found.is_none()
+            && let Expression::MethodCall {
+                value, name, span, ..
+            } = expression
+        {
+            found = violation(value, name, *span);
+        }
+        Ok(())
+    };
+    crate::visit::visit_statements(&mut body, &mut visit)?;
+    if let Some(value) = &function.return_value {
+        let mut value = value.clone();
+        crate::visit::visit_expression(&mut value, &mut visit)?;
+    }
+    drop(visit);
+    match found {
+        Some(diagnostic) => Err(diagnostic),
+        None => Ok(()),
+    }
 }
 
 fn parameter_environment(function: &Function) -> HashMap<String, TypeName> {
@@ -193,7 +614,7 @@ fn specialize_call(
     pending: &mut Vec<Function>,
 ) -> Result<(), Diagnostic> {
     let Some(template) = resolve_template(name, caller, templates) else {
-        if !explicit_type_arguments.is_empty() {
+        if !explicit_type_arguments.is_empty() && !is_comptime_intrinsic(name) {
             return Err(Diagnostic {
                 code: "R0264",
                 message: format!("`{name}` is not a generic function"),
@@ -223,6 +644,18 @@ fn specialize_call(
         substitutions.insert(parameter.clone(), ty.clone());
     }
     for (parameter, argument) in template.parameters.iter().zip(arguments) {
+        // An untyped literal takes the type that an explicit type argument
+        // already fixed; semantic analysis converts it to the parameter type.
+        if let TypeName::Parameter(name, _) = &parameter.ty
+            && substitutions.contains_key(name)
+            && is_untyped_literal(argument)
+        {
+            continue;
+        }
+        // A parameter whose type does not mention a type parameter needs no inference.
+        if is_fixed_type(&parameter.ty) {
+            continue;
+        }
         let Some(actual) = infer_type(
             argument,
             environment,
@@ -275,7 +708,8 @@ fn specialize_call(
         } else {
             "$RynResult#"
         };
-        if let Some(concrete) = enum_definitions.iter().find(|candidate| {
+        let created = NEW_ENUMS.with(|enums| enums.borrow().clone());
+        if let Some(concrete) = enum_definitions.iter().chain(&created).find(|candidate| {
             candidate.name != definition.name
                 && candidate.name.starts_with(family)
                 && candidate.variants.len() == specialized.variants.len()
@@ -298,6 +732,67 @@ fn specialize_call(
                 TypeName::Named(concrete.name.clone(), definition.span),
             );
         }
+    }
+    // A generic structure written with type parameters stands for the concrete instance whose
+    // fields equal its fields under the inferred substitution.
+    let placeholders: Vec<StructDef> = STRUCTS.with(|structs| {
+        structs
+            .borrow()
+            .iter()
+            .filter(|definition| definition.name.starts_with(STRUCT_PLACEHOLDER))
+            .cloned()
+            .collect()
+    });
+    for placeholder in placeholders {
+        let mut fields = placeholder.fields.clone();
+        for field in &mut fields {
+            substitute_type(&mut field.ty, &substitutions);
+        }
+        let concrete = STRUCTS.with(|structs| {
+            structs
+                .borrow()
+                .iter()
+                .find(|candidate| {
+                    candidate.name.starts_with(STRUCT_INSTANCE)
+                        && candidate.fields.len() == fields.len()
+                        && candidate.fields.iter().zip(&fields).all(|(left, right)| {
+                            left.name == right.name && type_key(&left.ty) == type_key(&right.ty)
+                        })
+                })
+                .map(|candidate| candidate.name.clone())
+        });
+        if let Some(concrete) = concrete {
+            substitutions.insert(
+                placeholder.name.clone(),
+                TypeName::Named(concrete, placeholder.span),
+            );
+        }
+    }
+    // A tuple written with type parameters stands for the tuple of its element types under
+    // the inferred substitution.
+    let tuple_templates: Vec<StructDef> = STRUCTS.with(|structs| {
+        structs
+            .borrow()
+            .iter()
+            .filter(|definition| is_tuple_template(definition))
+            .cloned()
+            .collect()
+    });
+    for template_tuple in tuple_templates {
+        let mut fields = template_tuple
+            .fields
+            .iter()
+            .map(|field| {
+                let mut ty = field.ty.clone();
+                substitute_type(&mut ty, &substitutions);
+                ty
+            })
+            .collect::<Vec<_>>();
+        if fields.iter().any(type_has_parameter) {
+            continue;
+        }
+        let concrete = tuple_type(std::mem::take(&mut fields), template_tuple.span);
+        substitutions.insert(template_tuple.name.clone(), concrete);
     }
     for parameter in &template.type_parameters {
         if !substitutions.contains_key(parameter) {
@@ -374,6 +869,45 @@ fn specialize_call(
     Ok(())
 }
 
+/// Compile-time metadata functions take explicit type arguments but are not generic functions.
+pub fn is_comptime_intrinsic(name: &str) -> bool {
+    matches!(
+        name,
+        "field_count" | "variant_count" | "type_name" | "has_field"
+    )
+}
+
+/// Whether a parameter type is concrete: it cannot mention a type parameter.
+fn is_fixed_type(ty: &TypeName) -> bool {
+    match ty {
+        TypeName::I8
+        | TypeName::I16
+        | TypeName::I32
+        | TypeName::I64
+        | TypeName::U8
+        | TypeName::U16
+        | TypeName::U32
+        | TypeName::U64
+        | TypeName::F32
+        | TypeName::F64
+        | TypeName::Str
+        | TypeName::OwnedString
+        | TypeName::Char
+        | TypeName::Bool => true,
+        TypeName::Named(name, _) => !name.contains('<') && !name.contains('$'),
+        TypeName::Reference(inner, _, _) | TypeName::RawPointer(inner, _) => is_fixed_type(inner),
+        _ => false,
+    }
+}
+
+fn is_untyped_literal(expression: &Expression) -> bool {
+    match expression {
+        Expression::Integer(..) | Expression::Float(..) => true,
+        Expression::Negate(inner, _) => is_untyped_literal(inner),
+        _ => false,
+    }
+}
+
 fn unify(
     pattern: &TypeName,
     actual: &TypeName,
@@ -391,8 +925,8 @@ fn unify(
                         span,
                         help: Some(format!(
                             "this call uses both `{}` and `{}` for `{parameter}`",
-                            type_key(previous),
-                            type_key(actual)
+                            display_key(previous),
+                            display_key(actual)
                         )),
                     });
                 }
@@ -437,20 +971,59 @@ fn unify(
                 _ => return Err(generic_type_mismatch(pattern, actual, span)),
             }
         }
+        (TypeName::Named(pattern_name, _), TypeName::Named(actual_name, _))
+            if pattern_name != actual_name
+                && pattern_name.starts_with(STRUCT_PLACEHOLDER)
+                && actual_name.starts_with(STRUCT_INSTANCE) =>
+        {
+            // `Stack<T>` against a concrete `Stack<i32>`: unify the fields.
+            let (Some(pattern_struct), Some(actual_struct)) =
+                (find_struct(pattern_name), find_struct(actual_name))
+            else {
+                return Err(generic_type_mismatch(pattern, actual, span));
+            };
+            if pattern_struct.fields.len() != actual_struct.fields.len()
+                || pattern_struct
+                    .fields
+                    .iter()
+                    .zip(&actual_struct.fields)
+                    .any(|(left, right)| left.name != right.name)
+            {
+                return Err(generic_type_mismatch(pattern, actual, span));
+            }
+            for (left, right) in pattern_struct.fields.iter().zip(&actual_struct.fields) {
+                unify(&left.ty, &right.ty, substitutions, enum_definitions, span)?;
+            }
+        }
+        (TypeName::Named(pattern_name, _), TypeName::Named(actual_name, _))
+            if pattern_name != actual_name
+                && pattern_name.starts_with(TUPLE_PREFIX)
+                && actual_name.starts_with(TUPLE_PREFIX) =>
+        {
+            // `(A, B)` against a concrete tuple: unify the element types.
+            let (Some(pattern_tuple), Some(actual_tuple)) =
+                (find_struct(pattern_name), find_struct(actual_name))
+            else {
+                return Err(generic_type_mismatch(pattern, actual, span));
+            };
+            if pattern_tuple.fields.len() != actual_tuple.fields.len() {
+                return Err(generic_type_mismatch(pattern, actual, span));
+            }
+            for (left, right) in pattern_tuple.fields.iter().zip(&actual_tuple.fields) {
+                unify(&left.ty, &right.ty, substitutions, enum_definitions, span)?;
+            }
+        }
         (
             TypeName::Named(pattern_name, pattern_span),
             TypeName::Named(actual_name, actual_span),
         ) if pattern_name != actual_name => {
-            let pattern_enum = enum_definitions
-                .iter()
-                .find(|definition| definition.name == *pattern_name);
-            let actual_enum = enum_definitions
-                .iter()
-                .find(|definition| definition.name == *actual_name);
+            let pattern_enum = find_enum_definition(pattern_name, enum_definitions);
+            let actual_enum = find_enum_definition(actual_name, enum_definitions);
             let same_family = |left: &str, right: &str| {
-                ["$RynOption#", "$RynResult#"]
+                [OPTION_PREFIX, "$RynResult#"]
                     .iter()
                     .any(|prefix| left.starts_with(prefix) && right.starts_with(prefix))
+                    || enum_placeholder_matches(left, right)
             };
             if let (Some(pattern_enum), Some(actual_enum)) = (pattern_enum, actual_enum)
                 && same_family(&pattern_enum.name, &actual_enum.name)
@@ -506,8 +1079,8 @@ fn merge_substitutions(
                     span,
                     help: Some(format!(
                         "this call uses both `{}` and `{}` for `{parameter}`",
-                        type_key(previous),
-                        type_key(&actual)
+                        display_key(previous),
+                        display_key(&actual)
                     )),
                 });
             }
@@ -522,12 +1095,75 @@ fn generic_type_mismatch(pattern: &TypeName, actual: &TypeName, span: Span) -> D
         code: "R0263",
         message: format!(
             "generic argument has type `{}` but the parameter pattern is `{}`",
-            type_key(actual),
-            type_key(pattern)
+            display_key(actual),
+            display_key(pattern)
         ),
         span,
         help: Some("pass a value whose type matches the generic function parameter".into()),
     }
+}
+
+/// A type as a diagnostic shows it: tuples and enum instances appear in their source forms
+/// instead of their internal names.
+fn display_key(ty: &TypeName) -> String {
+    match ty {
+        TypeName::Named(name, _) => display_name(name),
+        TypeName::Parameter(name, _) => name.clone(),
+        TypeName::Vec(element, _) => format!("Vec<{}>", display_key(element)),
+        TypeName::Set(element, _) => format!("Set<{}>", display_key(element)),
+        TypeName::Map(key, value, _) => format!("Map<{},{}>", display_key(key), display_key(value)),
+        TypeName::Array(element, length, _) => format!("[{};{length}]", display_key(element)),
+        TypeName::Slice(element, _) => format!("&[{}]", display_key(element)),
+        TypeName::Reference(element, mutable, _) => {
+            format!(
+                "&{}{}",
+                if *mutable { "mut " } else { "" },
+                display_key(element)
+            )
+        }
+        TypeName::RawPointer(element, _) => format!("*{}", display_key(element)),
+        TypeName::FunctionPointer(parameters, result, extern_c, _) => {
+            let prefix = if *extern_c { "extern \"C\" " } else { "" };
+            let parameters = parameters
+                .iter()
+                .map(display_key)
+                .collect::<Vec<_>>()
+                .join(",");
+            match result {
+                Some(result) => format!("{prefix}fun({parameters})->{}", display_key(result)),
+                None => format!("{prefix}fun({parameters})"),
+            }
+        }
+        _ => type_key(ty),
+    }
+}
+
+fn display_name(name: &str) -> String {
+    if name.starts_with(TUPLE_PREFIX)
+        && let Some(definition) = find_struct(name)
+    {
+        let fields = definition
+            .fields
+            .iter()
+            .map(|field| display_key(&field.ty))
+            .collect::<Vec<_>>();
+        return format!("({})", fields.join(", "));
+    }
+    if name.starts_with(OPTION_PREFIX) {
+        return "Option".into();
+    }
+    if name.starts_with("$RynResult#") {
+        return "Result".into();
+    }
+    for prefix in [ENUM_PLACEHOLDER, ENUM_INSTANCE] {
+        if let Some((template, _)) = name
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.rsplit_once('#'))
+        {
+            return template.to_owned();
+        }
+    }
+    name.to_owned()
 }
 
 fn type_key(ty: &TypeName) -> String {
@@ -728,7 +1364,10 @@ fn substitute_expression(expression: &mut Expression, substitutions: &HashMap<St
                 substitute_expression(argument, substitutions);
             }
         }
-        Expression::StructLiteral { fields, .. } => {
+        Expression::StructLiteral { name, fields, .. } => {
+            if let Some(TypeName::Named(replacement, _)) = substitutions.get(name.as_str()) {
+                name.clone_from(replacement);
+            }
             for (_, value, _) in fields {
                 substitute_expression(value, substitutions);
             }
@@ -975,7 +1614,9 @@ fn rewrite_statements(
                     specializations,
                     pending,
                 )?;
-                type_arguments.clear();
+                if !is_comptime_intrinsic(name) {
+                    type_arguments.clear();
+                }
             }
             Statement::MethodCall {
                 value, arguments, ..
@@ -1210,6 +1851,10 @@ fn rewrite_expression(
             for ty in type_arguments.iter_mut() {
                 substitute_type(ty, environment);
             }
+            // Types are inferred from the arguments as written: a nested call
+            // to a generic function is rewritten to a specialization that
+            // `infer_type` cannot see yet, but its template can.
+            let written_arguments = arguments.clone();
             for argument in arguments.iter_mut() {
                 rewrite_expression(
                     argument,
@@ -1225,7 +1870,7 @@ fn rewrite_expression(
             specialize_call(
                 name,
                 type_arguments,
-                arguments,
+                &written_arguments,
                 *span,
                 environment,
                 caller,
@@ -1235,7 +1880,9 @@ fn rewrite_expression(
                 specializations,
                 pending,
             )?;
-            type_arguments.clear();
+            if !is_comptime_intrinsic(name) {
+                type_arguments.clear();
+            }
         }
         Expression::MethodCall {
             value,
@@ -1602,7 +2249,23 @@ fn infer_type(
         Expression::String(_, _) => Some(TypeName::Str),
         Expression::Character(_, _) => Some(TypeName::Char),
         Expression::Boolean(_, _) => Some(TypeName::Bool),
-        Expression::Name(name, _) => environment.get(name).cloned(),
+        Expression::Name(name, span) => environment.get(name).cloned().or_else(|| {
+            // A plain function used as a value has a function-pointer type.
+            let function = functions.get(name)?;
+            if function.extern_c || !function.type_parameters.is_empty() {
+                return None;
+            }
+            Some(TypeName::FunctionPointer(
+                function
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.ty.clone())
+                    .collect(),
+                function.return_type.clone().map(Box::new),
+                false,
+                *span,
+            ))
+        }),
         Expression::Cast(_, ty, _) => Some(ty.clone()),
         Expression::Range { .. } => None,
         Expression::LayoutOf { .. } => Some(TypeName::U64),
@@ -1625,6 +2288,51 @@ fn infer_type(
         } => {
             if name == "String" {
                 return Some(TypeName::OwnedString);
+            }
+            // `Option::Some(value)` is parsed as a call; it takes its `Option<T>` from the payload.
+            if name == "Option::Some" && arguments.len() == 1 {
+                let payload = infer_type(
+                    &arguments[0],
+                    environment,
+                    functions,
+                    templates,
+                    enum_definitions,
+                    caller,
+                )?;
+                return Some(option_type(payload, expression.span(), enum_definitions));
+            }
+            // `Enum::Variant(payload)` of a generic user enum takes its type arguments from the
+            // payload, through the enum's placeholder.
+            if let Some((enum_name, variant)) = name.rsplit_once("::")
+                && !matches!(enum_name, "Option" | "Result")
+                && enum_definitions.iter().any(|definition| {
+                    definition
+                        .name
+                        .starts_with(&format!("{ENUM_PLACEHOLDER}{enum_name}#"))
+                        && definition
+                            .variants
+                            .iter()
+                            .any(|candidate| candidate.name == variant)
+                })
+            {
+                let mut payload = Vec::with_capacity(arguments.len());
+                for argument in arguments {
+                    payload.push(infer_type(
+                        argument,
+                        environment,
+                        functions,
+                        templates,
+                        enum_definitions,
+                        caller,
+                    )?);
+                }
+                return generic_enum_instance(
+                    enum_name,
+                    variant,
+                    &payload,
+                    expression.span(),
+                    enum_definitions,
+                );
             }
             if let Some(TypeName::FunctionPointer(_, result, _, _)) = environment.get(name) {
                 return result.as_deref().cloned();
@@ -1717,6 +2425,20 @@ fn infer_type(
                 usize::try_from(*length).ok()?,
                 *span,
             ))
+        }
+        Expression::Tuple(elements, _) if !elements.is_empty() => {
+            let mut fields = Vec::with_capacity(elements.len());
+            for element in elements {
+                fields.push(infer_type(
+                    element,
+                    environment,
+                    functions,
+                    templates,
+                    enum_definitions,
+                    caller,
+                )?);
+            }
+            Some(tuple_type(fields, expression.span()))
         }
         Expression::Tuple(_, _) => None,
         Expression::Index { value, .. } => {
@@ -1814,6 +2536,23 @@ fn infer_type(
                 }
                 _ => None,
             }
+        }
+        // `Option::Some(value)` takes its `Option<T>` from the payload's type.
+        Expression::EnumConstruct {
+            enum_name,
+            variant,
+            arguments,
+            span,
+        } if enum_name == "Option" && variant == "Some" && arguments.len() == 1 => {
+            let payload = infer_type(
+                &arguments[0],
+                environment,
+                functions,
+                templates,
+                enum_definitions,
+                caller,
+            )?;
+            Some(option_type(payload, *span, enum_definitions))
         }
         Expression::EnumConstruct { .. } | Expression::Not(_, _) | Expression::Propagate(_, _) => {
             None

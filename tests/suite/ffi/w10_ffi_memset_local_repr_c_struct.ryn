@@ -1,0 +1,21 @@
+// test: run
+// out: 0
+// out: 0
+// out: 0
+// out: true
+extern "C" fun memset(p: *u8, value: i32, n: u64) -> *u8;
+#[repr(C)]
+struct Header {
+    kind: u8,
+    length: u32,
+    code: u16
+}
+fun main() {
+    mut h := Header { kind: 9 as u8, length: 77 as u32, code: 3 as u16 }
+    p := &raw mut h
+    memset(p as *u8, 0, sizeof(Header) as u64)
+    echo h.kind
+    echo h.length
+    echo h.code
+    echo sizeof(Header) == 12
+}

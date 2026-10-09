@@ -1,17 +1,130 @@
-// The self-hosted Ryn frontend.
+// The self-hosted Ryn compiler front and middle end.
 //
 // usage: ryn-frontend [--recover] <source.ryn> <output>
 //        ryn-frontend --monomorphize <program> <output>
+//        ryn-frontend --sema <program> <output>
+//        ryn-frontend --patterns <program> <output>
+//        ryn-frontend --comptime <program> <output>
+//        ryn-frontend --ast-roundtrip <program> <output>
+//        ryn-frontend --ir-roundtrip <ir> <output>
 //
 // The first form lexes and parses a source file and writes the encoded
 // syntax tree, or its diagnostics; `--recover` reports every independent
 // syntax error instead of the first. The second form reads an encoded
-// program, specializes its generic functions, and writes the result.
+// program, specializes its generic functions, and writes the result. The
+// third form reads a specialized program and writes the typed IR text that
+// semantic analysis produces; it exits with status 3 when the program uses
+// something the Ryn semantic analysis does not handle, so the caller can fall
+// back. The last form decodes a program into the Ryn data model and encodes
+// it again; the tests use it to check that the model loses nothing.
 
 use std::fs
 use std::io
 use frontend::generics
 use frontend::parser
+use middle::ast
+use middle::ir
+use middle::constants
+use middle::lower
+use middle::patterns
+
+fun analyze(input_path: str, output_path: str) -> i32 {
+    text := fs::read_text(input_path)
+    decoded := ast::decode_program(text)
+    when decoded.is_err() {
+        echo "invalid syntax tree text"
+        return 1
+    }
+    lowered := lower::lower_program(decoded.unwrap())
+    when lowered.is_err() {
+        message := lowered.unwrap_err()
+        // A diagnostic of the Ryn analysis is handed over in the output file.
+        when message.starts_with("diagnostic ") {
+            when !fs::write(output_path, message) {
+                io::eprintln("ryn-frontend: cannot write the output")
+                return 1
+            }
+            return 0
+        }
+        echo message
+        return 3
+    }
+    when !fs::write(output_path, lowered.unwrap()) {
+        io::eprintln("ryn-frontend: cannot write the output")
+        return 1
+    }
+    return 0
+}
+
+// The pattern checks of the bootstrap's pattern pass, on the syntax tree before it is rewritten. The output is the
+// diagnostic that the first failing `choose` gives, or `ok`.
+fun check_patterns(input_path: str, output_path: str) -> i32 {
+    text := fs::read_text(input_path)
+    decoded := ast::decode_program(text)
+    when decoded.is_err() {
+        echo "invalid syntax tree text"
+        return 1
+    }
+    mut out := String("ok")
+    found := patterns::check_program(decoded.unwrap())
+    when found.is_some() {
+        out = found.unwrap()
+    }
+    when !fs::write(output_path, out) {
+        io::eprintln("ryn-frontend: cannot write the output")
+        return 1
+    }
+    return 0
+}
+
+// The compile-time checks of the bootstrap's compile-time pass, on the syntax tree before it is evaluated. The output is the
+// diagnostic that the first failing constant or assertion gives, or `ok`.
+fun check_comptime(input_path: str, output_path: str) -> i32 {
+    text := fs::read_text(input_path)
+    decoded := ast::decode_program(text)
+    when decoded.is_err() {
+        echo "invalid syntax tree text"
+        return 1
+    }
+    mut out := String("ok")
+    found := constants::check_program(decoded.unwrap())
+    when found.is_some() {
+        out = found.unwrap()
+    }
+    when !fs::write(output_path, out) {
+        io::eprintln("ryn-frontend: cannot write the output")
+        return 1
+    }
+    return 0
+}
+
+fun roundtrip(input_path: str, output_path: str) -> i32 {
+    text := fs::read_text(input_path)
+    decoded := ast::decode_program(text)
+    when decoded.is_err() {
+        echo "invalid syntax tree text"
+        return 1
+    }
+    when !fs::write(output_path, ast::encode_program(decoded.unwrap())) {
+        io::eprintln("ryn-frontend: cannot write the output")
+        return 1
+    }
+    return 0
+}
+
+fun ir_roundtrip(input_path: str, output_path: str) -> i32 {
+    text := fs::read_text(input_path)
+    decoded := ir::decode_ir(text)
+    when decoded.is_err() {
+        echo "invalid IR text"
+        return 1
+    }
+    when !fs::write(output_path, ir::encode_ir(decoded.unwrap())) {
+        io::eprintln("ryn-frontend: cannot write the output")
+        return 1
+    }
+    return 0
+}
 
 fun main() -> i32 {
     mut mode := String()
@@ -20,9 +133,24 @@ fun main() -> i32 {
         mode = String(arg(0))
         first = 1
     }
-    when arg_count() != first + 2 || (first == 1 && mode != "--recover" && mode != "--monomorphize") {
-        io::eprintln("usage: ryn-frontend [--recover|--monomorphize] <input> <output>")
+    when arg_count() != first + 2 || (first == 1 && mode != "--recover" && mode != "--monomorphize" && mode != "--sema" && mode != "--patterns" && mode != "--comptime" && mode != "--ast-roundtrip" && mode != "--ir-roundtrip") {
+        io::eprintln("usage: ryn-frontend [--recover|--monomorphize|--sema|--patterns|--comptime|--ast-roundtrip|--ir-roundtrip] <input> <output>")
         return 2
+    }
+    when mode == "--sema" {
+        return analyze(arg(first), arg(first + 1))
+    }
+    when mode == "--patterns" {
+        return check_patterns(arg(first), arg(first + 1))
+    }
+    when mode == "--comptime" {
+        return check_comptime(arg(first), arg(first + 1))
+    }
+    when mode == "--ast-roundtrip" {
+        return roundtrip(arg(first), arg(first + 1))
+    }
+    when mode == "--ir-roundtrip" {
+        return ir_roundtrip(arg(first), arg(first + 1))
     }
     input := read_file(arg(first))
     mut encoded := String()

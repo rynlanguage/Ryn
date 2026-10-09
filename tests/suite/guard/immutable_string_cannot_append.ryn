@@ -1,0 +1,6 @@
+// test: fail
+// code: R0204
+fun main() {
+    s := String("a")
+    s.append("b")
+}

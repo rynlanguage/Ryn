@@ -1,0 +1,17 @@
+// test: run
+// out: 99
+shape Entity {
+    fun score(self) -> i32 => 1
+}
+struct Boss {
+    n: i32,
+}
+extend Boss {
+    fun score(self) -> i32 { 99 }
+}
+fun rate<T: Entity>(e: T) -> i32 {
+    e.score()
+}
+fun main() {
+    echo rate(Boss { n: 0 })
+}

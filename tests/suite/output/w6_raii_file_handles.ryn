@@ -1,0 +1,71 @@
+// test: run
+// out: close 2 with 30 bytes
+// out: close 1 with 30 bytes
+// out: first
+// out: copied 30
+// out: close 2 with 5 bytes
+// out: close 1 with 5 bytes
+// out: second
+// out: failed: negative write
+// out: counter still 0
+// out: main finished
+// File-like handles whose destructor reports the total bytes written when they go out of scope.
+#[drop(close_file)]
+struct File { h: *i32, id: i32, bytes: i64 }
+
+fun close_file(f: File) {
+    echo "close {f.id} with {f.bytes} bytes"
+}
+
+fun open(id: i32, h: *i32) -> File {
+    return File { h: h, id: id, bytes: 0 }
+}
+
+extend File {
+    fun write(mut self, n: i64) -> Result<bool, String> {
+        when n < 0 {
+            return Result::Err(String("negative write"))
+        }
+        self.bytes += n
+        return Result::Ok(true)
+    }
+}
+
+// Copies every chunk to both files; a bad chunk aborts with `?` and both files are closed.
+fun copy_chunks(h: *i32, sizes: Vec<i64>) -> Result<i64, String> {
+    mut src := open(1, h)
+    mut dst := open(2, h)
+    for n in sizes {
+        src.write(n)?
+        dst.write(n)?
+    }
+    return Result::Ok(dst.bytes)
+}
+
+fun report(label: String, r: Result<i64, String>) {
+    echo label
+    when r.is_ok() {
+        total := r.unwrap()
+        echo "copied {total}"
+    } else {
+        e := r.unwrap_err()
+        echo "failed: {e}"
+    }
+}
+
+fun main() {
+    mut counter: i32 = 0
+    defer {
+        echo "main finished"
+    }
+    mut good: Vec<i64> = Vec()
+    good.push(10)
+    good.push(20)
+    report(String("first"), copy_chunks(&raw mut counter, good))
+    mut bad: Vec<i64> = Vec()
+    bad.push(5)
+    bad.push(-1)
+    bad.push(7)
+    report(String("second"), copy_chunks(&raw mut counter, bad))
+    echo "counter still {counter}"
+}

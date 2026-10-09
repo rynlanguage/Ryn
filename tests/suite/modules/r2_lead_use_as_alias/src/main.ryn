@@ -1,0 +1,10 @@
+// test: run
+// out: 7
+// out: 0
+use geometry::shapes as geo
+fun main() {
+    p := geo::Point { x: 3, y: 4 }
+    echo geo::sum(p)
+    o := geo::origin()
+    echo o.x
+}

@@ -1,0 +1,31 @@
+// test: run
+// out: 0
+// out: 4
+// out: 4
+// out: 8
+// out: 8
+// out: 6
+// out: 1
+// out: 7
+// out: 2
+// out: 3
+fun main() {
+    mut v: Vec<i32> = Vec()
+    echo v.capacity()
+    v.push(1)
+    echo v.capacity()
+    v.push(2)
+    v.push(3)
+    v.push(4)
+    echo v.capacity()
+    v.push(5)
+    echo v.capacity()
+    v.insert(0, 9)
+    echo v.capacity()
+    echo v.len()
+    echo v.take(1)
+    v.set(0, 7)
+    echo v.index(0)
+    echo v.index(1)
+    echo v.index(2)
+}

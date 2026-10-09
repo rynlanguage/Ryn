@@ -1,0 +1,8 @@
+// test: fail
+// code: R0263
+fun same<T>(a: T, b: T) -> T {
+    a
+}
+fun main() {
+    echo same(1 as i32, 2 as i64)
+}

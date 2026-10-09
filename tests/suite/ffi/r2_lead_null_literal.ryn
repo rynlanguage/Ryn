@@ -1,0 +1,19 @@
+// test: run
+// out: true
+// out: true
+// out: true
+// out: false
+// out: true
+fun is_null(p: *i64) -> bool {
+    return pointer_is_null(p as *u8)
+}
+fun main() {
+    echo is_null(null)
+    mut q: *i64 = null
+    echo pointer_is_null(q as *u8)
+    echo q == null
+    x := 5
+    r := &raw mut x
+    echo r == null
+    echo r != null
+}

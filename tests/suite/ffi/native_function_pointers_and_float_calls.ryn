@@ -1,0 +1,70 @@
+// test: run
+// out: 42
+// out: 5
+// out: 2.5
+// out: 1.5
+// out: 5
+// out: 6
+// out: 5
+// out: 4
+// out: 3
+// out: 1
+// out: 0
+
+// Function pointers on the native backend: indirect calls with integer and float arguments, a callback that C calls
+// (`qsort` with a comparison that orders descending), and C functions that take and return doubles.
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(p: *u8);
+extern "C" fun qsort(base: *u8, count: u64, size: u64, compare: extern "C" fun(*u8, *u8) -> i32);
+extern "C" fun fabs(x: f64) -> f64;
+extern "C" fun fmod(x: f64, y: f64) -> f64;
+extern "C" fun hypot(x: f64, y: f64) -> f64;
+
+fun add(a: i32, b: i32) -> i32 {
+    return a + b
+}
+
+fun scale(x: f64, k: i32) -> f64 {
+    return x * (k as f64)
+}
+
+fun descending(a: *u8, b: *u8) -> i32 {
+    x := *(a as *i32)
+    y := *(b as *i32)
+    when x < y {
+        return 1
+    }
+    when x > y {
+        return -1
+    }
+    return 0
+}
+
+fun apply(f: fun(i32, i32) -> i32, a: i32, b: i32) -> i32 {
+    return f(a, b)
+}
+
+fun main() {
+    echo apply(add, 20, 22)
+    g: fun(f64, i32) -> f64 = scale
+    echo g(1.25, 4)
+    echo fabs(-2.5)
+    echo fmod(7.5, 2.0)
+    echo hypot(3.0, 4.0)
+    n := 6
+    buf := malloc((n * 4) as u64)
+    base := buf as u64
+    mut i := 0
+    while i < n {
+        p := (base + (i * 4) as u64) as *i32
+        *p = ((i * 5) % 7) as i32
+        i += 1
+    }
+    qsort(buf, n as u64, 4 as u64, descending)
+    mut j := 0
+    while j < n {
+        echo *((base + (j * 4) as u64) as *i32)
+        j += 1
+    }
+    free(buf)
+}

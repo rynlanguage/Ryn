@@ -26,7 +26,9 @@ fn dump_syntax_tree_text_for_the_ryn_tool() {
             let name = format!(
                 "{}_{}.ast",
                 directory.replace('/', "_"),
-                path.file_stem().expect("program has a name").to_string_lossy()
+                path.file_stem()
+                    .expect("program has a name")
+                    .to_string_lossy()
             );
             fs::write(output.join(name), ast_codec::encode_program(&program))
                 .expect("syntax tree text is written");

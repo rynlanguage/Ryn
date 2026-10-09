@@ -1,0 +1,9 @@
+// test: run
+// out: inside
+const N: i32 = 3
+fun main() {
+    when true {
+        static_assert(N == 3)
+        echo "inside"
+    }
+}

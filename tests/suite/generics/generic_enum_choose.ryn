@@ -1,0 +1,17 @@
+// test: run
+// out: 42
+// out: 0
+enum Outcome<T> {
+    Value(T),
+    Empty
+}
+fun read(o: Outcome<i32>) -> i32 {
+    choose o {
+        Outcome::Value(n) => n,
+        Outcome::Empty => 0
+    }
+}
+fun main() {
+    echo read(Outcome::Value(42))
+    echo read(Outcome::Empty)
+}

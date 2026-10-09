@@ -1,0 +1,10 @@
+// test: run
+// out: 8080
+// out: 443
+// out: 7
+use app::net::http::codes
+fun main() {
+    echo codes::port()
+    echo codes::tls_port()
+    echo codes::ports_open()
+}

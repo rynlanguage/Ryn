@@ -1,0 +1,21 @@
+// test: run
+// out: 1004
+// out: 2006
+// out: 61
+// out: -1
+struct Point { x: i32, y: i32 }
+enum Slot { Full(Point), Empty }
+fun f(s: Slot) -> i32 {
+    choose s {
+        Slot::Full(Point { x: 0, y }) => y + 1000,
+        Slot::Full(Point { x, y: 9 }) => x + 2000,
+        Slot::Full(Point { x, y }) => x * 10 + y,
+        Slot::Empty => -1
+    }
+}
+fun main() {
+    echo f(Slot::Full(Point { x: 0, y: 4 }))
+    echo f(Slot::Full(Point { x: 6, y: 9 }))
+    echo f(Slot::Full(Point { x: 6, y: 1 }))
+    echo f(Slot::Empty)
+}

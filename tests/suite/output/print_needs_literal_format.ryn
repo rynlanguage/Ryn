@@ -1,0 +1,6 @@
+// test: fail
+// code: R0210
+fun main() {
+    f := String("x")
+    print(f)
+}

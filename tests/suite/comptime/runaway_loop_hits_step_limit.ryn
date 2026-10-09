@@ -1,0 +1,17 @@
+// test: fail
+// msg: steps
+// code: R0463
+fun spin() -> i32 {
+    mut n: i32 = 0
+    while true {
+        n += 1
+        when n > 1000000000 {
+            return n
+        }
+    }
+    return 0
+}
+const NEVER: i32 = spin()
+fun main() {
+    echo NEVER
+}

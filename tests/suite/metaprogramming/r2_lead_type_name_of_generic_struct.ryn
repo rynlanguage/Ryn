@@ -1,0 +1,11 @@
+// test: run
+// out: Box<i32>
+// out: Pair<Box<i32>, String>
+// out: Vec<Box<bool>>
+struct Box<T> { value: T }
+struct Pair<A, B> { a: A, b: B }
+fun main() {
+    echo type_name::<Box<i32>>()
+    echo type_name::<Pair<Box<i32>, String>>()
+    echo type_name::<Vec<Box<bool>>>()
+}

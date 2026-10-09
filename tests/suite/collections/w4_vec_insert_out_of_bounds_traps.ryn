@@ -1,0 +1,14 @@
+// test: run
+// out: 3
+// out: 2
+// exit: 1
+// err: Vec insert index is out of bounds
+fun main() {
+    mut v: Vec<i32> = Vec()
+    v.push(1)
+    v.insert(1, 2)
+    v.insert(0, 0)
+    echo v.len()
+    echo v.index(2)
+    v.insert(9, 5)
+}

@@ -1,0 +1,13 @@
+// test: fail
+// code: R0252
+struct Holder {
+    p: *i32
+}
+fun main() {
+    mut h := Holder { p: (0 as u64) as *i32 }
+    when true {
+        mut x: i32 = 5
+        h.p = &raw mut x
+    }
+    echo pointer_is_null(h.p as *u8)
+}

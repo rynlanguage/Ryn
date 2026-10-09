@@ -1,0 +1,12 @@
+// test: fail
+// msg: Vec
+// code: R0464
+fun make() -> Vec<i32> {
+    mut v: Vec<i32> = Vec()
+    v.push(1)
+    return v
+}
+const ITEMS: Vec<i32> = make()
+fun main() {
+    echo 1
+}

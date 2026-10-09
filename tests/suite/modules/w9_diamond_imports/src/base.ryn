@@ -1,0 +1,9 @@
+pub struct Counter {
+    pub n: i32
+}
+pub fun next(x: i32) -> i32 {
+    return x + 1
+}
+pub fun calls() -> i32 {
+    return 2
+}

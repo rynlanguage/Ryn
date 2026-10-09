@@ -1,0 +1,12 @@
+// test: run
+// out: 5
+// out: true
+// out: 2.5
+fun id<T>(v: T) -> T {
+    v
+}
+fun main() {
+    echo id(5 as i32)
+    echo id(true)
+    echo id(2.5 as f64)
+}

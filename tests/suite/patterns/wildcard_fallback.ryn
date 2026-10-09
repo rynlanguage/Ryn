@@ -1,0 +1,14 @@
+// test: run
+// out: true
+// out: false
+enum Color { Red, Green, Blue }
+fun is_red(c: Color) -> bool {
+    choose c {
+        Color::Red => true,
+        _ => false
+    }
+}
+fun main() {
+    echo is_red(Color::Red)
+    echo is_red(Color::Blue)
+}

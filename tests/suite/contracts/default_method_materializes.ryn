@@ -1,0 +1,38 @@
+// test: run
+// out: true
+// out: false
+shape Entity {
+    fun update(mut self, delta: f32)
+    fun enabled(self) -> bool => true
+}
+struct Player {
+    health: i32,
+}
+extend Player {
+    fun update(mut self, delta: f32) {
+        self.health -= 1
+    }
+}
+struct Torch {
+    battery: i32,
+}
+extend Torch {
+    fun update(mut self, delta: f32) {
+        self.battery -= 10
+    }
+    fun enabled(self) -> bool {
+        return self.battery > 0
+    }
+}
+fun tick<T: Entity>(entity: T) -> T {
+    entity.update(0.016)
+    entity
+}
+fun main() {
+    mut player := Player { health: 100 }
+    player = tick(player)
+    echo player.enabled()
+    mut torch := Torch { battery: 5 }
+    torch = tick(torch)
+    echo torch.enabled()
+}

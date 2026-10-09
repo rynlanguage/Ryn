@@ -1,0 +1,7 @@
+// test: fail
+// code: R0464
+// msg: does not fit in `i32`
+const S: i32 = 1 << 40
+fun main() {
+    echo S
+}

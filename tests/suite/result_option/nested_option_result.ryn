@@ -1,0 +1,9 @@
+// test: run
+// out: 31
+fun main() {
+    nested: Option<Result<i32, String>> = Option::Some(Result::Ok(31))
+    echo choose nested {
+        Option::Some(r) => choose r { Result::Ok(v) => v, Result::Err(m) => 0 },
+        Option::None => 0
+    }
+}

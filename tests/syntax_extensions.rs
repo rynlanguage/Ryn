@@ -33,7 +33,8 @@ fn run_program(label: &str, source_text: &str, frontend: Option<&str>) -> std::p
 }
 
 fn pipe_and_coalesce_source() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/programs/pass/pipe_and_coalesce.ryn");
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/programs/pass/pipe_and_coalesce.ryn");
     fs::read_to_string(path).expect("pipe and coalesce fixture exists")
 }
 
@@ -89,10 +90,7 @@ fun main() -> i32 {
         "lazy coalesce should run, stderr:\n{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    assert_eq!(
-        String::from_utf8_lossy(&result.stdout),
-        "3\nfallback\n11\n"
-    );
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "3\nfallback\n11\n");
 }
 
 #[test]
@@ -170,11 +168,13 @@ fn defer_keeps_owned_values_alive_until_the_block_ends() {
 #[test]
 fn question_mark_runs_pending_defer_blocks_on_its_early_return() {
     let option = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/programs/pass/defer_propagate_option.ryn"),
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/programs/pass/defer_propagate_option.ryn"),
     )
     .expect("option propagate fixture exists");
     let result = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/programs/pass/defer_propagate_result.ryn"),
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/programs/pass/defer_propagate_result.ryn"),
     )
     .expect("result propagate fixture exists");
     for frontend in [None, Some("rust")] {

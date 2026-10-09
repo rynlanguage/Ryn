@@ -1,0 +1,7 @@
+// test: fail
+// msg: never match
+// code: R0235
+fun main() {
+    n: i32 = 3
+    echo choose n { 1 => 10, 1 => 11, _ => 0 }
+}

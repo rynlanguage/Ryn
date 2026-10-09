@@ -1,0 +1,58 @@
+// test: run
+// out: 3.14159
+// out: -0.000001
+// out: 1000
+// out: 0.001
+// out: 123456789012345680000000000000
+// out: 0.25
+// out: inf
+// out: -inf
+// out: -1.5
+// out: -1.5
+// out: -1.5
+// out: -1.5
+// out: -1.5
+// out: 0.1
+// out: 16777216
+// out: inf
+// out: -1.5
+// out: 2.5!
+// out: 18
+
+// Parsing floats from text and writing them back, single and double precision, on the native backend.
+
+fun parse(text: str) -> f64 {
+    return choose String(text).try_to_f64() {
+        Option::Some(v) => v,
+        Option::None => -1.5
+    }
+}
+
+fun parse32(text: str) -> f32 {
+    return choose String(text).try_to_f32() {
+        Option::Some(v) => v,
+        Option::None => -1.5
+    }
+}
+
+fun main() {
+    echo parse("3.14159")
+    echo parse("-0.000001")
+    echo parse("1E3")
+    echo parse("1e-3")
+    echo parse("123456789012345678901234567890")
+    echo parse("+.25")
+    echo parse("infinity")
+    echo parse("-INF")
+    echo parse("1e")
+    echo parse("1.5.2")
+    echo parse("--1")
+    echo parse("+")
+    echo parse("1 ")
+    echo parse32("0.1")
+    echo parse32("16777217")
+    echo parse32("1e39")
+    echo parse32("x")
+    echo String(2.5).concat("!")
+    echo String(1.0 / 3.0).len()
+}

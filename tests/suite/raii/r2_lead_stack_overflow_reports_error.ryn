@@ -1,0 +1,12 @@
+// test: run
+// exit: 1
+// out: 1000
+// err: stack overflow
+fun depth(n: i64) -> i64 {
+    when n == 0 { return 0 }
+    return 1 + depth(n - 1)
+}
+fun main() {
+    echo depth(1000)
+    echo depth(100000000)
+}

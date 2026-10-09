@@ -1,0 +1,12 @@
+#[drop(close)]
+pub struct Handle {
+    pub h: *i32,
+    pub id: i32
+}
+fun close(handle: Handle) {
+    echo "closed"
+}
+pub fun make() -> Handle {
+    // The handle is an opaque address (like a file descriptor), not a pointer to this frame.
+    return Handle { h: (9 as u64) as *i32, id: 9 }
+}

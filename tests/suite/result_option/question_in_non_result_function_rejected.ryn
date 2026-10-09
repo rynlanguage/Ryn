@@ -1,0 +1,8 @@
+// test: fail
+fun inner() -> Result<i32, String> {
+    return Result::Ok(1)
+}
+fun main() {
+    v := inner()?
+    echo v
+}

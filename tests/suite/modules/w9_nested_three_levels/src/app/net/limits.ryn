@@ -1,0 +1,4 @@
+pub const MAX_CONNS: i32 = 7
+pub fun max_conns() -> i32 {
+    return MAX_CONNS
+}

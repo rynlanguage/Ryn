@@ -1,0 +1,7 @@
+// test: run
+// err: division or remainder by zero
+// exit: 1
+fun main() {
+    mut d: i32 = 0
+    echo 1 / d
+}

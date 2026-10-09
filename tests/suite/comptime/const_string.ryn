@@ -1,0 +1,6 @@
+// test: run
+// out: ryn
+const NAME: str = "ryn"
+fun main() {
+    echo NAME
+}

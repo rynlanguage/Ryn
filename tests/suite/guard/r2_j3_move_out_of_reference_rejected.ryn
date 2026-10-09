@@ -1,0 +1,11 @@
+// test: fail
+// code: R0240
+// msg: cannot move a value out of a reference
+fun take(r: &String) -> String {
+    return *r
+}
+fun main() {
+    s := String("a")
+    t := take(&s)
+    echo t
+}

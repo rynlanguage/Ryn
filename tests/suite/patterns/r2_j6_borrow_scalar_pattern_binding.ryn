@@ -1,0 +1,9 @@
+// test: run
+// out: 42
+fun read(r: &i64) -> i64 { return *r + 1 }
+enum Num { Val(i64), Zero }
+fun main() {
+    n := Num::Val(41)
+    a := choose n { Num::Val(v) => read(&v), Num::Zero => 0 }
+    echo a
+}

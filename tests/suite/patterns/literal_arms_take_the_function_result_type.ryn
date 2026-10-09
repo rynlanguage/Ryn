@@ -1,0 +1,13 @@
+// test: run
+// out: 10
+// out: 20
+fun pick(n: i32) -> i32 {
+    choose n {
+        1 => 10,
+        _ => 20
+    }
+}
+fun main() {
+    echo pick(1)
+    echo pick(2)
+}

@@ -1,0 +1,7 @@
+// test: fail
+// code: R0011
+// msg: another decimal point
+fun main() {
+    x := 1.2.3
+    echo x
+}

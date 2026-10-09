@@ -1,0 +1,14 @@
+// test: run
+// out: 9
+struct Holder {
+    p: *i32
+}
+fun main() {
+    mut x: i32 = 5
+    mut h := Holder { p: (0 as u64) as *i32 }
+    when true {
+        h.p = &raw mut x
+    }
+    *h.p = 9
+    echo x
+}

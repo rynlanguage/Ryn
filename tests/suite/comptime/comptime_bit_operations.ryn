@@ -1,0 +1,9 @@
+// test: run
+// out: 19
+// out: 3
+const MASK: u32 = (1 as u32 << 4) | 3
+const LOW: u32 = MASK & 7
+fun main() {
+    echo MASK
+    echo LOW
+}

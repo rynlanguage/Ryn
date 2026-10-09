@@ -1,0 +1,23 @@
+// test: run
+// out: 1
+// out: 2
+enum Outcome<T> { Value(T), Empty }
+enum Either<L, R> { Left(L), Right(R) }
+fun tag<T>(o: Outcome<T>) -> i32 {
+    choose o {
+        Outcome::Value(_) => 1,
+        Outcome::Empty => 0
+    }
+}
+fun side<A, B>(e: Either<A, B>) -> i32 {
+    choose e {
+        Either::Left(_) => 1,
+        Either::Right(_) => 2
+    }
+}
+fun main() {
+    o: Outcome<i32> = Outcome::Value(3 as i32)
+    echo tag(o)
+    e: Either<i32, bool> = Either::Right(true)
+    echo side(e)
+}

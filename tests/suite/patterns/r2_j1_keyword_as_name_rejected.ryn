@@ -1,0 +1,7 @@
+// test: fail
+// code: R0012
+// msg: `shape` is a reserved keyword
+fun main() {
+    shape := 1
+    echo shape
+}

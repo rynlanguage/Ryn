@@ -1,0 +1,9 @@
+// test: run
+// out: using
+// out: closed
+use resource
+fun main() {
+    mut x: i32 = 0
+    r := resource::open(&raw mut x)
+    echo "using"
+}

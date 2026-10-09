@@ -1,0 +1,16 @@
+// test: run
+// out: 100
+// out: 200
+// out: 300
+fun sign(n: i32) -> i32 {
+    choose n {
+        -1 => 100,
+        0 => 200,
+        _ => 300
+    }
+}
+fun main() {
+    echo sign(-1)
+    echo sign(0)
+    echo sign(5)
+}

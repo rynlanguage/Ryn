@@ -1,0 +1,11 @@
+// test: run
+// out: 8
+// out: 100
+const SCALE: i32 = 100
+fun scaled(SCALE: i32) -> i32 {
+    return SCALE * 2
+}
+fun main() {
+    echo scaled(4)
+    echo SCALE
+}

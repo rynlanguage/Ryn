@@ -2,6 +2,8 @@
 //! subset into object files. Each object links with `ld` and prints and exits as the program's `// out:` and `// exit:`
 //! lines say; a program outside the subset is declined with the reason.
 
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,7 +36,11 @@ fn ir_of(source: &Path, directory: &Path) -> PathBuf {
         String::from_utf8_lossy(&output.stderr)
     );
     let ir = dump.join("ryn.ir");
-    assert!(ir.is_file(), "the Ryn analysis wrote no IR for {}", source.display());
+    assert!(
+        ir.is_file(),
+        "the Ryn analysis wrote no IR for {}",
+        source.display()
+    );
     ir
 }
 
@@ -50,7 +56,11 @@ fn object_of(ir: &Path) -> Result<Vec<u8>, String> {
             .arg(&path)
             .output()
             .expect("native driver builds");
-        assert!(build.status.success(), "driver build failed: {}", String::from_utf8_lossy(&build.stderr));
+        assert!(
+            build.status.success(),
+            "driver build failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
         path
     });
     let mut output = Command::new(driver)
@@ -60,12 +70,20 @@ fn object_of(ir: &Path) -> Result<Vec<u8>, String> {
     if output.status.code() == Some(3)
         && String::from_utf8_lossy(&output.stderr).contains("in a freestanding program")
     {
-        output = Command::new(driver).arg(ir).arg("libc").output().expect("libc driver runs");
+        output = Command::new(driver)
+            .arg(ir)
+            .arg("libc")
+            .output()
+            .expect("libc driver runs");
     }
     if output.status.code() == Some(3) {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
-    assert!(output.status.success(), "the native driver failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "the native driver failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     Ok(output.stdout)
 }
 
@@ -95,9 +113,10 @@ fn link_object(object: &[u8], directory: &Path) -> PathBuf {
         linker.arg("-static");
     }
     linker.arg("-o").arg(&executable).arg(&object_path);
-    if !freestanding { linker.arg("-lm"); }
-    let link = linker.output()
-        .expect("ld runs");
+    if !freestanding {
+        linker.arg("-lm");
+    }
+    let link = linker.output().expect("ld runs");
     assert!(
         link.status.success(),
         "cc failed: {}",
@@ -108,7 +127,9 @@ fn link_object(object: &[u8], directory: &Path) -> PathBuf {
 
 fn link_and_run(object: &[u8], directory: &Path) -> (String, i32) {
     let executable = link_object(object, directory);
-    let run = Command::new(&executable).output().expect("the program runs");
+    let run = Command::new(&executable)
+        .output()
+        .expect("the program runs");
     (
         String::from_utf8_lossy(&run.stdout).into_owned(),
         run.status.code().unwrap_or(-1),
@@ -280,7 +301,8 @@ fn scalar_programs_run_as_objects_built_by_the_ryn_backend() {
     for program in programs {
         let source = repository(program);
         let ir = ir_of(&source, &directory);
-        let object = object_of(&ir).unwrap_or_else(|reason| panic!("{program} is declined: {reason}"));
+        let object =
+            object_of(&ir).unwrap_or_else(|reason| panic!("{program} is declined: {reason}"));
         let (output, status) = link_and_run(&object, &directory);
         let (expected_output, expected_status) = expectations(&source);
         assert_eq!(output, expected_output, "{program}: standard output");
@@ -323,8 +345,14 @@ fn thirty_million_temporary_allocations_fit_in_one_gibibyte() {
     let run = Command::new("bash")
         .args(["-c", "ulimit -v 1048576; exec \"$1\"", "ryn-memory-limit"])
         .arg(executable)
-        .output().expect("limited stress runs");
-    assert!(run.status.success(), "allocation stress failed: {:?}: {}", run.status, String::from_utf8_lossy(&run.stderr));
+        .output()
+        .expect("limited stress runs");
+    assert!(
+        run.status.success(),
+        "allocation stress failed: {:?}: {}",
+        run.status,
+        String::from_utf8_lossy(&run.stderr)
+    );
     assert_eq!(run.stdout, b"480000000\n0\n0\n");
     fs::remove_dir_all(directory).unwrap();
 }
@@ -340,6 +368,10 @@ fn freestanding_allocator_traps_on_double_free() {
     let object = object_of(&ir).expect("allocator detector probe compiles");
     let executable = link_object(&object, &directory);
     let run = Command::new(executable).output().unwrap();
-    assert_eq!(run.status.signal(), Some(4), "double free must trap with SIGILL");
+    assert_eq!(
+        run.status.signal(),
+        Some(4),
+        "double free must trap with SIGILL"
+    );
     fs::remove_dir_all(directory).unwrap();
 }

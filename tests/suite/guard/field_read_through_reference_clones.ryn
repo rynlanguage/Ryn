@@ -1,0 +1,12 @@
+// test: run
+// out: a
+// out: a
+struct P { name: String }
+fun take(p: &P) -> String {
+    return p.name
+}
+fun main() {
+    p := P { name: String("a") }
+    echo take(&p)
+    echo p.name
+}

@@ -1,0 +1,11 @@
+// test: fail
+// msg: `when` condition must have type `bool`
+// code: R0207
+const N: i32 = 3
+fun main() {
+    when N {
+        echo "bad"
+    } else {
+        echo "bad2"
+    }
+}

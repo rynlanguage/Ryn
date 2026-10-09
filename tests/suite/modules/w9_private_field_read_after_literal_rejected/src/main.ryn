@@ -1,0 +1,9 @@
+// test: fail
+// code: R0426
+// msg: is private
+use m
+fun main() {
+    p := m::P { x: 1, y: 2 }
+    echo p.x
+    echo p.y
+}

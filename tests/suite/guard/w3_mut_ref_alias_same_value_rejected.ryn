@@ -1,0 +1,10 @@
+// test: fail
+// code: R0249
+fun both(a: &mut i32, b: &mut i32) {
+    *a = 1
+}
+fun main() {
+    mut x: i32 = 0
+    both(&mut x, &mut x)
+    echo x
+}

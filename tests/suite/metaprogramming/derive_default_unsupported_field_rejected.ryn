@@ -1,0 +1,8 @@
+// test: fail
+// code: R0466
+struct Plain { n: i32 }
+#[derive(Default)]
+struct Holder { p: Plain }
+fun main() {
+    echo 1
+}

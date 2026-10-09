@@ -1,0 +1,8 @@
+struct Node {
+    value: i32,
+    next: Node
+}
+
+fun main() {
+    echo 0
+}

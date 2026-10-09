@@ -224,6 +224,9 @@ impl Encoder {
         self.line();
         self.strings(&declaration.path);
         self.span(declaration.span);
+        self.option(declaration.alias.as_ref(), |encoder, name| {
+            encoder.string(name);
+        });
     }
 
     fn struct_def(&mut self, definition: &StructDef) {
@@ -238,6 +241,7 @@ impl Encoder {
         });
         self.strings(&definition.derives);
         self.string(&definition.module_path);
+        self.string(&definition.display);
         self.span(definition.span);
     }
 
@@ -1014,10 +1018,10 @@ impl<'a> Decoder<'a> {
     }
 
     fn use_decl(&mut self) -> Decoded<UseDecl> {
-        Ok(UseDecl {
-            path: self.strings()?,
-            span: self.span()?,
-        })
+        let path = self.strings()?;
+        let span = self.span()?;
+        let alias = self.option(Self::string)?;
+        Ok(UseDecl { path, alias, span })
     }
 
     fn struct_def(&mut self) -> Decoded<StructDef> {
@@ -1030,6 +1034,7 @@ impl<'a> Decoder<'a> {
             drop_function: self.option(Self::string)?,
             derives: self.strings()?,
             module_path: self.string()?,
+            display: self.string()?,
             span: self.span()?,
         })
     }
@@ -1385,8 +1390,7 @@ impl<'a> Decoder<'a> {
                 let value = self.expression()?;
                 let target = self.expression()?;
                 let span = self.span()?;
-                Expression::pipe_into(value, target, span)
-                    .map_err(|(_, message)| message)?
+                Expression::pipe_into(value, target, span).map_err(|(_, message)| message)?
             }
             "Coalesce" => {
                 let value = self.expression()?;

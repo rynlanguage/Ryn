@@ -1,0 +1,8 @@
+// test: run
+// out: custom 4
+fun print(value: i32) {
+    echo "custom {value}"
+}
+fun main() {
+    print(4)
+}

@@ -1,0 +1,17 @@
+// test: run
+// out: 4
+shape Sized {
+    fun size(self) -> i32
+}
+struct Crate {
+    n: i32,
+}
+extend Crate as Sized {
+    fun size(self) -> i32 { self.n * 2 }
+}
+fun measure<T: Sized>(v: T) -> i32 {
+    v.size()
+}
+fun main() {
+    echo measure(Crate { n: 2 })
+}

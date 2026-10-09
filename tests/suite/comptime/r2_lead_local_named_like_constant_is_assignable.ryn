@@ -1,0 +1,13 @@
+// test: run
+// out: 7
+// out: 2
+const K: i64 = 2
+fun bump() -> i64 {
+    mut K: i64 = 5
+    K = K + 2
+    return K
+}
+fun main() {
+    echo bump()
+    echo 2
+}

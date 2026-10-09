@@ -1,4 +1,4 @@
-//! The syntax tree data model written in Ryn (`selfhost/ast_roundtrip`) must decode every
+//! The syntax tree data model written in Ryn (`selfhost/src/middle/ast.ryn`) must decode every
 //! successful syntax tree text the Rust encoder writes and encode it back to the same bytes,
 //! and must reject texts that were cut short or corrupted.
 
@@ -15,26 +15,7 @@ static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 
 /// Builds the Ryn-written round-trip tool with the compiler under test and returns its executable.
 fn build_tool() -> PathBuf {
-    let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("selfhost/ast_roundtrip");
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg(&project)
-        .arg("--release")
-        .output()
-        .expect("ryn process starts");
-    assert!(
-        output.status.success(),
-        "the Ryn syntax tree round-trip tool should build, stderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    project
-        .join("build")
-        .join("release")
-        .join(if cfg!(windows) {
-            "ast_roundtrip.exe"
-        } else {
-            "ast_roundtrip"
-        })
+    ryn::frontend::locate_or_build_self_hosted().expect("the self-hosted frontend builds")
 }
 
 fn scratch_path(extension: &str) -> PathBuf {
@@ -51,6 +32,7 @@ fn round_trip(tool: &Path, text: &str) -> Option<String> {
     let output = scratch_path("out");
     fs::write(&input, text).expect("syntax tree text is written");
     let status = Command::new(tool)
+        .arg("--ast-roundtrip")
         .arg(&input)
         .arg(&output)
         .output()
@@ -97,7 +79,10 @@ fn ryn_syntax_tree_model_round_trips_every_encoded_program_and_rejects_damaged_t
     for text in &texts {
         let encoded =
             round_trip(&tool, text).expect("the Ryn model should decode this syntax tree text");
-        assert_eq!(&encoded, text, "re-encoding must reproduce the text exactly");
+        assert_eq!(
+            &encoded, text,
+            "re-encoding must reproduce the text exactly"
+        );
     }
 
     let sample = texts

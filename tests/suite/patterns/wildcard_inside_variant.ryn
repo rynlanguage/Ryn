@@ -1,0 +1,12 @@
+// test: run
+// out: 4
+enum Pair { Two(i32, i32), None }
+fun first(p: Pair) -> i32 {
+    choose p {
+        Pair::Two(a, _) => a,
+        Pair::None => 0
+    }
+}
+fun main() {
+    echo first(Pair::Two(4, 5))
+}

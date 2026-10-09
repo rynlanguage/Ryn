@@ -1,0 +1,8 @@
+// test: run
+// out: 19
+// out: s
+use util
+fun main() {
+    echo util::identity::<i32>(19 as i32)
+    echo util::identity(String("s"))
+}

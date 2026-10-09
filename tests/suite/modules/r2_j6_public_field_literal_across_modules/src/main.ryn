@@ -1,0 +1,7 @@
+// test: run
+// out: 3
+use m
+fun main() {
+    p := m::P { x: 1, y: 2 }
+    echo p.x + p.y
+}

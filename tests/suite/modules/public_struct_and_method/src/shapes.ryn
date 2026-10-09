@@ -1,0 +1,9 @@
+pub struct Rect {
+    pub w: i32,
+    pub h: i32
+}
+extend Rect {
+    pub fun area(self) -> i32 {
+        return self.w * self.h
+    }
+}

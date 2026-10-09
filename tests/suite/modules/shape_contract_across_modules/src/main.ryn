@@ -1,0 +1,14 @@
+// test: run
+// out: 4
+use contracts
+struct Dog {
+    legs: i32
+}
+extend Dog {
+    pub fun count(self) -> i32 {
+        return self.legs
+    }
+}
+fun main() {
+    echo contracts::total(Dog { legs: 4 })
+}

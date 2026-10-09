@@ -1,0 +1,6 @@
+name: w9-path-dependency-transitive
+version: 0.1.0
+owner: guest
+dependencies:
+  outer:
+    path: ./vendor/outer

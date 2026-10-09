@@ -1,0 +1,6 @@
+pub shape Countable {
+    fun count(self) -> i32
+}
+pub fun total<T: Countable>(v: T) -> i32 {
+    return v.count()
+}

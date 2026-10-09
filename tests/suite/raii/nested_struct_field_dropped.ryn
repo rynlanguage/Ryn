@@ -1,0 +1,13 @@
+// test: run
+// out: held
+// out: drop 7
+#[drop(rel)]
+struct R { h: *i32, id: i32 }
+fun rel(r: R) { echo "drop {r.id}" }
+fun mk(id: i32, p: *i32) -> R { return R { h: p, id: id } }
+struct Wrapper { inner: R, n: i32 }
+fun main() {
+    mut x: i32 = 0
+    w := Wrapper { inner: mk(7, &raw mut x), n: 1 }
+    echo "held"
+}

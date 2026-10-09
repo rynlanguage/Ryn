@@ -1,0 +1,30 @@
+// test: run
+// out: NaN
+// out: inf
+// out: -inf
+// out: -0
+// out: 1000000000000000000000
+// out: 0.0000001
+// out: 0.1
+// out: 16777216
+// out: 10000000000000000
+// out: 0.30000000000000004
+// out: 0.000015
+fun main() {
+    mut zero: f64 = 0.0
+    echo zero / zero
+    echo 1.0 / zero
+    echo -1.0 / zero
+    echo -zero
+    mut big: f64 = 1e21
+    echo big
+    mut tiny: f64 = 1e-7
+    echo tiny
+    f: f32 = 0.1
+    echo f
+    echo 16777217.0 as f32
+    echo 1.0e16 + 0.0
+    echo 0.1 + 0.2
+    mut small: f64 = 1.5e-5
+    echo small
+}

@@ -1,0 +1,13 @@
+// test: fail
+// code: R0251
+fun main() {
+    a: i32 = 1
+    mut r: &i32 = &a
+    mut i: i32 = 0
+    while i < 2 {
+        b: i32 = i
+        r = &b
+        i += 1
+    }
+    echo *r
+}

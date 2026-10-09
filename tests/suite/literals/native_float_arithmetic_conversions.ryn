@@ -1,0 +1,32 @@
+// test: run
+// out: true
+// out: false
+// out: true
+// out: false
+// out: true
+// out: false
+// out: true
+// out: true
+// out: true
+// out: true
+fun half(x: f64) -> f64 {
+    return x / 2.0
+}
+fun main() {
+    a := 1.5
+    b := 2.25
+    c := a + b
+    d := c * 2.0 - 1.0
+    e := half(d)
+    f := 0.0 - e
+    echo c > 3.0
+    echo c < 3.0
+    echo c == 3.75
+    echo c != 3.75
+    echo f <= -1.0
+    echo f >= -1.0
+    echo (7 as i32) as f64 > 6.5
+    echo (1.5 as f32) as f64 == 1.5
+    echo (3 as i64) as f32 == 3.0
+    echo a - b < 0.0
+}

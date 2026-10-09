@@ -1,0 +1,23 @@
+// test: run
+// out: String
+// out: [Point; 2]
+// out: Map<String, i32>
+// out: Set<i32>
+// out: Vec<Point>
+// out: *u8
+// out: str
+// out: u64
+struct Point {
+    x: i32,
+    y: i32
+}
+fun main() {
+    echo type_name::<String>()
+    echo type_name::<[Point; 2]>()
+    echo type_name::<Map<String, i32>>()
+    echo type_name::<Set<i32>>()
+    echo type_name::<Vec<Point>>()
+    echo type_name::<*u8>()
+    echo type_name::<str>()
+    echo type_name::<u64>()
+}

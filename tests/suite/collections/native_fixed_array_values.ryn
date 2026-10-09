@@ -1,0 +1,75 @@
+// test: run
+// out: 10
+// out: 104
+// out: 1
+// out: 20
+// out: 10
+// out: 4
+// out: -18
+// out: 0
+// out: 2
+// out: 1
+// out: false
+// out: z
+// out: 10
+// out: true
+// out: 9
+// out: 2
+// out: 1
+
+// Arrays of plain scalars on the native backend: literals, repeat, indexing, indexed writes, a whole-array assignment
+// that reads the array it replaces, and arrays passed and returned by value.
+
+fun sum(values: [i64; 4]) -> i64 {
+    mut total: i64 = 0
+    for i in 0..4 {
+        total += values[i]
+    }
+    return total
+}
+
+// The callee works on its own copy, so the caller's array is unchanged.
+fun bump(values: [i64; 4]) -> i64 {
+    mut local := values
+    local[0] = 100
+    return local[0] + local[3]
+}
+
+fun pair(a: i64, b: i64) -> [i64; 2] {
+    return [a + b, a - b]
+}
+
+fun main() {
+    a: [i64; 4] = [1, 2, 3, 4]
+    echo sum(a)
+    echo bump(a)
+    echo a[0]
+    echo sum([5; 4])
+    p := pair(7, 3)
+    echo p[0]
+    echo p[1]
+    mut q: [i64; 3] = [0; 3]
+    q[1] = -9
+    q[2] = q[1] * 2
+    echo q[2]
+    echo q[0]
+    mut s: [i64; 2] = [1, 2]
+    s = [s[1], s[0]]
+    echo s[0]
+    echo s[1]
+    flags: [bool; 3] = [true, false, true]
+    echo flags[1]
+    letters: [char; 2] = ['a', 'z']
+    echo letters[1]
+    bytes: [u8; 2] = [250, 3]
+    echo bytes[0] - 240
+    weights: [f64; 2] = [0.5, 2.0]
+    echo weights[1] > weights[0]
+    mut t: [i64; 3] = [0; 3]
+    k: u8 = 2
+    t[k] = 9
+    echo t[2]
+    t = [t[2] - 7, 2, t[2]]
+    echo t[0]
+    echo t[2] - 8
+}

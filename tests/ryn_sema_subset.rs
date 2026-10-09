@@ -1,4 +1,4 @@
-//! The subset of semantic analysis written in Ryn (`selfhost/sema_subset`) must produce the
+//! The subset of semantic analysis written in Ryn (`selfhost/src/middle`) must produce the
 //! same IR text as the bootstrap `sema::analyze` for every program it accepts, and must
 //! decline the rest with `unsupported`, never with a wrong program.
 
@@ -17,26 +17,7 @@ static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 const UNSUPPORTED: i32 = 3;
 
 fn build_tool() -> PathBuf {
-    let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("selfhost/sema_subset");
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg(&project)
-        .arg("--release")
-        .output()
-        .expect("ryn process starts");
-    assert!(
-        output.status.success(),
-        "the Ryn semantic subset should build, stderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    project
-        .join("build")
-        .join("release")
-        .join(if cfg!(windows) {
-            "sema_subset.exe"
-        } else {
-            "sema_subset"
-        })
+    ryn::frontend::locate_or_build_self_hosted().expect("the self-hosted frontend builds")
 }
 
 fn scratch_path(extension: &str) -> PathBuf {
@@ -53,6 +34,7 @@ fn lower(tool: &Path, syntax_tree: &str) -> Result<String, i32> {
     let output = scratch_path("ir");
     fs::write(&input, syntax_tree).expect("syntax tree text is written");
     let status = Command::new(tool)
+        .arg("--sema")
         .arg(&input)
         .arg(&output)
         .output()
@@ -84,7 +66,10 @@ fn ryn_sema_subset_matches_the_bootstrap_ir_for_every_program_it_accepts() {
             let Ok(program) = parser::parse(&source) else {
                 continue;
             };
-            let syntax_tree = ast_codec::encode_program(&program);
+            let specialized =
+                ryn::generics::monomorphize(parser::parse(&source).expect("program parses again"))
+                    .expect("program specializes");
+            let syntax_tree = ast_codec::encode_program(&specialized);
             let Ok(expected) = sema::analyze(program).map(|ir| ir_codec::encode_ir(&ir)) else {
                 continue;
             };
@@ -108,7 +93,7 @@ fn ryn_sema_subset_matches_the_bootstrap_ir_for_every_program_it_accepts() {
         }
     }
     assert!(
-        accepted >= 25,
-        "expected the subset to accept at least twenty-five corpus programs, got {accepted}"
+        accepted >= 100,
+        "expected the subset to accept at least one hundred corpus programs, got {accepted}"
     );
 }

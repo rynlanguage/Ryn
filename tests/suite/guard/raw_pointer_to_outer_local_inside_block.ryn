@@ -1,0 +1,11 @@
+// test: run
+// out: 8
+fun main() {
+    mut x: i32 = 5
+    mut p: *i32 = (0 as u64) as *i32
+    when true {
+        p = &raw mut x
+    }
+    *p = 8
+    echo x
+}

@@ -1,0 +1,10 @@
+// test: run
+// out: 3
+fun same(p: *i32) -> *i32 {
+    return p
+}
+fun main() {
+    mut x: i32 = 3
+    q := same(&raw mut x)
+    echo *q
+}

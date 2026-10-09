@@ -1,0 +1,13 @@
+// test: run
+// out: 8
+// out: 1
+fun main() {
+    mut x: i32 = 5
+    p := &raw mut x
+    unsafe {
+        y: i32 = 3
+        *p = *p + y
+    }
+    echo x
+    unsafe { echo 1 }
+}

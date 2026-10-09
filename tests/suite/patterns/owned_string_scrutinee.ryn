@@ -1,0 +1,9 @@
+// test: run
+// out: 1
+fun main() {
+    s := String("hello")
+    echo choose s {
+        "hello" => 1,
+        _ => 0
+    }
+}

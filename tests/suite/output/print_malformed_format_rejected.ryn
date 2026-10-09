@@ -1,0 +1,5 @@
+// test: fail
+// code: R0014
+fun main() {
+    print("oops {", 1 as i32)
+}

@@ -1,0 +1,15 @@
+// test: run
+// out: 4
+// out: 9
+fun main() {
+    mut flag := true
+    when flag {
+        n: i32 = 4
+        echo n
+    }
+    while flag {
+        m: i32 = 9
+        echo m
+        flag = false
+    }
+}

@@ -1,0 +1,7 @@
+// test: run
+// out: through std::io
+use std::io
+fun main() {
+    io::println("through std::io")
+    io::eprintln("to stderr")
+}

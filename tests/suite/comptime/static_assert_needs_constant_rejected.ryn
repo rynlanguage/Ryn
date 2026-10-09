@@ -1,0 +1,6 @@
+// test: fail
+// code: R0461
+fun main() {
+    x: i32 = 3
+    static_assert(x == 3)
+}

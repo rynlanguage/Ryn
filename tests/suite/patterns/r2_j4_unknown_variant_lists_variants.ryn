@@ -1,0 +1,11 @@
+// test: fail
+// code: R0233
+// msg: the variants of `Color` are `Red`, `Green`
+enum Color {
+    Red,
+    Green
+}
+fun main() {
+    c := Color::Blue
+    echo 1
+}

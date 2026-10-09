@@ -1,0 +1,10 @@
+use app::net::limits
+pub fun port() -> i32 {
+    return 8080
+}
+pub fun tls_port() -> i32 {
+    return 443
+}
+pub fun ports_open() -> i32 {
+    return limits::max_conns()
+}

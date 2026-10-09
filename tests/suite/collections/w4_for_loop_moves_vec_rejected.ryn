@@ -1,0 +1,11 @@
+// test: fail
+// code: R0240
+// msg: use of a moved value
+fun main() {
+    mut v: Vec<i32> = Vec()
+    v.push(1)
+    for x in v {
+        echo x
+    }
+    echo v.len()
+}

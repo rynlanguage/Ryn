@@ -1,0 +1,9 @@
+// test: run
+// out: 9
+fun square(n: i32) -> i32 {
+    return n * n
+}
+const NINE: i32 = square(3)
+fun main() {
+    echo NINE
+}

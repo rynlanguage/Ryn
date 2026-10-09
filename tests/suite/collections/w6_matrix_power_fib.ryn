@@ -1,0 +1,106 @@
+// test: run
+// out: 10 2 5
+// out: 22 5 14
+// out: 34 8 23
+// out: 1 2 3
+// out: 4 5 6
+// out: 7 8 9
+// out: F10=55 F20=6765 F30=832040
+// Square matrices stored row-major; multiplication, identity, and Fibonacci by matrix power.
+struct Matrix { n: u64, data: Vec<i64> }
+
+extend Matrix {
+    fun at(self, r: u64, c: u64) -> i64 {
+        return self.data.index(r * self.n + c)
+    }
+    fun mul(self, other: Matrix) -> Matrix {
+        mut out: Vec<i64> = Vec()
+        for r in 0..self.n {
+            for c in 0..self.n {
+                mut sum: i64 = 0
+                for k in 0..self.n {
+                    sum += self.data.index(r * self.n + k) * other.data.index(k * other.n + c)
+                }
+                out.push(sum)
+            }
+        }
+        return Matrix { n: self.n, data: out }
+    }
+}
+
+fun from_values(n: u64, vals: Vec<i64>) -> Matrix {
+    return Matrix { n: n, data: vals }
+}
+
+fun identity(n: u64) -> Matrix {
+    mut v: Vec<i64> = Vec()
+    for r in 0..n {
+        for c in 0..n {
+            when r == c {
+                v.push(1)
+            } else {
+                v.push(0)
+            }
+        }
+    }
+    return Matrix { n: n, data: v }
+}
+
+fun fib_step() -> Matrix {
+    mut v: Vec<i64> = Vec()
+    v.push(1)
+    v.push(1)
+    v.push(1)
+    v.push(0)
+    return Matrix { n: 2, data: v }
+}
+
+fun fib_via_power(k: u64) -> i64 {
+    mut acc := identity(2)
+    for _ in 0..k {
+        acc = acc.mul(fib_step())
+    }
+    return acc.at(0, 1)
+}
+
+fun print_matrix(m: Matrix) {
+    for r in 0..m.n {
+        print("{} {} {}", m.at(r, 0), m.at(r, 1), m.at(r, 2))
+    }
+}
+
+fun rows_a() -> Vec<i64> {
+    mut a: Vec<i64> = Vec()
+    for i in 1..=9 {
+        a.push(i)
+    }
+    return a
+}
+
+fun rows_b() -> Vec<i64> {
+    mut b: Vec<i64> = Vec()
+    b.push(1)
+    b.push(0)
+    b.push(2)
+    b.push(0)
+    b.push(1)
+    b.push(0)
+    b.push(3)
+    b.push(0)
+    b.push(1)
+    return b
+}
+
+fun main() {
+    left := from_values(3, rows_a())
+    right := from_values(3, rows_b())
+    p := left.mul(right)
+    print_matrix(p)
+    id := identity(3)
+    q := id.mul(from_values(3, rows_a()))
+    print_matrix(q)
+    f10 := fib_via_power(10)
+    f20 := fib_via_power(20)
+    f30 := fib_via_power(30)
+    print("F10={} F20={} F30={}", f10, f20, f30)
+}

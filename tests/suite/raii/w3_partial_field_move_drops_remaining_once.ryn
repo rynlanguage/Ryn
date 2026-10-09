@@ -1,0 +1,29 @@
+// test: run
+// out: consumed 1
+// out: drop 1
+// out: end
+// out: drop 2
+#[drop(rel)]
+struct R {
+    h: *i32,
+    id: i32,
+}
+fun rel(r: R) {
+    echo "drop {r.id}"
+}
+fun mk(id: i32, p: *i32) -> R {
+    return R { h: p, id: id }
+}
+struct Pair {
+    a: R,
+    b: R,
+}
+fun consume(r: R) {
+    echo "consumed {r.id}"
+}
+fun main() {
+    mut x: i32 = 0
+    p := Pair { a: mk(1, &raw mut x), b: mk(2, &raw mut x) }
+    consume(p.a)
+    echo "end"
+}

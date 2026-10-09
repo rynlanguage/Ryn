@@ -1,0 +1,10 @@
+// test: fail
+// code: R0235
+fun main() {
+    t := (1 as i32, 2 as i32)
+    echo choose t {
+        (1, 2) => 1,
+        (1, 2, 3) => 2,
+        _ => 0
+    }
+}

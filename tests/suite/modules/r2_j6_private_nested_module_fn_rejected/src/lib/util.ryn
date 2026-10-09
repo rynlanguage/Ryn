@@ -1,0 +1,3 @@
+fun hidden() -> i32 {
+    return 1
+}

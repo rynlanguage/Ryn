@@ -1,0 +1,13 @@
+// test: run
+// out: 100
+// out: 14
+fun f(n: i32) -> i32 {
+    choose n {
+        0 => 100,
+        other => other * 2
+    }
+}
+fun main() {
+    echo f(0)
+    echo f(7)
+}

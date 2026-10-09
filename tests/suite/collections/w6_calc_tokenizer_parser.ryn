@@ -1,0 +1,149 @@
+// test: run
+// out: = 21
+// out: = 12
+// out: = -16
+// out: error: division by zero
+// out: error: expected )
+// out: = 87
+// out: 3
+enum Tok { Num(i64), Plus, Minus, Star, Slash, LParen, RParen }
+
+fun tokenize(src: String) -> Vec<Tok> {
+    mut out: Vec<Tok> = Vec()
+    mut i: u64 = 0
+    n := src.char_count()
+    while i < n {
+        c := src.char_at(i)
+        when c == ' ' {
+            i += 1
+            continue
+        }
+        when c >= '0' && c <= '9' {
+            mut value: i64 = 0
+            while i < n && src.char_at(i) >= '0' && src.char_at(i) <= '9' {
+                d := src.char_at(i)
+                value = value * 10 + ((d as i64) - ('0' as i64))
+                i += 1
+            }
+            out.push(Tok::Num(value))
+            continue
+        }
+        tok := choose c {
+            '+' => Tok::Plus,
+            '-' => Tok::Minus,
+            '*' => Tok::Star,
+            '/' => Tok::Slash,
+            '(' => Tok::LParen,
+            _ => Tok::RParen
+        }
+        out.push(tok)
+        i += 1
+    }
+    return out
+}
+
+struct Parser { toks: Vec<Tok>, pos: u64 }
+
+extend Parser {
+    fun peek(self) -> Tok {
+        return self.toks.index(self.pos)
+    }
+    fun kind(self) -> i64 {
+        return choose self.peek() {
+            Tok::Plus => 1,
+            Tok::Minus => 2,
+            Tok::Star => 3,
+            Tok::Slash => 4,
+            _ => 0
+        }
+    }
+    fun at_end(self) -> bool {
+        return self.pos >= self.toks.len()
+    }
+    fun expr(mut self) -> Result<i64, String> {
+        mut acc := self.term()?
+        while !self.at_end() {
+            when self.kind() == 1 {
+                self.pos += 1
+                acc = acc + self.term()?
+            } else when self.kind() == 2 {
+                self.pos += 1
+                acc = acc - self.term()?
+            } else {
+                break
+            }
+        }
+        return Result::Ok(acc)
+    }
+    fun term(mut self) -> Result<i64, String> {
+        mut acc := self.factor()?
+        while !self.at_end() {
+            when self.kind() == 3 {
+                self.pos += 1
+                acc = acc * self.factor()?
+            } else when self.kind() == 4 {
+                self.pos += 1
+                divisor := self.factor()?
+                when divisor == 0 {
+                    return Result::Err(String("division by zero"))
+                }
+                acc = acc / divisor
+            } else {
+                break
+            }
+        }
+        return Result::Ok(acc)
+    }
+    fun paren(mut self) -> Result<i64, String> {
+        v := self.expr()?
+        when self.at_end() {
+            return Result::Err(String("expected )"))
+        }
+        self.pos += 1
+        return Result::Ok(v)
+    }
+    fun factor(mut self) -> Result<i64, String> {
+        when self.at_end() {
+            return Result::Err(String("unexpected end"))
+        }
+        t := self.peek()
+        self.pos += 1
+        return choose t {
+            Tok::Num(v) => Result::Ok(v),
+            Tok::Minus => Result::Ok(0 - self.factor()?),
+            Tok::LParen => self.paren(),
+            _ => Result::Err(String("unexpected token"))
+        }
+    }
+}
+
+fun evaluate(src: String) -> Result<i64, String> {
+    mut p := Parser { toks: tokenize(src), pos: 0 }
+    return p.expr()
+}
+
+fun show_ok(v: i64) {
+    echo "= {v}"
+}
+fun show_err(m: String) {
+    echo "error: {m}"
+}
+
+fun report(src: String) {
+    r := evaluate(src)
+    when r.is_ok() {
+        show_ok(r.unwrap())
+    } else {
+        show_err(r.unwrap_err())
+    }
+}
+
+fun main() {
+    report(String("12 + 3*(4-1)"))
+    report(String("2*(3+4)-5/2"))
+    report(String("-(4+4)*2"))
+    report(String("7/(3-3)"))
+    report(String("(1+2"))
+    report(String("100 - 7 - 3 * 2"))
+    echo tokenize(String("(8)")).len()
+}

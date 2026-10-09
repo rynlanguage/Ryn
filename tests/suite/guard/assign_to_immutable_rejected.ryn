@@ -1,0 +1,6 @@
+// test: fail
+// code: R0204
+fun main() {
+    x: i32 = 1
+    x = 2
+}

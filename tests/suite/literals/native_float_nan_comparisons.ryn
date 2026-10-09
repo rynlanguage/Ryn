@@ -1,0 +1,15 @@
+// test: run
+// out: false
+// out: true
+// out: false
+// out: false
+// out: false
+fun main() {
+    z := 0.0
+    n := z / z
+    echo n == n
+    echo n != n
+    echo n < 1.0
+    echo n >= 1.0
+    echo n < n
+}

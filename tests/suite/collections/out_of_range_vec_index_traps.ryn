@@ -1,0 +1,7 @@
+// test: run
+// exit: 1
+fun main() {
+    mut v: Vec<i32> = Vec()
+    v.push(1)
+    echo v.index(5)
+}

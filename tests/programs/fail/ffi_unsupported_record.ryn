@@ -1,7 +1,8 @@
 #[repr(C)]
 struct Record {
     first: i32,
-    second: i64
+    second: i64,
+    third: i64
 }
 
 extern "C" fun consume(record: Record);

@@ -1,0 +1,7 @@
+fun main() {
+    echo 1
+}
+
+fun main() {
+    echo 2
+}

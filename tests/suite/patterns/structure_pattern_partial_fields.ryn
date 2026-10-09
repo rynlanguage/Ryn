@@ -1,0 +1,14 @@
+// test: run
+// out: 22
+// out: 0
+struct Point { x: i32, y: i32 }
+fun f(p: Point) -> i32 {
+    choose p {
+        Point { y: 2 } => 22,
+        _ => 0
+    }
+}
+fun main() {
+    echo f(Point { x: 9, y: 2 })
+    echo f(Point { x: 9, y: 3 })
+}

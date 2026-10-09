@@ -1,0 +1,10 @@
+// test: run
+// out: Point
+// out: i32
+// out: Vec<u8>
+struct Point { x: i32 }
+fun main() {
+    echo type_name::<Point>()
+    echo type_name::<i32>()
+    echo type_name::<Vec<u8>>()
+}

@@ -1,0 +1,15 @@
+// test: run
+// out: 1
+// out: 0
+enum Outcome<T> { Value(T), Empty }
+fun tag<T>(o: Outcome<T>) -> i32 {
+    choose o {
+        Outcome::Value(_) => 1,
+        Outcome::Empty => 0
+    }
+}
+fun main() {
+    echo tag(Outcome::Value(3 as i32))
+    o: Outcome<i64> = Outcome::Empty
+    echo tag(o)
+}

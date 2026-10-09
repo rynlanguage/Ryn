@@ -1,0 +1,52 @@
+// test: run
+// out: true
+// out: true
+// out: false
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(p: *u8);
+extern "C" fun getenv(name: *u8) -> *u8;
+extern "C" fun time(seconds: *i64) -> i64;
+fun put8(address: u64, value: u8) {
+    p := address as *u8
+    *p = value
+}
+fun main() {
+    name := malloc(32 as u64)
+    base := name as u64
+    put8(base + 0 as u64, 82 as u8)
+    put8(base + 1 as u64, 89 as u8)
+    put8(base + 2 as u64, 78 as u8)
+    put8(base + 3 as u64, 95 as u8)
+    put8(base + 4 as u64, 87 as u8)
+    put8(base + 5 as u64, 49 as u8)
+    put8(base + 6 as u64, 48 as u8)
+    put8(base + 7 as u64, 95 as u8)
+    put8(base + 8 as u64, 83 as u8)
+    put8(base + 9 as u64, 85 as u8)
+    put8(base + 10 as u64, 82 as u8)
+    put8(base + 11 as u64, 69 as u8)
+    put8(base + 12 as u64, 76 as u8)
+    put8(base + 13 as u64, 89 as u8)
+    put8(base + 14 as u64, 95 as u8)
+    put8(base + 15 as u64, 85 as u8)
+    put8(base + 16 as u64, 78 as u8)
+    put8(base + 17 as u64, 83 as u8)
+    put8(base + 18 as u64, 69 as u8)
+    put8(base + 19 as u64, 84 as u8)
+    put8(base + 20 as u64, 95 as u8)
+    put8(base + 21 as u64, 86 as u8)
+    put8(base + 22 as u64, 65 as u8)
+    put8(base + 23 as u64, 82 as u8)
+    put8(base + 24 as u64, 73 as u8)
+    put8(base + 25 as u64, 65 as u8)
+    put8(base + 26 as u64, 66 as u8)
+    put8(base + 27 as u64, 76 as u8)
+    put8(base + 28 as u64, 69 as u8)
+    put8(base + 29 as u64, 0 as u8)
+    missing := getenv(name)
+    echo pointer_is_null(missing)
+    now := time((0 as u64) as *i64)
+    echo now > 1000000000
+    echo now < 0
+    free(name)
+}

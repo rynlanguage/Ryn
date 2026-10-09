@@ -5,6 +5,8 @@
 // the self-hosted parser can reproduce the bootstrap syntax tree exactly.
 // Spans are UTF-8 byte offsets into the source text.
 
+use middle::floatlib
+
 // Token kinds. The numbering is private to the self-hosted frontend.
 pub struct Tk {
     unused: u8
@@ -644,6 +646,43 @@ extend Lexer {
         self.push(Tk::INTEGER, start, self.at, 0, value)
     }
 
+    // Reports a number that runs into identifier characters (`12abc`) or into a
+    // second decimal point (`1.2.3`), leaving `self.at` after the bad run.
+    // Returns true when such an error was reported.
+    fun malformed_number(mut self, start: u64) -> bool {
+        when is_alnum(self.byte(self.at)) || self.byte(self.at) == 95 {
+            mut run := self.at
+            while is_alnum(self.byte(run)) || self.byte(run) == 95 {
+                run += 1
+            }
+            self.at = run
+            self.fail(diag_help(
+                "R0011",
+                String("numeric literal is directly followed by letters or `_`"),
+                start,
+                run,
+                String("separate the number from the name with a space or an operator")
+            ))
+            return true
+        }
+        when self.byte(self.at) == 46 && is_digit(self.byte(self.at + 1)) {
+            mut run := self.at + 1
+            while is_digit(self.byte(run)) {
+                run += 1
+            }
+            self.at = run
+            self.fail(diag_help(
+                "R0011",
+                String("numeric literal is followed by another decimal point"),
+                start,
+                run,
+                String("a floating-point literal has one `.`; separate values with spaces or operators")
+            ))
+            return true
+        }
+        return false
+    }
+
     fun number(mut self, start: u64) {
         first := self.byte(start)
         second := self.byte(start + 1)
@@ -709,7 +748,10 @@ extend Lexer {
             cursor += 1
         }
         when is_float {
-            parsed := normalized.try_to_f64()
+            when self.malformed_number(start) {
+                return
+            }
+            parsed := floatlib::parse_f64(normalized.clone())
             when parsed.is_none() {
                 self.fail(diag(
                     "R0007",
@@ -719,12 +761,12 @@ extend Lexer {
                 ))
                 return
             }
-            value := parsed.unwrap()
-            when value - value != 0.0 {
+            bits := parsed.unwrap()
+            when (bits >> (52 as u32)) & 2047 == 2047 {
                 self.fail(diag("R0007", String("floating-point literal must be finite"), start, self.at))
                 return
             }
-            text := self.push_text(String(value))
+            text := self.push_text(floatlib::format_f64(bits))
             self.push(Tk::FLOAT, start, self.at, text, 0)
             return
         }
@@ -769,6 +811,9 @@ extend Lexer {
             }
             value = value * multiplier
             self.at = unit_end
+        }
+        when self.malformed_number(start) {
+            return
         }
         self.push(Tk::INTEGER, start, self.at, 0, value)
     }

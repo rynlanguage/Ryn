@@ -1,0 +1,17 @@
+// test: run
+// out: 7
+// out: 9000000000
+// out: 42
+use std::arena
+struct Pair {
+    x: i32,
+    y: i64,
+}
+fun main() {
+    mut a := arena::Arena::with_capacity(256 as u64)
+    p := arena::alloc(&mut a, Pair { x: 7, y: 9000000000 })
+    echo (*p).x
+    echo (*p).y
+    n := arena::alloc(&mut a, 42 as u8)
+    echo *n
+}

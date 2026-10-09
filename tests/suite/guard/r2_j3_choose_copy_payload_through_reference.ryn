@@ -1,0 +1,24 @@
+// test: run
+// out: 4
+// out: 8
+// out: 0
+enum Level {
+    Low(i32),
+    High(i32),
+    Off,
+}
+fun weight(l: &Level) -> i32 {
+    choose *l {
+        Level::Low(v) => v,
+        Level::High(v) => v * 2,
+        Level::Off => 0,
+    }
+}
+fun main() {
+    low := Level::Low(4)
+    high := Level::High(4)
+    off := Level::Off
+    echo weight(&low)
+    echo weight(&high)
+    echo weight(&off)
+}

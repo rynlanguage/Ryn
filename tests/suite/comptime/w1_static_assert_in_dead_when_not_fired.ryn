@@ -1,0 +1,9 @@
+// test: run
+// out: ok
+const DEBUG: bool = false
+fun main() {
+    when DEBUG {
+        static_assert(false, "must not fire")
+    }
+    echo "ok"
+}

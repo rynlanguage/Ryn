@@ -1,0 +1,7 @@
+use res::handle
+pub fun pass(h: handle::Handle) -> handle::Handle {
+    return h
+}
+pub fun size(h: &handle::Handle) -> i32 {
+    return 1
+}

@@ -1,0 +1,4 @@
+fun square(n: i32) -> i32 {
+    return n * n
+}
+pub const AREA: i32 = square(9)

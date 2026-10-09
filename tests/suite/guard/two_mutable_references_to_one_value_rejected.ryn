@@ -1,0 +1,9 @@
+// test: fail
+// code: R0249
+fun two(a: &mut i32, b: &mut i32) {
+    *a = 1
+}
+fun main() {
+    mut x: i32 = 1
+    two(&mut x, &mut x)
+}

@@ -1,0 +1,23 @@
+// test: run
+// out: 3
+shape Counter {
+    fun bump(mut self)
+    fun value(self) -> i32
+}
+struct C {
+    n: i32
+}
+extend C {
+    fun bump(mut self) { self.n += 1 }
+    fun value(self) -> i32 { self.n }
+}
+fun bump_twice<T: Counter>(c: T) -> T {
+    c.bump()
+    c.bump()
+    c
+}
+fun main() {
+    mut c := C { n: 1 }
+    c = bump_twice(c)
+    echo c.value()
+}

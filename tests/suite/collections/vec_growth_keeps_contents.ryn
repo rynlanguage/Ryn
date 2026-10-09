@@ -1,0 +1,15 @@
+// test: run
+// out: 1000
+// out: 1998
+// out: true
+fun main() {
+    mut v: Vec<i64> = Vec()
+    mut i: i64 = 0
+    while i < 1000 {
+        v.push(i * 2)
+        i += 1
+    }
+    echo v.len()
+    echo v.index(999)
+    echo v.capacity() >= v.len()
+}

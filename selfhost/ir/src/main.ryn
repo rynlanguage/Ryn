@@ -412,8 +412,12 @@ extend Reader {
 
     fun call_target(mut self) -> Result<bool, String> {
         tag := self.token()?
-        when tag == "Function" || tag == "TryReadFile" || tag == "ReadFileResult" || tag == "IndirectFunctionPointer" || tag == "VecSlice" {
+        when tag == "Function" || tag == "TryReadFile" || tag == "ReadFileResult" {
             self.uint()?
+            return Result::Ok(true)
+        }
+        when tag == "VecSlice" || tag == "IndirectFunctionPointer" {
+            self.ty()?
             return Result::Ok(true)
         }
         when tag == "ArgumentCount" || tag == "Argument" || tag == "SliceLen" {
@@ -423,9 +427,15 @@ extend Reader {
             self.token()?
             return Result::Ok(true)
         }
-        when tag == "Vec" || tag == "Map" || tag == "Set" {
+        when tag == "Vec" {
             self.token()?
-            self.uint()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "Map" || tag == "Set" {
+            self.token()?
+            self.ty()?
+            self.ty()?
             return Result::Ok(true)
         }
         when tag == "EnumNew" {
@@ -452,7 +462,7 @@ extend Reader {
             return Result::Ok(true)
         }
         when tag == "VecGetOption" {
-            self.uint()?
+            self.ty()?
             self.uint()?
             self.boolean()?
             return Result::Ok(true)
@@ -547,7 +557,7 @@ extend Reader {
         }
         when tag == "ArrayAsSlice" {
             self.expression()?
-            self.uint()?
+            self.ty()?
             self.uint()?
             return Result::Ok(true)
         }

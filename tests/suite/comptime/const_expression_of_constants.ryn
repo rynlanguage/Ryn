@@ -1,0 +1,8 @@
+// test: run
+// out: 42
+const WIDTH: i32 = 6
+const HEIGHT: i32 = 7
+const AREA: i32 = WIDTH * HEIGHT
+fun main() {
+    echo AREA
+}

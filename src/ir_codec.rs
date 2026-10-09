@@ -480,27 +480,31 @@ impl Encoder {
             }
             IrCallTarget::IndirectFunctionPointer(id) => {
                 self.word("IndirectFunctionPointer");
-                self.uint(*id as u64);
+                self.ty(Type::FunctionPointer(*id));
             }
             IrCallTarget::Vec(op, id) => {
                 self.word("Vec");
                 self.word(vec_op_name(*op));
-                self.uint(*id as u64);
+                self.ty(vec_elem(*id));
             }
             IrCallTarget::VecSlice(id) => {
                 self.word("VecSlice");
-                self.uint(*id as u64);
+                self.ty(vec_elem(*id));
             }
             IrCallTarget::SliceLen => self.word("SliceLen"),
             IrCallTarget::Map(op, id) => {
+                let (key, value) = map_info(*id);
                 self.word("Map");
                 self.word(map_op_name(*op));
-                self.uint(*id as u64);
+                self.ty(key);
+                self.ty(value);
             }
             IrCallTarget::Set(op, id) => {
+                let (key, value) = map_info(*id);
                 self.word("Set");
                 self.word(map_op_name(*op));
-                self.uint(*id as u64);
+                self.ty(key);
+                self.ty(value);
             }
             IrCallTarget::EnumNew { enum_id, tag } => {
                 self.word("EnumNew");
@@ -540,7 +544,7 @@ impl Encoder {
                 pop,
             } => {
                 self.word("VecGetOption");
-                self.uint(*elem_id as u64);
+                self.ty(vec_elem(*elem_id));
                 self.uint(*option_id as u64);
                 self.boolean(*pop);
             }
@@ -708,7 +712,7 @@ impl Encoder {
             } => {
                 self.word("ArrayAsSlice");
                 self.expression(array);
-                self.uint(*slice_id as u64);
+                self.ty(vec_elem(*slice_id));
                 self.uint(*length as u64);
             }
             IrExpression::ArrayIndex {
@@ -1269,12 +1273,32 @@ impl<'a> Decoder<'a> {
             "TryReadFile" => IrCallTarget::TryReadFile(self.usize()?),
             "ReadFileResult" => IrCallTarget::ReadFileResult(self.usize()?),
             "System" => IrCallTarget::System(op_by_name(SYSTEM_OP_NAMES, self.word()?)?),
-            "IndirectFunctionPointer" => IrCallTarget::IndirectFunctionPointer(self.usize()?),
-            "Vec" => IrCallTarget::Vec(op_by_name(VEC_OP_NAMES, self.word()?)?, self.usize()?),
-            "VecSlice" => IrCallTarget::VecSlice(self.usize()?),
+            "IndirectFunctionPointer" => match self.ty()? {
+                Type::FunctionPointer(id) => IrCallTarget::IndirectFunctionPointer(id),
+                other => {
+                    return Err(format!(
+                        "indirect call through a non-function type {other:?}"
+                    ));
+                }
+            },
+            "Vec" => {
+                let op = op_by_name(VEC_OP_NAMES, self.word()?)?;
+                IrCallTarget::Vec(op, intern_vec_elem(self.ty()?))
+            }
+            "VecSlice" => IrCallTarget::VecSlice(intern_vec_elem(self.ty()?)),
             "SliceLen" => IrCallTarget::SliceLen,
-            "Map" => IrCallTarget::Map(op_by_name(MAP_OP_NAMES, self.word()?)?, self.usize()?),
-            "Set" => IrCallTarget::Set(op_by_name(MAP_OP_NAMES, self.word()?)?, self.usize()?),
+            "Map" => {
+                let op = op_by_name(MAP_OP_NAMES, self.word()?)?;
+                let key = self.ty()?;
+                let value = self.ty()?;
+                IrCallTarget::Map(op, intern_map(key, value))
+            }
+            "Set" => {
+                let op = op_by_name(MAP_OP_NAMES, self.word()?)?;
+                let key = self.ty()?;
+                let value = self.ty()?;
+                IrCallTarget::Set(op, intern_map(key, value))
+            }
             "EnumNew" => IrCallTarget::EnumNew {
                 enum_id: self.usize()?,
                 tag: self.usize()?,
@@ -1295,7 +1319,7 @@ impl<'a> Decoder<'a> {
                 failure: op_by_name(SYSTEM_OP_NAMES, self.word()?)?,
             },
             "VecGetOption" => IrCallTarget::VecGetOption {
-                elem_id: self.usize()?,
+                elem_id: intern_vec_elem(self.ty()?),
                 option_id: self.usize()?,
                 pop: self.boolean()?,
             },
@@ -1400,7 +1424,7 @@ impl<'a> Decoder<'a> {
             },
             "ArrayAsSlice" => IrExpression::ArrayAsSlice {
                 array: Box::new(self.expression()?),
-                slice_id: self.usize()?,
+                slice_id: intern_vec_elem(self.ty()?),
                 length: self.usize()?,
             },
             "ArrayIndex" => IrExpression::ArrayIndex {
@@ -2024,4 +2048,3 @@ const BINARY_OP_NAMES: &[(&str, BinaryOp)] = &[
     ("And", BinaryOp::And),
     ("Or", BinaryOp::Or),
 ];
-

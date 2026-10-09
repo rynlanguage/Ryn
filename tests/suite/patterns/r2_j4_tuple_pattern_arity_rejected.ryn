@@ -1,0 +1,7 @@
+// test: fail
+// code: R0235
+// msg: tuple pattern has 3 element(s) but the value has 2
+fun main() {
+    t := (1 as i32, 2 as i32)
+    echo choose t { (a, b, c) => 0 }
+}

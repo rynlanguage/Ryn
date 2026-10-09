@@ -1,0 +1,12 @@
+// test: run
+// out: 11
+// out: 12
+// out: 2
+use left
+use right
+use base
+fun main() {
+    echo left::bump()
+    echo right::bump()
+    echo base::calls()
+}

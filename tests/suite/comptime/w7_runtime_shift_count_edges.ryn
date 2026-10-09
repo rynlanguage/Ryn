@@ -1,0 +1,36 @@
+// test: run
+// out: 0
+// out: -1
+// out: 1
+// out: -1
+// out: 1
+// out: -9223372036854775808
+// out: 0
+// out: -1
+// out: 0
+fun main() {
+    mut one8: u8 = 1
+    mut c8: u32 = 8
+    echo one8 << c8
+    mut n8: i8 = -128
+    mut c7: u32 = 7
+    echo n8 >> c7
+    mut hi: u32 = 2147483648
+    mut c31: u32 = 31
+    echo hi >> c31
+    mut m1: i32 = -1
+    echo m1 >> c31
+    mut big: u64 = 18446744073709551615
+    mut c63: u32 = 63
+    echo big >> c63
+    mut i: i64 = 1
+    echo i << c63
+    mut u: u64 = 1
+    mut c64: u32 = 64
+    echo u << c64
+    mut neg16: i16 = -1
+    mut c100: u32 = 100
+    echo neg16 >> c100
+    mut pos16: u16 = 65535
+    echo pos16 >> c100
+}

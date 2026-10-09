@@ -1,0 +1,6 @@
+// test: fail
+// code: R0210
+use util
+fun main() {
+    echo util::absent()
+}

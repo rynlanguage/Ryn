@@ -1,0 +1,35 @@
+// test: run
+// out: 1000
+// out: 0.5
+// out: 5
+// out: 2.5
+// out: -0
+// out: inf
+// out: NaN
+// out: -inf
+// out: 12345.5
+// out: 12345.5
+// out: 12345.5
+// out: 12345.5
+// out: 12345.5
+fun parse_f64(text: str) -> f64 {
+    choose String(text).try_to_f64() {
+        Option::Some(value) => value,
+        Option::None => 12345.5
+    }
+}
+fun main() {
+    echo parse_f64("1e3")
+    echo parse_f64(".5")
+    echo parse_f64("5.")
+    echo parse_f64("+2.5")
+    echo parse_f64("-0")
+    echo parse_f64("1e400")
+    echo parse_f64("NaN")
+    echo parse_f64("-inf")
+    echo parse_f64("1_0")
+    echo parse_f64(" 1")
+    echo parse_f64("e5")
+    echo parse_f64("0x10")
+    echo parse_f64("")
+}

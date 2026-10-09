@@ -1,0 +1,17 @@
+// test: run
+// out: a
+// out: b
+// out: b
+fun eat(s: String) {
+    echo s
+}
+fun main() {
+    mut s := String("a")
+    mut i: i32 = 0
+    while i < 2 {
+        eat(s)
+        s = String("b")
+        i += 1
+    }
+    echo s
+}

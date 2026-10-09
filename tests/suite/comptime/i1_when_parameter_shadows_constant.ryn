@@ -1,0 +1,13 @@
+// test: run
+// out: param else
+const FLAG: bool = true
+fun pick(FLAG: bool) {
+    when FLAG {
+        echo "param taken"
+    } else {
+        echo "param else"
+    }
+}
+fun main() {
+    pick(false)
+}

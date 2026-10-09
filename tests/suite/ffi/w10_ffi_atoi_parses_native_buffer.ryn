@@ -1,0 +1,37 @@
+// test: run
+// out: -42
+// out: 17
+// out: 0
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(p: *u8);
+extern "C" fun atoi(text: *u8) -> i32;
+fun put8(address: u64, value: u8) {
+    p := address as *u8
+    *p = value
+}
+fun main() {
+    signed := malloc(8 as u64)
+    s := signed as u64
+    put8(s, 32 as u8)
+    put8(s + 1 as u64, 32 as u8)
+    put8(s + 2 as u64, 45 as u8)
+    put8(s + 3 as u64, 52 as u8)
+    put8(s + 4 as u64, 50 as u8)
+    put8(s + 5 as u64, 0 as u8)
+    echo atoi(signed)
+    trailing := malloc(8 as u64)
+    t := trailing as u64
+    put8(t, 49 as u8)
+    put8(t + 1 as u64, 55 as u8)
+    put8(t + 2 as u64, 120 as u8)
+    put8(t + 3 as u64, 0 as u8)
+    echo atoi(trailing)
+    word := malloc(4 as u64)
+    w := word as u64
+    put8(w, 120 as u8)
+    put8(w + 1 as u64, 0 as u8)
+    echo atoi(word)
+    free(signed)
+    free(trailing)
+    free(word)
+}

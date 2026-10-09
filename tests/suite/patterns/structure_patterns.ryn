@@ -1,0 +1,20 @@
+// test: run
+// out: 0
+// out: 5
+// out: 8
+// out: 9
+struct Point { x: i32, y: i32 }
+fun where_is(p: Point) -> i32 {
+    choose p {
+        Point { x: 0, y: 0 } => 0,
+        Point { x: 0, y } => y,
+        Point { x, y: 0 } => x * 2,
+        _ => 9
+    }
+}
+fun main() {
+    echo where_is(Point { x: 0, y: 0 })
+    echo where_is(Point { x: 0, y: 5 })
+    echo where_is(Point { x: 4, y: 0 })
+    echo where_is(Point { x: 1, y: 1 })
+}

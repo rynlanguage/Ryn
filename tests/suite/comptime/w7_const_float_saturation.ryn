@@ -1,0 +1,27 @@
+// test: run
+// out: 2147483647
+// out: -2147483648
+// out: 0
+// out: 255
+// out: 255
+// out: 0
+// out: 18446744073709551615
+// out: 7
+const A: i32 = 1e20 as i32
+const B: i32 = (-1e20) as i32
+const C: i64 = (-0.9) as i64
+const D: u8 = 255.9 as u8
+const E: u8 = 256.0 as u8
+const F: u8 = (-3.99) as u8
+const G: u64 = 1e30 as u64
+const H: i32 = 7.9 as i32
+fun main() {
+    echo A
+    echo B
+    echo C
+    echo D
+    echo E
+    echo F
+    echo G
+    echo H
+}

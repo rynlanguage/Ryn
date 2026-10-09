@@ -1,0 +1,13 @@
+// test: run
+// out: 0
+// out: true
+// out: true
+// out: true
+// exit: 0
+fun main() {
+    echo arg_count()
+    text := String(arg(0))
+    echo text.is_empty()
+    echo arg(3) == ""
+    echo String(arg(3)).is_empty()
+}

@@ -1,0 +1,9 @@
+// test: fail
+// code: R0240
+fun main() {
+    mut v: Vec<i32> = Vec()
+    v.push(1)
+    s := v.as_slice()
+    v.push(2)
+    echo s.len()
+}

@@ -1,0 +1,10 @@
+// test: fail
+// code: R0235
+fun inner() -> Result<i32, String> {
+    return Result::Ok(1)
+}
+fun main() {
+    echo choose inner() {
+        Result::Ok(v) => v
+    }
+}

@@ -1,0 +1,17 @@
+// test: run
+// out: 6
+// out: 16
+// out: 0
+enum Shape { Circle(i32), Square(i32), Empty }
+fun area(s: Shape) -> i32 {
+    choose s {
+        Shape::Circle(r) => r * 3,
+        Shape::Square(w) => w * w,
+        Shape::Empty => 0
+    }
+}
+fun main() {
+    echo area(Shape::Circle(2))
+    echo area(Shape::Square(4))
+    echo area(Shape::Empty)
+}

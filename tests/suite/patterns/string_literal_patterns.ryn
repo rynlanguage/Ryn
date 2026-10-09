@@ -1,0 +1,16 @@
+// test: run
+// out: 1
+// out: 2
+// out: 0
+fun name(s: str) -> i32 {
+    choose s {
+        "ryn" => 1,
+        "lang" => 2,
+        _ => 0
+    }
+}
+fun main() {
+    echo name("ryn")
+    echo name("lang")
+    echo name("zig")
+}

@@ -1,0 +1,6 @@
+// test: fail
+// code: R0465
+struct Pair { a: i32 }
+fun main() {
+    echo field_count()
+}

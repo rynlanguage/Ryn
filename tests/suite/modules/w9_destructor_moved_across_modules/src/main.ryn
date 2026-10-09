@@ -1,0 +1,18 @@
+// test: run
+// out: made
+// out: passed
+// out: 1
+// out: body
+// out: after
+// out: closed
+use res::handle
+use res::relay
+fun main() {
+    h := handle::make()
+    echo "made"
+    h2 := relay::pass(h)
+    echo "passed"
+    echo relay::size(&h2)
+    echo "body"
+    echo "after"
+}

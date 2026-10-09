@@ -1,0 +1,6 @@
+// test: fail
+// code: R0464
+const FLAG: i32 = true
+fun main() {
+    echo FLAG
+}

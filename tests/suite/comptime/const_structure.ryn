@@ -1,0 +1,17 @@
+// test: run
+// out: base-v2
+// out: 6
+// out: 0.5
+struct Config { name: String, size: u32, ratio: f64 }
+fun make() -> Config {
+    mut c := Config { name: String("base"), size: 4, ratio: 0.5 }
+    c.size += 2
+    c.name.append("-v2")
+    return c
+}
+const CONFIG: Config = make()
+fun main() {
+    echo CONFIG.name
+    echo CONFIG.size
+    echo CONFIG.ratio
+}

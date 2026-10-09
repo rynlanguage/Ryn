@@ -1,0 +1,13 @@
+// test: run
+// out: 3
+// out: 10
+// out: 30
+fun main() {
+    mut v: Vec<i32> = Vec()
+    v.push(10)
+    v.push(20)
+    v.push(30)
+    echo v.len()
+    echo v.index(0)
+    echo v.index(2)
+}

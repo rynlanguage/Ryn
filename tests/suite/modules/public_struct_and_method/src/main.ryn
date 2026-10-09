@@ -1,0 +1,7 @@
+// test: run
+// out: 12
+use shapes
+fun main() {
+    r := shapes::Rect { w: 3, h: 4 }
+    echo r.area()
+}

@@ -1,0 +1,19 @@
+// test: run
+// exit: 1
+// err: must use ordered in-bounds
+// out: a
+// out: é€𝄞
+// out:
+// out: aé€𝄞zß
+// out: ß
+// out: 195
+fun main() {
+    s := String("aé€𝄞zß")
+    echo s.substring(0, 1)
+    echo s.substring(1, 4)
+    echo s.substring(2, 2)
+    echo s.substring(0, 6)
+    echo s.substring(5, 6)
+    echo s.byte_at(1)
+    echo s.substring(3, 2)
+}

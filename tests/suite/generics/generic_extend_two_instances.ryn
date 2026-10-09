@@ -1,0 +1,20 @@
+// test: run
+// out: 40000000000
+// out: y
+// out: 2
+struct Stack<T> { items: Vec<T> }
+extend<T> Stack<T> {
+    pub fun push_item(mut self, v: T) { self.items.push(v) }
+    pub fun size(self) -> u64 { return self.items.len() }
+    pub fun top(self) -> T { return self.items.index(self.items.len() - 1) }
+}
+fun main() {
+    mut a := Stack::<i64> { items: Vec<i64>() }
+    a.push_item(40000000000)
+    mut b := Stack::<String> { items: Vec<String>() }
+    b.push_item(String("x"))
+    b.push_item(String("y"))
+    echo a.top()
+    echo b.top()
+    echo b.size()
+}

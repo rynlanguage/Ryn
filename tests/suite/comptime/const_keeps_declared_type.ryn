@@ -1,0 +1,8 @@
+// test: run
+// out: 255
+const SMALL: u8 = 250
+fun main() {
+    x := SMALL
+    y: u8 = x + 5
+    echo y
+}

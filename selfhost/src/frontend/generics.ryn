@@ -11,6 +11,11 @@
 
 use frontend::lexer
 
+// Compile-time metadata functions take explicit type arguments but are not generic functions.
+fun is_comptime_intrinsic(name: String) -> bool {
+    return name == "field_count" || name == "variant_count" || name == "type_name" || name == "has_field"
+}
+
 struct TypeKind {
     unused: u8
 }
@@ -198,6 +203,7 @@ struct FunctionNode {
     type_params: Vec<String>,
     bound_params: Vec<String>,
     bound_lists: Vec<String>,
+    bound_names: Vec<String>,
     public: bool,
     module_path: String,
     param_names: Vec<String>,
@@ -208,6 +214,16 @@ struct FunctionNode {
     body: Vec<u64>,
     has_value: bool,
     value: u64,
+    start: u64,
+    end: u64
+}
+
+#[derive(Clone)]
+struct StructNode {
+    name: String,
+    raw: String,
+    field_names: Vec<String>,
+    field_types: Vec<u64>,
     start: u64,
     end: u64
 }
@@ -240,7 +256,7 @@ struct Tree {
     use_count: u64,
     use_paths: Vec<String>,
     use_aliases: Vec<String>,
-    structs_raw: String,
+    structs: Vec<StructNode>,
     struct_count: u64,
     aliases_raw: String,
     alias_count: u64,
@@ -248,10 +264,21 @@ struct Tree {
     extend_count: u64,
     shapes_raw: String,
     shape_count: u64,
+    shape_names: Vec<String>,
+    shape_methods: Vec<String>,
+    check_allowed: Map<String, String>,
+    check_shapes: Map<String, String>,
+    check_type_parameter: Map<String, String>,
+    check_failed: bool,
+    check_message: String,
+    check_help: String,
+    check_start: u64,
+    check_end: u64,
     templates: Map<String, u64>,
     known: Map<String, u64>,
     specializations: Map<String, String>,
-    pending: Vec<u64>
+    pending: Vec<u64>,
+    generated_enums: u64
 }
 
 fun word(text: str) -> String {
@@ -851,6 +878,7 @@ extend Tree {
             type_params: Vec<String>(),
             bound_params: Vec<String>(),
             bound_lists: Vec<String>(),
+            bound_names: Vec<String>(),
             public: false,
             module_path: String(),
             param_names: Vec<String>(),
@@ -875,8 +903,9 @@ extend Tree {
         while index < bound_count && !self.failed {
             function.bound_params.push(self.string())
             list_start := self.at
-            self.strings()
+            names := self.strings()
             function.bound_lists.push(self.text.slice(list_start, self.at))
+            function.bound_names.push(join(names, "|"))
             index += 1
         }
         function.public = self.boolean()
@@ -943,14 +972,22 @@ extend Tree {
 
     // Declarations that pass through unchanged are decoded only to find
     // where they end.
-    fun skip_struct(mut self) {
-        self.string()
+    fun decode_struct(mut self) {
+        start_text := self.at
+        mut definition := StructNode {
+            name: self.string(),
+            raw: String(),
+            field_names: Vec<String>(),
+            field_types: Vec<u64>(),
+            start: 0,
+            end: 0
+        }
         self.strings()
         count := self.uint()
         mut index: u64 = 0
         while index < count && !self.failed {
-            self.string()
-            self.decode_type()
+            definition.field_names.push(self.string())
+            definition.field_types.push(self.decode_type())
             self.boolean()
             self.uint()
             self.uint()
@@ -963,8 +1000,41 @@ extend Tree {
         }
         self.strings()
         self.string()
-        self.uint()
-        self.uint()
+        self.string()
+        definition.start = self.uint()
+        definition.end = self.uint()
+        definition.raw = self.text.slice(start_text, self.at)
+        self.structs.push(definition)
+    }
+
+    fun find_struct(self, name: String) -> u64 {
+        // Returns the structure index plus one, or zero when absent.
+        mut index: u64 = 0
+        while index < self.structs.len() {
+            when self.structs[index].name == name {
+                return index + 1
+            }
+            index += 1
+        }
+        return 0
+    }
+
+    fun has_struct_placeholders(self) -> bool {
+        for definition in self.structs.clone() {
+            when starts_with_text(definition.name.clone(), "$RynStructParam#") {
+                return true
+            }
+        }
+        return false
+    }
+
+    fun has_enum_placeholders(self) -> bool {
+        for definition in self.enums.clone() {
+            when starts_with_text(definition.name.clone(), "$RynEnumParam#") {
+                return true
+            }
+        }
+        return false
     }
 
     fun skip_alias(mut self) {
@@ -1005,11 +1075,14 @@ extend Tree {
     }
 
     fun skip_shape(mut self) {
-        self.string()
+        shape_name := self.string()
         count := self.uint()
+        mut methods := String("|")
         mut index: u64 = 0
         while index < count && !self.failed {
-            self.string()
+            method_name := self.string()
+            methods.append(method_name)
+            methods.push('|')
             parameters := self.uint()
             mut parameter: u64 = 0
             while parameter < parameters && !self.failed {
@@ -1032,6 +1105,8 @@ extend Tree {
             self.uint()
             index += 1
         }
+        self.shape_names.push(shape_name)
+        self.shape_methods.push(methods)
         self.string()
         self.uint()
         self.uint()
@@ -1050,17 +1125,19 @@ extend Tree {
             path := self.strings()
             self.uint()
             self.uint()
+            mut local_name := path[path.len() - 1]
+            when self.present() {
+                local_name = self.string()
+            }
             self.uses_raw.append(self.text.slice(start, self.at))
-            self.use_aliases.push(path[path.len() - 1])
+            self.use_aliases.push(local_name)
             self.use_paths.push(join(path, "::"))
             index += 1
         }
         self.struct_count = self.uint()
         index = 0
         while index < self.struct_count && !self.failed {
-            start := self.at
-            self.skip_struct()
-            self.structs_raw.append(self.text.slice(start, self.at))
+            self.decode_struct()
             index += 1
         }
         enum_count := self.uint()
@@ -1102,6 +1179,73 @@ extend Tree {
         self.skip_space()
         return !self.failed && self.at == self.text.len()
     }
+}
+
+// The template name of a generic user enum: the text between `prefix_len` and the last `#`
+// (`Outcome` in `$RynEnum#Outcome#1`). Empty when the name has no such separator.
+fun enum_template(name: String, prefix_len: u64) -> String {
+    mut last: u64 = 0
+    mut found := false
+    mut index: u64 = prefix_len
+    while index < name.len() {
+        when name.byte_at(index) == 35 {
+            last = index
+            found = true
+        }
+        index += 1
+    }
+    when !found {
+        return String()
+    }
+    return name.slice(prefix_len, last)
+}
+
+// Whether a `$RynEnumParam#<Template>#<n>` placeholder stands for `$RynEnum#<Template>#<k>`
+// (mirrors `generics::enum_placeholder_matches`).
+fun enum_placeholder_matches(pattern: String, actual: String) -> bool {
+    when !starts_with_text(pattern.clone(), "$RynEnumParam#") || !starts_with_text(actual.clone(), "$RynEnum#") {
+        return false
+    }
+    pattern_template := enum_template(pattern.clone(), 14)
+    actual_template := enum_template(actual, 9)
+    return !pattern_template.is_empty() && pattern_template == actual_template
+}
+
+fun has_name(names: Vec<String>, name: String) -> bool {
+    for candidate in names {
+        when candidate == name {
+            return true
+        }
+    }
+    return false
+}
+
+fun same_names(left: Vec<String>, right: Vec<String>) -> bool {
+    when left.len() != right.len() {
+        return false
+    }
+    mut index: u64 = 0
+    while index < left.len() {
+        when left[index] != right[index] {
+            return false
+        }
+        index += 1
+    }
+    return true
+}
+
+fun same_counts(left: Vec<u64>, right: Vec<u64>) -> bool {
+    when left.len() != right.len() {
+        return false
+    }
+    mut index: u64 = 0
+    while index < left.len() {
+        when left[index] != right[index] {
+            return false
+        }
+        index += 1
+    }
+    return true
 }
 
 fun join(values: Vec<String>, separator: str) -> String {
@@ -1550,6 +1694,153 @@ fun diag_help(code: str, message: String, start: u64, end: u64, help: String) ->
     return lexer::diag_help(code, message, start, end, help)
 }
 
+fun last_segment(name: String) -> String {
+    mut start: u64 = 0
+    mut at: u64 = 0
+    while at + 1 < name.len() {
+        when name.byte_at(at) == 58 && name.byte_at(at + 1) == 58 {
+            start = at + 2
+        }
+        at += 1
+    }
+    return name.slice(start, name.len())
+}
+
+fun contains_text(haystack: String, needle: String) -> bool {
+    return haystack.find(needle).is_some()
+}
+
+extend Tree {
+    // A generic body is analyzed only after it is specialized, when `T` is a concrete type that may
+    // have more methods than its shape bound. Mirrors `check_bounded_method_calls` in generics.rs.
+    fun note_bound_call(mut self, receiver: u64, method: String, start: u64, end: u64) {
+        when self.check_failed {
+            return
+        }
+        node := self.exprs[receiver]
+        when node.kind != Ex::NAME || !self.check_allowed.contains_key(node.text.clone()) {
+            return
+        }
+        mut needle := String("|")
+        needle.append(method.clone())
+        needle.push('|')
+        when contains_text(self.check_allowed.get(node.text.clone()).unwrap(), needle) {
+            return
+        }
+        mut message := String("method `")
+        message.append(method.clone())
+        message.append("` is not part of the bound `")
+        message.append(self.check_shapes.get(node.text.clone()).unwrap())
+        message.append("` of type parameter `")
+        message.append(self.check_type_parameter.get(node.text.clone()).unwrap())
+        message.push('`')
+        mut help := String("a generic function may only call the methods its shape bound declares; add `")
+        help.append(method)
+        help.append("` to the shape")
+        self.check_failed = true
+        self.check_message = message
+        self.check_help = help
+        self.check_start = start
+        self.check_end = end
+    }
+
+    fun collect_lets(self, statements: Vec<u64>, names: Map<String, bool>) -> Map<String, bool> {
+        mut found := names
+        for statement in statements {
+            node := self.stmts[statement]
+            when node.kind == St::LET || node.kind == St::FOR || node.kind == St::FOR_EACH {
+                found.insert(node.text.clone(), true)
+            }
+            when node.kind == St::IF || node.kind == St::FOR || node.kind == St::FOR_EACH || node.kind == St::WHILE || node.kind == St::DEFER {
+                found = self.collect_lets(node.body.clone(), found)
+                found = self.collect_lets(node.body2.clone(), found)
+            }
+        }
+        return found
+    }
+
+    fun check_function_bounds(mut self, function_index: u64) -> Result<bool, lexer::Diag> {
+        function := self.functions[function_index]
+        self.check_allowed = Map<String, String>()
+        self.check_shapes = Map<String, String>()
+        self.check_type_parameter = Map<String, String>()
+        self.check_failed = false
+        rebound := self.collect_lets(function.body.clone(), Map<String, bool>())
+        mut parameter: u64 = 0
+        while parameter < function.param_names.len() {
+            ty := self.types[function.param_types[parameter]]
+            name := function.param_names[parameter]
+            parameter += 1
+            when ty.kind != TypeKind::PARAM || rebound.contains_key(name.clone()) {
+                continue
+            }
+            mut bound_index: u64 = 0
+            while bound_index < function.bound_params.len() {
+                when function.bound_params[bound_index] == ty.name {
+                    mut allowed := String("|")
+                    mut known := true
+                    mut listed := String()
+                    for bound in split_text(function.bound_names[bound_index].clone(), 124 as u8) {
+                        when bound.is_empty() {
+                            continue
+                        }
+                        mut found := false
+                        mut shape_index: u64 = 0
+                        while shape_index < self.shape_names.len() {
+                            when self.shape_names[shape_index] == bound || last_segment(self.shape_names[shape_index].clone()) == last_segment(bound.clone()) {
+                                allowed.append(self.shape_methods[shape_index].slice(1, self.shape_methods[shape_index].len()))
+                                found = true
+                                break
+                            }
+                            shape_index += 1
+                        }
+                        when !found {
+                            known = false
+                        }
+                        when !listed.is_empty() {
+                            listed.append(" + ")
+                        }
+                        listed.append(bound)
+                    }
+                    when known && !listed.is_empty() {
+                        self.check_allowed.insert(name.clone(), allowed)
+                        self.check_shapes.insert(name.clone(), listed)
+                        self.check_type_parameter.insert(name.clone(), ty.name.clone())
+                    }
+                }
+                bound_index += 1
+            }
+        }
+        when self.check_allowed.is_empty() {
+            return Result::Ok(true)
+        }
+        self.copy_stmts(function.body.clone(), Map<String, u64>())
+        when function.has_value {
+            self.copy_expr(function.value, Map<String, u64>())
+        }
+        self.check_allowed = Map<String, String>()
+        when self.check_failed {
+            return Result::Err(diag_help("R0450", self.check_message.clone(), self.check_start, self.check_end, self.check_help.clone()))
+        }
+        return Result::Ok(true)
+    }
+}
+
+fun split_text(value: String, separator: u8) -> Vec<String> {
+    mut parts := Vec<String>()
+    mut start: u64 = 0
+    mut at: u64 = 0
+    while at < value.len() {
+        when value.byte_at(at) == separator {
+            parts.push(value.slice(start, at))
+            start = at + 1
+        }
+        at += 1
+    }
+    parts.push(value.slice(start, value.len()))
+    return parts
+}
+
 extend Tree {
     fun type_key(self, ty: u64) -> String {
         node := self.types[ty]
@@ -1708,6 +1999,257 @@ extend Tree {
         return false
     }
 
+    // A tuple structure whose element types still mention type parameters: a template.
+    fun is_tuple_template(self, definition: StructNode) -> bool {
+        when !starts_with_text(definition.name.clone(), "$RynTuple#") {
+            return false
+        }
+        for field in definition.field_types.clone() {
+            when self.type_has_parameter(field) {
+                return true
+            }
+        }
+        return false
+    }
+
+    // The tuple structure with the given element types, registered on first use
+    // (mirrors `generics::tuple_type`). Returns the named type.
+    fun ensure_tuple(mut self, fields: Vec<u64>, start: u64, end: u64) -> u64 {
+        mut keys := Vec<String>()
+        for field in fields.clone() {
+            keys.push(self.type_key(field))
+        }
+        mut name := String("$RynTuple#")
+        name.append(join(keys, ","))
+        when self.find_struct(name.clone()) == 0 {
+            mut raw := enc_str(name.clone())
+            raw.append(enc_uint(0))
+            raw.append(enc_uint(fields.len()))
+            mut names := Vec<String>()
+            mut index: u64 = 0
+            for field in fields.clone() {
+                mut field_name := String("_")
+                field_name.append(String(index))
+                raw.append(enc_str(field_name.clone()))
+                raw.append(self.encode_type(field))
+                raw.append(enc_bool(false))
+                raw.append(enc_span(start, end))
+                names.push(field_name)
+                index += 1
+            }
+            raw.append(enc_bool(false))
+            raw.append(enc_bool(false))
+            raw.append(word("-"))
+            raw.append(enc_uint(0))
+            raw.append(enc_str(String()))
+            raw.append(enc_str(String()))
+            raw.append(enc_span(start, end))
+            self.structs.push(StructNode {
+                name: name.clone(),
+                raw: raw,
+                field_names: names,
+                field_types: fields,
+                start: start,
+                end: end
+            })
+        }
+        return self.named(TypeKind::NAMED, name, start, end)
+    }
+
+    // Whether the program has a placeholder of the generic user enum `enum_name` with a
+    // variant `variant` (mirrors the check in `infer_type`).
+    fun has_enum_placeholder(self, enum_name: String, variant: String) -> bool {
+        mut prefix := String("$RynEnumParam#")
+        prefix.append(enum_name)
+        prefix.push('#')
+        mut index: u64 = 0
+        while index < self.enums.len() {
+            definition := self.enums[index]
+            when definition.name.starts_with(prefix.clone()) && has_name(definition.variant_names.clone(), variant.clone()) {
+                return true
+            }
+            index += 1
+        }
+        return false
+    }
+
+    // The instance of a generic user enum that `Enum::Variant(payload)` builds, found through
+    // the enum's placeholder (mirrors `generics::generic_enum_instance`). Returns 0 when unknown.
+    fun generic_enum_instance(mut self, enum_name: String, variant: String, payload: Vec<u64>, start: u64, end: u64) -> u64 {
+        mut prefix := String("$RynEnumParam#")
+        prefix.append(enum_name.clone())
+        prefix.push('#')
+        mut placeholder: u64 = 0
+        mut found := false
+        while placeholder < self.enums.len() && !found {
+            when self.enums[placeholder].name.starts_with(prefix.clone()) && has_name(self.enums[placeholder].variant_names.clone(), variant.clone()) {
+                found = true
+            } else {
+                placeholder += 1
+            }
+        }
+        when !found {
+            return 0
+        }
+        definition := self.enums[placeholder]
+        mut variant_index: u64 = 0
+        mut offset: u64 = 0
+        while definition.variant_names[variant_index] != variant {
+            offset += definition.variant_counts[variant_index]
+            variant_index += 1
+        }
+        when definition.variant_counts[variant_index] != payload.len() {
+            return 0
+        }
+        mut substitutions := Map<String, u64>()
+        mut position: u64 = 0
+        while position < payload.len() {
+            unified := self.unify(definition.fields[offset + position], payload[position], Map<String, u64>(), start, end)
+            when unified.is_err() {
+                return 0
+            }
+            merged := self.merge(substitutions, unified.unwrap(), start, end)
+            when merged.is_err() {
+                return 0
+            }
+            substitutions = merged.unwrap()
+            position += 1
+        }
+        mut variant_names := Vec<String>()
+        mut variant_counts := Vec<u64>()
+        mut fields := Vec<u64>()
+        mut field: u64 = 0
+        mut variant_position: u64 = 0
+        while variant_position < definition.variant_names.len() {
+            count := definition.variant_counts[variant_position]
+            variant_names.push(definition.variant_names[variant_position].clone())
+            variant_counts.push(count)
+            mut offset_field: u64 = 0
+            while offset_field < count {
+                substituted := self.substitute_type(definition.fields[field], substitutions.clone())
+                when self.type_has_parameter(substituted) {
+                    return 0
+                }
+                fields.push(substituted)
+                field += 1
+                offset_field += 1
+            }
+            variant_position += 1
+        }
+        mut instance_prefix := String("$RynEnum#")
+        instance_prefix.append(enum_name.clone())
+        instance_prefix.push('#')
+        mut existing: u64 = 0
+        while existing < self.enums.len() {
+            candidate := self.enums[existing]
+            when candidate.name.starts_with(instance_prefix.clone()) && same_names(candidate.variant_names.clone(), variant_names.clone())
+                && same_counts(candidate.variant_counts.clone(), variant_counts.clone()) && self.same_types(candidate.fields.clone(), fields.clone()) {
+                return self.named(TypeKind::NAMED, candidate.name.clone(), start, end)
+            }
+            existing += 1
+        }
+        mut name := instance_prefix.clone()
+        name.append("generic")
+        name.append(String(self.generated_enums))
+        self.generated_enums += 1
+        mut raw := enc_str(name.clone())
+        raw.append(enc_uint(0))
+        raw.append(enc_uint(variant_names.len()))
+        mut raw_field: u64 = 0
+        mut raw_variant: u64 = 0
+        while raw_variant < variant_names.len() {
+            raw.append(enc_str(variant_names[raw_variant].clone()))
+            raw.append(enc_uint(variant_counts[raw_variant]))
+            mut count_index: u64 = 0
+            while count_index < variant_counts[raw_variant] {
+                raw.append(self.encode_type(fields[raw_field]))
+                raw_field += 1
+                count_index += 1
+            }
+            raw.append(enc_span(start, end))
+            raw_variant += 1
+        }
+        raw.append(enc_bool(false))
+        raw.append(enc_str(String()))
+        raw.append(enc_span(start, end))
+        self.enums.push(EnumNode {
+            name: name.clone(),
+            raw: raw,
+            variant_names: variant_names,
+            variant_counts: variant_counts,
+            fields: fields,
+            start: start,
+            end: end
+        })
+        return self.named(TypeKind::NAMED, name, start, end)
+    }
+
+    // Whether two lists of types are equal by their keys.
+    fun same_types(self, left: Vec<u64>, right: Vec<u64>) -> bool {
+        when left.len() != right.len() {
+            return false
+        }
+        mut index: u64 = 0
+        while index < left.len() {
+            when self.type_key(left[index]) != self.type_key(right[index]) {
+                return false
+            }
+            index += 1
+        }
+        return true
+    }
+
+    // The `Option` instance whose `Some` payload is `payload`, created when the program has
+    // none (mirrors `generics::option_type`). Returns the named type.
+    fun ensure_option(mut self, payload: u64, start: u64, end: u64) -> u64 {
+        payload_key := self.type_key(payload)
+        mut index: u64 = 0
+        while index < self.enums.len() {
+            definition := self.enums[index]
+            when starts_with_text(definition.name.clone(), "$RynOption#") && definition.variant_names.len() == 2
+                && definition.variant_names[0] == "Some" && definition.variant_counts[0] == 1
+                && definition.variant_names[1] == "None" && definition.variant_counts[1] == 0
+                && self.type_key(definition.fields[0]) == payload_key {
+                return self.named(TypeKind::NAMED, definition.name.clone(), start, end)
+            }
+            index += 1
+        }
+        mut name := String("$RynOption#generic")
+        name.append(String(self.generated_enums))
+        self.generated_enums += 1
+        mut raw := enc_str(name.clone())
+        raw.append(enc_uint(0))
+        raw.append(enc_uint(2))
+        raw.append(enc_str(String("Some")))
+        raw.append(enc_uint(1))
+        raw.append(self.encode_type(payload))
+        raw.append(enc_span(start, end))
+        raw.append(enc_str(String("None")))
+        raw.append(enc_uint(0))
+        raw.append(enc_span(start, end))
+        raw.append(enc_bool(false))
+        raw.append(enc_str(String()))
+        raw.append(enc_span(start, end))
+        mut variant_names := Vec<String>()
+        variant_names.push(String("Some"))
+        variant_names.push(String("None"))
+        mut variant_counts := Vec<u64>()
+        variant_counts.push(1)
+        variant_counts.push(0)
+        mut fields := Vec<u64>()
+        fields.push(payload)
+        self.enums.push(EnumNode {
+            name: name.clone(),
+            raw: raw,
+            variant_names: variant_names,
+            variant_counts: variant_counts,
+            fields: fields,
+            start: start,
+            end: end
+        })
+        return self.named(TypeKind::NAMED, name, start, end)
+    }
+
     fun enum_has_type_parameters(self, index: u64) -> bool {
         for field in self.enums[index].fields.clone() {
             when self.type_has_parameter(field) {
@@ -1730,11 +2272,121 @@ extend Tree {
         return 0
     }
 
+    // A type as a diagnostic shows it (mirrors `generics::display_key`): tuples and enum
+    // instances appear in their source forms instead of their internal names.
+    fun display_key(self, ty: u64) -> String {
+        node := self.types[ty]
+        kind := node.kind
+        when kind == TypeKind::NAMED {
+            return self.display_name(node.name.clone())
+        }
+        when kind == TypeKind::PARAM {
+            return node.name
+        }
+        when kind == TypeKind::VEC || kind == TypeKind::SET {
+            mut key := when kind == TypeKind::VEC { String("Vec<") } else { String("Set<") }
+            key.append(self.display_key(node.first))
+            key.push('>')
+            return key
+        }
+        when kind == TypeKind::MAP {
+            mut key := String("Map<")
+            key.append(self.display_key(node.first))
+            key.push(',')
+            key.append(self.display_key(node.second))
+            key.push('>')
+            return key
+        }
+        when kind == TypeKind::ARRAY {
+            mut key := String("[")
+            key.append(self.display_key(node.first))
+            key.push(';')
+            key.append(String(node.length))
+            key.push(']')
+            return key
+        }
+        when kind == TypeKind::SLICE {
+            mut key := String("&[")
+            key.append(self.display_key(node.first))
+            key.push(']')
+            return key
+        }
+        when kind == TypeKind::REF {
+            mut key := String("&")
+            when node.flag {
+                key.append("mut ")
+            }
+            key.append(self.display_key(node.first))
+            return key
+        }
+        when kind == TypeKind::RAW {
+            mut key := String("*")
+            key.append(self.display_key(node.first))
+            return key
+        }
+        when kind != TypeKind::FNPTR {
+            return self.type_key(ty)
+        }
+        mut key := String()
+        when node.flag {
+            key.append("extern \"C\" ")
+        }
+        key.append("fun(")
+        mut first := true
+        for parameter in node.params.clone() {
+            when !first {
+                key.push(',')
+            }
+            first = false
+            key.append(self.display_key(parameter))
+        }
+        key.push(')')
+        when node.has_result {
+            key.append("->")
+            key.append(self.display_key(node.first))
+        }
+        return key
+    }
+
+    fun display_name(self, name: String) -> String {
+        when starts_with_text(name.clone(), "$RynTuple#") {
+            index := self.find_struct(name.clone())
+            when index != 0 {
+                mut fields := Vec<String>()
+                for field in self.structs[index - 1].field_types.clone() {
+                    fields.push(self.display_key(field))
+                }
+                mut shown := String("(")
+                shown.append(join(fields, ", "))
+                shown.push(')')
+                return shown
+            }
+            return name
+        }
+        when starts_with_text(name.clone(), "$RynOption#") {
+            return String("Option")
+        }
+        when starts_with_text(name.clone(), "$RynResult#") {
+            return String("Result")
+        }
+        when starts_with_text(name.clone(), "$RynEnumParam#") || starts_with_text(name.clone(), "$RynEnum#") {
+            mut prefix: u64 = 9
+            when starts_with_text(name.clone(), "$RynEnumParam#") {
+                prefix = 14
+            }
+            template := enum_template(name.clone(), prefix)
+            when !template.is_empty() {
+                return template
+            }
+        }
+        return name
+    }
+
     fun mismatch(self, pattern: u64, actual: u64, start: u64, end: u64) -> lexer::Diag {
         mut message := String("generic argument has type `")
-        message.append(self.type_key(actual))
+        message.append(self.display_key(actual))
         message.append("` but the parameter pattern is `")
-        message.append(self.type_key(pattern))
+        message.append(self.display_key(pattern))
         message.push('`')
         return diag_help("R0263", message, start, end, String("pass a value whose type matches the generic function parameter"))
     }
@@ -1744,9 +2396,9 @@ extend Tree {
         message.append(parameter.clone())
         message.append("` has conflicting types")
         mut help := String("this call uses both `")
-        help.append(self.type_key(previous))
+        help.append(self.display_key(previous))
         help.append("` and `")
-        help.append(self.type_key(actual))
+        help.append(self.display_key(actual))
         help.append("` for `")
         help.append(parameter)
         help.push('`')
@@ -1791,6 +2443,49 @@ extend Tree {
             }
             return Result::Ok(result)
         }
+        when left.kind == TypeKind::NAMED && right.kind == TypeKind::NAMED && left.name != right.name
+            && starts_with_text(left.name.clone(), "$RynStructParam#") && starts_with_text(right.name.clone(), "$RynStruct#") {
+            // `Stack<T>` against a concrete `Stack<i32>`: unify the fields.
+            pattern_struct := self.find_struct(left.name.clone())
+            actual_struct := self.find_struct(right.name.clone())
+            when pattern_struct == 0 || actual_struct == 0 {
+                return Result::Err(self.mismatch(pattern, actual, start, end))
+            }
+            left_definition := self.structs[pattern_struct - 1]
+            right_definition := self.structs[actual_struct - 1]
+            when left_definition.field_names.len() != right_definition.field_names.len() {
+                return Result::Err(self.mismatch(pattern, actual, start, end))
+            }
+            mut field: u64 = 0
+            while field < left_definition.field_names.len() {
+                when left_definition.field_names[field] != right_definition.field_names[field] {
+                    return Result::Err(self.mismatch(pattern, actual, start, end))
+                }
+                result = self.unify(left_definition.field_types[field], right_definition.field_types[field], result, start, end)?
+                field += 1
+            }
+            return Result::Ok(result)
+        }
+        when left.kind == TypeKind::NAMED && right.kind == TypeKind::NAMED && left.name != right.name
+            && starts_with_text(left.name.clone(), "$RynTuple#") && starts_with_text(right.name.clone(), "$RynTuple#") {
+            // `(A, B)` against a concrete tuple: unify the element types.
+            pattern_tuple := self.find_struct(left.name.clone())
+            actual_tuple := self.find_struct(right.name.clone())
+            when pattern_tuple == 0 || actual_tuple == 0 {
+                return Result::Err(self.mismatch(pattern, actual, start, end))
+            }
+            left_definition := self.structs[pattern_tuple - 1]
+            right_definition := self.structs[actual_tuple - 1]
+            when left_definition.field_types.len() != right_definition.field_types.len() {
+                return Result::Err(self.mismatch(pattern, actual, start, end))
+            }
+            mut field: u64 = 0
+            while field < left_definition.field_types.len() {
+                result = self.unify(left_definition.field_types[field], right_definition.field_types[field], result, start, end)?
+                field += 1
+            }
+            return Result::Ok(result)
+        }
         when left.kind == TypeKind::NAMED && right.kind == TypeKind::NAMED && left.name != right.name {
             pattern_enum := self.find_enum(left.name.clone())
             actual_enum := self.find_enum(right.name.clone())
@@ -1798,6 +2493,7 @@ extend Tree {
             when pattern_enum != 0 && actual_enum != 0 {
                 same_family = (starts_with_text(left.name.clone(), "$RynOption#") && starts_with_text(right.name.clone(), "$RynOption#"))
                     || (starts_with_text(left.name.clone(), "$RynResult#") && starts_with_text(right.name.clone(), "$RynResult#"))
+                    || enum_placeholder_matches(left.name.clone(), right.name.clone())
             }
             when same_family {
                 pattern_definition := self.enums[pattern_enum - 1]
@@ -1887,6 +2583,7 @@ extend Tree {
             new_list := self.copy_exprs(node.list.clone(), substitutions)
             node.list = new_list
         } else when kind == Ex::METHOD_CALL {
+            self.note_bound_call(node.a, node.text.clone(), node.start, node.end)
             new_a := self.copy_expr(node.a, substitutions.clone())
             node.a = new_a
             new_types := self.copy_types(node.types.clone(), substitutions.clone())
@@ -1894,6 +2591,12 @@ extend Tree {
             new_list := self.copy_exprs(node.list.clone(), substitutions)
             node.list = new_list
         } else when kind == Ex::STRUCT || kind == Ex::ARRAY || kind == Ex::TUPLE {
+            when kind == Ex::STRUCT && substitutions.contains_key(node.text.clone()) {
+                replacement := self.types[substitutions.get(node.text.clone()).unwrap()]
+                when replacement.kind == TypeKind::NAMED {
+                    node.text = replacement.name
+                }
+            }
             new_list := self.copy_exprs(node.list.clone(), substitutions)
             node.list = new_list
         } else when kind == Ex::FIELD || kind == Ex::NEGATE || kind == Ex::NOT || kind == Ex::BIT_NOT
@@ -1994,6 +2697,7 @@ extend Tree {
             new_list := self.copy_exprs(node.list.clone(), substitutions)
             node.list = new_list
         } else when kind == St::METHOD_CALL {
+            self.note_bound_call(node.a, node.text.clone(), node.start, node.end)
             new_a := self.copy_expr(node.a, substitutions.clone())
             node.a = new_a
             new_list := self.copy_exprs(node.list.clone(), substitutions)
@@ -2097,7 +2801,33 @@ extend Tree {
         when kind == Ex::CHAR { return TypeKind::CHAR as u64 }
         when kind == Ex::BOOL { return TypeKind::BOOL as u64 }
         when kind == Ex::NAME {
-            return self.environment_type(environment, node.text)
+            known_type := self.environment_type(environment, node.text.clone())
+            when known_type != 0 {
+                return known_type
+            }
+            // A plain function used as a value has a function-pointer type.
+            mut function_index: u64 = 0
+            when self.known.contains_key(node.text.clone()) {
+                function_index = self.known.get(node.text.clone()).unwrap() + 1
+            } else {
+                function_index = self.resolve_template(node.text.clone(), caller)
+            }
+            when function_index == 0 {
+                return 0
+            }
+            function := self.functions[function_index - 1]
+            when function.extern_c || !function.type_params.is_empty() {
+                return 0
+            }
+            mut pointer := blank_type(TypeKind::FNPTR)
+            pointer.params = function.param_types.clone()
+            pointer.has_result = function.has_return
+            when function.has_return {
+                pointer.first = function.return_type
+            }
+            pointer.start = node.start
+            pointer.end = node.end
+            return self.new_type(pointer)
         }
         when kind == Ex::CAST {
             return node.ty
@@ -2125,6 +2855,41 @@ extend Tree {
         when kind == Ex::CALL {
             when node.text == "String" {
                 return TypeKind::STRING as u64
+            }
+            // `Option::Some(value)` is parsed as a call; it takes its `Option<T>` from the payload.
+            when node.text == "Option::Some" && node.list.len() == 1 {
+                payload := self.infer_type(node.list[0], environment.clone(), caller)
+                when payload == 0 {
+                    return 0
+                }
+                return self.ensure_option(payload, node.start, node.end)
+            }
+            // `Enum::Variant(payload)` of a generic user enum takes its type arguments from the
+            // payload, through the enum's placeholder.
+            mut separator: u64 = 0
+            mut split := false
+            mut scan: u64 = 0
+            while scan + 1 < node.text.len() {
+                when node.text.byte_at(scan) == 58 && node.text.byte_at(scan + 1) == 58 {
+                    separator = scan
+                    split = true
+                }
+                scan += 1
+            }
+            when split {
+                enum_name := node.text.slice(0, separator)
+                variant := node.text.slice(separator + 2, node.text.len())
+                when enum_name != "Option" && enum_name != "Result" && self.has_enum_placeholder(enum_name.clone(), variant.clone()) {
+                    mut payload := Vec<u64>()
+                    for argument in node.list.clone() {
+                        argument_type := self.infer_type(argument, environment.clone(), caller)
+                        when argument_type == 0 {
+                            return 0
+                        }
+                        payload.push(argument_type)
+                    }
+                    return self.generic_enum_instance(enum_name, variant, payload, node.start, node.end)
+                }
             }
             pointer := self.environment_type(environment.clone(), node.text.clone())
             when pointer != 0 && self.types[pointer].kind == TypeKind::FNPTR {
@@ -2241,6 +3006,20 @@ extend Tree {
         when kind == Ex::RANGE {
             return 0
         }
+        when kind == Ex::TUPLE {
+            when node.list.is_empty() {
+                return 0
+            }
+            mut fields := Vec<u64>()
+            for element in node.list.clone() {
+                field := self.infer_type(element, environment.clone(), caller)
+                when field == 0 {
+                    return 0
+                }
+                fields.push(field)
+            }
+            return self.ensure_tuple(fields, node.start, node.end)
+        }
         when kind == Ex::BINARY {
             op := node.text
             when op == "Eq" || op == "Ne" || op == "Lt" || op == "Le" || op == "Gt" || op == "Ge" || op == "And" || op == "Or" {
@@ -2306,10 +3085,36 @@ extend Tree {
 // Specializing calls and rewriting function bodies.
 
 extend Tree {
+    fun is_fixed_type(self, ty: u64) -> bool {
+        node := self.types[ty]
+        kind := node.kind
+        when kind == TypeKind::NAMED {
+            return !node.name.contains("<") && !node.name.contains("$")
+        }
+        when kind == TypeKind::REF || kind == TypeKind::RAW {
+            return self.is_fixed_type(node.first)
+        }
+        return kind == TypeKind::I8 || kind == TypeKind::I16 || kind == TypeKind::I32 || kind == TypeKind::I64
+            || kind == TypeKind::U8 || kind == TypeKind::U16 || kind == TypeKind::U32 || kind == TypeKind::U64
+            || kind == TypeKind::F32 || kind == TypeKind::F64 || kind == TypeKind::STR || kind == TypeKind::STRING
+            || kind == TypeKind::CHAR || kind == TypeKind::BOOL
+    }
+
+    fun is_untyped_literal(self, index: u64) -> bool {
+        node := self.exprs[index]
+        when node.kind == Ex::INT || node.kind == Ex::FLOAT {
+            return true
+        }
+        when node.kind == Ex::NEGATE {
+            return self.is_untyped_literal(node.a)
+        }
+        return false
+    }
+
     fun specialize_call(mut self, name: String, explicit: Vec<u64>, arguments: Vec<u64>, start: u64, end: u64, environment: Map<String, u64>, caller: u64) -> Result<String, lexer::Diag> {
         found := self.resolve_template(name.clone(), caller)
         when found == 0 {
-            when !explicit.is_empty() {
+            when !explicit.is_empty() && !is_comptime_intrinsic(name.clone()) {
                 mut message := String("`")
                 message.append(name)
                 message.append("` is not a generic function")
@@ -2335,6 +3140,18 @@ extend Tree {
         }
         index = 0
         while index < template.param_types.len() && index < arguments.len() {
+            // An untyped literal takes the type an explicit type argument fixed.
+            when self.types[template.param_types[index]].kind == TypeKind::PARAM
+                && substitutions.contains_key(self.types[template.param_types[index]].name.clone())
+                && self.is_untyped_literal(arguments[index]) {
+                index += 1
+                continue
+            }
+            // A parameter whose type does not mention a type parameter needs no inference.
+            when self.is_fixed_type(template.param_types[index]) {
+                index += 1
+                continue
+            }
             actual := self.infer_type(arguments[index], environment.clone(), caller)
             when actual == 0 {
                 mut message := String("cannot infer generic type arguments for `")
@@ -2405,6 +3222,61 @@ extend Tree {
             }
             definition_index += 1
         }
+        // A generic structure written with type parameters stands for the concrete instance
+        // whose fields equal its fields under the inferred substitution.
+        mut placeholder_index: u64 = 0
+        while placeholder_index < self.structs.len() {
+            placeholder := self.structs[placeholder_index]
+            when starts_with_text(placeholder.name.clone(), "$RynStructParam#") {
+                mut substituted := Vec<u64>()
+                for field in placeholder.field_types.clone() {
+                    substituted.push(self.substitute_type(field, substitutions.clone()))
+                }
+                mut candidate_index: u64 = 0
+                mut matched := false
+                while candidate_index < self.structs.len() && !matched {
+                    candidate := self.structs[candidate_index]
+                    when starts_with_text(candidate.name.clone(), "$RynStruct#") && candidate.field_names.len() == placeholder.field_names.len() {
+                        mut same := true
+                        mut field: u64 = 0
+                        while field < candidate.field_names.len() && same {
+                            when candidate.field_names[field] != placeholder.field_names[field]
+                                || self.type_key(candidate.field_types[field]) != self.type_key(substituted[field]) {
+                                same = false
+                            }
+                            field += 1
+                        }
+                        when same {
+                            replacement := self.named(TypeKind::NAMED, candidate.name.clone(), placeholder.start, placeholder.end)
+                            substitutions.insert(placeholder.name.clone(), replacement)
+                            matched = true
+                        }
+                    }
+                    candidate_index += 1
+                }
+            }
+            placeholder_index += 1
+        }
+        // A tuple written with type parameters stands for the tuple of its element types under
+        // the inferred substitution.
+        for definition in self.structs.clone() {
+            when self.is_tuple_template(definition.clone()) {
+                mut fields := Vec<u64>()
+                for field in definition.field_types.clone() {
+                    fields.push(self.substitute_type(field, substitutions.clone()))
+                }
+                mut generic := false
+                for field in fields.clone() {
+                    when self.type_has_parameter(field) {
+                        generic = true
+                    }
+                }
+                when !generic {
+                    concrete := self.ensure_tuple(fields, definition.start, definition.end)
+                    substitutions.insert(definition.name.clone(), concrete)
+                }
+            }
+        }
         for parameter in template.type_params.clone() {
             when !substitutions.contains_key(parameter.clone()) {
                 mut message := String("cannot infer generic parameter `")
@@ -2472,6 +3344,8 @@ extend Tree {
             function.value = new_value
         }
         self.pending.push(self.functions.len())
+        // Later calls infer types through the concrete signature.
+        self.known.insert(specialized_name.clone(), self.functions.len())
         self.functions.push(function)
         return Result::Ok(specialized_name)
     }
@@ -2493,7 +3367,9 @@ extend Tree {
             self.rewrite_exprs(node.list.clone(), environment.clone(), caller)?
             new_text := self.specialize_call(node.text.clone(), node.types.clone(), node.list.clone(), node.start, node.end, environment, caller)?
             node.text = new_text
-            node.types = Vec<u64>()
+            when !is_comptime_intrinsic(node.text.clone()) {
+                node.types = Vec<u64>()
+            }
             self.exprs.set(index, node)
             return Result::Ok(true)
         }
@@ -2625,7 +3501,9 @@ extend Tree {
             self.rewrite_exprs(node.list.clone(), current.clone(), caller)?
             new_text := self.specialize_call(node.text.clone(), node.types.clone(), node.list.clone(), node.start, node.end, current.clone(), caller)?
             node.text = new_text
-            node.types = Vec<u64>()
+            when !is_comptime_intrinsic(node.text.clone()) {
+                node.types = Vec<u64>()
+            }
             self.stmts.set(index, node)
         } else when kind == St::METHOD_CALL {
             self.rewrite_expr(node.a, current.clone(), caller)?
@@ -2702,8 +3580,15 @@ extend Tree {
             }
             index += 1
         }
-        when !has_generic {
+        when !has_generic && !self.has_struct_placeholders() && !self.has_enum_placeholders() {
             return Result::Ok(self.text.clone())
+        }
+        index = 0
+        while index < program_functions {
+            when !self.functions[index].type_params.is_empty() {
+                self.check_function_bounds(index)?
+            }
+            index += 1
         }
         mut use_index: u64 = 0
         while use_index < self.use_paths.len() {
@@ -2753,7 +3638,7 @@ extend Tree {
         mut enum_count: u64 = 0
         mut enum_index: u64 = 0
         while enum_index < self.enums.len() {
-            when !self.enum_has_type_parameters(enum_index) {
+            when !self.enum_has_type_parameters(enum_index) && !starts_with_text(self.enums[enum_index].name.clone(), "$RynEnumParam#") {
                 enums.append(self.enums[enum_index].raw)
                 enum_count += 1
             }
@@ -2768,8 +3653,16 @@ extend Tree {
         out.append(enc_uint(self.use_count))
         out.append(self.uses_raw.clone())
         out.push('\n')
-        out.append(enc_uint(self.struct_count))
-        out.append(self.structs_raw.clone())
+        mut structs := String()
+        mut struct_count: u64 = 0
+        for definition in self.structs.clone() {
+            when !starts_with_text(definition.name.clone(), "$RynStructParam#") && !self.is_tuple_template(definition.clone()) {
+                structs.append(definition.raw)
+                struct_count += 1
+            }
+        }
+        out.append(enc_uint(struct_count))
+        out.append(structs)
         out.push('\n')
         out.append(enc_uint(enum_count))
         out.append(enums)
@@ -2831,7 +3724,7 @@ pub fun specialize(encoded: String) -> String {
         use_count: 0,
         use_paths: Vec<String>(),
         use_aliases: Vec<String>(),
-        structs_raw: String(),
+        structs: Vec<StructNode>(),
         struct_count: 0,
         aliases_raw: String(),
         alias_count: 0,
@@ -2839,10 +3732,21 @@ pub fun specialize(encoded: String) -> String {
         extend_count: 0,
         shapes_raw: String(),
         shape_count: 0,
+        shape_names: Vec<String>(),
+        shape_methods: Vec<String>(),
+        check_allowed: Map<String, String>(),
+        check_shapes: Map<String, String>(),
+        check_type_parameter: Map<String, String>(),
+        check_failed: false,
+        check_message: String(),
+        check_help: String(),
+        check_start: 0,
+        check_end: 0,
         templates: Map<String, u64>(),
         known: Map<String, u64>(),
         specializations: Map<String, String>(),
-        pending: Vec<u64>()
+        pending: Vec<u64>(),
+        generated_enums: 0
     }
     when !tree.decode_program() {
         return encode_failure(lexer::diag(

@@ -1,0 +1,14 @@
+// test: run
+// out: 3
+// out: 4
+// out: STRASSE É
+// out: àé ω
+// out: 2
+fun main() {
+    w := String("\u{a0}\u{3000} pad \u{3000}")
+    echo w.trim().len()
+    echo String("  tabs\t\n").trim().len()
+    echo String("straße é").to_upper()
+    echo String("ÀÉ Ω").to_lower()
+    echo String("ß").to_upper().len()
+}

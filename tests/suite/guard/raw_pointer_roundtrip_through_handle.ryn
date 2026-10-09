@@ -1,0 +1,8 @@
+// test: run
+// out: 9
+fun main() {
+    mut x: i32 = 5
+    p := &raw mut x
+    *p = 9
+    echo x
+}

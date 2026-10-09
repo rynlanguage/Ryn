@@ -1,0 +1,12 @@
+// test: run
+// out: 610
+fun fib(n: i32) -> i32 {
+    when n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+const FIB15: i32 = fib(15)
+fun main() {
+    echo FIB15
+}

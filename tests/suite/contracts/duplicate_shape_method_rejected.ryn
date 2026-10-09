@@ -1,0 +1,8 @@
+// test: fail
+shape Show {
+    fun show(self) -> i32
+    fun show(self) -> i32
+}
+fun main() {
+    echo 1
+}

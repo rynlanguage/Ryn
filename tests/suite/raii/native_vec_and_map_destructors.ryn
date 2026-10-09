@@ -1,0 +1,62 @@
+// test: run
+// out: 0
+// out: 2
+// out: 3
+// out: 5
+// out: true
+// out: 2
+// out: 5
+// out: 6
+// out: 7
+// out: 8
+// out: 0
+
+// Vectors and maps of destructor values on the native backend: elements are dropped last to first when the owner ends,
+// `clear` drops them at once, a map drops a value it replaces or removes, and a vector that is moved is dropped once.
+#[drop(release)]
+struct Token { h: *i64 }
+
+fun release(t: Token) {
+    *t.h = *t.h + 1
+}
+
+fun fill(hits: *i64, count: i64) -> Vec<Token> {
+    mut v: Vec<Token> = Vec()
+    mut i: i64 = 0
+    while i < count {
+        v.push(Token { h: hits })
+        i += 1
+    }
+    return v
+}
+
+fun scoped(hits: *i64) {
+    mut a: Vec<Token> = Vec()
+    a.push(Token { h: hits })
+    a.push(Token { h: hits })
+    echo *hits
+}
+
+fun main() {
+    mut hits: i64 = 0
+    scoped(&raw mut hits)
+    echo hits
+    mut b := fill(&raw mut hits, 3)
+    echo b.len()
+    b.clear()
+    echo hits
+    echo b.is_empty()
+    moved := fill(&raw mut hits, 2)
+    echo moved.len()
+    echo hits
+    mut m := Map<i64, Token>()
+    m.insert(1, Token { h: &raw mut hits })
+    m.insert(1, Token { h: &raw mut hits })
+    echo hits
+    m.insert(2, Token { h: &raw mut hits })
+    m.remove(2)
+    echo hits
+    m.clear()
+    echo hits
+    echo m.len()
+}

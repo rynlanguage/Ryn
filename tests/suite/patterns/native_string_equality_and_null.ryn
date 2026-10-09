@@ -1,0 +1,26 @@
+// test: run
+// out: true
+// out: false
+// out: true
+// out: false
+// out: true
+// out: true
+// out: false
+// out: false
+// out: false
+// out: true
+fun main() {
+    a := String("abc")
+    b := String("abd")
+    e := String("")
+    echo a == String("abc")
+    echo a == b
+    echo a != b
+    echo a == "ab"
+    echo "abc" == a
+    echo e == ""
+    echo e != ""
+    echo a == ""
+    echo "x" != "x"
+    echo "" == e
+}

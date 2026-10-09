@@ -1,0 +1,8 @@
+// test: run
+// out: ab=3
+fun main() {
+    write("a")
+    write("b")
+    write("={}", 3 as i32)
+    write("\n")
+}

@@ -1,0 +1,7 @@
+// test: run
+// out: 3
+struct Vec3 { x: f32, y: f32, z: f32 }
+const DIMENSIONS: u64 = field_count::<Vec3>()
+fun main() {
+    echo DIMENSIONS
+}

@@ -1,0 +1,8 @@
+// test: run
+// out: two
+fun main() {
+    mut m := Map<i32, String>()
+    m.insert(1, String("one"))
+    m.insert(2, String("two"))
+    echo choose m.get(2) { Option::Some(s) => s, Option::None => String("none") }
+}

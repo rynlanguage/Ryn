@@ -1,0 +1,19 @@
+// test: run
+// out: 100
+// out: 7
+// out: 30
+// out: -1
+fun quad(t: (i32, i32)) -> i32 {
+    choose t {
+        (0, 0) => 100,
+        (0, y) => y,
+        (x, 0) => x * 10,
+        _ => -1
+    }
+}
+fun main() {
+    echo quad((0, 0))
+    echo quad((0, 7))
+    echo quad((3, 0))
+    echo quad((3, 3))
+}

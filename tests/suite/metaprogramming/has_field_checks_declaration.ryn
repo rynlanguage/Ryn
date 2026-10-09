@@ -1,0 +1,8 @@
+// test: run
+// out: true
+// out: false
+struct User { name: String, age: u32 }
+fun main() {
+    echo has_field::<User>("age")
+    echo has_field::<User>("email")
+}

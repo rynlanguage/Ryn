@@ -1,0 +1,8 @@
+// test: run
+// out: 6
+fun first<T>(items: &[T]) -> &T {
+    &items[0]
+}
+fun main() {
+    echo *first([6 as i32, 7 as i32])
+}

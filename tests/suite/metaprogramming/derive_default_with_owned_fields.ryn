@@ -1,0 +1,10 @@
+// test: run
+// out: 0
+// out: 0
+#[derive(Default)]
+struct Profile { name: String, tags: Vec<String> }
+fun main() {
+    p := Profile::default()
+    echo p.name.char_count()
+    echo p.tags.len()
+}

@@ -1,0 +1,5 @@
+// test: run
+// err: only-stderr
+fun main() {
+    eprint("only-stderr")
+}

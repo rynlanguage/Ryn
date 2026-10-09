@@ -1,0 +1,11 @@
+// test: run
+// out: 2
+// out: 1
+fun main() {
+    a: i32 = 1
+    when true {
+        b: i32 = 2
+        echo b
+    }
+    echo a
+}

@@ -1,0 +1,45 @@
+// test: run
+// out: 127
+// out: 99
+// out: -128
+// out: 99
+// out: 99
+// out: 255
+// out: 99
+// out: 99
+// out: 3
+// out: 18446744073709551615
+// out: 0
+// out: -9223372036854775808
+// out: 0
+// out: 9223372036854775807
+// out: 0
+fun show_i8(t: str) {
+    echo choose String(t).try_to_i8() { Option::Some(v) => v, Option::None => 99 }
+}
+fun show_u8(t: str) {
+    echo choose String(t).try_to_u8() { Option::Some(v) => v, Option::None => 99 }
+}
+fun show_u64(t: str) {
+    echo choose String(t).try_to_u64() { Option::Some(v) => v, Option::None => 0 }
+}
+fun show_i64(t: str) {
+    echo choose String(t).try_to_i64() { Option::Some(v) => v, Option::None => 0 }
+}
+fun main() {
+    show_i8("127")
+    show_i8("128")
+    show_i8("-128")
+    show_i8("-129")
+    show_i8("+")
+    show_u8("255")
+    show_u8("256")
+    show_u8("-1")
+    show_u8("+3")
+    show_u64("18446744073709551615")
+    show_u64("18446744073709551616")
+    show_i64("-9223372036854775808")
+    show_i64("-9223372036854775809")
+    show_i64("9223372036854775807")
+    show_i64("9223372036854775808")
+}

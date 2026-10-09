@@ -1,0 +1,35 @@
+// test: run
+// out: 7
+// out: -999
+// out: -999
+// out: -999
+// out: 7
+// out: 2147483647
+// out: -999
+// out: -2147483648
+// out: -999
+// out: -999
+// out: -999
+// out: -999
+// out: -999
+fun parse_i32(text: str) -> i32 {
+    choose String(text).try_to_i32() {
+        Option::Some(value) => value,
+        Option::None => -999
+    }
+}
+fun main() {
+    echo parse_i32("+7")
+    echo parse_i32(" 42")
+    echo parse_i32("")
+    echo parse_i32("-")
+    echo parse_i32("007")
+    echo parse_i32("2147483647")
+    echo parse_i32("2147483648")
+    echo parse_i32("-2147483648")
+    echo parse_i32("-2147483649")
+    echo parse_i32("0x1A")
+    echo parse_i32("1_000")
+    echo parse_i32("+-1")
+    echo parse_i32("12abc")
+}

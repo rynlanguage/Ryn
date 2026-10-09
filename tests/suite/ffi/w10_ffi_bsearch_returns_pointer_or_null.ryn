@@ -1,0 +1,45 @@
+// test: run
+// out: false
+// out: 2
+// out: true
+// out: false
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(p: *u8);
+extern "C" fun bsearch(key: *u8, base: *u8, count: u64, size: u64, compare: extern "C" fun(*u8, *u8) -> i32) -> *u8;
+type Compare = extern "C" fun(*u8, *u8) -> i32
+fun compare_i32(a: *u8, b: *u8) -> i32 {
+    x := *(a as *i32)
+    y := *(b as *i32)
+    when x < y {
+        return -1
+    }
+    when x > y {
+        return 1
+    }
+    return 0
+}
+fun store(address: u64, value: i32) {
+    p := address as *i32
+    *p = value
+}
+fun main() {
+    table := malloc(20 as u64)
+    base := table as u64
+    mut i := 0
+    while i < 5 {
+        store(base + (i * 4) as u64, (i * 10 + 5) as i32)
+        i += 1
+    }
+    key := malloc(4 as u64)
+    store(key as u64, 25)
+    compare: Compare = compare_i32
+    hit := bsearch(key, table, 5 as u64, 4 as u64, compare)
+    echo pointer_is_null(hit)
+    echo ((hit as u64) - base) / 4 as u64
+    store(key as u64, 26)
+    miss := bsearch(key, table, 5 as u64, 4 as u64, compare_i32)
+    echo pointer_is_null(miss)
+    echo pointer_is_null(miss) == false
+    free(key)
+    free(table)
+}

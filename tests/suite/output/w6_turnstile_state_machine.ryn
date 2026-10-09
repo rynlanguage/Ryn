@@ -1,0 +1,85 @@
+// test: run
+// out: events 12 passes 2 rejects 1
+// out: summary 210
+// out: events 6 passes 1 rejects 1
+// out: summary 110
+// Turnstile state machine driven by a script of one-letter events.
+enum State { Locked, Unlocked, Broken }
+enum Event { Coin, Push, Kick, Reset }
+
+struct Gate { state: State, passes: i64, rejects: i64, events: i64 }
+
+fun event_of(c: char) -> Option<Event> {
+    return choose c {
+        'C' => Option::Some(Event::Coin),
+        'P' => Option::Some(Event::Push),
+        'K' => Option::Some(Event::Kick),
+        'R' => Option::Some(Event::Reset),
+        _ => Option::None
+    }
+}
+
+fun state_name(s: State) -> i64 {
+    return choose s {
+        State::Locked => 0,
+        State::Unlocked => 1,
+        State::Broken => 2
+    }
+}
+
+fun next(s: State, e: Event) -> State {
+    return choose s {
+        State::Locked => choose e {
+            Event::Coin => State::Unlocked,
+            _ => State::Locked
+        },
+        State::Unlocked => choose e {
+            Event::Push => State::Locked,
+            Event::Kick => State::Broken,
+            Event::Reset => State::Locked,
+            Event::Coin => State::Unlocked
+        },
+        State::Broken => choose e {
+            Event::Reset => State::Locked,
+            _ => State::Broken
+        }
+    }
+}
+
+extend Gate {
+    fun feed(mut self, e: Event, pushing: bool) {
+        self.events += 1
+        before := state_name(self.state)
+        self.state = next(self.state, e)
+        when pushing && before == 1 {
+            self.passes += 1
+        }
+        when pushing && before == 0 {
+            self.rejects += 1
+        }
+    }
+    fun summary(self) -> i64 {
+        return self.passes * 100 + self.rejects * 10 + state_name(self.state)
+    }
+}
+
+fun run(script: String) -> i64 {
+    mut gate := Gate { state: State::Locked, passes: 0, rejects: 0, events: 0 }
+    n := script.char_count()
+    for i in 0..n {
+        c := script.char_at(i)
+        ev := event_of(c)
+        when ev.is_some() {
+            gate.feed(ev.unwrap(), c == 'P')
+        }
+    }
+    echo "events {gate.events} passes {gate.passes} rejects {gate.rejects}"
+    return gate.summary()
+}
+
+fun main() {
+    code := run(String("CPPCCKPXRCPCR"))
+    echo "summary {code}"
+    other := run(String("PKCCPRX"))
+    echo "summary {other}"
+}

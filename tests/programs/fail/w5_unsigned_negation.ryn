@@ -1,0 +1,4 @@
+fun main() {
+    count: u8 = -1
+    echo count
+}

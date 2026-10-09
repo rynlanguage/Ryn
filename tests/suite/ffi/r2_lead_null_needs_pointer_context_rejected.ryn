@@ -1,0 +1,7 @@
+// test: fail
+// code: R0203
+// msg: `null` needs a raw pointer type
+fun main() {
+    x := null
+    echo 1
+}

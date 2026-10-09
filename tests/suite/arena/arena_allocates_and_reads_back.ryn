@@ -1,0 +1,11 @@
+// test: run
+// out: 42
+// out: 1
+use std::arena
+fun main() {
+    mut a := arena::Arena::with_capacity(64 as u64)
+    x := arena::alloc(&mut a, 41 as i32)
+    *x = *x + 1
+    echo *x
+    echo a.count()
+}

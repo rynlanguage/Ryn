@@ -1,0 +1,7 @@
+// test: run
+// out: 24
+fun main() {
+    mut a: [i32; 3] = [1, 2, 3]
+    a[1] = 20
+    echo a[0] + a[1] + a[2]
+}

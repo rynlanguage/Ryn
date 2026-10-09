@@ -1,0 +1,21 @@
+// test: run
+// out: 200000
+// out: 19999900000
+// out: 199999
+fun main() {
+    mut v: Vec<i64> = Vec()
+    mut i: i64 = 0
+    while i < 200000 {
+        v.push(i)
+        i += 1
+    }
+    echo v.len()
+    mut sum: i64 = 0
+    mut k: u64 = 0
+    while k < v.len() {
+        sum += v.index(k)
+        k += 1
+    }
+    echo sum
+    echo v.index(199999)
+}

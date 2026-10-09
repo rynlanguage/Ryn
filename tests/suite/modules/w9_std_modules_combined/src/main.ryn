@@ -1,0 +1,30 @@
+// test: run
+// out: 4
+// out: 3
+// out: 40
+// out: 1
+// out: hello
+// out: 2.5
+// out: 4
+use std::option
+use std::result
+use std::arena
+use std::io
+use std::math
+struct Node {
+    id: i32,
+    weight: f64
+}
+fun main() {
+    o: Option<i32> = Option::Some(4)
+    echo choose o { Option::Some(x) => x, Option::None => 0 }
+    r: Result<i32, i32> = Result::Ok(3)
+    echo choose r { Result::Ok(x) => x, Result::Err(e) => e }
+    mut a := arena::Arena::with_capacity(128 as u64)
+    n := arena::alloc(&mut a, Node { id: 40, weight: 2.5 })
+    echo (*n).id
+    echo a.count()
+    io::println("hello")
+    echo math::clamp(2.5, 0.0, 9.0)
+    echo math::floor(4.9)
+}

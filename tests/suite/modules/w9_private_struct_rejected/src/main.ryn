@@ -1,0 +1,7 @@
+// test: fail
+// code: R0227
+use hid
+fun main() {
+    s := hid::Secret { v: 1 }
+    echo s.v
+}

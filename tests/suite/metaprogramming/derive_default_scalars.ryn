@@ -1,0 +1,14 @@
+// test: run
+// out: 0
+// out: 0
+// out: false
+// out: 0
+#[derive(Default)]
+struct Config { depth: i32, ratio: f64, on: bool, id: u64 }
+fun main() {
+    c := Config::default()
+    echo c.depth
+    echo c.ratio
+    echo c.on
+    echo c.id
+}

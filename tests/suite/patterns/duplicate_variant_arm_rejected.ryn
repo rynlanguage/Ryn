@@ -1,0 +1,7 @@
+// test: fail
+// code: R0235
+enum E { A, B }
+fun main() {
+    e := E::A
+    echo choose e { E::A => 1, E::B => 2, E::A => 3 }
+}

@@ -1,0 +1,18 @@
+// test: run
+// err: array index is out of bounds
+// exit: 1
+// out: before
+
+// The bounds of an indexed write are checked before the value is evaluated, so `noisy` never runs.
+fun noisy(i: i64) -> i64 {
+    echo "noisy"
+    return i
+}
+
+fun main() {
+    mut a: [i64; 3] = [0; 3]
+    echo "before"
+    idx: i64 = 3
+    a[idx] = noisy(7)
+    echo "after"
+}

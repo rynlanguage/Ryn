@@ -1,0 +1,7 @@
+// test: fail
+fun make<T>() -> T {
+    return 1 as T
+}
+fun main() {
+    x := make()
+}

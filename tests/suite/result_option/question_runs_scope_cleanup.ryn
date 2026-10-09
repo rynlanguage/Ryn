@@ -1,0 +1,14 @@
+// test: run
+// out: cleanup
+// out: failed
+fun inner() -> Result<i32, String> {
+    return Result::Err(String("failed"))
+}
+fun outer() -> Result<i32, String> {
+    defer { echo "cleanup" }
+    v := inner()?
+    return Result::Ok(v)
+}
+fun main() {
+    echo outer().unwrap_err()
+}

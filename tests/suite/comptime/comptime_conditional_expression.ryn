@@ -1,0 +1,7 @@
+// test: run
+// out: 10
+const SMALL: bool = 3 < 5
+const PICK: i32 = when SMALL { 10 } else { 20 }
+fun main() {
+    echo PICK
+}

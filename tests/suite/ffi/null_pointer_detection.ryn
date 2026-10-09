@@ -1,0 +1,10 @@
+// test: run
+// out: true
+// out: false
+fun main() {
+    nothing := (0 as u64) as *u8
+    echo pointer_is_null(nothing)
+    mut x: i32 = 1
+    live := &raw mut x
+    echo pointer_is_null(live as *u8)
+}

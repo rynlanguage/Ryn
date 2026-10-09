@@ -1,0 +1,16 @@
+// test: run
+// out: 40
+shape Show {
+    fun show(self) -> i32
+}
+struct A { n: i32 }
+extend A {
+    fun show(self) -> i32 { self.n }
+}
+struct Box<T> { v: T }
+fun show_box<T: Show>(b: Box<T>) -> i32 {
+    return b.v.show() * 10
+}
+fun main() {
+    echo show_box(Box::<A> { v: A { n: 4 } })
+}

@@ -1,0 +1,7 @@
+// test: run
+// out: checked
+struct Pair { a: i32, b: i32 }
+fun main() {
+    static_assert(field_count::<Pair>() == 2, "Pair has two fields")
+    echo "checked"
+}

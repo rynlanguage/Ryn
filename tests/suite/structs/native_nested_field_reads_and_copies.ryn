@@ -1,0 +1,37 @@
+// test: run
+// out: 1
+// out: 6
+// out: 7
+// out: 52
+// out: 2
+// out: 4
+// out: 5
+// exit: 0
+struct Point { x: i64, y: i64 }
+struct Segment { start: Point, end: Point, label: i64 }
+
+enum Holder {
+    Holding(Point),
+    Empty,
+}
+
+fun length_sq(p: Point) -> i64 {
+    return p.x * p.x + p.y * p.y
+}
+
+fun main() {
+    seg := Segment { start: Point { x: 1, y: 2 }, end: Point { x: 4, y: 6 }, label: 7 }
+    echo seg.start.x
+    echo seg.end.y
+    echo seg.label
+    echo length_sq(seg.end)
+    first := seg.start
+    echo first.y
+    held := Holder::Holding(seg.end)
+    picked := choose held {
+        Holder::Holding(p) => p.x,
+        Holder::Empty => 0,
+    }
+    echo picked
+    echo seg.start.x + seg.end.x
+}

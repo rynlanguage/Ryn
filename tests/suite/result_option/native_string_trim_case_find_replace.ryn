@@ -1,0 +1,47 @@
+// test: run
+// out: 8
+// out: 0
+// out: 0
+// out: left
+// out: 5
+// out: STRASSE ÀÉÎ ΩΜΕΓΑ ПРИВЕТ
+// out: straße àéî ωμεγα привет
+// out: mixed 123
+// out: 6
+// out: -1
+// out: 0
+// out: 0
+// out: 1 two 1
+// out: three two three
+// out: nothing
+// out:
+// out: 4
+
+// Trimming, case changes, find and replace on the native backend, including text outside ASCII.
+
+fun index_of(text: String, part: str) -> i64 {
+    return choose text.find(part) {
+        Option::Some(i) => i as i64,
+        Option::None => -1
+    }
+}
+
+fun main() {
+    echo String("  hi there \t").trim().len()
+    echo String("\n\n").trim().len()
+    echo String("").trim().len()
+    echo String("  left").trim_start()
+    echo String("right  ").trim_end().len()
+    echo String("Straße ÀÉÎ Ωμεγα Привет").to_upper()
+    echo String("Straße ÀÉÎ ΩΜΕΓΑ ПРИВЕТ").to_lower()
+    echo String("MiXeD 123").to_lower()
+    echo index_of(String("héllo wörld"), "wörld")
+    echo index_of(String("héllo wörld"), "xyz")
+    echo index_of(String("héllo"), "")
+    echo index_of(String("aaa"), "aa")
+    echo String("one two one").replace("one", "1")
+    echo String("one two one").replace("one", "three")
+    echo String("nothing").replace("zzz", "y")
+    echo String("aaa").replace("a", "")
+    echo String("héhé").replace("é", "e").len()
+}

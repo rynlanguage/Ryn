@@ -1,0 +1,7 @@
+// test: fail
+// code: R0240
+fun main() {
+    a := String("a")
+    b := a
+    echo a
+}

@@ -1,0 +1,12 @@
+// test: run
+// out: two
+const A: i32 = 2
+fun main() {
+    when A == 1 {
+        echo "one"
+    } when A == 2 {
+        echo "two"
+    } else {
+        echo "other"
+    }
+}

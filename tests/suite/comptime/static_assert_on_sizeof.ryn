@@ -1,0 +1,9 @@
+// test: run
+// out: layout ok
+struct Header { tag: u8, size: u32 }
+fun main() {
+    static_assert(sizeof(i32) == 4)
+    static_assert(alignof(u64) == 8)
+    static_assert(sizeof(Header) == 8)
+    echo "layout ok"
+}

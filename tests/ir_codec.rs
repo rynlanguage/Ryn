@@ -41,7 +41,10 @@ fn round_trip(path: &PathBuf) -> bool {
 #[test]
 fn every_pass_fixture_round_trips_its_ir() {
     let paths = program_paths("tests/programs/pass");
-    assert!(!paths.is_empty(), "the pass-program suite must not be empty");
+    assert!(
+        !paths.is_empty(),
+        "the pass-program suite must not be empty"
+    );
     for path in &paths {
         assert!(
             round_trip(path),

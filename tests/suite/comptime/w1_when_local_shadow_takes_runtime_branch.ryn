@@ -1,0 +1,11 @@
+// test: run
+// out: shadow-taken
+const F: bool = false
+fun main() {
+    F := true
+    when F {
+        echo "shadow-taken"
+    } else {
+        echo "const-taken"
+    }
+}

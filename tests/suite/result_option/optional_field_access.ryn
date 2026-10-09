@@ -1,0 +1,12 @@
+// test: run
+// out: 6
+// out: -1
+struct Box { n: i32 }
+fun main() {
+    a: Option<Box> = Option::Some(Box { n: 6 })
+    b: Option<Box> = Option::None
+    x := a?.n ?? -1
+    y := b?.n ?? -1
+    echo x
+    echo y
+}

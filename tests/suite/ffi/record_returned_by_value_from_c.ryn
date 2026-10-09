@@ -1,0 +1,14 @@
+// test: run
+// out: 3
+// out: 2
+#[repr(C)]
+struct DivT {
+    quot: i32,
+    rem: i32
+}
+extern "C" fun div(a: i32, b: i32) -> DivT;
+fun main() {
+    r := div(17, 5)
+    echo r.quot
+    echo r.rem
+}

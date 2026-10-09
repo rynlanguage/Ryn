@@ -1,0 +1,7 @@
+// test: fail
+// code: R0464
+// msg: -1 does not fit in `u32`
+const X: u32 = 0 - 1
+fun main() {
+    echo X
+}

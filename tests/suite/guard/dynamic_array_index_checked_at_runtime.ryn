@@ -1,0 +1,11 @@
+// test: run
+// err: array index is out of bounds
+// exit: 1
+fun main() {
+    a: [i32; 3] = [1, 2, 3]
+    mut i: i32 = 0
+    while i < 4 {
+        i += 1
+    }
+    echo a[i]
+}

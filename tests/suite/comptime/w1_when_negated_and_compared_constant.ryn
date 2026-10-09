@@ -1,0 +1,15 @@
+// test: run
+// out: b
+// out: c
+const K: bool = false
+fun main() {
+    when K {
+        echo "a"
+    }
+    when !K {
+        echo "b"
+    }
+    when K == false {
+        echo "c"
+    }
+}

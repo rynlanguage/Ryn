@@ -566,6 +566,14 @@ fn lex_all(text: &str, recovering: bool) -> (Vec<Token>, Vec<Diagnostic>) {
                         Cow::Borrowed(numeric_text)
                     };
                     if is_float {
+                        if let Some((diagnostic, resume)) = malformed_number_end(bytes, start, i) {
+                            diagnostics.push(diagnostic);
+                            if !recovering {
+                                break 'tokens;
+                            }
+                            i = resume;
+                            continue;
+                        }
                         let value = match normalized.parse::<f64>() {
                             Ok(value) => value,
                             Err(_) => {
@@ -645,10 +653,13 @@ fn lex_all(text: &str, recovering: bool) -> (Vec<Token>, Vec<Diagnostic>) {
                             };
                             value = milliseconds;
                             i = unit_end;
-                            out.push(Token {
-                                kind: TokenKind::Integer(value),
-                                span: Span { start, end: i },
-                            });
+                        }
+                        if let Some((diagnostic, resume)) = malformed_number_end(bytes, start, i) {
+                            diagnostics.push(diagnostic);
+                            if !recovering {
+                                break 'tokens;
+                            }
+                            i = resume;
                             continue;
                         }
                         TokenKind::Integer(value)
@@ -833,6 +844,46 @@ fn numeric_separator_diagnostic(span: Span) -> Diagnostic {
         span,
         help: None,
     }
+}
+
+/// Reports a number that runs into identifier characters (`12abc`) or into a second decimal
+/// point (`1.2.3`). `end` is the byte after the number; the returned byte is where lexing resumes.
+fn malformed_number_end(bytes: &[u8], start: usize, end: usize) -> Option<(Diagnostic, usize)> {
+    let is_name_byte = |byte: &u8| byte.is_ascii_alphanumeric() || *byte == b'_';
+    if bytes.get(end).is_some_and(is_name_byte) {
+        let mut run = end;
+        while bytes.get(run).is_some_and(is_name_byte) {
+            run += 1;
+        }
+        return Some((
+            Diagnostic {
+                code: "R0011",
+                message: "numeric literal is directly followed by letters or `_`".into(),
+                span: Span { start, end: run },
+                help: Some("separate the number from the name with a space or an operator".into()),
+            },
+            run,
+        ));
+    }
+    if bytes.get(end) == Some(&b'.') && bytes.get(end + 1).is_some_and(u8::is_ascii_digit) {
+        let mut run = end + 1;
+        while bytes.get(run).is_some_and(u8::is_ascii_digit) {
+            run += 1;
+        }
+        return Some((
+            Diagnostic {
+                code: "R0011",
+                message: "numeric literal is followed by another decimal point".into(),
+                span: Span { start, end: run },
+                help: Some(
+                    "a floating-point literal has one `.`; separate values with spaces or operators"
+                        .into(),
+                ),
+            },
+            run,
+        ));
+    }
+    None
 }
 
 fn character_literal(text: &str, start: usize) -> Result<(char, usize), Diagnostic> {
@@ -1150,6 +1201,16 @@ mod tests {
     fn rejects_non_finite_float_literals() {
         let error = lex("1e999").expect_err("infinite literal should be rejected");
         assert_eq!(error.code, "R0007");
+    }
+
+    #[test]
+    fn rejects_numbers_running_into_names_or_a_second_decimal_point() {
+        for source in ["12abc", "12i32", "1.2.3", "2s2"] {
+            let error = lex(source).expect_err("malformed number should be rejected");
+            assert_eq!(error.code, "R0011", "source: {source:?}");
+        }
+        let tokens = lex("3min 0..2 1.5e3").expect("valid number forms are lexable");
+        assert!(matches!(tokens[0].kind, TokenKind::Integer(180_000)));
     }
 
     #[test]

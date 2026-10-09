@@ -1,0 +1,17 @@
+// test: run
+// out: 8
+shape Offset {
+    fun value(self) -> i32
+    fun shifted(self) -> i32 {
+        base := self.value() + 5
+        base
+    }
+}
+struct Q { v: i32 }
+extend Q as Offset {
+    fun value(self) -> i32 { self.v }
+}
+fun main() {
+    q := Q { v: 3 }
+    echo q.shifted()
+}

@@ -1,0 +1,12 @@
+// test: fail
+// code: R0248
+// msg: would outlive its function
+struct H { p: *i32 }
+fun make() -> H {
+    mut x: i32 = 5
+    return H { p: &raw mut x }
+}
+fun main() {
+    h := make()
+    echo *h.p
+}

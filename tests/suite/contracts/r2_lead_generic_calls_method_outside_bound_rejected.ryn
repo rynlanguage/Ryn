@@ -1,0 +1,15 @@
+// test: fail
+// code: R0450
+// msg: method `extra` is not part of the bound `Show`
+shape Show { fun show(self) -> i32 }
+struct B { n: i32 }
+extend B as Show {
+    fun show(self) -> i32 { return self.n }
+    fun extra(self) -> i32 { return 7 }
+}
+fun f<T: Show>(a: T) -> i32 {
+    return a.extra()
+}
+fun main() {
+    echo f(B { n: 1 })
+}

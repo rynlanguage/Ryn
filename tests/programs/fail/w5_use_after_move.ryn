@@ -1,0 +1,9 @@
+fun consume(text: String) {
+    echo text
+}
+
+fun main() {
+    text := String("ryn")
+    consume(text)
+    consume(text)
+}

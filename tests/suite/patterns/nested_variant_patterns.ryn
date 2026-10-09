@@ -1,0 +1,18 @@
+// test: run
+// out: 3
+// out: 7
+// out: 0
+enum Inner { Data(i32), Nothing }
+enum Outer { Nested(Inner), Direct(i32) }
+fun f(o: Outer) -> i32 {
+    choose o {
+        Outer::Nested(Inner::Data(n)) => n,
+        Outer::Nested(Inner::Nothing) => 0,
+        Outer::Direct(x) => x
+    }
+}
+fun main() {
+    echo f(Outer::Direct(3))
+    echo f(Outer::Nested(Inner::Data(7)))
+    echo f(Outer::Nested(Inner::Nothing))
+}

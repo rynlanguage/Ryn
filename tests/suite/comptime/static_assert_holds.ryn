@@ -1,0 +1,8 @@
+// test: run
+// out: ok
+const SIZE: i32 = 8
+fun main() {
+    static_assert(SIZE == 8)
+    static_assert(SIZE > 0 && SIZE < 16, "size in range")
+    echo "ok"
+}

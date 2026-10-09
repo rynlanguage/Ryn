@@ -1,0 +1,47 @@
+// test: run
+// out: 13
+// out: -198
+// out: 11
+// out: 8
+// out: -1
+// exit: 0
+struct Point { x: i64, y: i64 }
+
+struct Problem { code: i64, weight: i64 }
+
+fun check(n: i64) -> Result<i64, Problem> {
+    when n < 0 {
+        return Result::Err(Problem { code: n, weight: 2 })
+    }
+    return Result::Ok(n * 3)
+}
+
+fun run(n: i64) -> Result<i64, Problem> {
+    v := check(n)?
+    return Result::Ok(v + 1)
+}
+
+fun find(flag: bool) -> Option<Point> {
+    when flag {
+        return Option::Some(Point { x: 8, y: 9 })
+    }
+    return Option::None
+}
+
+fun x_part(p: Point) -> i64 {
+    return p.x
+}
+
+fun x_of(flag: bool) -> Option<i64> {
+    return Option::Some(x_part(find(flag)?))
+}
+
+fun main() {
+    echo choose run(4) { Result::Ok(v) => v, Result::Err(e) => 0 }
+    echo choose run(-2) { Result::Ok(v) => v, Result::Err(e) => e.code * 100 + e.weight }
+    p := Point { x: 5, y: 6 }
+    wrapped := Option::Some(p)
+    echo choose wrapped { Option::Some(q) => q.x + q.y, Option::None => 0 }
+    echo choose x_of(true) { Option::Some(v) => v, Option::None => 0 }
+    echo choose x_of(false) { Option::Some(v) => v, Option::None => -1 }
+}

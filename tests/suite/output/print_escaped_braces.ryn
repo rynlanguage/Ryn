@@ -1,0 +1,5 @@
+// test: run
+// out: {} stays and 9
+fun main() {
+    print("{{}} stays and {}", 9 as i32)
+}

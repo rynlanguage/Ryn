@@ -1,0 +1,10 @@
+// test: run
+// out: 41
+fun set(v: &mut i32) {
+    *v = 41
+}
+fun main() {
+    mut x: i32 = 1
+    set(&mut x)
+    echo x
+}

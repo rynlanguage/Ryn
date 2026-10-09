@@ -1,0 +1,13 @@
+// test: run
+// out: 3
+// out: 0
+fun find(n: i32) -> Option<i32> {
+    when n > 0 {
+        return Option::Some(n)
+    }
+    return Option::None
+}
+fun main() {
+    echo choose find(3) { Option::Some(v) => v, Option::None => 0 }
+    echo choose find(-3) { Option::Some(v) => v, Option::None => 0 }
+}

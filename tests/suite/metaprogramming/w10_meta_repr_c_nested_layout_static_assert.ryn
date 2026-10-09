@@ -1,0 +1,26 @@
+// test: run
+// out: 16
+// out: 8
+// out: 32
+// out: 8
+// out: 26
+#[repr(C)]
+struct Pair {
+    a: i32,
+    b: i64
+}
+#[repr(C)]
+struct Outer {
+    tag: u8,
+    pair: Pair,
+    last: u16
+}
+fun main() {
+    static_assert(sizeof(Pair) == 16 && alignof(Pair) == 8)
+    static_assert(sizeof(Outer) == 32 && alignof(Outer) == 8)
+    echo sizeof(Pair)
+    echo alignof(Pair)
+    echo sizeof(Outer)
+    echo alignof(Outer)
+    echo sizeof(Outer) - 6 as u64
+}

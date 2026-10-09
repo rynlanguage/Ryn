@@ -1,0 +1,15 @@
+// test: run
+// out: 10
+fun total(values: &[i32]) -> i32 {
+    mut t: i32 = 0
+    for v in values {
+        t += v
+    }
+    return t
+}
+fun main() {
+    mut v: Vec<i32> = Vec()
+    v.push(4)
+    v.push(6)
+    echo total(v.as_slice())
+}

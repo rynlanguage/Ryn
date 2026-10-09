@@ -1,0 +1,32 @@
+// test: run
+// out: 3 4
+// out: 4 3
+// out: 8
+// out: 6 5
+// out: 5 6
+struct Pair { a: i64, b: i64 }
+
+fun make(x: i64, y: i64) -> Pair {
+    return Pair { a: x, b: y }
+}
+
+fun swap(p: Pair) -> Pair {
+    return Pair { a: p.b, b: p.a }
+}
+
+fun pass_through(p: Pair) -> Pair {
+    return p
+}
+
+fun main() {
+    p := make(3, 4)
+    print("{} {}", p.a, p.b)
+    q := swap(p)
+    print("{} {}", q.a, q.b)
+    print("{}", make(7, 8).b)
+    make(1, 2)
+    r := swap(make(5, 6))
+    print("{} {}", r.a, r.b)
+    s := pass_through(swap(r))
+    print("{} {}", s.a, s.b)
+}

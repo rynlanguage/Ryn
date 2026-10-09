@@ -1,0 +1,7 @@
+// test: run
+// out: 2
+const HALF: f64 = 0.5
+const TWICE: f64 = HALF * 4.0
+fun main() {
+    echo TWICE
+}

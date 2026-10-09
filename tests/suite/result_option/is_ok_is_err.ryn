@@ -1,0 +1,17 @@
+// test: run
+// out: true
+// out: false
+// out: false
+// out: true
+fun ok() -> Result<i32, String> {
+    return Result::Ok(1)
+}
+fun err() -> Result<i32, String> {
+    return Result::Err(String("e"))
+}
+fun main() {
+    echo ok().is_ok()
+    echo ok().is_err()
+    echo err().is_ok()
+    echo err().is_err()
+}

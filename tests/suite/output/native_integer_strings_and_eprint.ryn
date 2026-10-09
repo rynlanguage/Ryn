@@ -1,0 +1,21 @@
+// test: run
+// err: e-42
+// err: |7
+// out: 0
+// out: -7
+// out: 123456789
+// out: -9223372036854775808
+// out: 18446744073709551615
+// out: 255
+// out: -127
+fun main() {
+    echo String(0 as i32)
+    echo String(-7 as i32)
+    echo String(123456789 as i64)
+    echo String(-9223372036854775807 - 1)
+    echo String(18446744073709551615 as u64)
+    echo String(255 as u8)
+    echo String(-127 as i8)
+    eprint("e{}", -42 as i32)
+    eprint("|{}", 7 as u64)
+}

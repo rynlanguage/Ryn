@@ -1,0 +1,8 @@
+// test: run
+// out: 2
+// out: 4
+fun pick<A, B>(a: A, b: B) -> B { return b }
+fun main() {
+    echo pick::<i32, i64>(1, 2)
+    echo pick(3 as u8, 4 as i32)
+}

@@ -1,0 +1,6 @@
+// test: fail
+// code: R0247
+extern "C" fun takes(items: Vec<i32>);
+fun main() {
+    echo 1
+}

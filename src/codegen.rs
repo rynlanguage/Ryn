@@ -372,6 +372,9 @@ pub(crate) fn build_native_with_optimize(
     output: &Path,
     optimize: &str,
 ) -> Result<(), BuildError> {
+    if let Some(path) = std::env::var_os("RYN_DUMP_IR") {
+        let _ = fs::write(path, crate::ir_codec::encode_ir(ir));
+    }
     let object = emit_object_with_optimize(ir, optimize)?;
     link_object(&object, output)
 }
@@ -1294,9 +1297,15 @@ fn make_signature(
         if function.external_symbol.is_some()
             && let Some((size, _)) = c_abi_packed_record_layout(parameter.ty, structs)
         {
-            signature
-                .params
-                .push(AbiParam::new(c_abi_integer_type(size)));
+            let (size, fields) = (
+                size,
+                c_abi_packed_record_layout(parameter.ty, structs)
+                    .map(|l| l.1)
+                    .unwrap_or_default(),
+            );
+            for ty in c_abi_param_types(size, &fields) {
+                signature.params.push(AbiParam::new(ty));
+            }
         } else {
             append_type(&mut signature.params, parameter.ty, pointer_type, structs);
         }
@@ -1309,11 +1318,11 @@ fn make_signature(
             // native ABI may not support the record's flattened result count.
             signature.params.insert(0, AbiParam::new(pointer_type));
         } else if function.external_symbol.is_some()
-            && let Some((size, _)) = c_abi_packed_record_layout(ty, structs)
+            && let Some((size, fields)) = c_abi_packed_record_layout(ty, structs)
         {
-            signature
-                .returns
-                .push(AbiParam::new(c_abi_integer_type(size)));
+            for ty in c_abi_param_types(size, &fields) {
+                signature.returns.push(AbiParam::new(ty));
+            }
         } else {
             append_type(&mut signature.returns, ty, pointer_type, structs);
         }
@@ -1349,7 +1358,8 @@ fn c_abi_packed_record_layout(
         aggregate_align = aggregate_align.max(field_align);
     }
     offset = offset.saturating_add(aggregate_align - 1) / aggregate_align * aggregate_align;
-    matches!(offset, 1 | 2 | 4 | 8).then_some((offset, fields))
+    (matches!(offset, 1 | 2 | 4 | 8) || (cfg!(not(windows)) && (9..=16).contains(&offset)))
+        .then_some((offset, fields))
 }
 
 fn is_direct_c_abi_record(ty: Type, structs: &[RynStruct]) -> bool {
@@ -1381,16 +1391,50 @@ fn c_abi_field_clif_type(ty: Type) -> types::Type {
     }
 }
 
+/// The ABI value types a packed C record travels in. System V classifies each
+/// eightbyte separately: it is SSE (a float register) only when it holds at least one
+/// field and every field in it is a float, otherwise INTEGER (an integer register).
+/// A record of up to 8 bytes is one eightbyte; a 4-byte float record is a single f32.
+fn c_abi_param_types(size: usize, fields: &[(usize, Type)]) -> Vec<types::Type> {
+    let sse_eightbyte = |eightbyte: usize| {
+        let mut any = false;
+        for (_, ty) in fields.iter().filter(|(offset, _)| offset / 8 == eightbyte) {
+            if !matches!(ty, Type::F32 | Type::F64) {
+                return false;
+            }
+            any = true;
+        }
+        any
+    };
+    if size <= 8 {
+        return vec![if sse_eightbyte(0) {
+            if size == 4 { types::F32 } else { types::F64 }
+        } else {
+            c_abi_integer_type(size)
+        }];
+    }
+    (0..2)
+        .map(|eightbyte| {
+            if sse_eightbyte(eightbyte) {
+                types::F64
+            } else {
+                types::I64
+            }
+        })
+        .collect()
+}
+
 fn pack_c_abi_record(
     b: &mut FunctionBuilder<'_>,
     values: &[Value],
     size: usize,
     fields: &[(usize, Type)],
-) -> Result<Value, String> {
+) -> Result<Vec<Value>, String> {
     if values.len() != fields.len() {
         return Err("internal error: C aggregate field count mismatch".into());
     }
-    let mut packed = b.ins().iconst(types::I64, 0);
+    let words = if size > 8 { 2 } else { 1 };
+    let mut packed: Vec<Value> = (0..words).map(|_| b.ins().iconst(types::I64, 0)).collect();
     for (value, (offset, ty)) in values.iter().zip(fields) {
         let bits = match ty {
             Type::F32 => b.ins().bitcast(types::I32, MemFlagsData::new(), *value),
@@ -1402,35 +1446,64 @@ fn pack_c_abi_record(
         } else {
             b.ins().uextend(types::I64, bits)
         };
-        if *offset != 0 {
-            part = b.ins().ishl_imm_u(part, (*offset * 8) as i64);
+        let word = offset / 8;
+        let shift = offset % 8;
+        if shift != 0 {
+            part = b.ins().ishl_imm_u(part, (shift * 8) as i64);
         }
-        packed = b.ins().bor(packed, part);
+        packed[word] = b.ins().bor(packed[word], part);
     }
-    if size == 8 {
-        Ok(packed)
-    } else {
-        Ok(b.ins().ireduce(c_abi_integer_type(size), packed))
+    if size <= 8 {
+        let value = match c_abi_param_types(size, fields)[0] {
+            types::F64 => b.ins().bitcast(types::F64, MemFlagsData::new(), packed[0]),
+            types::F32 => {
+                let bits = b.ins().ireduce(types::I32, packed[0]);
+                b.ins().bitcast(types::F32, MemFlagsData::new(), bits)
+            }
+            types::I64 => packed[0],
+            ty => b.ins().ireduce(ty, packed[0]),
+        };
+        return Ok(vec![value]);
     }
+    let types = c_abi_param_types(size, fields);
+    Ok(packed
+        .into_iter()
+        .zip(types)
+        .map(|(word, ty)| {
+            if ty == types::F64 {
+                b.ins().bitcast(types::F64, MemFlagsData::new(), word)
+            } else {
+                word
+            }
+        })
+        .collect())
 }
 
 fn unpack_c_abi_record(
     b: &mut FunctionBuilder<'_>,
-    value: Value,
+    values: &[Value],
     size: usize,
     fields: &[(usize, Type)],
 ) -> Vec<Value> {
-    let value = if size == 8 {
-        value
-    } else {
-        b.ins().uextend(types::I64, value)
-    };
+    let words: Vec<Value> = values
+        .iter()
+        .map(|value| match b.func.dfg.value_type(*value) {
+            types::F64 => b.ins().bitcast(types::I64, MemFlagsData::new(), *value),
+            types::I64 => *value,
+            types::F32 => {
+                let bits = b.ins().bitcast(types::I32, MemFlagsData::new(), *value);
+                b.ins().uextend(types::I64, bits)
+            }
+            _ => b.ins().uextend(types::I64, *value),
+        })
+        .collect();
+    let _ = size;
     fields
         .iter()
         .map(|(offset, ty)| {
-            let mut field = value;
-            if *offset != 0 {
-                field = b.ins().ushr_imm_u(field, (*offset * 8) as i64);
+            let mut field = words[offset / 8];
+            if offset % 8 != 0 {
+                field = b.ins().ushr_imm_u(field, ((offset % 8) * 8) as i64);
             }
             let width = match ty {
                 Type::I8 | Type::U8 | Type::Bool => 8,
@@ -2348,6 +2421,37 @@ fn drop_temporary(b: &mut FunctionBuilder<'_>, runtime: PrintFunctions, value: C
     }
 }
 
+/// A discarded value with a custom destructor is dropped at the end of its statement, the way
+/// a named one is: its destructor receives the whole value, unless the handle is null.
+fn drop_discarded_destructor(
+    b: &mut FunctionBuilder<'_>,
+    env: &ExprEnv<'_>,
+    drop_function: usize,
+    value: CompiledValue,
+    seal_state: &mut BlockSealState,
+) {
+    let arguments = flatten_value(value);
+    let Some(&handle) = arguments.first() else {
+        return;
+    };
+    let is_null = b.ins().icmp_imm_s(IntCC::Equal, handle, 0);
+    let skip = b.create_block();
+    let invoke = b.create_block();
+    let merge = b.create_block();
+    let from = b.current_block().expect("drop has a current block");
+    b.ins().brif(is_null, skip, &[], invoke, &[]);
+    seal_ready(b, from, seal_state);
+    b.switch_to_block(invoke);
+    b.ins().call(env.calls[drop_function], &arguments);
+    b.ins().jump(merge, &[]);
+    seal_ready(b, invoke, seal_state);
+    b.switch_to_block(skip);
+    b.ins().jump(merge, &[]);
+    seal_ready(b, skip, seal_state);
+    b.switch_to_block(merge);
+    seal_ready(b, merge, seal_state);
+}
+
 fn make_temporary(value: &mut CompiledValue) {
     match value {
         CompiledValue::OwnedString { temporary, .. } => *temporary = true,
@@ -2760,7 +2864,21 @@ fn emit_statements(
                         let mut offset = 0;
                         let result =
                             compiled_value_from_type(ty, &result, &mut offset, env.structs)?;
-                        drop_temporary(b, env.print_functions, result);
+                        match ty {
+                            Type::Struct(struct_id)
+                                if env.structs[struct_id].drop_function.is_some() =>
+                            {
+                                let drop_function = env.structs[struct_id].drop_function.unwrap();
+                                drop_discarded_destructor(
+                                    b,
+                                    env,
+                                    drop_function,
+                                    result,
+                                    seal_state,
+                                );
+                            }
+                            _ => drop_temporary(b, env.print_functions, result),
+                        }
                     }
                     true
                 }
@@ -6823,10 +6941,10 @@ fn emit_call(
                 if signature.extern_c
                     && let Some((size, fields)) = c_abi_packed_record_layout(*ty, env.structs)
                 {
-                    call_signature
-                        .params
-                        .push(AbiParam::new(c_abi_integer_type(size)));
-                    values.push(pack_c_abi_record(b, &flatten_value(value), size, &fields)?);
+                    for abi in c_abi_param_types(size, &fields) {
+                        call_signature.params.push(AbiParam::new(abi));
+                    }
+                    values.extend(pack_c_abi_record(b, &flatten_value(value), size, &fields)?);
                 } else {
                     call_signature.params.push(AbiParam::new(clif_scalar_type(
                         *ty,
@@ -6837,11 +6955,11 @@ fn emit_call(
             }
             if let Some(result) = signature.result {
                 if signature.extern_c
-                    && let Some((size, _)) = c_abi_packed_record_layout(result, env.structs)
+                    && let Some((size, fields)) = c_abi_packed_record_layout(result, env.structs)
                 {
-                    call_signature
-                        .returns
-                        .push(AbiParam::new(c_abi_integer_type(size)));
+                    for abi in c_abi_param_types(size, &fields) {
+                        call_signature.returns.push(AbiParam::new(abi));
+                    }
                 } else {
                     call_signature.returns.push(AbiParam::new(clif_scalar_type(
                         result,
@@ -6862,12 +6980,13 @@ fn emit_call(
                 && let Some(result) = signature.result
                 && let Some((size, fields)) = c_abi_packed_record_layout(result, env.structs)
             {
-                let [packed] = results.as_slice() else {
+                if results.len() != c_abi_param_types(size, &fields).len() {
                     return Err(
-                        "internal error: indirect C aggregate return must be one ABI value".into(),
+                        "internal error: indirect C aggregate return has the wrong ABI value count"
+                            .into(),
                     );
-                };
-                Ok(unpack_c_abi_record(b, *packed, size, &fields))
+                }
+                Ok(unpack_c_abi_record(b, &results, size, &fields))
             } else {
                 Ok(results)
             }
@@ -6974,7 +7093,7 @@ fn emit_function_call(
                 .get(index)
                 .and_then(|ty| c_abi_packed_record_layout(*ty, env.structs))
         {
-            args.push(pack_c_abi_record(b, &flattened, size, &fields)?);
+            args.extend(pack_c_abi_record(b, &flattened, size, &fields)?);
         } else {
             args.extend(flattened);
         }
@@ -7020,10 +7139,12 @@ fn emit_function_call(
         && let Some((size, fields)) =
             return_type.and_then(|ty| c_abi_packed_record_layout(ty, env.structs))
     {
-        let [packed] = results.as_slice() else {
-            return Err("internal error: packed C aggregate return must be one ABI value".into());
-        };
-        Ok(unpack_c_abi_record(b, *packed, size, &fields))
+        if results.len() != c_abi_param_types(size, &fields).len() {
+            return Err(
+                "internal error: packed C aggregate return has the wrong ABI value count".into(),
+            );
+        }
+        Ok(unpack_c_abi_record(b, &results, size, &fields))
     } else {
         Ok(results)
     }
@@ -7240,6 +7361,31 @@ fn emit_if_expression(
     compiled_value_from_type(ty, b.block_params(merge_block), &mut offset, env.structs)
 }
 
+/// A `choose` payload binding that is borrowed (`x.method()` takes `&x`) needs
+/// its stack home refreshed, exactly like `let` and assignment do; otherwise the
+/// borrow reads an unwritten stack slot.
+fn sync_choose_binding_to_address_slot(
+    b: &mut FunctionBuilder<'_>,
+    env: &ExprEnv<'_>,
+    slot: usize,
+    ty: Type,
+    pointer_type: types::Type,
+) -> Result<(), String> {
+    if let Some(Some(stack_slot)) = env.address_slots.get(slot) {
+        store_local_variables_to_stack_slot(
+            b,
+            slot,
+            ty,
+            *stack_slot,
+            0,
+            pointer_type,
+            env.structs,
+            matches!(ty, Type::Struct(id) if env.structs[id].repr_c),
+        )?;
+    }
+    Ok(())
+}
+
 fn emit_enum_match(
     b: &mut FunctionBuilder<'_>,
     module: &ObjectModule,
@@ -7352,6 +7498,13 @@ fn emit_enum_match(
                         true,
                     )?;
                     store_local(b, binding.slot, field_type, local_value, env.structs)?;
+                    sync_choose_binding_to_address_slot(
+                        b,
+                        env,
+                        binding.slot,
+                        field_type,
+                        pointer_type,
+                    )?;
                     continue;
                 }
                 let word_index = b.ins().iconst(types::I64, payload_word_offset as i64);
@@ -7403,6 +7556,13 @@ fn emit_enum_match(
                     }
                 };
                 b.def_var(Variable::from_u32(binding.slot as u32), local_value);
+                sync_choose_binding_to_address_slot(
+                    b,
+                    env,
+                    binding.slot,
+                    field_type,
+                    pointer_type,
+                )?;
             }
         }
         let result = emit_expr(b, module, &arm.body, env, seal_state)?;

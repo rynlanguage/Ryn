@@ -1,0 +1,13 @@
+// test: run
+// out: 4
+// out: 3
+fun depth<T>(v: T, n: i32) -> i32 {
+    choose n {
+        0 => 0,
+        _ => 1 + depth(v, n - 1)
+    }
+}
+fun main() {
+    echo depth(true, 4)
+    echo depth(7 as i64, 3)
+}

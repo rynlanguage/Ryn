@@ -1,0 +1,7 @@
+// test: run
+// exit: 1
+// err: needed a value
+fun main() {
+    o: Option<i32> = Option::None
+    echo o.expect("needed a value")
+}

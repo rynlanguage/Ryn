@@ -1,0 +1,33 @@
+// test: run
+// out: -1
+// out: 65535
+// out: 18446744073709551615
+// out: 0
+// out: 32768
+// out: -1
+// out: -1
+// out: -2147483648
+// out: 18446744073709551614
+// out: 254
+// out: -56
+// out: 200
+fun main() {
+    mut a: i8 = -1
+    echo a as i16
+    echo a as u16
+    echo a as u64
+    mut b: i16 = -32768
+    echo b as u8
+    echo b as u16
+    mut c: u64 = 18446744073709551615
+    echo c as i8
+    echo c as i64
+    mut d: u32 = 2147483648
+    echo d as i32
+    mut e: i32 = -2
+    echo e as u64
+    echo e as u8
+    mut f: u8 = 200
+    echo f as i8
+    echo f as f32
+}

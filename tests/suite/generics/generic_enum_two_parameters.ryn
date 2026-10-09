@@ -1,0 +1,17 @@
+// test: run
+// out: 3
+// out: 7
+enum Selection<T, E> {
+    Value(T),
+    Problem(E)
+}
+fun measure(s: Selection<String, i32>) -> u64 {
+    choose s {
+        Selection::Value(t) => t.char_count(),
+        Selection::Problem(c) => c as u64
+    }
+}
+fun main() {
+    echo measure(Selection::<String, i32>::Value(String("two")))
+    echo measure(Selection::<String, i32>::Problem(7 as i32))
+}

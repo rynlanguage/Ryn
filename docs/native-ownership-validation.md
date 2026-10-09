@@ -79,5 +79,4 @@ cargo test --test native_backend
 RUST_MIN_STACK=16777216 cargo test
 ```
 
-Session diagnostics, measured outputs and executables are retained in `/tmp/ryn-ownership-work`. The unrelated existing
-working-tree edits were preserved. This work is on `selfhost/native-ownership`; nothing was pushed.
+Session diagnostics, measured outputs and executables are retained in `/tmp/ryn-ownership-work`. The earlier compiler, documentation and test changes are included with the user's explicit authorization so this snapshot includes the validated dependencies. Generated executables, caches and logs are excluded. This work is on `selfhost/native-ownership`.

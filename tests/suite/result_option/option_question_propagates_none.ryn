@@ -1,0 +1,20 @@
+// test: run
+// out: 8
+// out: none
+fun pos(n: i32) -> Option<i32> {
+    when n > 0 {
+        return Option::Some(n)
+    }
+    return Option::None
+}
+fun double(n: i32) -> Option<i32> {
+    v := pos(n)?
+    return Option::Some(v * 2)
+}
+fun main() {
+    echo choose double(4) { Option::Some(v) => v, Option::None => 0 }
+    r := double(-1)
+    when r.is_none() {
+        echo "none"
+    }
+}
