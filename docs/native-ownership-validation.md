@@ -42,8 +42,9 @@ newline. The copied lowerer source was checked byte-identical to the repository 
 
 The Rust-built full compiler comparison **did not finish under the same 1 GiB limit**: its allocator aborted
 (`memory allocation of 3 bytes failed`, exit 134). Consequently there is no claim of a Rust/native full-compiler binary
-comparison. Functional output comparisons below and lowerer IR parity did complete. Freestanding float text still has
-17 known declines; libc object mode remains available to the native object tests.
+comparison. Functional output comparisons below and lowerer IR parity did complete. The 17 freestanding float-text declines
+recorded here were resolved on 2026-10-09 by embedding the Ryn float runtime; see
+[native float validation](native-float-validation.md). libc object mode remains available to the native object tests.
 
 ## Stress output and memory parity
 

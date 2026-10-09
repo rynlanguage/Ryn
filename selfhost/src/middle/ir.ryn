@@ -176,6 +176,9 @@ pub struct IrProgram {
 // order `ryn::ir_codec` writes them, so the same words and counts are checked as in the
 // Rust decoder, and nodes are pushed to the arenas once their children are read.
 struct IrDecoder {
+    function_base: u64,
+    struct_base: u64,
+    enum_base: u64,
     text: String,
     at: u64,
     types: Vec<IrTy>,
@@ -431,7 +434,8 @@ extend IrDecoder {
         }
         slot_count := self.uint()?
         repr_c := self.boolean()?
-        drop_function := self.optional_uint()?
+        mut drop_function := self.optional_uint()?
+        when drop_function.is_some() { drop_function = Option::Some(drop_function.unwrap() + self.function_base) }
         derives_clone := self.boolean()?
         derives_hash := self.boolean()?
         module_path := self.string()?
@@ -533,11 +537,11 @@ extend IrDecoder {
             return Result::Ok(self.push_ty(IrTy::Scalar(word)))
         }
         when word == "Struct" {
-            id := self.uint()?
+            id := self.uint()? + self.struct_base
             return Result::Ok(self.push_ty(IrTy::StructTy(id)))
         }
         when word == "Enum" {
-            id := self.uint()?
+            id := self.uint()? + self.enum_base
             return Result::Ok(self.push_ty(IrTy::EnumTy(id)))
         }
         when word == "Vec" {
@@ -664,7 +668,7 @@ extend IrDecoder {
         }
         when word == "ReferenceFieldAssign" {
             pointer := self.expression()?
-            struct_id := self.uint()?
+            struct_id := self.uint()? + self.struct_base
             field_index := self.uint()?
             ty := self.ty()?
             value := self.expression()?
@@ -742,7 +746,7 @@ extend IrDecoder {
     fun call_target(mut self) -> Result<CallTarget, String> {
         word := self.token()?
         when word == "Function" {
-            id := self.uint()?
+            id := self.uint()? + self.function_base
             return Result::Ok(CallTarget::Func(id))
         }
         when word == "ArgumentCount" {
@@ -758,11 +762,11 @@ extend IrDecoder {
             return Result::Ok(CallTarget::FilesystemOp(self.token()?))
         }
         when word == "TryReadFile" {
-            id := self.uint()?
+            id := self.uint()? + self.enum_base
             return Result::Ok(CallTarget::TryRead(id))
         }
         when word == "ReadFileResult" {
-            id := self.uint()?
+            id := self.uint()? + self.enum_base
             return Result::Ok(CallTarget::ReadFileRes(id))
         }
         when word == "System" {
@@ -797,22 +801,22 @@ extend IrDecoder {
             return Result::Ok(CallTarget::SetOp(op, key, value))
         }
         when word == "EnumNew" {
-            enum_id := self.uint()?
+            enum_id := self.uint()? + self.enum_base
             tag := self.uint()?
             return Result::Ok(CallTarget::EnumNew(enum_id, tag))
         }
         when word == "EnumPredicate" {
             op := self.token()?
-            id := self.uint()?
+            id := self.uint()? + self.enum_base
             return Result::Ok(CallTarget::EnumPredicate(op, id))
         }
         when word == "EnumUnwrapOr" {
-            enum_id := self.uint()?
+            enum_id := self.uint()? + self.enum_base
             value_type := self.ty()?
             return Result::Ok(CallTarget::EnumUnwrapOr(enum_id, value_type))
         }
         when word == "EnumUnwrap" {
-            enum_id := self.uint()?
+            enum_id := self.uint()? + self.enum_base
             value_type := self.ty()?
             message := self.boolean()?
             success_tag := self.uint()?
@@ -821,7 +825,7 @@ extend IrDecoder {
         }
         when word == "VecGetOption" {
             elem_id := self.ty()?
-            option_id := self.uint()?
+            option_id := self.uint()? + self.enum_base
             pop := self.boolean()?
             return Result::Ok(CallTarget::VecGetOption(elem_id, option_id, pop))
         }
@@ -882,7 +886,7 @@ extend IrDecoder {
             return Result::Ok(self.push_expr(IrExpr::MoveRef(slot, ty)))
         }
         when word == "StructValue" {
-            struct_id := self.uint()?
+            struct_id := self.uint()? + self.struct_base
             count := self.uint()?
             mut field_indices: Vec<u64> = Vec()
             mut values: Vec<u64> = Vec()
@@ -896,7 +900,7 @@ extend IrDecoder {
         }
         when word == "Field" {
             value := self.expression()?
-            struct_id := self.uint()?
+            struct_id := self.uint()? + self.struct_base
             field_index := self.uint()?
             ty := self.ty()?
             span := self.span()?
@@ -904,7 +908,7 @@ extend IrDecoder {
         }
         when word == "ReferenceField" {
             pointer := self.expression()?
-            struct_id := self.uint()?
+            struct_id := self.uint()? + self.struct_base
             field_index := self.uint()?
             ty := self.ty()?
             span := self.span()?
@@ -933,7 +937,7 @@ extend IrDecoder {
         }
         when word == "EnumMatch" {
             value := self.expression()?
-            enum_id := self.uint()?
+            enum_id := self.uint()? + self.enum_base
             count := self.uint()?
             mut arms: Vec<u64> = Vec()
             mut index: u64 = 0
@@ -946,8 +950,8 @@ extend IrDecoder {
         }
         when word == "Propagate" {
             value := self.expression()?
-            input_enum := self.uint()?
-            output_enum := self.uint()?
+            input_enum := self.uint()? + self.enum_base
+            output_enum := self.uint()? + self.enum_base
             success_type := self.ty()?
             failure_type := self.optional_ty()?
             success_variant := self.uint()?
@@ -1005,7 +1009,7 @@ extend IrDecoder {
         }
         when word == "StringFindOption" {
             value := self.expression()?
-            enum_id := self.uint()?
+            enum_id := self.uint()? + self.enum_base
             return Result::Ok(self.push_expr(IrExpr::StringFindOption(value, enum_id)))
         }
         when word == "StringAsStr" {
@@ -1034,7 +1038,7 @@ extend IrDecoder {
             return Result::Ok(self.push_expr(IrExpr::BitNot(value, ty)))
         }
         when word == "FunctionAddress" {
-            function := self.uint()?
+            function := self.uint()? + self.function_base
             ty := self.ty()?
             return Result::Ok(self.push_expr(IrExpr::FunctionAddress(function, ty)))
         }
@@ -1050,11 +1054,37 @@ extend IrDecoder {
 
 // Decodes the text written by `ryn::ir_codec::encode_ir`.
 pub fun decode_ir(text: String) -> Result<IrProgram, String> {
-    mut decoder := IrDecoder { text: text, at: 0, types: Vec(), exprs: Vec(), stmts: Vec(), parts: Vec(), arms: Vec() }
+    mut decoder := IrDecoder { function_base: 0, struct_base: 0, enum_base: 0, text: text, at: 0, types: Vec(), exprs: Vec(), stmts: Vec(), parts: Vec(), arms: Vec() }
     decoder.expect_word("Ir")?
     program := decoder.ir()?
     decoder.finish()?
     return Result::Ok(program)
+}
+
+// Appends a separately lowered runtime module. Existing arena entries seed the decoder, so
+// children get final arena indices directly; only definition references need base offsets.
+pub fun append_ir(program: IrProgram, text: String) -> Result<IrProgram, String> {
+    main_index := program.main_index
+    instant_drop := program.instant_drop
+    mut decoder := IrDecoder {
+        function_base: program.functions.len(), struct_base: program.structs.len(), enum_base: program.enums.len(),
+        text: text, at: 0, types: program.types, exprs: program.exprs, stmts: program.stmts, parts: program.parts, arms: program.arms,
+    }
+    decoder.expect_word("Ir")?
+    mut added := decoder.ir()?
+    decoder.finish()?
+    mut structs := program.structs
+    for definition in added.structs { structs.push(definition) }
+    mut enums := program.enums
+    for definition in added.enums { enums.push(definition) }
+    mut functions := program.functions
+    for definition in added.functions { functions.push(definition) }
+    added.structs = structs
+    added.enums = enums
+    added.functions = functions
+    added.main_index = main_index
+    added.instant_drop = instant_drop
+    return Result::Ok(added)
 }
 
 // Writes the text form. The field order mirrors `IrDecoder`, so decoding the output gives

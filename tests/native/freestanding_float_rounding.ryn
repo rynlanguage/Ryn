@@ -1,0 +1,44 @@
+// test: run
+// out: 1.0000001
+// out: 1
+// out: 0.000000000000000000000000000000000000000000001
+// out: 0
+// out: -0
+// out: true
+// out: true
+// out: true
+// out: 0
+// out: 0
+
+extern "C" fun ryn_native_live_allocations() -> u64;
+extern "C" fun ryn_native_live_bytes() -> u64;
+
+fun main() {
+    // Direct decimal-to-f32 rounding must avoid double rounding via f64.
+    echo String("1.0000000596046448").try_to_f32().unwrap()
+    echo String("1.0000000596046447").try_to_f32().unwrap()
+    echo String("7.006492321624086e-46").try_to_f32().unwrap()
+    echo String("7.006492321624085e-46").try_to_f32().unwrap()
+    echo String("-1e-10000000").try_to_f64().unwrap()
+    nan := String("NaN").try_to_f32().unwrap()
+    echo nan != nan
+    echo String(String("1e10000000").try_to_f32().unwrap()) == "inf"
+    echo String("1e+").try_to_f64().is_none()
+    before_count := ryn_native_live_allocations()
+    before_bytes := ryn_native_live_bytes()
+    mut at: u64 = 0
+    while at < 1000 {
+        parsed := String("0.10000000000000001").try_to_f64().unwrap()
+        text := String(parsed)
+        single := String("1.0000000596046448").try_to_f32().unwrap()
+        single_text := String(single)
+        mut items: Vec<String> = Vec()
+        items.push(String("owned"))
+        items.get(0)
+        items.pop()
+        items.pop()
+        at += text.len() - text.len() + single_text.len() - single_text.len() + 1
+    }
+    echo ryn_native_live_allocations() - before_count
+    echo ryn_native_live_bytes() - before_bytes
+}

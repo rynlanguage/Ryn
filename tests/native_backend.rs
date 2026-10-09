@@ -137,6 +137,34 @@ fn link_and_run(object: &[u8], directory: &Path) -> (String, i32) {
 }
 
 #[test]
+fn float_text_is_freestanding_and_rounds_without_libc() {
+    for path in [
+        "tests/suite/literals/native_float_display_shortest.ryn",
+        "tests/suite/result_option/native_float_parse_and_text.ryn",
+        "tests/suite/comptime/w7_float_display_specials.ryn",
+        "tests/native/freestanding_float_rounding.ryn",
+        "tests/native/freestanding_math.ryn",
+    ] {
+        let directory = temp_dir(&format!(
+            "float-{}",
+            Path::new(path).file_stem().unwrap().to_string_lossy()
+        ));
+        let source = repository(path);
+        let object = object_of(&ir_of(&source, &directory)).expect("float program compiles");
+        assert!(
+            object.windows(8).any(|word| word == b"\0_start\0"),
+            "float text must link without libc"
+        );
+        assert_eq!(
+            link_and_run(&object, &directory),
+            expectations(&source),
+            "{path}"
+        );
+        fs::remove_dir_all(directory).expect("scratch removed");
+    }
+}
+
+#[test]
 fn scalar_programs_run_as_objects_built_by_the_ryn_backend() {
     let programs = [
         "tests/suite/collections/for_loop_over_range.ryn",

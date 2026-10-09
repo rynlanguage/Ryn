@@ -1,0 +1,244 @@
+// Freestanding x86-64 math. SSE2 gives sqrt; x87 provides the elementary
+// operations without external symbols. The x87 stack and control word are restored.
+use back::x64
+
+fun instruction(asm: &mut x64::Asm, first: u64, second: u64) {
+    asm.b(first)
+    asm.b(second)
+}
+
+// fld/fstp qword [rsp + offset].
+fun load(asm: &mut x64::Asm, offset: u64) {
+    asm.b(0xDD) asm.b(0x44) asm.b(0x24) asm.b(offset)
+}
+fun store(asm: &mut x64::Asm, offset: u64) {
+    asm.b(0xDD) asm.b(0x5C) asm.b(0x24) asm.b(offset)
+}
+
+// rax is the first f64's bits, rcx the second for pow. Return the f64 bits in rax.
+pub fun emit(asm: &mut x64::Asm, op: String) {
+    when op == "MathSqrt" {
+        asm.movq_to_xmm(true, 0, x64::Reg::RAX)
+        asm.sse_op(8, 0x51, 0, 0)
+        asm.movq_from_xmm(true, x64::Reg::RAX, 0)
+        return
+    }
+    asm.alu_ri(5, x64::Reg::RSP, 32)
+    asm.store(8, x64::Reg::RAX, x64::Reg::RSP, 0)
+    asm.store(8, x64::Reg::RCX, x64::Reg::RSP, 8)
+    when op == "MathFloor" || op == "MathCeil" || op == "MathRound" {
+        // Save the caller's control word and select floor, ceil or truncation.
+        asm.b(0xD9) asm.b(0x7C) asm.b(0x24) asm.b(16)
+        asm.load(2, false, x64::Reg::RDX, x64::Reg::RSP, 16)
+        asm.alu_ri(4, x64::Reg::RDX, 0xF3FF)
+        mut mode: u64 = 0x400
+        when op == "MathCeil" { mode = 0x800 }
+        when op == "MathRound" { mode = 0xC00 }
+        asm.alu_ri(1, x64::Reg::RDX, mode as i64)
+        asm.store(2, x64::Reg::RDX, x64::Reg::RSP, 18)
+        asm.b(0xD9) asm.b(0x6C) asm.b(0x24) asm.b(18)
+        load(asm, 0)
+        when op == "MathRound" {
+            instruction(asm, 0xD9, 0xE1) // fabs
+            asm.mov_ri(x64::Reg::RDX, 4602678819172646912) // 0.5
+            asm.store(8, x64::Reg::RDX, x64::Reg::RSP, 24)
+            load(asm, 24)
+            instruction(asm, 0xDE, 0xC1) // faddp
+        }
+        instruction(asm, 0xD9, 0xFC) // frndint
+        store(asm, 0)
+        asm.b(0xD9) asm.b(0x6C) asm.b(0x24) asm.b(16)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 0)
+        when op == "MathRound" {
+            asm.mov_ri(x64::Reg::RCX, 0x8000000000000000)
+            asm.alu_rr(33, x64::Reg::RAX, x64::Reg::RCX)
+            asm.alu_rr(9, x64::Reg::RDX, x64::Reg::RAX)
+        }
+        asm.mov_rr(x64::Reg::RAX, x64::Reg::RDX)
+    } else {
+        when op == "MathPow" {
+            emit_pow(asm)
+            asm.alu_ri(0, x64::Reg::RSP, 32)
+            return
+        } else when op == "MathLog" || op == "MathLog2" || op == "MathLog10" {
+            mut constant: u64 = 0xE8 // fld1
+            when op == "MathLog" { constant = 0xED } // fldln2
+            when op == "MathLog10" { constant = 0xEC } // fldlg2
+            instruction(asm, 0xD9, constant)
+            load(asm, 0)
+            instruction(asm, 0xD9, 0xF1)
+        } else {
+            // Reduce finite arguments outside the hardware trig range. FPREM1
+            // reduces in pieces; C2 remains set until the reduction is complete.
+            instruction(asm, 0xD9, 0xEB) // fldpi
+            instruction(asm, 0xD8, 0xC0) // fadd st(0),st(0): 2*pi
+            load(asm, 0)
+            reduce := asm.new_label()
+            reduced := asm.new_label()
+            asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 0)
+            asm.mov_ri(x64::Reg::RCX, 0x7FFFFFFFFFFFFFFF)
+            asm.alu_rr(33, x64::Reg::RDX, x64::Reg::RCX)
+            asm.mov_ri(x64::Reg::RCX, 0x43E0000000000000) // 2^63
+            asm.alu_rr(57, x64::Reg::RDX, x64::Reg::RCX)
+            asm.jcc(x64::Cc::BELOW, reduced)
+            asm.mov_ri(x64::Reg::RCX, 0x7FF0000000000000)
+            asm.alu_rr(57, x64::Reg::RDX, x64::Reg::RCX)
+            asm.jcc(x64::Cc::ABOVE_EQUAL, reduced)
+            asm.bind(reduce)
+            instruction(asm, 0xD9, 0xF5) // fprem1
+            instruction(asm, 0xDF, 0xE0) // fnstsw ax
+            asm.alu_ri(4, x64::Reg::RAX, 0x400)
+            asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
+            asm.jcc(x64::Cc::NOT_EQUAL, reduce)
+            asm.bind(reduced)
+            instruction(asm, 0xDD, 0xD9) // remove 2*pi, keeping the argument
+            when op == "MathSin" { instruction(asm, 0xD9, 0xFE) }
+            when op == "MathCos" { instruction(asm, 0xD9, 0xFF) }
+            when op == "MathTan" {
+                instruction(asm, 0xD9, 0xF2)
+                instruction(asm, 0xDD, 0xD8) // discard the extra 1
+            }
+        }
+        store(asm, 0)
+        asm.load(8, false, x64::Reg::RAX, x64::Reg::RSP, 0)
+    }
+    asm.alu_ri(0, x64::Reg::RSP, 32)
+}
+
+// IEEE pow classification before the x87 finite positive-magnitude path.
+fun emit_pow(asm: &mut x64::Asm) {
+    one := asm.new_label()
+    nan := asm.new_label()
+    zero := asm.new_label()
+    infinity := asm.new_label()
+    core := asm.new_label()
+    finish := asm.new_label()
+    nonnegative := asm.new_label()
+    finite_exponent := asm.new_label()
+    parity_done := asm.new_label()
+    asm.mov_ri(x64::Reg::RDX, 0)
+    asm.store(8, x64::Reg::RDX, x64::Reg::RSP, 24)
+    asm.mov_ri(x64::Reg::RDX, 0x7FFFFFFFFFFFFFFF)
+    asm.mov_rr(x64::Reg::R8, x64::Reg::RAX)
+    asm.alu_rr(33, x64::Reg::R8, x64::Reg::RDX)
+    asm.mov_rr(x64::Reg::R9, x64::Reg::RCX)
+    asm.alu_rr(33, x64::Reg::R9, x64::Reg::RDX)
+    asm.test_rr(x64::Reg::R9, x64::Reg::R9)
+    asm.jcc(x64::Cc::EQUAL, one)
+    // +1 raised to anything, including NaN, is 1.
+    asm.mov_ri(x64::Reg::RDX, 0x3FF0000000000000)
+    asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RDX)
+    asm.jcc(x64::Cc::EQUAL, one)
+    asm.mov_ri(x64::Reg::RDX, 0x7FF0000000000000)
+    asm.alu_rr(57, x64::Reg::R8, x64::Reg::RDX)
+    asm.jcc(x64::Cc::ABOVE, nan)
+    asm.alu_rr(57, x64::Reg::R9, x64::Reg::RDX)
+    asm.jcc(x64::Cc::ABOVE, nan)
+    asm.jcc(x64::Cc::NOT_EQUAL, finite_exponent)
+    // Infinite exponent: only the magnitude's relation to 1 matters.
+    asm.mov_ri(x64::Reg::RDX, 0x3FF0000000000000)
+    asm.alu_rr(57, x64::Reg::R8, x64::Reg::RDX)
+    asm.jcc(x64::Cc::EQUAL, one)
+    large := asm.new_label()
+    asm.jcc(x64::Cc::ABOVE, large)
+    asm.test_rr(x64::Reg::RCX, x64::Reg::RCX)
+    asm.jcc(x64::Cc::LESS, infinity)
+    asm.jmp(zero)
+    asm.bind(large)
+    asm.test_rr(x64::Reg::RCX, x64::Reg::RCX)
+    asm.jcc(x64::Cc::LESS, zero)
+    asm.jmp(infinity)
+    asm.bind(finite_exponent)
+    asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
+    asm.jcc(x64::Cc::GREATER_EQUAL, nonnegative)
+    // Integers at least 2^53 have even parity. Smaller values fit an i64 exactly.
+    asm.mov_ri(x64::Reg::RDX, 0x4340000000000000)
+    asm.alu_rr(57, x64::Reg::R9, x64::Reg::RDX)
+    asm.jcc(x64::Cc::ABOVE_EQUAL, parity_done)
+    asm.movq_to_xmm(true, 0, x64::Reg::RCX)
+    asm.cvt_to_int(8, x64::Reg::RDX, 0)
+    asm.cvt_from_int(8, 1, x64::Reg::RDX)
+    asm.ucomis(8, 0, 1)
+    integral := asm.new_label()
+    asm.jcc(x64::Cc::EQUAL, integral)
+    // Negative zero and negative infinity accept fractional exponents; a
+    // finite negative nonzero base does not.
+    asm.test_rr(x64::Reg::R8, x64::Reg::R8)
+    asm.jcc(x64::Cc::EQUAL, nonnegative)
+    asm.mov_ri(x64::Reg::RDX, 0x7FF0000000000000)
+    asm.alu_rr(57, x64::Reg::R8, x64::Reg::RDX)
+    asm.jcc(x64::Cc::NOT_EQUAL, nan)
+    asm.jmp(nonnegative)
+    asm.bind(integral)
+    asm.alu_ri(4, x64::Reg::RDX, 1)
+    asm.test_rr(x64::Reg::RDX, x64::Reg::RDX)
+    asm.jcc(x64::Cc::EQUAL, parity_done)
+    asm.mov_ri(x64::Reg::RDX, 0x8000000000000000)
+    asm.store(8, x64::Reg::RDX, x64::Reg::RSP, 24)
+    asm.bind(parity_done)
+    asm.bind(nonnegative)
+    // Zero and infinity have reciprocal results for negative exponents.
+    asm.test_rr(x64::Reg::R8, x64::Reg::R8)
+    nonzero := asm.new_label()
+    asm.jcc(x64::Cc::NOT_EQUAL, nonzero)
+    asm.test_rr(x64::Reg::RCX, x64::Reg::RCX)
+    asm.jcc(x64::Cc::LESS, infinity)
+    asm.jmp(zero)
+    asm.bind(nonzero)
+    asm.mov_ri(x64::Reg::RDX, 0x7FF0000000000000)
+    asm.alu_rr(57, x64::Reg::R8, x64::Reg::RDX)
+    asm.jcc(x64::Cc::NOT_EQUAL, core)
+    asm.test_rr(x64::Reg::RCX, x64::Reg::RCX)
+    asm.jcc(x64::Cc::LESS, zero)
+    asm.jmp(infinity)
+    asm.bind(core)
+    asm.store(8, x64::Reg::R8, x64::Reg::RSP, 0)
+    load(asm, 8)
+    load(asm, 0)
+    instruction(asm, 0xD9, 0xF1) // y*log2(abs(x))
+    // Bound the exponent before f2xm1, which requires a finite fraction.
+    asm.b(0xDD) asm.b(0x54) asm.b(0x24) asm.b(0) // fst without pop
+    asm.sse_load(8, 0, x64::Reg::RSP, 0)
+    asm.mov_ri(x64::Reg::RDX, 0x4090000000000000) // 1024
+    asm.movq_to_xmm(true, 1, x64::Reg::RDX)
+    asm.ucomis(8, 0, 1)
+    overflow := asm.new_label()
+    underflow := asm.new_label()
+    asm.jcc(x64::Cc::ABOVE_EQUAL, overflow)
+    asm.mov_ri(x64::Reg::RDX, 0xC090CC0000000000) // -1075
+    asm.movq_to_xmm(true, 1, x64::Reg::RDX)
+    asm.ucomis(8, 0, 1)
+    asm.jcc(x64::Cc::BELOW_EQUAL, underflow)
+    instruction(asm, 0xD9, 0xC0)
+    instruction(asm, 0xD9, 0xFC)
+    instruction(asm, 0xD9, 0xC9)
+    instruction(asm, 0xD8, 0xE1)
+    instruction(asm, 0xD9, 0xF0)
+    instruction(asm, 0xD9, 0xE8)
+    instruction(asm, 0xDE, 0xC1)
+    instruction(asm, 0xD9, 0xFD)
+    instruction(asm, 0xDD, 0xD9)
+    store(asm, 0)
+    asm.load(8, false, x64::Reg::RAX, x64::Reg::RSP, 0)
+    asm.jmp(finish)
+    asm.bind(overflow)
+    instruction(asm, 0xDD, 0xD8)
+    asm.jmp(infinity)
+    asm.bind(underflow)
+    instruction(asm, 0xDD, 0xD8)
+    asm.jmp(zero)
+    asm.bind(one)
+    asm.mov_ri(x64::Reg::RAX, 0x3FF0000000000000)
+    asm.jmp(finish)
+    asm.bind(nan)
+    asm.mov_ri(x64::Reg::RAX, 0x7FF8000000000000)
+    asm.jmp(finish)
+    asm.bind(zero)
+    asm.mov_ri(x64::Reg::RAX, 0)
+    asm.jmp(finish)
+    asm.bind(infinity)
+    asm.mov_ri(x64::Reg::RAX, 0x7FF0000000000000)
+    asm.bind(finish)
+    asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 24)
+    asm.alu_rr(9, x64::Reg::RAX, x64::Reg::RDX)
+}

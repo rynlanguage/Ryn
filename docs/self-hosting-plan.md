@@ -1033,6 +1033,12 @@ generator:
   `generate_executable` with `_start` builds programs without `cc` or libc. Freestanding, 407 of 424 run programs pass; the 17
   declined ones need float text (`echo` of a float), which still calls libc `snprintf`/`strtod`. Porting that to `middle/floatlib`
   is the remaining Stage 4 item.
+  - Stage 4 float item done (2026-10-09): `back/float_runtime_ir.ryn` embeds the typed IR of `float_runtime.ryn`, so
+    `middle/floatlib`'s shortest formatting and direct-width parsing compile into every freestanding binary; `back/math.ryn`
+    emits SSE2 and x87 for `std::math`. All 424 run programs now pass in the typed-IR pipeline. See
+    [native float validation](native-float-validation.md). The direct-source pipeline through `rync`'s own frontend still
+    passes 303 of 424; the remaining cases are compile-time evaluation, compile-time function calls, metaprogramming, some
+    pattern forms, module path lookup and C imports.
 - `selfhost/src/rync.ryn` is the libc-free compiler driver. The native-built `rync` compiles hello correctly.
 - Option 2 is implemented: deterministic owner drops and move invalidation in the native backend, with no GC.
   Nested enum payloads and unborrowed reference fields are cloned independently. Discarded temporaries (including String
