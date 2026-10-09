@@ -1,5 +1,7 @@
 # Full self-hosting plan
 
+Native ownership validation (2026-10-09): deterministic cleanup without GC now passes the 1 GiB native bootstrap and the stage2/stage3 binary fixpoint. See [native ownership validation](native-ownership-validation.md) for exact gates and memory measurements.
+
 Goal: the Ryn compiler is a Ryn program end to end, and `ryn bootstrap`
 rebuilds it from its own source without a Rust toolchain.
 
