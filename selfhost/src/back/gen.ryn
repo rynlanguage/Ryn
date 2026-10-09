@@ -13,7 +13,9 @@
 
 use back::x64
 use back::elf
+use back::math
 use back::floats
+use back::float_runtime_ir
 use back::textops
 use back::rt
 use middle::ir
@@ -150,6 +152,8 @@ pub struct Gen {
     print_bool_label: u64,
     // The routine that formats a float as text, and whether the program needs it: it is written only when it does.
     float_format_label: u64,
+    native_float_format: u64,
+    native_float_parse: u64,
     float_format_used: bool,
     // The cells past the locals that the function being generated uses for temporaries (arrays and slices that are not in
     // a local); the frame is sized once the body is generated.
@@ -236,7 +240,9 @@ pub fun generate_libc(program: ir::IrProgram) -> Result<Vec<u8>, String> {
     return build(program, false, true)
 }
 
-fun build(program: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>, String> {
+fun build(input: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>, String> {
+    runtime_base := input.functions.len()
+    program := ir::append_ir(input, float_runtime_ir::source_ir())?
     mut asm := x64::new_asm()
     mut gen := Gen {
         program: program,
@@ -279,6 +285,8 @@ fun build(program: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8
         print_i64_label: 0,
         print_bool_label: 0,
         float_format_label: 0,
+        native_float_format: runtime_base + float_runtime_ir::format_index(),
+        native_float_parse: runtime_base + float_runtime_ir::parse_index(),
         float_format_used: false,
         textops_used: 0,
         trim_label: 0,
@@ -1767,7 +1775,33 @@ extend Gen {
             return false
         }
         when self.freestanding {
-            return self.fail("a float written as text in a freestanding program")
+            self.needed.set(self.native_float_format, true)
+            asm.push(x64::Reg::RAX)
+            asm.mov_ri(x64::Reg::RAX, 0)
+            when single { asm.mov_ri(x64::Reg::RAX, 1) }
+            asm.push(x64::Reg::RAX)
+            asm.call_label(self.labels[self.native_float_format])
+            asm.alu_ri(0, x64::Reg::RSP, 16)
+            // Copy the owned runtime String into the caller's fixed buffer, then release it.
+            asm.alu_ri(5, x64::Reg::RSP, 432)
+            asm.store(8, x64::Reg::RAX, x64::Reg::RSP, 416)
+            asm.load(8, false, x64::Reg::RSI, x64::Reg::RAX, 0)
+            asm.load(8, false, x64::Reg::RDX, x64::Reg::RAX, 8)
+            asm.store(8, x64::Reg::RDX, x64::Reg::RSP, 424)
+            asm.mov_rr(x64::Reg::RDI, x64::Reg::RSP)
+            self.aligned_call(asm, String("memcpy"))
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 416)
+            asm.call_label(self.handle_drop_routine(asm, self.program.functions[self.native_float_format].return_type.unwrap()))
+            asm.load(8, false, x64::Reg::RAX, x64::Reg::RSP, 424)
+            // The caller removes 416 bytes. Move the text up by 16 first.
+            asm.push(x64::Reg::RAX)
+            asm.lea(x64::Reg::RSI, x64::Reg::RSP, 8)
+            asm.lea(x64::Reg::RDI, x64::Reg::RSP, 24)
+            asm.mov_rr(x64::Reg::RDX, x64::Reg::RAX)
+            self.aligned_call(asm, String("memmove"))
+            asm.pop(x64::Reg::RAX)
+            asm.alu_ri(0, x64::Reg::RSP, 16)
+            return true
         }
         self.float_format_used = true
         asm.alu_ri(5, x64::Reg::RSP, 416)
@@ -1850,11 +1884,8 @@ extend Gen {
             asm.mov_ri(x64::Reg::RCX, 1)
         }
         asm.call_label(self.case_label)
-        // rsi and rdx are a malloc'd buffer: it becomes the String's text.
-        when !self.string_from_parts(asm) {
-            return false
-        }
-        return true
+        // Adopt the allocated buffer rather than copying it and losing its owner.
+        return self.string_adopt_parts(asm)
     }
 
     // `find`: the index in characters of the first match, or -1.
@@ -2355,6 +2386,21 @@ extend Gen {
         return ok
     }
 
+    // An Option returned by a discarded get/pop still owns its box and payload.
+    fun discard_vec_option(mut self, asm: &mut x64::Asm, element: u64, option: u64, pop: bool, arguments: Vec<u64>) -> bool {
+        when !self.vec_get_option(asm, element, option, pop, arguments) { return false }
+        mut ty: u64 = 0
+        mut found: bool = false
+        while ty < self.program.types.len() && !found {
+            found = choose self.program.types[ty] { ir::IrTy::EnumTy(id) => id == option, _ => false }
+            when !found { ty += 1 }
+        }
+        when !found { self.program.types.push(ir::IrTy::EnumTy(option)) }
+        asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
+        asm.call_label(self.handle_drop_routine(asm, ty))
+        return true
+    }
+
     fun call_statement(mut self, asm: &mut x64::Asm, target: ir::CallTarget, arguments: Vec<u64>) -> bool {
         return choose target {
             ir::CallTarget::Func(id) => self.call_for_effect(asm, id, arguments),
@@ -2367,7 +2413,7 @@ extend Gen {
             ir::CallTarget::IndirectFn(id) => self.indirect_call(asm, id, arguments),
             ir::CallTarget::FilesystemOp(op) => self.filesystem(asm, op, arguments),
             ir::CallTarget::ArgCount => self.arg_count(asm),
-            ir::CallTarget::VecGetOption(element, option, pop) => self.vec_get_option(asm, element, option, pop, arguments),
+            ir::CallTarget::VecGetOption(element, option, pop) => self.discard_vec_option(asm, element, option, pop, arguments),
             ir::CallTarget::EnumPredicate(op, id) => self.guarded_predicate(asm, op, id, arguments),
             ir::CallTarget::TryRead(id) => self.fail("a call to the file reading builtin that gives an Option"),
             ir::CallTarget::ReadFileRes(id) => self.fail("a call to the file reading builtin that gives a Result"),
@@ -4277,7 +4323,7 @@ extend Gen {
             }
             self.textops_used = self.textops_used | 8
             asm.call_label(self.reverse_label)
-            return self.string_from_parts(asm)
+            return self.string_adopt_parts(asm)
         }
         when (op == "ToLower" || op == "ToUpper") && arguments.len() == 1 {
             return self.string_case(asm, arguments[0], op == "ToUpper")
@@ -4325,6 +4371,20 @@ extend Gen {
     }
 
     // A new String with the text in rsi and rdx: its bytes are copied, and its header is left in rax.
+    // Takes ownership of a malloc'd buffer in rsi of length rdx.
+    fun string_adopt_parts(mut self, asm: &mut x64::Asm) -> bool {
+        asm.push(x64::Reg::RSI)
+        asm.push(x64::Reg::RDX)
+        asm.mov_ri(x64::Reg::RDI, 24)
+        self.aligned_call(asm, String("malloc"))
+        asm.pop(x64::Reg::RDX)
+        asm.pop(x64::Reg::RSI)
+        asm.store(8, x64::Reg::RSI, x64::Reg::RAX, 0)
+        asm.store(8, x64::Reg::RDX, x64::Reg::RAX, 8)
+        asm.store(8, x64::Reg::RDX, x64::Reg::RAX, 16)
+        return true
+    }
+
     fun string_from_parts(mut self, asm: &mut x64::Asm) -> bool {
         // The source and its length stay on the stack while the allocations run.
         asm.push(x64::Reg::RSI)
@@ -6131,8 +6191,23 @@ extend Gen {
         asm.bind(no_exponent)
         asm.alu_rr(57, x64::Reg::R8, x64::Reg::RDX)
         asm.jcc(x64::Cc::NOT_EQUAL, bad)
-        // A terminated copy of the text is read by the C library; the copy is freed after.
+        // The freestanding routine returns the same tagged one-cell Option layout,
+        // with IEEE bits in the payload. Its str argument borrows the original text.
         asm.bind(valid)
+        when self.freestanding {
+            self.needed.set(self.native_float_parse, true)
+            asm.push(x64::Reg::RSI)
+            asm.push(x64::Reg::RDX)
+            asm.mov_ri(x64::Reg::RAX, 0)
+            when single { asm.mov_ri(x64::Reg::RAX, 1) }
+            asm.push(x64::Reg::RAX)
+            asm.call_label(self.labels[self.native_float_parse])
+            asm.alu_ri(0, x64::Reg::RSP, 24)
+            // Translate the runtime's Option tag to this program's Option definition.
+            asm.mov_ri(x64::Reg::RDX, some.unwrap())
+            asm.store(8, x64::Reg::RDX, x64::Reg::RAX, 0)
+            asm.jmp(done)
+        } else {
         asm.push(x64::Reg::RSI)
         asm.push(x64::Reg::RDX)
         asm.lea(x64::Reg::RDI, x64::Reg::RDX, 1)
@@ -6169,6 +6244,7 @@ extend Gen {
         asm.mov_ri(x64::Reg::RDX, some.unwrap())
         asm.store(8, x64::Reg::RDX, x64::Reg::RAX, 0)
         asm.jmp(done)
+        }
         asm.bind(bad)
         asm.mov_ri(x64::Reg::RDI, 16)
         self.aligned_call(asm, String("malloc"))
@@ -7283,6 +7359,7 @@ extend Gen {
             when !self.expr(asm, arguments[0]) {
                 return false
             }
+            when self.freestanding { math::emit(asm, op) return true }
             asm.movq_to_xmm(true, 0, x64::Reg::RAX)
             self.aligned_call(asm, function)
             asm.movq_from_xmm(true, x64::Reg::RAX, 0)
@@ -7295,6 +7372,12 @@ extend Gen {
             asm.push(x64::Reg::RAX)
             when !self.expr(asm, arguments[1]) {
                 return false
+            }
+            when self.freestanding {
+                asm.mov_rr(x64::Reg::RCX, x64::Reg::RAX)
+                asm.pop(x64::Reg::RAX)
+                math::emit(asm, op)
+                return true
             }
             asm.movq_to_xmm(true, 1, x64::Reg::RAX)
             asm.pop(x64::Reg::RAX)

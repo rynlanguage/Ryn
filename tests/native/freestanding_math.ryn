@@ -1,0 +1,53 @@
+// test: run
+// out: -8
+// out: 4
+// out: -0.125
+// out: NaN
+// out: inf
+// out: -inf
+// out: -0
+// out: 1
+// out: 1
+// out: inf
+// out: 0
+// out: 0.5
+// out: -0
+// out: -1
+// out: 0
+// out: -0
+// out: NaN
+// out: -inf
+// out: 1024
+
+use std::math
+fun main() {
+    zero: f64 = 0.0
+    nan := zero / zero
+    inf := 1.0 / zero
+    echo math::pow(-2.0, 3.0)
+    echo math::pow(-2.0, 2.0)
+    echo math::pow(-2.0, -3.0)
+    echo math::pow(-2.0, 0.5)
+    echo math::pow(0.0, -2.0)
+    echo math::pow(-0.0, -3.0)
+    echo math::pow(-0.0, 3.0)
+    echo math::pow(nan, 0.0)
+    echo math::pow(1.0, nan)
+    echo math::pow(2.0, inf)
+    echo math::pow(0.5, inf)
+    echo math::pow(4.0, -0.5)
+    echo math::round(-0.49999999999999994)
+    echo math::round(-0.5)
+    echo math::floor(0.5)
+    echo math::ceil(-0.5)
+    echo math::sqrt(-1.0)
+    echo math::log(0.0)
+    // Every iteration must leave the x87 register stack balanced.
+    mut n: u64 = 0
+    mut total: f64 = 0.0
+    while n < 1024 {
+        total += math::pow(2.0, math::log2(2.0)) - math::round(0.5)
+        n += 1
+    }
+    echo total
+}

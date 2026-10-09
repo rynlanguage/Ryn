@@ -1,0 +1,18 @@
+// Runtime entry points lowered into the native backend's embedded IR by
+// tools/update-native-float-runtime.py. No libc, host files or Rust are needed at runtime.
+use middle::floatlib
+
+pub fun runtime_format(bits: u64, single: bool) -> String {
+    when single { return floatlib::format_f32(bits) }
+    return floatlib::format_f64(bits)
+}
+
+pub fun runtime_parse(text: str, single: bool) -> Option<u64> {
+    when single { return floatlib::parse_f32(text) }
+    return floatlib::parse_f64(text)
+}
+
+fun main() {
+    runtime_format(0, false)
+    runtime_parse("", false)
+}

@@ -58,6 +58,17 @@ jobs:
           grep -Fxq 'argument count: 1' <<< "$output"
           grep -Fxq 'first argument: linux smoke' <<< "$output"
 
+      - name: Bootstrap native compiler under 1 GiB
+        shell: bash
+        run: |
+          mkdir -p native-bootstrap/dump
+          ./target/release/ryn build selfhost/src/native.ryn -o native-bootstrap/native
+          RYN_DUMP_SEMA="$PWD/native-bootstrap/dump" ./target/release/ryn check selfhost/src/rync.ryn
+          native-bootstrap/native native-bootstrap/dump/ryn.ir exe > native-bootstrap/seed
+          chmod +x native-bootstrap/seed
+          tools/bootstrap-native.sh "$PWD/native-bootstrap/seed" "$PWD/native-bootstrap/fixpoint"
+          python3 tools/test-native-sources.py "$PWD/native-bootstrap/fixpoint/rync-stage2" tests/native/freestanding_float_rounding.ryn tests/native/freestanding_math.ryn tests/native/nested_result_ownership.ryn
+
       - name: Package and upload Linux binary
         shell: bash
         env:
@@ -71,6 +82,17 @@ jobs:
           tar -czf "${stage}.tar.gz" "$stage"
           sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
           gh release upload "$TAG" "${stage}.tar.gz" "${stage}.tar.gz.sha256" --repo "$GITHUB_REPOSITORY" --clobber
+          native_stage="rync-${version}-linux-x86_64"
+          mkdir -p "$native_stage/tools" "$native_stage/docs" "$native_stage/selfhost" "$native_stage/stdlib/std"
+          cp native-bootstrap/fixpoint/rync-stage2 "$native_stage/rync"
+          cp docs/native-compiler.md "$native_stage/README.md"
+          cp tools/bootstrap-native.sh "$native_stage/tools/"
+          cp -R selfhost/src "$native_stage/selfhost/"
+          cp -R stdlib/std/src "$native_stage/stdlib/std/"
+          cp docs/native-compiler.md docs/native-ownership-validation.md docs/native-float-validation.md "$native_stage/docs/"
+          tar -czf "${native_stage}.tar.gz" "$native_stage"
+          sha256sum "${native_stage}.tar.gz" > "${native_stage}.tar.gz.sha256"
+          gh release upload "$TAG" "${native_stage}.tar.gz" "${native_stage}.tar.gz.sha256" --repo "$GITHUB_REPOSITORY" --clobber
 
   windows-x86_64:
     name: Windows x86_64

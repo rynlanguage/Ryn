@@ -186,12 +186,30 @@ fun repeat_zeros(count: u64) -> String {
 }
 
 // The text Rust's `Display` gives a double with the bits `bits`.
-pub fun format_f64(bits: u64) -> String {
-    negative := (bits >> (63 as u32)) == 1
-    biased := ((bits >> (52 as u32)) & 2047) as u64
-    fraction := bits & 4503599627370495
+pub fun format_f64(bits: u64) -> String { return format_ieee(bits, false) }
+
+pub fun format_f32(bits: u64) -> String { return format_ieee(bits, true) }
+
+fun format_ieee(bits: u64, single: bool) -> String {
+    mut fraction_bits: u32 = 52
+    mut sign_shift: u32 = 63
+    mut exponent_mask: u64 = 2047
+    mut hidden: u64 = 4503599627370496
+    mut bias: i64 = 1075
+    mut minimum: i64 = -1074
+    when single {
+        fraction_bits = 23
+        sign_shift = 31
+        exponent_mask = 255
+        hidden = 8388608
+        bias = 150
+        minimum = -149
+    }
+    negative := (bits >> sign_shift) == 1
+    biased := ((bits >> fraction_bits) & exponent_mask) as u64
+    fraction := bits & (hidden - 1)
     mut out := String("")
-    when biased == 2047 {
+    when biased == exponent_mask {
         when fraction != 0 {
             return String("NaN")
         }
@@ -214,13 +232,13 @@ pub fun format_f64(bits: u64) -> String {
     mut plus: u64 = 1
     mut inclusive: bool = false
     when biased == 0 {
-        exp = -1074
+        exp = minimum
         inclusive = (mant & 1) == 0
         mant = mant << (1 as u32)
         exp -= 1
     } else {
-        mant = mant | 4503599627370496
-        exp = (biased as i64) - 1075
+        mant = mant | hidden
+        exp = (biased as i64) - bias
         inclusive = (mant & 1) == 0
         when fraction == 0 && biased > 1 {
             mant = mant << (2 as u32)
@@ -371,11 +389,27 @@ pub fun format_f64(bits: u64) -> String {
 
 
 // The double nearest to `numerator / denominator` (both positive big integers), as bits, rounding ties to even.
-fun round_ratio(numerator: Vec<u32>, denominator: Vec<u32>) -> u64 {
+fun round_ratio(numerator: Vec<u32>, denominator: Vec<u32>, single: bool) -> u64 {
+    mut precision: i64 = 53
+    mut minimum: i64 = -1074
+    mut maximum: i64 = 971
+    mut hidden: u64 = 4503599627370496
+    mut bias: i64 = 1075
+    mut shift: u32 = 52
+    mut infinity: u64 = 9218868437227405312
+    when single {
+        precision = 24
+        minimum = -149
+        maximum = 104
+        hidden = 8388608
+        bias = 150
+        shift = 23
+        infinity = 2139095040
+    }
     // The binary exponent of the quotient is near the difference of the sizes; the unit of the last place is 2^e.
-    mut e: i64 = (big_bits(numerator.clone()) as i64) - (big_bits(denominator.clone()) as i64) - 53
-    when e < -1074 {
-        e = -1074
+    mut e: i64 = (big_bits(numerator.clone()) as i64) - (big_bits(denominator.clone()) as i64) - precision
+    when e < minimum {
+        e = minimum
     }
     mut quotient: u64 = 0
     mut remainder: Vec<u32> = Vec()
@@ -405,9 +439,9 @@ fun round_ratio(numerator: Vec<u32>, denominator: Vec<u32>) -> u64 {
         remainder = top
         divisor = bottom
         // The quotient must have 53 bits, unless the exponent is the smallest.
-        when quotient >= 9007199254740992 {
+        when quotient >= (hidden * 2) {
             e += 1
-        } else when quotient < 4503599627370496 && e > -1074 {
+        } else when quotient < hidden && e > minimum {
             e -= 1
         } else {
             settled = true
@@ -417,24 +451,36 @@ fun round_ratio(numerator: Vec<u32>, denominator: Vec<u32>) -> u64 {
     c := big_cmp(twice, divisor)
     when c > 0 || (c == 0 && (quotient & 1) == 1) {
         quotient += 1
-        when quotient == 9007199254740992 {
-            quotient = 4503599627370496
+        when quotient == (hidden * 2) {
+            quotient = hidden
             e += 1
         }
     }
-    when quotient < 4503599627370496 {
+    when quotient < hidden {
         return quotient
     }
-    when e > 971 {
-        return 9218868437227405312
+    when e > maximum {
+        return infinity
     }
-    biased := (e + 1075) as u64
-    return (biased << (52 as u32)) | (quotient - 4503599627370496)
+    biased := (e + bias) as u64
+    return (biased << shift) | (quotient - hidden)
 }
 
 // The bits of the double nearest to the decimal number `text` (an optional sign, digits with an optional point, and an
 // optional exponent; also `inf`, `infinity` and `nan` in any case), or nothing when the text is not such a number.
-pub fun parse_f64(text: str) -> Option<u64> {
+pub fun parse_f64(text: str) -> Option<u64> { return parse_ieee(text, false) }
+
+pub fun parse_f32(text: str) -> Option<u64> { return parse_ieee(text, true) }
+
+fun parse_ieee(text: str, single: bool) -> Option<u64> {
+    mut sign: u64 = 9223372036854775808
+    mut infinity: u64 = 9218868437227405312
+    mut nan: u64 = 9221120237041090560
+    when single {
+        sign = 2147483648
+        infinity = 2139095040
+        nan = 2143289344
+    }
     source := String(text)
     n := source.len()
     mut at: u64 = 0
@@ -448,14 +494,14 @@ pub fun parse_f64(text: str) -> Option<u64> {
     }
     mut sign_bit: u64 = 0
     when negative {
-        sign_bit = 9223372036854775808
+        sign_bit = sign
     }
     lowered := source.slice(at, n).to_lower()
     when lowered == "inf" || lowered == "infinity" {
-        return Option::Some(sign_bit | 9218868437227405312)
+        return Option::Some(sign_bit | infinity)
     }
     when lowered == "nan" {
-        return Option::Some(9221120237041090560)
+        return Option::Some(nan)
     }
     // Digits of the mantissa without the point, and the exponent that moves the point to the end of them.
     mut digits: Vec<u8> = Vec()
@@ -520,7 +566,7 @@ pub fun parse_f64(text: str) -> Option<u64> {
     significant := (digits.len() - first) as i64
     magnitude := significant + exponent
     when magnitude > 310 {
-        return Option::Some(sign_bit | 9218868437227405312)
+        return Option::Some(sign_bit | infinity)
     }
     when magnitude < -330 {
         return Option::Some(sign_bit)
@@ -539,5 +585,5 @@ pub fun parse_f64(text: str) -> Option<u64> {
     } else {
         denominator = big_mul_pow10(denominator, (0 - exponent) as u64)
     }
-    return Option::Some(sign_bit | round_ratio(numerator, denominator))
+    return Option::Some(sign_bit | round_ratio(numerator, denominator, single))
 }
