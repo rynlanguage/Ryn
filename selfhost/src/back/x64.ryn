@@ -1,0 +1,591 @@
+// An x86-64 instruction encoder. It writes machine code into a byte buffer, binds labels and
+// patches jumps to them, and records the relocations a linker must resolve for symbol references.
+//
+// Registers are numbered as the hardware numbers them: rax 0, rcx 1, rdx 2, rbx 3, rsp 4, rbp 5,
+// rsi 6, rdi 7, r8 to r15 8 to 15. The same numbers name the xmm registers in the SSE helpers.
+// Memory operands are always `[base + disp32]`, or `[rip + symbol]` through a relocation.
+
+pub struct Reg { unused: u64 }
+
+extend Reg {
+    pub const RAX: u64 = 0
+    pub const RCX: u64 = 1
+    pub const RDX: u64 = 2
+    pub const RBX: u64 = 3
+    pub const RSP: u64 = 4
+    pub const RBP: u64 = 5
+    pub const RSI: u64 = 6
+    pub const RDI: u64 = 7
+    pub const R8: u64 = 8
+    pub const R9: u64 = 9
+    pub const R10: u64 = 10
+    pub const R11: u64 = 11
+}
+
+// Condition codes, as the low nibble of the `jcc`, `setcc`, and `cmovcc` opcodes.
+pub struct Cc { unused: u64 }
+
+extend Cc {
+    pub const BELOW: u64 = 2
+    pub const ABOVE_EQUAL: u64 = 3
+    pub const EQUAL: u64 = 4
+    pub const NOT_EQUAL: u64 = 5
+    pub const BELOW_EQUAL: u64 = 6
+    pub const ABOVE: u64 = 7
+    pub const PARITY: u64 = 10
+    pub const NOT_PARITY: u64 = 11
+    pub const LESS: u64 = 12
+    pub const GREATER_EQUAL: u64 = 13
+    pub const LESS_EQUAL: u64 = 14
+    pub const GREATER: u64 = 15
+}
+
+// How the linker patches a relocated field.
+pub struct RelocKind { unused: u64 }
+
+extend RelocKind {
+    pub const PC32: u64 = 2
+    pub const PLT32: u64 = 4
+}
+
+pub struct Asm {
+    pub code: Vec<u8>,
+    pub label_offsets: Vec<u64>,
+    pub fixup_positions: Vec<u64>,
+    pub fixup_labels: Vec<u64>,
+    pub reloc_offsets: Vec<u64>,
+    pub reloc_symbols: Vec<u64>,
+    pub reloc_kinds: Vec<u64>,
+    pub reloc_addends: Vec<i64>,
+}
+
+pub fun new_asm() -> Asm {
+    return Asm { code: Vec(), label_offsets: Vec(), fixup_positions: Vec(), fixup_labels: Vec(), reloc_offsets: Vec(), reloc_symbols: Vec(), reloc_kinds: Vec(), reloc_addends: Vec() }
+}
+
+// Marks a label as not bound yet.
+fun unbound() -> u64 {
+    return 18446744073709551615
+}
+
+extend Asm {
+    pub fun position(self) -> u64 {
+        return self.code.len()
+    }
+
+    pub fun b(mut self, value: u64) {
+        self.code.push((value & 255) as u8)
+    }
+
+    pub fun d32(mut self, value: u64) {
+        self.b(value)
+        self.b(value >> (8 as u32))
+        self.b(value >> (16 as u32))
+        self.b(value >> (24 as u32))
+    }
+
+    pub fun d64(mut self, value: u64) {
+        self.d32(value)
+        self.d32(value >> (32 as u32))
+    }
+
+    // A signed 32-bit field.
+    pub fun s32(mut self, value: i64) {
+        self.d32((value as u64) & 4294967295)
+    }
+
+    // Overwrites four bytes already emitted.
+    pub fun patch32(mut self, at: u64, value: u64) {
+        self.code.set(at, (value & 255) as u8)
+        self.code.set(at + 1, ((value >> (8 as u32)) & 255) as u8)
+        self.code.set(at + 2, ((value >> (16 as u32)) & 255) as u8)
+        self.code.set(at + 3, ((value >> (24 as u32)) & 255) as u8)
+    }
+
+    // A REX prefix when one is needed: `wide` selects 64-bit operands; `force` emits it for the
+    // byte registers that need it.
+    pub fun rex(mut self, wide: u64, reg: u64, base: u64, force: bool) {
+        mut prefix: u64 = 64
+        mut needed := force
+        when wide != 0 {
+            prefix = prefix | 8
+            needed = true
+        }
+        when reg >= 8 {
+            prefix = prefix | 4
+            needed = true
+        }
+        when base >= 8 {
+            prefix = prefix | 1
+            needed = true
+        }
+        when needed {
+            self.b(prefix)
+        }
+    }
+
+    // The ModRM, optional SIB, and 32-bit displacement of `[base + disp]` with `reg` in the reg field.
+    pub fun mem(mut self, reg: u64, base: u64, disp: i64) {
+        self.b(128 | ((reg & 7) << (3 as u32)) | (base & 7))
+        when (base & 7) == 4 {
+            self.b(36)
+        }
+        self.s32(disp)
+    }
+
+    // ModRM for two registers.
+    pub fun rr(mut self, reg: u64, rm: u64) {
+        self.b(192 | ((reg & 7) << (3 as u32)) | (rm & 7))
+    }
+
+    // `mov dst, [base + disp]` reading `size` bytes, zero- or sign-extended to 64 bits.
+    pub fun load(mut self, size: u64, signed: bool, dst: u64, base: u64, disp: i64) {
+        when size == 8 {
+            self.rex(1, dst, base, false)
+            self.b(139)
+        } else when size == 4 {
+            when signed {
+                self.rex(1, dst, base, false)
+                self.b(99)
+            } else {
+                self.rex(0, dst, base, false)
+                self.b(139)
+            }
+        } else {
+            self.rex(if_wide(signed), dst, base, false)
+            self.b(15)
+            when size == 2 {
+                when signed {
+                    self.b(191)
+                } else {
+                    self.b(183)
+                }
+            } else {
+                when signed {
+                    self.b(190)
+                } else {
+                    self.b(182)
+                }
+            }
+        }
+        self.mem(dst, base, disp)
+    }
+
+    // `mov [base + disp], src` writing the low `size` bytes.
+    pub fun store(mut self, size: u64, src: u64, base: u64, disp: i64) {
+        when size == 8 {
+            self.rex(1, src, base, false)
+            self.b(137)
+        } else when size == 4 {
+            self.rex(0, src, base, false)
+            self.b(137)
+        } else when size == 2 {
+            self.b(102)
+            self.rex(0, src, base, false)
+            self.b(137)
+        } else {
+            self.rex(0, src, base, src >= 4)
+            self.b(136)
+        }
+        self.mem(src, base, disp)
+    }
+
+    // `mov dst, imm`.
+    pub fun mov_ri(mut self, dst: u64, value: u64) {
+        // The flags stay untouched, so this is safe between a compare and its use.
+        when value <= 4294967295 {
+            self.rex(0, 0, dst, false)
+            self.b(184 + (dst & 7))
+            self.d32(value)
+        } else {
+            self.rex(1, 0, dst, false)
+            self.b(184 + (dst & 7))
+            self.d64(value)
+        }
+    }
+
+    // `mov dst, src`.
+    pub fun mov_rr(mut self, dst: u64, src: u64) {
+        when dst == src {
+            return
+        }
+        self.rex(1, src, dst, false)
+        self.b(137)
+        self.rr(src, dst)
+    }
+
+    // `lea dst, [base + disp]`.
+    pub fun lea(mut self, dst: u64, base: u64, disp: i64) {
+        self.rex(1, dst, base, false)
+        self.b(141)
+        self.mem(dst, base, disp)
+    }
+
+    // `lea dst, [rip + symbol]`: the address of a symbol in this object.
+    // `lea dst, [rip + label]`: the address of a label in the same code, patched when the labels are resolved.
+    pub fun lea_label(mut self, dst: u64, label: u64) {
+        self.rex(1, dst, 0, false)
+        self.b(141)
+        self.b(5 | ((dst & 7) << (3 as u32)))
+        self.fixup_positions.push(self.code.len())
+        self.fixup_labels.push(label)
+        self.d32(0)
+    }
+
+    pub fun lea_symbol(mut self, dst: u64, symbol: u64) {
+        self.rex(1, dst, 0, false)
+        self.b(141)
+        self.b(5 | ((dst & 7) << (3 as u32)))
+        self.reloc(symbol, RelocKind::PC32)
+    }
+
+    // Emits the 32-bit field a relocation patches and records it. The addend makes the field
+    // relative to the end of the instruction.
+    pub fun reloc(mut self, symbol: u64, kind: u64) {
+        self.reloc_offsets.push(self.code.len())
+        self.reloc_symbols.push(symbol)
+        self.reloc_kinds.push(kind)
+        self.reloc_addends.push(-4)
+        self.d32(0)
+    }
+
+    // `op dst, src` for add (1), or (9), and (33), sub (41), xor (49), cmp (57), at 64 bits.
+    pub fun alu_rr(mut self, opcode: u64, dst: u64, src: u64) {
+        self.rex(1, src, dst, false)
+        self.b(opcode)
+        self.rr(src, dst)
+    }
+
+    // `op dst, imm32` for add (0), or (1), and (4), sub (5), xor (6), cmp (7), at 64 bits.
+    pub fun alu_ri(mut self, extension: u64, dst: u64, value: i64) {
+        self.rex(1, 0, dst, false)
+        self.b(129)
+        self.rr(extension, dst)
+        self.s32(value)
+    }
+
+    // `imul dst, src`.
+    pub fun imul_rr(mut self, dst: u64, src: u64) {
+        self.rex(1, dst, src, false)
+        self.b(15)
+        self.b(175)
+        self.rr(dst, src)
+    }
+
+    // F7 group at 64 bits: not (2), neg (3), mul (4), imul (5), div (6), idiv (7).
+    pub fun unary(mut self, extension: u64, reg: u64) {
+        self.rex(1, 0, reg, false)
+        self.b(247)
+        self.rr(extension, reg)
+    }
+
+    // Shift by cl at 64 bits: shl (4), shr (5), sar (7).
+    pub fun shift_cl(mut self, extension: u64, reg: u64) {
+        self.rex(1, 0, reg, false)
+        self.b(211)
+        self.rr(extension, reg)
+    }
+
+    pub fun cqo(mut self) {
+        self.b(72)
+        self.b(153)
+    }
+
+    pub fun test_rr(mut self, a: u64, b: u64) {
+        self.rex(1, b, a, false)
+        self.b(133)
+        self.rr(b, a)
+    }
+
+    // `setcc al` followed by a zero extension into `dst`.
+    pub fun setcc(mut self, condition: u64, dst: u64) {
+        self.b(15)
+        self.b(144 + condition)
+        self.b(192)
+        self.rex(0, dst, 0, false)
+        self.b(15)
+        self.b(182)
+        self.rr(dst, 0)
+    }
+
+    // `cmovcc dst, src` at 64 bits.
+    pub fun cmov(mut self, condition: u64, dst: u64, src: u64) {
+        self.rex(1, dst, src, false)
+        self.b(15)
+        self.b(64 + condition)
+        self.rr(dst, src)
+    }
+
+    // Sign-extends the low `from` bytes of `src` into `dst`.
+    pub fun sext_rr(mut self, dst: u64, src: u64, from: u64) {
+        when from == 8 {
+            self.mov_rr(dst, src)
+            return
+        }
+        self.rex(1, dst, src, false)
+        when from == 4 {
+            self.b(99)
+        } else {
+            self.b(15)
+            when from == 2 {
+                self.b(191)
+            } else {
+                self.b(190)
+            }
+        }
+        self.rr(dst, src)
+    }
+
+    // Zero-extends the low `from` bytes of `src` into `dst`.
+    pub fun zext_rr(mut self, dst: u64, src: u64, from: u64) {
+        when from == 8 {
+            self.mov_rr(dst, src)
+            return
+        }
+        when from == 4 {
+            self.rex(0, dst, src, false)
+            self.b(139)
+            self.rr(dst, src)
+            return
+        }
+        self.rex(0, dst, src, src >= 4)
+        self.b(15)
+        when from == 2 {
+            self.b(183)
+        } else {
+            self.b(182)
+        }
+        self.rr(dst, src)
+    }
+
+    pub fun new_label(mut self) -> u64 {
+        self.label_offsets.push(unbound())
+        return self.label_offsets.len() - 1
+    }
+
+    pub fun bind(mut self, label: u64) {
+        self.label_offsets.set(label, self.code.len())
+    }
+
+    // `jmp label`.
+    pub fun jmp(mut self, label: u64) {
+        self.b(233)
+        self.fixup_positions.push(self.code.len())
+        self.fixup_labels.push(label)
+        self.d32(0)
+    }
+
+    // `jcc label`.
+    pub fun jcc(mut self, condition: u64, label: u64) {
+        self.b(15)
+        self.b(128 + condition)
+        self.fixup_positions.push(self.code.len())
+        self.fixup_labels.push(label)
+        self.d32(0)
+    }
+
+    // `call symbol` through the procedure linkage table.
+    pub fun call_symbol(mut self, symbol: u64) {
+        self.b(232)
+        self.reloc(symbol, RelocKind::PLT32)
+    }
+
+    // `call symbol` for a C function: the stack is aligned to 16 bytes first, as the System V ABI wants, and rbx keeps the
+    // old stack pointer across the call.
+    pub fun call_aligned(mut self, symbol: u64) {
+        self.push(Reg::RBX)
+        self.mov_rr(Reg::RBX, Reg::RSP)
+        self.alu_ri(4, Reg::RSP, (0 as i64) - 16)
+        self.call_symbol(symbol)
+        self.mov_rr(Reg::RSP, Reg::RBX)
+        self.pop(Reg::RBX)
+    }
+
+    // `call label` within the same code.
+    pub fun call_label(mut self, label: u64) {
+        self.b(232)
+        self.fixup_positions.push(self.code.len())
+        self.fixup_labels.push(label)
+        self.d32(0)
+    }
+
+    // `rep movsb`, `rep stosb`, and the direction flag: set (`std`) to copy backward, cleared (`cld`) otherwise.
+    pub fun rep_movsb(mut self) {
+        self.b(243)
+        self.b(164)
+    }
+
+    pub fun rep_stosb(mut self) {
+        self.b(243)
+        self.b(170)
+    }
+
+    pub fun std(mut self) {
+        self.b(253)
+    }
+
+    pub fun cld(mut self) {
+        self.b(252)
+    }
+
+    pub fun syscall(mut self) {
+        self.b(15)
+        self.b(5)
+    }
+
+    pub fun call_reg(mut self, reg: u64) {
+        self.rex(0, 0, reg, false)
+        self.b(255)
+        self.rr(2, reg)
+    }
+
+    pub fun ret(mut self) {
+        self.b(195)
+    }
+
+    pub fun push(mut self, reg: u64) {
+        self.rex(0, 0, reg, false)
+        self.b(80 + (reg & 7))
+    }
+
+    pub fun pop(mut self, reg: u64) {
+        self.rex(0, 0, reg, false)
+        self.b(88 + (reg & 7))
+    }
+
+    pub fun trap(mut self) {
+        self.b(15)
+        self.b(11)
+    }
+
+    // `movss`/`movsd` load: `precision` is 4 or 8.
+    pub fun sse_load(mut self, precision: u64, xmm: u64, base: u64, disp: i64) {
+        self.b(sse_prefix(precision))
+        self.rex(0, xmm, base, false)
+        self.b(15)
+        self.b(16)
+        self.mem(xmm, base, disp)
+    }
+
+    pub fun sse_store(mut self, precision: u64, xmm: u64, base: u64, disp: i64) {
+        self.b(sse_prefix(precision))
+        self.rex(0, xmm, base, false)
+        self.b(15)
+        self.b(17)
+        self.mem(xmm, base, disp)
+    }
+
+    // `movdqu`: sixteen bytes between an xmm register and memory, with any alignment.
+    pub fun movdqu_load(mut self, xmm: u64, base: u64, disp: i64) {
+        self.b(243)
+        self.rex(0, xmm, base, false)
+        self.b(15)
+        self.b(111)
+        self.mem(xmm, base, disp)
+    }
+
+    pub fun movdqu_store(mut self, xmm: u64, base: u64, disp: i64) {
+        self.b(243)
+        self.rex(0, xmm, base, false)
+        self.b(15)
+        self.b(127)
+        self.mem(xmm, base, disp)
+    }
+
+    // Scalar arithmetic on two xmm registers: add (88), mul (89), sub (92), div (94).
+    pub fun sse_op(mut self, precision: u64, opcode: u64, dst: u64, src: u64) {
+        self.b(sse_prefix(precision))
+        self.rex(0, dst, src, false)
+        self.b(15)
+        self.b(opcode)
+        self.rr(dst, src)
+    }
+
+    // `ucomiss`/`ucomisd`.
+    pub fun ucomis(mut self, precision: u64, a: u64, b: u64) {
+        when precision == 8 {
+            self.b(102)
+        }
+        self.rex(0, a, b, false)
+        self.b(15)
+        self.b(46)
+        self.rr(a, b)
+    }
+
+    // Converts between single and double precision: `from` is the source precision.
+    pub fun cvt_precision(mut self, from: u64, dst: u64, src: u64) {
+        self.b(sse_prefix(from))
+        self.rex(0, dst, src, false)
+        self.b(15)
+        self.b(90)
+        self.rr(dst, src)
+    }
+
+    // `cvtsi2ss`/`cvtsi2sd` from a 64-bit integer register.
+    pub fun cvt_from_int(mut self, precision: u64, dst: u64, src: u64) {
+        self.b(sse_prefix(precision))
+        self.rex(1, dst, src, false)
+        self.b(15)
+        self.b(42)
+        self.rr(dst, src)
+    }
+
+    // `cvttss2si`/`cvttsd2si` into a 64-bit integer register.
+    pub fun cvt_to_int(mut self, precision: u64, dst: u64, src: u64) {
+        self.b(sse_prefix(precision))
+        self.rex(1, dst, src, false)
+        self.b(15)
+        self.b(44)
+        self.rr(dst, src)
+    }
+
+    // `movd`/`movq` from an integer register to an xmm register.
+    pub fun movq_to_xmm(mut self, wide: bool, xmm: u64, src: u64) {
+        self.b(102)
+        self.rex(if_wide(wide), xmm, src, false)
+        self.b(15)
+        self.b(110)
+        self.rr(xmm, src)
+    }
+
+    // `movd`/`movq` from an xmm register to an integer register.
+    pub fun movq_from_xmm(mut self, wide: bool, dst: u64, xmm: u64) {
+        self.b(102)
+        self.rex(if_wide(wide), xmm, dst, false)
+        self.b(15)
+        self.b(126)
+        self.rr(xmm, dst)
+    }
+
+    // Resolves every jump to a label that was bound.
+    pub fun resolve(mut self) -> bool {
+        mut index: u64 = 0
+        while index < self.fixup_positions.len() {
+            target := self.label_offsets[self.fixup_labels[index]]
+            when target == unbound() {
+                return false
+            }
+            at := self.fixup_positions[index]
+            self.patch32(at, target - (at + 4))
+            index += 1
+        }
+        self.fixup_positions = Vec()
+        self.fixup_labels = Vec()
+        return true
+    }
+}
+
+fun if_wide(flag: bool) -> u64 {
+    when flag {
+        return 1
+    }
+    return 0
+}
+
+// The mandatory prefix of the scalar SSE instructions for single (4) and double (8) precision.
+fun sse_prefix(precision: u64) -> u64 {
+    when precision == 8 {
+        return 242
+    }
+    return 243
+}
