@@ -1,0 +1,20 @@
+// test: run
+// out: 105
+// out: 203
+// out: 27
+// out: -1
+enum Shape { Pair((i32, i32)), Empty }
+fun f(s: Shape) -> i32 {
+    choose s {
+        Shape::Pair((0, y)) => y + 100,
+        Shape::Pair((x, 0)) => x + 200,
+        Shape::Pair((x, y)) => x * 10 + y,
+        Shape::Empty => -1
+    }
+}
+fun main() {
+    echo f(Shape::Pair((0, 5)))
+    echo f(Shape::Pair((3, 0)))
+    echo f(Shape::Pair((2, 7)))
+    echo f(Shape::Empty)
+}

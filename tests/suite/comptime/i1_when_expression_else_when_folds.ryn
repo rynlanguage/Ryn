@@ -1,0 +1,11 @@
+// test: run
+// out: 20
+// out: 7
+const MODE: i32 = 2
+fun pick() -> i32 {
+    return when MODE == 1 { 10 } else when MODE == 2 { 20 } else { no_such() }
+}
+fun main() {
+    echo pick()
+    echo when MODE > 5 { no_such2() } else { 7 }
+}

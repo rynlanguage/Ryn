@@ -1,0 +1,14 @@
+// test: run
+// out: 9
+struct Box<T> {
+    value: T
+}
+struct Nested<T> {
+    inner: Box<T>
+}
+fun read(n: Nested<i32>) -> i32 {
+    n.inner.value
+}
+fun main() {
+    echo read(Nested::<i32> { inner: Box::<i32> { value: 9 } })
+}

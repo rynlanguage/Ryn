@@ -1,0 +1,14 @@
+// test: run
+// out: 3
+const N: i32 = 3
+fun main() {
+    mut total: i32 = 0
+    for i in 0..N {
+        when N > 2 {
+            total = total + i
+        } else {
+            missing_thing()
+        }
+    }
+    echo total
+}

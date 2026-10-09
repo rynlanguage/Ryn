@@ -1,0 +1,25 @@
+// test: run
+// out: 1
+// out: 20
+shape Show {
+    fun show(self) -> i32
+}
+struct A {
+    n: i32
+}
+struct B {
+    n: i32
+}
+extend A {
+    fun show(self) -> i32 { self.n }
+}
+extend B {
+    fun show(self) -> i32 { self.n * 10 }
+}
+fun render<T: Show>(v: T) -> i32 {
+    v.show()
+}
+fun main() {
+    echo render(A { n: 1 })
+    echo render(B { n: 2 })
+}

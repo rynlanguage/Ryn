@@ -1,0 +1,24 @@
+// test: run
+// out: 7
+// out: 20
+// out: 3
+// out: 3
+// exit: 0
+struct Point { x: i64, y: i64 }
+
+fun find(flag: bool) -> Option<Point> {
+    when flag {
+        return Option::Some(Point { x: 3, y: 4 })
+    }
+    return Option::None
+}
+
+fun main() {
+    p := find(true).unwrap()
+    echo p.x + p.y
+    q := find(false).unwrap_or(Point { x: 10, y: 20 })
+    echo q.y
+    r := find(true).unwrap_or(Point { x: 1, y: 1 })
+    echo r.x
+    echo find(true).unwrap().x
+}

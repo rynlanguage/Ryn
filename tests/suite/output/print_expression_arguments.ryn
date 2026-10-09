@@ -1,0 +1,7 @@
+// test: run
+// out: sum=5 product=6
+fun main() {
+    a := 2 as i32
+    b := 3 as i32
+    print("sum={} product={}", a + b, a * b)
+}

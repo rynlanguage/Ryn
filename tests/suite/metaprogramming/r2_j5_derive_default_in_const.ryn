@@ -1,0 +1,8 @@
+// test: run
+// out: 0
+#[derive(Default)]
+struct Pair { a: i32, b: i32 }
+const W: Pair = Pair::default()
+fun main() {
+    echo W.b
+}

@@ -1,0 +1,13 @@
+// test: fail
+// code: R0241
+fun eat(s: String) {
+    echo s
+}
+fun main() {
+    a := String("a")
+    mut i: i32 = 0
+    while i < 2 {
+        eat(a)
+        i += 1
+    }
+}

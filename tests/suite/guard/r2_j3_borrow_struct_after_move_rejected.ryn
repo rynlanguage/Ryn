@@ -1,0 +1,16 @@
+// test: fail
+// code: R0240
+// msg: use of a moved value
+struct P {
+    name: String
+    n: i32
+}
+fun eat(p: P) {
+    echo p.name
+}
+fun main() {
+    p := P { name: String("a"), n: 1 }
+    eat(p)
+    r := &p
+    echo r.n
+}

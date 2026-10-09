@@ -1,0 +1,13 @@
+// test: run
+// out: a
+// out: é
+// out: €
+// out: 𝄞
+// out: [Z]
+fun main() {
+    echo 'a'
+    echo 'é'
+    echo '€'
+    echo '𝄞'
+    print("[{}]", 'Z')
+}

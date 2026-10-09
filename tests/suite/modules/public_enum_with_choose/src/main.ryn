@@ -1,0 +1,10 @@
+// test: run
+// out: 7
+use kinds
+fun main() {
+    k := kinds::Kind::Number(7)
+    echo choose k {
+        kinds::Kind::Number(n) => n,
+        kinds::Kind::End => 0
+    }
+}

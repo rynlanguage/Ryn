@@ -1,0 +1,7 @@
+// test: fail
+// code: R0235
+// msg: pattern does not match the type of the value
+fun main() {
+    n: i32 = 3
+    echo choose n { (a, b) => 5 }
+}

@@ -1,0 +1,11 @@
+// test: fail
+// msg: unknown variable `y`
+// code: R0203
+const B: bool = true
+fun main() {
+    when B {
+        y := 2
+        echo y
+    }
+    echo y
+}

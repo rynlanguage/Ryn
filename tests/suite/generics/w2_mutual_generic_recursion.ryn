@@ -1,0 +1,21 @@
+// test: run
+// out: true
+// out: false
+// out: true
+fun even<T>(v: T, n: i32) -> bool {
+    choose n {
+        0 => true,
+        _ => odd(v, n - 1)
+    }
+}
+fun odd<T>(v: T, n: i32) -> bool {
+    choose n {
+        0 => false,
+        _ => even(v, n - 1)
+    }
+}
+fun main() {
+    echo even(1 as i32, 6)
+    echo odd(2 as u8, 6)
+    echo odd("s", 3)
+}

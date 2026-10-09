@@ -1,0 +1,9 @@
+// test: fail
+// code: R0421
+use util
+fun helper() -> i32 {
+    return 1
+}
+fun main() {
+    echo helper()
+}

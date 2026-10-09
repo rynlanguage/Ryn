@@ -1,0 +1,4 @@
+fun main() {
+    value: Strng = "text"
+    echo value
+}

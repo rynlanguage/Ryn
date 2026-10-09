@@ -1,0 +1,12 @@
+// test: run
+// out: 6
+const N: u64 = 3
+struct Grid {
+    cells: [i32; N]
+}
+fun total(g: Grid) -> i32 {
+    return g.cells[0] + g.cells[1] + g.cells[2]
+}
+fun main() {
+    echo total(Grid { cells: [1, 2, 3] })
+}

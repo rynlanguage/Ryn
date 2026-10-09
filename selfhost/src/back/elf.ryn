@@ -1,0 +1,378 @@
+// Writes an x86-64 ELF relocatable object: one code section, one read-only data section, the
+// symbol table, and the relocations of the code. The system linker turns it into an executable.
+
+// A section the symbols and relocations of an object may point into.
+pub struct Where { unused: u64 }
+
+extend Where {
+    pub const UNDEFINED: u64 = 0
+    pub const TEXT: u64 = 1
+    pub const RODATA: u64 = 2
+    pub const BSS: u64 = 3
+}
+
+pub struct ObjectInput {
+    pub text: Vec<u8>,
+    pub rodata: Vec<u8>,
+    // The size of the zero-filled, writable section, whose symbols are of `Where::BSS`.
+    pub bss_size: u64,
+    pub symbol_names: Vec<String>,
+    pub symbol_sections: Vec<u64>,
+    pub symbol_values: Vec<u64>,
+    pub symbol_sizes: Vec<u64>,
+    pub symbol_global: Vec<bool>,
+    pub reloc_offsets: Vec<u64>,
+    pub reloc_symbols: Vec<u64>,
+    pub reloc_kinds: Vec<u64>,
+    pub reloc_addends: Vec<i64>,
+}
+
+struct Out {
+    bytes: Vec<u8>,
+}
+
+extend Out {
+    fun b(mut self, value: u64) {
+        self.bytes.push((value & 255) as u8)
+    }
+
+    fun w16(mut self, value: u64) {
+        self.b(value)
+        self.b(value >> (8 as u32))
+    }
+
+    fun w32(mut self, value: u64) {
+        self.w16(value)
+        self.w16(value >> (16 as u32))
+    }
+
+    fun w64(mut self, value: u64) {
+        self.w32(value)
+        self.w32(value >> (32 as u32))
+    }
+
+    fun text(mut self, value: String) {
+        mut index: u64 = 0
+        while index < value.len() {
+            self.b(value.byte_at(index) as u64)
+            index += 1
+        }
+    }
+
+    // Pads with zero bytes to a multiple of `alignment`.
+    fun align(mut self, alignment: u64) {
+        while (self.bytes.len() % alignment) != 0 {
+            self.b(0)
+        }
+    }
+
+    // (Walked by index: iterating a vector that is passed in takes the elements off its front one at a time, which shifts all the
+    // rest each time and costs time in proportion to the square of the length.)
+    fun append(mut self, other: Vec<u8>) {
+        mut at: u64 = 0
+        while at < other.len() {
+            self.bytes.push(other[at])
+            at += 1
+        }
+    }
+}
+
+// One entry of the section header table.
+struct Header {
+    name: u64,
+    kind: u64,
+    flags: u64,
+    offset: u64,
+    size: u64,
+    link: u64,
+    info: u64,
+    alignment: u64,
+    entry_size: u64,
+}
+
+fun header_row(name: u64, kind: u64, flags: u64, offset: u64, size: u64, link: u64, info: u64, alignment: u64, entry_size: u64) -> Header {
+    return Header { name: name, kind: kind, flags: flags, offset: offset, size: size, link: link, info: info, alignment: alignment, entry_size: entry_size }
+}
+
+// Adds a name to a string table and returns its offset.
+fun intern(table: Vec<u8>, name: String) -> Vec<u8> {
+    mut out := table
+    mut index: u64 = 0
+    while index < name.len() {
+        out.push(name.byte_at(index))
+        index += 1
+    }
+    out.push(0 as u8)
+    return out
+}
+
+pub fun write_object(input: ObjectInput) -> Vec<u8> {
+    // Symbols: the null symbol, then the local ones, then the global ones.
+    mut order: Vec<u64> = Vec()
+    mut position: u64 = 0
+    while position < input.symbol_names.len() {
+        when !input.symbol_global[position] {
+            order.push(position)
+        }
+        position += 1
+    }
+    first_global := order.len() + 1
+    position = 0
+    while position < input.symbol_names.len() {
+        when input.symbol_global[position] {
+            order.push(position)
+        }
+        position += 1
+    }
+    mut elf_index: Vec<u64> = Vec()
+    position = 0
+    while position < input.symbol_names.len() {
+        elf_index.push(0)
+        position += 1
+    }
+    mut rank: u64 = 0
+    while rank < order.len() {
+        elf_index.set(order[rank], rank + 1)
+        rank += 1
+    }
+
+    mut symbol_strings: Vec<u8> = Vec()
+    symbol_strings.push(0 as u8)
+    mut name_offsets: Vec<u64> = Vec()
+    position = 0
+    while position < input.symbol_names.len() {
+        name_offsets.push(symbol_strings.len())
+        symbol_strings = intern(symbol_strings, input.symbol_names[position].clone())
+        position += 1
+    }
+
+    mut symtab := Out { bytes: Vec() }
+    // The null symbol.
+    symtab.w32(0)
+    symtab.b(0)
+    symtab.b(0)
+    symtab.w16(0)
+    symtab.w64(0)
+    symtab.w64(0)
+    rank = 0
+    while rank < order.len() {
+        index := order[rank]
+        symtab.w32(name_offsets[index])
+        mut bind: u64 = 0
+        when input.symbol_global[index] {
+            bind = 1
+        }
+        mut kind: u64 = 0
+        mut section: u64 = 0
+        when input.symbol_sections[index] == Where::TEXT {
+            kind = 2
+            section = 1
+        } else when input.symbol_sections[index] == Where::RODATA {
+            kind = 1
+            section = 2
+        } else when input.symbol_sections[index] == Where::BSS {
+            kind = 1
+            section = 7
+        }
+        symtab.b((bind << (4 as u32)) | kind)
+        symtab.b(0)
+        symtab.w16(section)
+        symtab.w64(input.symbol_values[index])
+        symtab.w64(input.symbol_sizes[index])
+        rank += 1
+    }
+
+    mut rela := Out { bytes: Vec() }
+    position = 0
+    while position < input.reloc_offsets.len() {
+        rela.w64(input.reloc_offsets[position])
+        rela.w64((elf_index[input.reloc_symbols[position]] << (32 as u32)) | input.reloc_kinds[position])
+        rela.w64((input.reloc_addends[position]) as u64)
+        position += 1
+    }
+
+    // Section names.
+    mut section_names: Vec<u8> = Vec()
+    section_names.push(0 as u8)
+    text_name := section_names.len()
+    section_names = intern(section_names, String(".text"))
+    rodata_name := section_names.len()
+    section_names = intern(section_names, String(".rodata"))
+    stack_name := section_names.len()
+    section_names = intern(section_names, String(".note.GNU-stack"))
+    rela_name := section_names.len()
+    section_names = intern(section_names, String(".rela.text"))
+    symtab_name := section_names.len()
+    section_names = intern(section_names, String(".symtab"))
+    strtab_name := section_names.len()
+    section_names = intern(section_names, String(".strtab"))
+    bss_name := section_names.len()
+    section_names = intern(section_names, String(".bss"))
+    shstrtab_name := section_names.len()
+    section_names = intern(section_names, String(".shstrtab"))
+
+    // Layout: the header, then each section's bytes, then the section header table.
+    mut out := Out { bytes: Vec() }
+    for _ in 0..64 {
+        out.b(0)
+    }
+    mut headers: Vec<Header> = Vec()
+    headers.push(header_row(0, 0, 0, 0, 0, 0, 0, 0, 0))
+    out.align(16)
+    text_at := out.bytes.len()
+    out.append(input.text.clone())
+    headers.push(header_row(text_name, 1, 6, text_at, input.text.len(), 0, 0, 16, 0))
+    out.align(16)
+    rodata_at := out.bytes.len()
+    out.append(input.rodata.clone())
+    headers.push(header_row(rodata_name, 1, 2, rodata_at, input.rodata.len(), 0, 0, 16, 0))
+    headers.push(header_row(stack_name, 1, 0, out.bytes.len(), 0, 0, 0, 1, 0))
+    out.align(8)
+    rela_at := out.bytes.len()
+    out.append(rela.bytes.clone())
+    headers.push(header_row(rela_name, 4, 64, rela_at, rela.bytes.len(), 5, 1, 8, 24))
+    out.align(8)
+    symtab_at := out.bytes.len()
+    out.append(symtab.bytes.clone())
+    headers.push(header_row(symtab_name, 2, 0, symtab_at, symtab.bytes.len(), 6, first_global, 8, 24))
+    strtab_at := out.bytes.len()
+    out.append(symbol_strings.clone())
+    headers.push(header_row(strtab_name, 3, 0, strtab_at, symbol_strings.len(), 0, 0, 1, 0))
+    // The zero-filled section takes no bytes in the file. Its index is 7, before the section names, which stay last.
+    bss_at := out.bytes.len()
+    headers.push(header_row(bss_name, 8, 3, bss_at, input.bss_size, 0, 0, 8, 0))
+    shstrtab_at := out.bytes.len()
+    out.append(section_names.clone())
+    headers.push(header_row(shstrtab_name, 3, 0, shstrtab_at, section_names.len(), 0, 0, 1, 0))
+    out.align(8)
+    table_at := out.bytes.len()
+    for header in headers.clone() {
+        out.w32(header.name)
+        out.w32(header.kind)
+        out.w64(header.flags)
+        out.w64(0)
+        out.w64(header.offset)
+        out.w64(header.size)
+        out.w32(header.link)
+        out.w32(header.info)
+        out.w64(header.alignment)
+        out.w64(header.entry_size)
+    }
+
+    // The ELF header.
+    mut header_bytes := Out { bytes: Vec() }
+    header_bytes.b(127)
+    header_bytes.b(69)
+    header_bytes.b(76)
+    header_bytes.b(70)
+    header_bytes.b(2)
+    header_bytes.b(1)
+    header_bytes.b(1)
+    header_bytes.b(0)
+    header_bytes.w64(0)
+    header_bytes.w16(1)
+    header_bytes.w16(62)
+    header_bytes.w32(1)
+    header_bytes.w64(0)
+    header_bytes.w64(0)
+    header_bytes.w64(table_at)
+    header_bytes.w32(0)
+    header_bytes.w16(64)
+    header_bytes.w16(0)
+    header_bytes.w16(0)
+    header_bytes.w16(64)
+    header_bytes.w16(headers.len())
+    header_bytes.w16(headers.len() - 1)
+    mut at: u64 = 0
+    while at < 64 {
+        out.bytes.set(at, header_bytes.bytes[at])
+        at += 1
+    }
+    return out.bytes
+}
+
+// ---- the linker ------------------------------------------------------------------------------------------------------
+
+// Links one object that needs nothing from outside into a static executable: three segments (the headers and the code, the
+// read-only data, and the zero-filled data), loaded at 0x400000 and following pages, entered at symbol 0. A relocation is
+// resolved to the address of its symbol; a symbol that is not defined is an error.
+pub fun link_executable(input: ObjectInput) -> Result<Vec<u8>, String> {
+    page: u64 = 4096
+    base: u64 = 4194304
+    text_at: u64 = page
+    text_end := text_at + input.text.len()
+    rodata_at := (text_end + page - 1) / page * page
+    rodata_end := rodata_at + input.rodata.len()
+    bss_at := (rodata_end + page - 1) / page * page
+    mut code := input.text.clone()
+    // Resolve each relocation against the final addresses.
+    mut index: u64 = 0
+    while index < input.reloc_offsets.len() {
+        symbol := input.reloc_symbols[index]
+        section := input.symbol_sections[symbol]
+        mut target: u64 = 0
+        when section == Where::TEXT {
+            target = base + text_at + input.symbol_values[symbol]
+        } else when section == Where::RODATA {
+            target = base + rodata_at + input.symbol_values[symbol]
+        } else when section == Where::BSS {
+            target = base + bss_at + input.symbol_values[symbol]
+        } else {
+            mut message := String("undefined symbol: ")
+            message.append(input.symbol_names[symbol].clone())
+            return Result::Err(message)
+        }
+        place := base + text_at + input.reloc_offsets[index]
+        value := (target + (input.reloc_addends[index] as u64) - place) & 4294967295
+        at := input.reloc_offsets[index]
+        mut byte: u64 = 0
+        while byte < 4 {
+            code.set(at + byte, ((value >> ((byte * 8) as u32)) & 255) as u8)
+            byte += 1
+        }
+        index += 1
+    }
+    mut out := Out { bytes: Vec() }
+    // The ELF header.
+    out.b(127)
+    out.text(String("ELF"))
+    out.b(2)
+    out.b(1)
+    out.b(1)
+    out.b(0)
+    out.w64(0)
+    out.w16(2)
+    out.w16(62)
+    out.w32(1)
+    out.w64(base + text_at + input.symbol_values[0])
+    out.w64(64)
+    out.w64(0)
+    out.w32(0)
+    out.w16(64)
+    out.w16(56)
+    out.w16(3)
+    out.w16(64)
+    out.w16(0)
+    out.w16(0)
+    // Program headers: type, flags, offset, virtual address, physical address, file size, memory size, alignment.
+    program_header(&mut out, 5, 0, base, text_end, text_end, page)
+    program_header(&mut out, 4, rodata_at, base + rodata_at, input.rodata.len(), input.rodata.len(), page)
+    program_header(&mut out, 6, bss_at, base + bss_at, 0, input.bss_size, page)
+    out.align(page)
+    out.append(code)
+    out.align(page)
+    out.append(input.rodata.clone())
+    out.align(page)
+    return Result::Ok(out.bytes)
+}
+
+fun program_header(out: &mut Out, flags: u64, offset: u64, address: u64, file_size: u64, memory_size: u64, alignment: u64) {
+    out.w32(1)
+    out.w32(flags)
+    out.w64(offset)
+    out.w64(address)
+    out.w64(address)
+    out.w64(file_size)
+    out.w64(memory_size)
+    out.w64(alignment)
+}

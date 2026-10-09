@@ -1,0 +1,6 @@
+// test: run
+// out: 42
+const ANSWER: i32 = 42
+fun main() {
+    echo ANSWER
+}

@@ -1,0 +1,6 @@
+// test: run
+// out: 4
+enum Color { Red, Green, Blue, Other(i32) }
+fun main() {
+    echo variant_count::<Color>()
+}

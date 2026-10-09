@@ -1,0 +1,45 @@
+// test: run
+// out: 10
+// out: 20
+// out: 30
+// out: 40
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(p: *u8);
+extern "C" fun qsort(base: *u8, count: u64, size: u64, compare: extern "C" fun(*u8, *u8) -> i32);
+fun compare(a: *u8, b: *u8) -> i32 {
+    x := *(a as *i32)
+    y := *(b as *i32)
+    when x < y {
+        return -1
+    }
+    when x > y {
+        return 1
+    }
+    return 0
+}
+fun poke8(address: u64, value: u8) {
+    p := address as *u8
+    *p = value
+}
+fun poke32(address: u64, value: i32) {
+    p := address as *i32
+    *p = value
+}
+fun peek32(address: u64) -> i32 {
+    p := address as *i32
+    return *p
+}
+fun main() {
+    nums := malloc(16 as u64)
+    nb := nums as u64
+    poke32(nb, 30)
+    poke32(nb + 4 as u64, 10)
+    poke32(nb + 8 as u64, 40)
+    poke32(nb + 12 as u64, 20)
+    qsort(nums, 4 as u64, 4 as u64, compare)
+    echo peek32(nb)
+    echo peek32(nb + 4 as u64)
+    echo peek32(nb + 8 as u64)
+    echo peek32(nb + 12 as u64)
+    free(nums)
+}

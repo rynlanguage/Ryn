@@ -1,0 +1,10 @@
+// test: fail
+// code: R0235
+// msg: pattern does not match the type of the value
+struct P {
+    x: i32
+}
+fun main() {
+    n: i32 = 3
+    echo choose n { P { x } => x }
+}

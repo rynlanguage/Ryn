@@ -1,0 +1,13 @@
+// test: run
+// out: 2
+// out: 1
+struct Pair<A, B> { first: A, second: B }
+fun swap<A, B>(p: Pair<A, B>) -> Pair<B, A> {
+    return Pair::<B, A> { first: p.second, second: p.first }
+}
+fun main() {
+    unused := Pair::<i64, i32> { first: 0, second: 0 }
+    r := swap(Pair::<i32, i64> { first: 1, second: 2 })
+    echo r.first
+    echo r.second
+}

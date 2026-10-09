@@ -1,0 +1,13 @@
+// test: fail
+// code: R0234
+// msg: must return the same generic type
+fun pos(n: i32) -> Option<i32> {
+    return Option::None
+}
+fun f() -> Result<i32, String> {
+    v := pos(1)?
+    return Result::Ok(v)
+}
+fun main() {
+    echo choose f() { Result::Ok(v) => v, Result::Err(m) => 0 }
+}

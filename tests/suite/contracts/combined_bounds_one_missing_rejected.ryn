@@ -1,0 +1,20 @@
+// test: fail
+// code: R0450
+shape Show {
+    fun show(self) -> i32
+}
+shape Named {
+    fun name(self) -> i32
+}
+struct A {
+    n: i32
+}
+extend A {
+    fun show(self) -> i32 { self.n }
+}
+fun both<T: Show + Named>(a: T) -> i32 {
+    a.show() + a.name()
+}
+fun main() {
+    echo both(A { n: 1 })
+}

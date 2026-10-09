@@ -1,0 +1,45 @@
+// test: run
+// out: -9223372036854775808
+// out: 0
+// out: -128
+// out: 0
+// out: -3
+// out: -1
+// out: -3
+// out: 1
+// out: 3
+// out: -1
+// out: 15
+// out: 15
+// out: 1844674407370955161
+// out: 5
+fun main() {
+    mut a: i64 = -9223372036854775807 - 1
+    mut m: i64 = -1
+    echo a / m
+    echo a % m
+    mut b: i8 = -128
+    mut n: i8 = -1
+    echo b / n
+    echo b % n
+    mut p: i16 = -7
+    mut q: i16 = 2
+    echo p / q
+    echo p % q
+    mut r: i32 = 7
+    mut s: i32 = -2
+    echo r / s
+    echo r % s
+    mut t: i32 = -7
+    mut u: i32 = -2
+    echo t / u
+    echo t % u
+    mut v: u8 = 255
+    mut w: u8 = 16
+    echo v / w
+    echo v % w
+    mut x: u64 = 18446744073709551615
+    mut y: u64 = 10
+    echo x / y
+    echo x % y
+}

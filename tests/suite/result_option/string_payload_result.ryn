@@ -1,0 +1,8 @@
+// test: run
+// out: hello world
+fun greet() -> Result<String, String> {
+    return Result::Ok(String("hello world"))
+}
+fun main() {
+    echo greet().unwrap()
+}

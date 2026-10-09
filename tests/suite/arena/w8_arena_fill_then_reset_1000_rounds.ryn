@@ -1,0 +1,32 @@
+// test: run
+// out: 512000
+// out: 0
+// out: 1000
+use std::arena
+fun main() {
+    mut a := arena::Arena::with_capacity(4096 as u64)
+    mut round: i64 = 0
+    mut total: i64 = 0
+    mut overflow_returns: i64 = 0
+    while round < 1000 {
+        mut n: i64 = 0
+        mut more: bool = true
+        while more {
+            p := a.alloc_bytes(8 as u64, 8 as u64)
+            when pointer_is_null(p) {
+                more = false
+            } else {
+                n += 1
+            }
+        }
+        total += n
+        when a.count() != 512 as u64 {
+            overflow_returns += 1
+        }
+        a.reset()
+        round += 1
+    }
+    echo total
+    echo overflow_returns
+    echo round
+}

@@ -1,0 +1,12 @@
+// test: run
+// out: 2
+fun take<T>(items: Vec<T>) -> Vec<T> {
+    items
+}
+fun main() {
+    mut v: Vec<i32> = Vec()
+    v.push(1)
+    v.push(2)
+    w := take(v)
+    echo w.len()
+}

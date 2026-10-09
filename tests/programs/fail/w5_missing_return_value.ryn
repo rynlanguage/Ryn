@@ -1,0 +1,7 @@
+fun answer() -> i32 {
+    echo "computing"
+}
+
+fun main() {
+    echo answer()
+}

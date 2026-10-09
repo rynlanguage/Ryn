@@ -146,6 +146,121 @@ static RYN_ARGUMENTS: OnceLock<Vec<String>> = OnceLock::new();
 #[unsafe(no_mangle)]
 pub extern "C" fn ryn_args_init() {
     let _ = arguments();
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    stack_guard::install();
+}
+
+/// Turns a stack overflow of the main thread (a SIGSEGV just past the end of the stack) into a
+/// readable runtime error instead of a bare segmentation fault. The handler runs on its own
+/// alternate stack. Any other SIGSEGV keeps its default behaviour after a short message.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod stack_guard {
+    use std::{
+        ffi::c_void,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    #[repr(C)]
+    struct StackT {
+        sp: *mut c_void,
+        flags: i32,
+        size: usize,
+    }
+
+    #[repr(C)]
+    struct SigAction {
+        handler: usize,
+        mask: [u64; 16],
+        flags: i32,
+        restorer: usize,
+    }
+
+    #[repr(C)]
+    struct RLimit {
+        current: u64,
+        maximum: u64,
+    }
+
+    unsafe extern "C" {
+        fn sigaltstack(new: *const StackT, old: *mut StackT) -> i32;
+        fn sigaction(signal: i32, new: *const SigAction, old: *mut SigAction) -> i32;
+        fn getrlimit(resource: i32, limit: *mut RLimit) -> i32;
+        fn write(fd: i32, buffer: *const u8, length: usize) -> isize;
+        fn _exit(code: i32) -> !;
+    }
+
+    const SIGSEGV: i32 = 11;
+    const SIGBUS: i32 = 7;
+    const SA_SIGINFO: i32 = 4;
+    const SA_ONSTACK: i32 = 0x0800_0000;
+    const SA_RESETHAND: i32 = 0x8000_0000_u32 as i32;
+    const RLIMIT_STACK: i32 = 3;
+    const ALTERNATE_STACK: usize = 64 * 1024;
+
+    static STACK_LOW: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn handler(signal: i32, info: *const u8, _context: *const c_void) {
+        // `si_addr` is the faulting address; it sits at offset 16 of `siginfo_t` on 64-bit Linux.
+        let address = unsafe { std::ptr::read_unaligned(info.add(16) as *const usize) };
+        let low = STACK_LOW.load(Ordering::Relaxed);
+        let margin = 1024 * 1024;
+        let message: &[u8] = if low != 0 && address + margin >= low && address <= low + margin {
+            b"Ryn runtime error: stack overflow (recursion is too deep)\n"
+        } else if signal == SIGBUS {
+            b"Ryn runtime error: bus error\n"
+        } else {
+            b"Ryn runtime error: invalid memory access (segmentation fault)\n"
+        };
+        unsafe {
+            write(2, message.as_ptr(), message.len());
+            _exit(1)
+        }
+    }
+
+    pub fn install() {
+        unsafe {
+            // The stack grows down from just above this frame; its lowest address is
+            // approximately `top - limit`.
+            let marker = 0u8;
+            let top = &marker as *const u8 as usize;
+            let mut limit = RLimit {
+                current: 0,
+                maximum: 0,
+            };
+            if getrlimit(RLIMIT_STACK, &mut limit) == 0
+                && limit.current != u64::MAX
+                && limit.current > 0
+            {
+                STACK_LOW.store(
+                    top.saturating_sub(limit.current as usize),
+                    Ordering::Relaxed,
+                );
+            }
+            let memory = Box::leak(vec![0u8; ALTERNATE_STACK].into_boxed_slice());
+            let alternate = StackT {
+                sp: memory.as_mut_ptr() as *mut c_void,
+                flags: 0,
+                size: ALTERNATE_STACK,
+            };
+            if sigaltstack(&alternate, std::ptr::null_mut()) != 0 {
+                return;
+            }
+            let action = SigAction {
+                handler: handler as usize,
+                mask: [0; 16],
+                flags: SA_SIGINFO | SA_ONSTACK | SA_RESETHAND,
+                restorer: 0,
+            };
+            sigaction(SIGSEGV, &action, std::ptr::null_mut());
+            sigaction(SIGBUS, &action, std::ptr::null_mut());
+        }
+    }
 }
 
 fn arguments() -> &'static [String] {

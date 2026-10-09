@@ -1,0 +1,12 @@
+// test: run
+// out: 200
+struct Wrapper<T> { value: T }
+extend<T> Wrapper<T> {
+    pub fun widen(self) -> i64 {
+        return self.value as i64
+    }
+}
+fun main() {
+    w := Wrapper::<u8> { value: 200 }
+    echo w.widen()
+}

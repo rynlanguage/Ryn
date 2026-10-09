@@ -1,0 +1,12 @@
+// test: run
+// out: 7
+shape Seven {
+    fun seven(self) -> i32 { 7 }
+}
+struct R { v: i32 }
+extend R as Seven {
+}
+fun main() {
+    r := R { v: 0 }
+    echo r.seven()
+}

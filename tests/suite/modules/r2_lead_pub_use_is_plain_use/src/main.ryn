@@ -1,0 +1,10 @@
+// test: run
+// out: 3
+// out: 64
+pub use std::arena
+fun main() {
+    mut a := arena::Arena::with_capacity(64 as u64)
+    p := arena::alloc(&mut a, 3 as i32)
+    echo *p
+    echo a.capacity()
+}

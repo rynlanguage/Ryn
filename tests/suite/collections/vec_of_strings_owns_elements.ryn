@@ -1,0 +1,11 @@
+// test: run
+// out: ryn
+// out: 1
+fun main() {
+    mut names: Vec<String> = Vec()
+    names.push(String("ryn"))
+    names.push(String("lang"))
+    first := names.take(0)
+    echo first
+    echo names.len()
+}

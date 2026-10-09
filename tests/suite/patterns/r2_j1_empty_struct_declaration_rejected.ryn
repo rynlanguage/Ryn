@@ -1,0 +1,7 @@
+// test: fail
+// code: R0221
+// msg: at least one field
+struct E {}
+fun main() {
+    e := E {}
+}

@@ -1,0 +1,16 @@
+// test: fail
+// code: R0204
+// msg: method `grow` requires a mutable receiver
+struct Rect { w: i64, h: i64 }
+extend Rect {
+    fun grow(mut self, k: i64) -> i64 {
+        self.w = self.w * k
+        return self.w
+    }
+}
+enum Shape { Box(Rect), Dot }
+fun main() {
+    s := Shape::Box(Rect { w: 3, h: 3 })
+    r := choose s { Shape::Box(x) => x.grow(2), Shape::Dot => 0 }
+    echo r
+}

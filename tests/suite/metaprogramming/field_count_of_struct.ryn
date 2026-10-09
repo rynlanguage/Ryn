@@ -1,0 +1,6 @@
+// test: run
+// out: 3
+struct Point { x: i32, y: i32, z: i64 }
+fun main() {
+    echo field_count::<Point>()
+}

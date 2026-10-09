@@ -1,0 +1,10 @@
+// test: run
+// out: 9
+struct Box<T> { value: T }
+fun main() {
+    b := Box::<i32> { value: 9 }
+    echo b.get()
+}
+extend<T> Box<T> {
+    pub fun get(self) -> T { return self.value }
+}

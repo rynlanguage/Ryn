@@ -1,0 +1,20 @@
+// test: run
+// out: 30
+// out: -1
+// out: 20
+fun pos(n: i32) -> Option<i32> {
+    when n > 0 {
+        return Option::Some(n)
+    }
+    return Option::None
+}
+fun chain(n: i32) -> Option<i32> {
+    a := pos(n)?
+    b := pos(a - 10)?
+    return Option::Some(a + b)
+}
+fun main() {
+    echo choose chain(20) { Option::Some(v) => v, Option::None => -1 }
+    echo choose chain(5) { Option::Some(v) => v, Option::None => -1 }
+    echo choose chain(15) { Option::Some(v) => v, Option::None => -1 }
+}

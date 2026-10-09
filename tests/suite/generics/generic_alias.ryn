@@ -1,0 +1,14 @@
+// test: run
+// out: 11
+enum Outcome<T> {
+    Value(T),
+    Empty
+}
+type Maybe<T> = Outcome<T>
+fun main() {
+    v: Maybe<i32> = Outcome::Value(11)
+    echo choose v {
+        Outcome::Value(n) => n,
+        Outcome::Empty => 0
+    }
+}

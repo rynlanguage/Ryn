@@ -1,0 +1,18 @@
+// test: run
+// out: x
+// out: z
+// out: 2
+struct P {
+    a: String,
+    b: i32,
+}
+fun eat(s: String) {
+    echo s
+}
+fun main() {
+    mut p := P { a: String("x"), b: 2 }
+    eat(p.a)
+    p.a = String("z")
+    echo p.a
+    echo p.b
+}

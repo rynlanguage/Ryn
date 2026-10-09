@@ -1,0 +1,62 @@
+// test: run
+// out: 2
+// out: 1
+// out: nested-else
+// out: 3
+// out: 400
+// out: 6
+// out: 7
+const B: bool = true
+const C: bool = false
+fun find(limit: i32) -> i32 {
+    mut i: i32 = 0
+    while i < 10 {
+        when B {
+            when i == limit {
+                return i * 100
+            }
+        }
+        i += 1
+    }
+    return -1
+}
+fun main() {
+    x := 1
+    when B {
+        inner := 2
+        echo inner
+    }
+    echo x
+    when C {
+        echo "never"
+    }
+    when C {
+        echo "never2"
+    } else when B {
+        when C {
+            echo "no"
+        } else {
+            echo "nested-else"
+        }
+    }
+    mut count: i32 = 0
+    for k in 0..5 {
+        when B {
+            when k == 3 {
+                break
+            }
+            count += 1
+        }
+    }
+    echo count
+    echo find(4)
+    when C {
+        z := 5
+        echo z
+    } else {
+        w := 6
+        echo w
+    }
+    v := 7
+    echo v
+}

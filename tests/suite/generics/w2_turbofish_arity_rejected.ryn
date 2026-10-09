@@ -1,0 +1,6 @@
+// test: fail
+// code: R0264
+fun id<T>(v: T) -> T { return v }
+fun main() {
+    echo id::<i32, i64>(5)
+}

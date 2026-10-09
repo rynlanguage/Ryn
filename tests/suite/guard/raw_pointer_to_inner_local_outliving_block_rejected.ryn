@@ -1,0 +1,10 @@
+// test: fail
+// code: R0248
+fun main() {
+    mut p: *i32 = (0 as u64) as *i32
+    when true {
+        mut x: i32 = 5
+        p = &raw mut x
+    }
+    echo pointer_is_null(p as *u8)
+}

@@ -1,0 +1,14 @@
+// test: run
+// out: 2
+// out: true
+// out: 1
+fun main() {
+    mut s := Set<i32>()
+    s.insert(5)
+    s.insert(7)
+    mut t := s.clone()
+    echo t.len()
+    echo t.contains(7)
+    t.remove(5)
+    echo t.len()
+}

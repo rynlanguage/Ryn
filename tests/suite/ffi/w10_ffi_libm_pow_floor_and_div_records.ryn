@@ -1,0 +1,31 @@
+// test: run
+// out: 1024
+// out: -3
+// out: -3
+// out: -2
+// out: 14285714285
+// out: 5
+extern "C" fun pow(base: f64, exponent: f64) -> f64;
+extern "C" fun floor(value: f64) -> f64;
+extern "C" fun div(a: i32, b: i32) -> DivT;
+extern "C" fun ldiv(a: i64, b: i64) -> LDivT;
+#[repr(C)]
+struct DivT {
+    quot: i32,
+    rem: i32
+}
+#[repr(C)]
+struct LDivT {
+    quot: i64,
+    rem: i64
+}
+fun main() {
+    echo pow(2.0, 10.0)
+    echo floor(-2.5)
+    d := div(-17, 5)
+    echo d.quot
+    echo d.rem
+    l := ldiv(100000000000, 7)
+    echo l.quot
+    echo l.rem
+}

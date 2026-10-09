@@ -1,0 +1,14 @@
+// test: fail
+// code: R0251
+struct Holder {
+    r: &i32
+}
+fun main() {
+    a: i32 = 1
+    mut h := Holder { r: &a }
+    when true {
+        b: i32 = 5
+        h.r = &b
+    }
+    echo h.r
+}

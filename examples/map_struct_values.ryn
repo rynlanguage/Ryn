@@ -1,7 +1,8 @@
 struct Point { x: i32, y: i32 }
 
 fun point_sum(points: Map<i32, Point>) -> Option<i32> {
-    return Option::Some(points.get(3)?.x + points.get(3)?.y)
+    point := points.get(3)?
+    return Option::Some(point.x + point.y)
 }
 
 fun main() {

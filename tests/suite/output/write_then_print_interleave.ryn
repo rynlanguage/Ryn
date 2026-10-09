@@ -1,0 +1,9 @@
+// test: run
+// out: [1][2]
+// out: end
+fun main() {
+    write("[{}]", 1 as i32)
+    write("[{}]", 2 as i32)
+    write("\n")
+    print("end")
+}

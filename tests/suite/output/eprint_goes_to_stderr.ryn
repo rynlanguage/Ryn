@@ -1,0 +1,7 @@
+// test: run
+// out: visible
+// err: problem 5
+fun main() {
+    print("visible")
+    eprint("problem {}", 5 as i32)
+}

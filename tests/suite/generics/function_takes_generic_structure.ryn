@@ -1,0 +1,19 @@
+// test: run
+// out: 2
+// out: hey
+struct Stack<T> { items: Vec<T> }
+fun size<T>(s: Stack<T>) -> u64 {
+    return s.items.len()
+}
+fun first<T>(s: Stack<T>) -> T {
+    return s.items.index(0)
+}
+fun main() {
+    mut a := Stack::<i32> { items: Vec<i32>() }
+    a.items.push(1)
+    a.items.push(2)
+    echo size(a)
+    mut b := Stack::<String> { items: Vec<String>() }
+    b.items.push(String("hey"))
+    echo first(b)
+}

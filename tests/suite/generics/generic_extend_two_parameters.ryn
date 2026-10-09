@@ -1,0 +1,14 @@
+// test: run
+// out: 3
+// out: true
+struct Pair<A, B> { first: A, second: B }
+extend<A, B> Pair<A, B> {
+    pub fun first_value(self) -> A { return self.first }
+    pub fun second_value(self) -> B { return self.second }
+    pub const KIND: i32 = 7
+}
+fun main() {
+    p := Pair::<i32, bool> { first: 3, second: true }
+    echo p.first_value()
+    echo p.second_value()
+}

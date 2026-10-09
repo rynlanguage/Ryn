@@ -1,0 +1,21 @@
+fun parse(value: Option<i32>) -> Option<i32> {
+    defer {
+        echo "cleanup"
+    }
+    number := value?
+    return Option::Some(number + 1)
+}
+
+fun main() -> i32 {
+    present: Option<i32> = Option::Some(4)
+    missing: Option<i32> = Option::None
+    echo choose parse(present) {
+        Option::Some(value) => value,
+        Option::None => -1,
+    }
+    echo choose parse(missing) {
+        Option::Some(value) => value,
+        Option::None => -1,
+    }
+    return 0
+}

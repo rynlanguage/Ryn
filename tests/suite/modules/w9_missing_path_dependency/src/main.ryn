@@ -1,0 +1,7 @@
+// test: fail
+// code: R0425
+// msg: cannot resolve path dependency `ghost`
+use ghost::x
+fun main() {
+    echo 1
+}

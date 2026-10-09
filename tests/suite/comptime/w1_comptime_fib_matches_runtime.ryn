@@ -1,0 +1,22 @@
+// test: run
+// out: 6765
+// out: 6765
+// out: true
+fun fib(n: i32) -> i32 {
+    mut a: i32 = 0
+    mut b: i32 = 1
+    mut i: i32 = 0
+    while i < n {
+        t := a + b
+        a = b
+        b = t
+        i += 1
+    }
+    return a
+}
+const F20: i32 = comptime(fib(20))
+fun main() {
+    echo F20
+    echo fib(20)
+    echo comptime(fib(30)) == fib(30)
+}

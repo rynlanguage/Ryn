@@ -1,0 +1,9 @@
+// test: run
+// out: 44
+// out: 7
+const WRAPPED: u8 = 300 as u8
+const TRUNC: i32 = 7.9 as i32
+fun main() {
+    echo WRAPPED
+    echo TRUNC
+}

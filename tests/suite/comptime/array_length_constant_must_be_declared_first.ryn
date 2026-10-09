@@ -1,0 +1,6 @@
+// test: fail
+// code: R0012
+fun main() {
+    a: [i32; LATER] = [0; 3]
+}
+const LATER: u64 = 3

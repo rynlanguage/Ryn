@@ -1,0 +1,20 @@
+// test: run
+// out: abcé€😀
+// out: 12
+// out: 6
+// out: xz
+// exit: 0
+fun main() {
+    mut s := String("ab")
+    s.push('c')
+    s.push('é')
+    s.push('€')
+    s.push('😀')
+    echo s
+    echo s.len()
+    echo s.char_count()
+    mut t := String("")
+    t.append("x")
+    t.push('z')
+    echo t
+}

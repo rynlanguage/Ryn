@@ -1,0 +1,41 @@
+// test: run
+// out: true
+// out: false
+// out: true
+// out: true
+// out: true
+// out: true
+// out: false
+// out: true
+// out: true
+// out: true
+// out: false
+// out: true
+// out: héllo, wörld!
+// out: héllo, wörld?
+// out:
+// out: 15
+// exit: 0
+fun main() {
+    text := String("héllo, wörld")
+    needle := String("wör")
+    echo text.contains("llo")
+    echo text.contains("xyz")
+    echo text.contains("")
+    echo text.contains(needle)
+    echo text.contains(String("hé"))
+    echo text.ends_with("ld")
+    echo text.ends_with("l")
+    echo text.ends_with(String("wörld"))
+    echo text.ends_with("")
+    empty := String("")
+    echo empty.contains("")
+    echo empty.contains("a")
+    echo empty.ends_with("")
+    joined := text.concat("!")
+    echo joined
+    tail := String("?")
+    echo text.concat(tail)
+    echo empty.concat("")
+    echo joined.len()
+}

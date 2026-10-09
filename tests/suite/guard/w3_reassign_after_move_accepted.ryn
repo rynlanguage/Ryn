@@ -1,0 +1,10 @@
+// test: run
+// out: b
+// out: a
+fun main() {
+    mut s := String("a")
+    t := s
+    s = String("b")
+    echo s
+    echo t
+}

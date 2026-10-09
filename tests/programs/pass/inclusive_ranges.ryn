@@ -1,0 +1,29 @@
+fun main() -> i32 {
+    mut total: i64 = 0
+    for i in 0..=4 {
+        total += i
+    }
+    echo total
+    for i in 3..=2 {
+        echo "never"
+    }
+    lo: u8 = 250
+    hi: u8 = 255
+    mut count: i32 = 0
+    for i in lo..=hi {
+        count += 1
+    }
+    echo count
+    mut bytes: i32 = 0
+    for i in 0..=255 {
+        bytes += 1
+    }
+    echo bytes
+    for i in -3..=-1 {
+        echo i
+    }
+    for i in 5..=5 {
+        echo i
+    }
+    return 0
+}

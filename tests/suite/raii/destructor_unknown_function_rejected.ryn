@@ -1,0 +1,6 @@
+// test: fail
+#[drop(missing)]
+struct Bad { h: *i32 }
+fun main() {
+    echo 1
+}

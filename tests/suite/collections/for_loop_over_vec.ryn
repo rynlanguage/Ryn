@@ -1,0 +1,16 @@
+// test: run
+// out: 11
+fun main() {
+    mut v: Vec<i32> = Vec()
+    v.push(3)
+    v.push(5)
+    v.push(8)
+    mut sum: i32 = 0
+    for x in v {
+        when x == 5 {
+            continue
+        }
+        sum += x
+    }
+    echo sum
+}

@@ -1,0 +1,8 @@
+// test: fail
+// code: R0467
+// msg: cannot assign to the constant `K`
+const K: i64 = 2
+fun main() {
+    K = 3
+    echo K
+}

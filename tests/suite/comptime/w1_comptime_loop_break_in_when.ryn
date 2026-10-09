@@ -1,0 +1,16 @@
+// test: run
+// out: 10
+fun sum_to(n: i32) -> i32 {
+    mut total: i32 = 0
+    for i in 0..n {
+        when i == 5 {
+            break
+        }
+        total += i
+    }
+    return total
+}
+const S: i32 = comptime(sum_to(100))
+fun main() {
+    echo S
+}

@@ -1,0 +1,18 @@
+// test: run
+// out: 2000
+// out: 31
+// out: 1000
+// out: 5
+// out: 0
+// out: 1
+// out: 3003
+fun main() {
+    echo 2s
+    echo 0x1F
+    echo 1_000
+    echo 0b101
+    for i in 0..2 {
+        echo i
+    }
+    echo 3ms + 2999 + 1
+}

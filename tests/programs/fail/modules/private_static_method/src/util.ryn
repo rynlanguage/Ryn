@@ -1,0 +1,11 @@
+pub struct P {
+    pub open: i32
+}
+extend P {
+    fun hidden() -> i32 {
+        return 1
+    }
+}
+pub fun make() -> P {
+    return P { open: 1 }
+}

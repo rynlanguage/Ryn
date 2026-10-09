@@ -1,0 +1,70 @@
+// test: run
+// out: -3
+// out: -3
+// out: 0
+// out: 5
+// out: 12
+// out: true
+// out: false
+// out: 1
+// out: 9223372036854775808
+// out: 18446744073709551615
+// out:
+// out: a
+// out: aa
+// out: ab
+// out: b
+// out: true
+// out: false
+// out: Z
+// out: a
+// out: é
+// out: €
+fun main() {
+    mut a: Vec<i32> = Vec()
+    a.push(5)
+    a.push(-3)
+    a.push(12)
+    a.push(-3)
+    a.push(0)
+    a.sort()
+    echo a.index(0)
+    echo a.index(1)
+    echo a.index(2)
+    echo a.index(3)
+    echo a.index(4)
+    echo a.contains(12)
+    echo a.contains(7)
+    mut u: Vec<u64> = Vec()
+    u.push(18446744073709551615 as u64)
+    u.push(1 as u64)
+    u.push(9223372036854775808 as u64)
+    u.sort()
+    echo u.index(0)
+    echo u.index(1)
+    echo u.index(2)
+    mut t: Vec<String> = Vec()
+    t.push(String("ab"))
+    t.push(String("b"))
+    t.push(String(""))
+    t.push(String("a"))
+    t.push(String("aa"))
+    t.sort()
+    echo t.index(0)
+    echo t.index(1)
+    echo t.index(2)
+    echo t.index(3)
+    echo t.index(4)
+    echo t.contains(String("aa"))
+    echo t.contains(String("aaa"))
+    mut c: Vec<char> = Vec()
+    c.push('é')
+    c.push('a')
+    c.push('€')
+    c.push('Z')
+    c.sort()
+    echo c.index(0)
+    echo c.index(1)
+    echo c.index(2)
+    echo c.index(3)
+}

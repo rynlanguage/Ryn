@@ -1,0 +1,4 @@
+use inner
+pub fun twice_inner() -> i32 {
+    return inner::base() * 2
+}

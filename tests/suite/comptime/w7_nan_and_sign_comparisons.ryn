@@ -1,0 +1,26 @@
+// test: run
+// out: false
+// out: true
+// out: false
+// out: false
+// out: true
+// out: true
+// out: true
+// out: true
+// out: true
+fun main() {
+    mut z: f64 = 0.0
+    nan := z / z
+    echo nan == nan
+    echo nan != nan
+    echo nan < 1.0
+    echo nan >= nan
+    echo !(nan < 1.0)
+    echo -z == z
+    echo (1 < 2) == (3 > 2)
+    mut m: i8 = -1
+    mut um: u8 = 0
+    um = m as u8
+    echo um > 100
+    echo m < 0 && um > 100
+}

@@ -1,0 +1,29 @@
+// test: run
+// out: 12
+// out: 4
+// out: 10
+// out: 2
+// out: true
+// out: 16
+#[repr(C)]
+struct Mixed {
+    a: u8,
+    b: bool,
+    c: u16,
+    d: i32,
+    e: u8
+}
+const MIXED_SIZE: u64 = sizeof(Mixed)
+const MIXED_ALIGN: u64 = alignof(Mixed)
+const SHORTS_SIZE: u64 = sizeof([u16; 5])
+const SHORTS_ALIGN: u64 = alignof([u16; 5])
+const MIXED_FITS: bool = MIXED_SIZE == 12 && MIXED_ALIGN == 4
+fun main() {
+    echo MIXED_SIZE
+    echo MIXED_ALIGN
+    echo SHORTS_SIZE
+    echo SHORTS_ALIGN
+    static_assert(MIXED_FITS)
+    echo MIXED_FITS
+    echo sizeof(Mixed) + 4 as u64
+}

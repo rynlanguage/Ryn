@@ -1,0 +1,19 @@
+// test: run
+// out: apple
+// out: pear
+// out: true
+// out: fig
+// out: 2
+fun main() {
+    mut v: Vec<String> = Vec()
+    v.push(String("pear"))
+    v.push(String("apple"))
+    v.push(String("fig"))
+    v.sort()
+    echo v.index(0)
+    echo v.index(2)
+    echo v.contains(String("fig"))
+    t := v.take(1)
+    echo t
+    echo v.len()
+}

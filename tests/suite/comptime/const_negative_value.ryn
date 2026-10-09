@@ -1,0 +1,8 @@
+// test: run
+// out: -40
+// out: 10
+const COLD: i32 = -40
+fun main() {
+    echo COLD
+    echo COLD + 50
+}

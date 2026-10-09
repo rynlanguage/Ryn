@@ -1,0 +1,13 @@
+// test: run
+// out: 123456789012
+// out: 0
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(p: *u8);
+fun main() {
+    raw := malloc(16 as u64)
+    wide := raw as *i64
+    *wide = 123456789012
+    echo *wide
+    echo (raw as u64) % 8
+    free(raw)
+}

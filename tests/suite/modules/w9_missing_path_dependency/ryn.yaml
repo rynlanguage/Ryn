@@ -1,0 +1,6 @@
+name: w9-missing-path-dependency
+version: 0.1.0
+owner: guest
+dependencies:
+  ghost:
+    path: ./vendor/ghost

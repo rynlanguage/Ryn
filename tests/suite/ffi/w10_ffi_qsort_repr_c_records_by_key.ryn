@@ -1,0 +1,49 @@
+// test: run
+// out: 10
+// out: 1000000000000
+// out: 20
+// out: 3000000000000
+// out: 30
+// out: 0
+// out: 40
+// out: 4000000000000
+// out: 50
+// out: 2000000000000
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(p: *u8);
+extern "C" fun qsort(base: *u8, count: u64, size: u64, compare: extern "C" fun(*u8, *u8) -> i32);
+#[repr(C)]
+struct Item { key: i32, weight: i64 }
+fun by_key(a: *u8, b: *u8) -> i32 {
+    x := *(a as *Item)
+    y := *(b as *Item)
+    when x.key < y.key {
+        return -1
+    }
+    when x.key > y.key {
+        return 1
+    }
+    return 0
+}
+fun main() {
+    n := 5
+    buf := malloc((n * 16) as u64)
+    base := buf as u64
+    keys := [30, 10, 50, 20, 40]
+    mut i := 0
+    while i < n {
+        it := (base + (i * 16) as u64) as *Item
+        *it = Item { key: keys[i] as i32, weight: (i as i64) * 1000000000000 }
+        i += 1
+    }
+    qsort(buf, n as u64, 16 as u64, by_key)
+    mut j := 0
+    while j < n {
+        it := (base + (j * 16) as u64) as *Item
+        v := *it
+        echo v.key
+        echo v.weight
+        j += 1
+    }
+    free(buf)
+}

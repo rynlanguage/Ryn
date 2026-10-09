@@ -1,0 +1,7 @@
+// test: run
+// out: 12
+// out: 5
+fun main() {
+    echo choose (3 as i32, 4 as i32) { (a, b) => a * b }
+    echo choose (1 as i32, 2 as i32) { (a, b) => 5 }
+}

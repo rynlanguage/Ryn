@@ -1,0 +1,6 @@
+pub fun label() -> String {
+    return String("beta 2")
+}
+pub fun value() -> i32 {
+    return 2
+}

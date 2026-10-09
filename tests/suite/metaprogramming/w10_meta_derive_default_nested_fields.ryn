@@ -1,0 +1,45 @@
+// test: run
+// out: 0
+// out: 0
+// out: 0
+// out: 0
+// out: false
+// out: 0
+// out: 0
+// out: 0
+// out: 16
+// out: 0
+#[derive(Default)]
+struct Inner {
+    a: u8,
+    b: i64
+}
+#[derive(Default)]
+struct Grid {
+    cells: [i32; 4],
+    inner: Inner,
+    c: char,
+    f: f32,
+    ok: bool,
+    big: u64
+}
+#[derive(Default)]
+struct Wrap {
+    g: Grid,
+    names: Map<String, i32>,
+    tags: Vec<i32>
+}
+fun main() {
+    w := Wrap::default()
+    echo w.g.cells[3]
+    echo w.g.inner.b
+    echo w.g.c as u32
+    echo w.g.f
+    echo w.g.ok
+    echo w.g.big
+    echo w.names.len()
+    echo w.tags.len()
+    x := Inner::default()
+    echo sizeof(Inner)
+    echo x.a
+}

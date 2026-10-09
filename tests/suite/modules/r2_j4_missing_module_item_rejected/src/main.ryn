@@ -1,0 +1,7 @@
+// test: fail
+// code: R0230
+// msg: unknown item `HIDDEN_CONST` in module `helper`
+use helper
+fun main() {
+    echo helper::HIDDEN_CONST
+}

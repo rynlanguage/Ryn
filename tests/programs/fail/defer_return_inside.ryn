@@ -1,0 +1,6 @@
+fun main() -> i32 {
+    defer {
+        return 3
+    }
+    return 0
+}

@@ -1,0 +1,49 @@
+// test: run
+// out: total 42
+struct Pair {
+    name: String,
+    ids: Vec<u64>,
+}
+enum Node {
+    Leaf(u64),
+    Text(String),
+    Ids(Vec<u64>),
+    Named(Pair, u64),
+    Wrap(Option<String>),
+    Empty,
+}
+struct Bundle {
+    nodes: Vec<Node>,
+    label: String,
+    count: u64,
+}
+fun build(n: u64) -> Result<Bundle, String> {
+    mut nodes: Vec<Node> = Vec()
+    mut i: u64 = 0
+    while i < n {
+        mut ids: Vec<u64> = Vec()
+        ids.push(i)
+        nodes.push(Node::Leaf(i))
+        nodes.push(Node::Text(String("t")))
+        nodes.push(Node::Ids(ids))
+        nodes.push(Node::Named(Pair { name: String("p"), ids: Vec() }, i))
+        nodes.push(Node::Wrap(Option::Some(String("w"))))
+        nodes.push(Node::Empty)
+        i += 1
+    }
+    return Result::Ok(Bundle { nodes: nodes, label: String("b"), count: n })
+}
+fun main() {
+    mut total: u64 = 0
+    mut k: u64 = 0
+    while k < 2 {
+        r := build(3)
+        when r.is_err() {
+            echo "err"
+        }
+        b := r.unwrap()
+        total += b.nodes.len() + b.count
+        k += 1
+    }
+    echo "total {total}"
+}

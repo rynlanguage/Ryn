@@ -1,0 +1,9 @@
+// test: run
+// out: 77
+use ids
+fun show(id: ids::UserId) -> ids::UserId {
+    return id
+}
+fun main() {
+    echo show(77)
+}

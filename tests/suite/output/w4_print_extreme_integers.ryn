@@ -1,0 +1,19 @@
+// test: run
+// out: max u64 18446744073709551615
+// out: i64 min -9223372036854775808
+// out: i32 min -2147483648
+// out: char Z str s bool false
+// out: unicode 日本語 ß
+// out: braces {} 5
+// out: no newline 3.25
+fun main() {
+    print("max u64 {}", 18446744073709551615 as u64)
+    print("i64 min {}", -9223372036854775807 - 1)
+    print("i32 min {}", -2147483647 - 1 as i32)
+    print("char {} str {} bool {}", 'Z', "s", false)
+    print("unicode {} {}", "日本語", 'ß')
+    print("braces {{}} {}", 5)
+    write("no newline ")
+    write("{}", 3.25 as f32)
+    print("")
+}

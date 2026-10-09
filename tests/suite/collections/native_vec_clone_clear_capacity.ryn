@@ -1,0 +1,28 @@
+// test: run
+// out: 10
+// out: 10
+// out: 27
+// out: 20
+// out: 0
+// out: 20
+// out: 10
+// out: 12
+fun main() {
+    mut v: Vec<i32> = Vec()
+    mut i: i32 = 0
+    while i < 10 {
+        v.push(i * 3)
+        i += 1
+    }
+    mut c := v.clone()
+    echo c.capacity()
+    echo c.len()
+    echo c.index(9)
+    c.push(99)
+    echo c.capacity()
+    c.clear()
+    echo c.len()
+    echo c.capacity()
+    echo v.len()
+    echo v.index(4)
+}

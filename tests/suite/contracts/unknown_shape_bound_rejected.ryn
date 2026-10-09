@@ -1,0 +1,7 @@
+// test: fail
+fun f<T: Missing>(v: T) -> i32 {
+    1
+}
+fun main() {
+    echo f(1 as i32)
+}

@@ -1,0 +1,7 @@
+// test: fail
+// msg: size must be nine
+// code: R0460
+const SIZE: i32 = 8
+fun main() {
+    static_assert(SIZE == 9, "size must be nine")
+}

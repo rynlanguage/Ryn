@@ -1,0 +1,14 @@
+// test: run
+// out: other
+// out: 1
+// out: other
+const K: i32 = 2
+fun main() {
+    for K in 0..3 {
+        when K == 1 {
+            echo K
+        } else {
+            echo "other"
+        }
+    }
+}

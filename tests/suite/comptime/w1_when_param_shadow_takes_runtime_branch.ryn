@@ -1,0 +1,14 @@
+// test: run
+// out: 1
+// out: 2
+const F: bool = false
+fun pick(F: bool) -> i32 {
+    when F {
+        return 1
+    }
+    return 2
+}
+fun main() {
+    echo pick(true)
+    echo pick(false)
+}

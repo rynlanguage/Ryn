@@ -1,0 +1,7 @@
+// test: fail
+// msg: does not fit
+// code: R0464
+const BIG: u8 = 255 + 1
+fun main() {
+    echo BIG
+}

@@ -1,0 +1,27 @@
+// test: run
+// out: 8
+// out: 16
+// out: 4
+#[repr(C)]
+struct A {
+    tag: u8,
+    size: u32
+}
+#[repr(C)]
+struct B {
+    tag: u8,
+    wide: u64
+}
+#[repr(C)]
+struct C {
+    x: i16,
+    y: i16
+}
+fun main() {
+    static_assert(sizeof(A) == 8 && alignof(A) == 4)
+    static_assert(sizeof(B) == 16 && alignof(B) == 8)
+    static_assert(sizeof(C) == 4 && alignof(C) == 2)
+    echo sizeof(A)
+    echo sizeof(B)
+    echo sizeof(C)
+}

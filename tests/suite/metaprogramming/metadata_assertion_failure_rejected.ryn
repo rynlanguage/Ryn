@@ -1,0 +1,7 @@
+// test: fail
+// msg: expected three fields
+// code: R0460
+struct Pair { a: i32, b: i32 }
+fun main() {
+    static_assert(field_count::<Pair>() == 3, "expected three fields")
+}

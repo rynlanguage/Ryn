@@ -1,0 +1,13 @@
+// test: run
+// out: 3
+// out: 0
+fun len(o: Option<String>) -> u64 {
+    choose o {
+        Option::Some(s) => s.char_count(),
+        Option::None => 0 as u64
+    }
+}
+fun main() {
+    echo len(Option::Some(String("ryn")))
+    echo len(Option::None)
+}

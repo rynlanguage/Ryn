@@ -1,0 +1,10 @@
+// test: fail
+// code: R0255
+#[drop(done)]
+struct Bad { id: i32 }
+fun done(b: Bad) {
+    echo "x"
+}
+fun main() {
+    echo 1
+}

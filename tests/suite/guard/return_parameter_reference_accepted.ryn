@@ -1,0 +1,9 @@
+// test: run
+// out: 4
+fun id(r: &i32) -> &i32 {
+    return r
+}
+fun main() {
+    x: i32 = 4
+    echo *id(&x)
+}

@@ -1,0 +1,20 @@
+// test: run
+// out: 100000
+// out: 100000
+#[drop(bump)]
+struct Counter { h: *i64 }
+fun bump(c: Counter) {
+    *c.h = *c.h + 1
+}
+fun main() {
+    mut hits: i64 = 0
+    mut v: Vec<Counter> = Vec()
+    mut i: i64 = 0
+    while i < 100000 {
+        v.push(Counter { h: &raw mut hits })
+        i += 1
+    }
+    echo v.len()
+    v.clear()
+    echo hits
+}

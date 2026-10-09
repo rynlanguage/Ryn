@@ -1,0 +1,20 @@
+// test: run
+// out: 0
+// out: 0
+// out: 0
+// out: 0
+// out: true
+use std::arena
+fun main() {
+    mut a := arena::Arena::with_capacity(256 as u64)
+    one := a.alloc_bytes(1 as u64, 1 as u64)
+    two := a.alloc_bytes(2 as u64, 2 as u64)
+    four := a.alloc_bytes(4 as u64, 4 as u64)
+    eight := a.alloc_bytes(8 as u64, 8 as u64)
+    wide := a.alloc_bytes(16 as u64, 16 as u64)
+    echo (two as u64) % 2
+    echo (four as u64) % 4
+    echo (eight as u64) % 8
+    echo (wide as u64) % 16
+    echo (two as u64) > (one as u64)
+}

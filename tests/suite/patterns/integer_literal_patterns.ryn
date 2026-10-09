@@ -1,0 +1,16 @@
+// test: run
+// out: 10
+// out: 20
+// out: 0
+fun name(n: i32) -> i32 {
+    choose n {
+        1 => 10,
+        2 => 20,
+        _ => 0
+    }
+}
+fun main() {
+    echo name(1)
+    echo name(2)
+    echo name(3)
+}

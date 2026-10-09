@@ -1,0 +1,11 @@
+// test: run
+// out: else
+// out: 2
+fun main() {
+    when comptime(3 < 2) {
+        echo 5 + "x"
+    } else {
+        echo "else"
+    }
+    echo comptime(2)
+}

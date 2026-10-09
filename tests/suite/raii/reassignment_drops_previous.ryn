@@ -1,0 +1,15 @@
+// test: run
+// out: drop 1
+// out: assigned
+// out: drop 2
+#[drop(rel)]
+struct R { h: *i32, id: i32 }
+fun rel(r: R) { echo "drop {r.id}" }
+fun mk(id: i32, p: *i32) -> R { return R { h: p, id: id } }
+fun main() {
+    mut x: i32 = 0
+    p := &raw mut x
+    mut r := mk(1, p)
+    r = mk(2, p)
+    echo "assigned"
+}

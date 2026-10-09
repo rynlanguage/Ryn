@@ -1,0 +1,10 @@
+// test: fail
+// msg: recursion
+// code: R0463
+fun down(n: i32) -> i32 {
+    return down(n + 1)
+}
+const NEVER: i32 = down(0)
+fun main() {
+    echo NEVER
+}

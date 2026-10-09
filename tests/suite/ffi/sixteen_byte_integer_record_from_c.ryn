@@ -1,0 +1,14 @@
+// test: run
+// out: 10000000001
+// out: 7
+#[repr(C)]
+struct LDiv {
+    quot: i64,
+    rem: i64
+}
+extern "C" fun ldiv(a: i64, b: i64) -> LDiv;
+fun main() {
+    r := ldiv(100000000017, 10)
+    echo r.quot
+    echo r.rem
+}

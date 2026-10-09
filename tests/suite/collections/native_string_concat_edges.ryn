@@ -1,0 +1,18 @@
+// test: run
+// out: tail
+// out: head
+// out: 12-34
+// out: 19
+fun word(n: i32) -> String {
+    return String(n)
+}
+fun main() {
+    a := String("")
+    b := String("tail")
+    echo a.concat(b)
+    echo String("head").concat(String(""))
+    echo word(12).concat(word(-34))
+    mut big := String("x")
+    big.append("yy")
+    echo big.concat(String("0123456789abcdef")).len()
+}

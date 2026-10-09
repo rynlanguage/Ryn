@@ -1,0 +1,6 @@
+// test: fail
+// code: R0425
+use util
+fun main() {
+    echo util::hidden()
+}

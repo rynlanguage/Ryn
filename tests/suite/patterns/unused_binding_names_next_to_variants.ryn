@@ -1,0 +1,15 @@
+// test: run
+// out: 1
+enum Shape { Dot, Box(i32) }
+fun main() {
+    s := Shape::Box(1)
+    echo choose s {
+        Shape::Dot => 0,
+        rest => 1
+    }
+    t := Shape::Dot
+    v := choose t {
+        Shape::Dot => 0,
+        whole => when true { 1 } else { 2 }
+    }
+}

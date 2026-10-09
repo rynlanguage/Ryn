@@ -1,0 +1,19 @@
+// test: run
+// out: 4999950000
+// out: 1000
+use std::arena
+fun main() {
+    mut a := arena::Arena::with_capacity(1024 as u64)
+    mut i: i64 = 0
+    mut sum: i64 = 0
+    while i < 100000 {
+        p := arena::alloc(&mut a, i)
+        sum += *p
+        when i % 100 == 99 {
+            a.reset()
+        }
+        i += 1
+    }
+    echo sum
+    echo i / 100
+}

@@ -1,0 +1,12 @@
+// test: run
+// out: 16000000
+fun main() {
+    mut i: i64 = 0
+    mut t: u64 = 0
+    while i < 1000000 {
+        s := String("temporary string")
+        t += s.char_count()
+        i += 1
+    }
+    echo t
+}

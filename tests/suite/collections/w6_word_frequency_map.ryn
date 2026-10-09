@@ -1,0 +1,76 @@
+// test: run
+// out: total 13 distinct 7
+// out: the: 4
+// out: and: 2
+// out: cat: 2
+// out: dog: 2
+// out: The: 1
+// out: a: 1
+// out: bird: 1
+// Word frequency: count words case-sensitively, then list by count (desc) and word (asc).
+fun is_letter(c: char) -> bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+fun word_end(text: String, start: u64) -> u64 {
+    mut i := start
+    n := text.char_count()
+    while i < n && is_letter(text.char_at(i)) {
+        i += 1
+    }
+    return i
+}
+
+fun main() {
+    text := String("the cat and the dog. The dog and the bird; a cat! 42 the")
+    mut counts := Map<String, i64>()
+    mut order: Vec<String> = Vec()
+    mut total: i64 = 0
+    mut i: u64 = 0
+    n := text.char_count()
+    while i < n {
+        when !is_letter(text.char_at(i)) {
+            i += 1
+            continue
+        }
+        end := word_end(text.clone(), i)
+        w := text.substring(i, end)
+        i = end
+        total += 1
+        old := choose counts.get(w.clone()) {
+            Option::Some(c) => c,
+            Option::None => 0
+        }
+        when old == 0 {
+            order.push(w.clone())
+        }
+        counts.insert(w, old + 1)
+    }
+    order.sort()
+    mut top: i64 = 0
+    for k in 0..order.len() {
+        c := choose counts.get(order.index(k).clone()) {
+            Option::Some(v) => v,
+            Option::None => 0
+        }
+        when c > top {
+            top = c
+        }
+    }
+    distinct := order.len()
+    echo "total {total} distinct {distinct}"
+    mut level := top
+    while level >= 1 {
+        for k in 0..order.len() {
+            w := order.index(k)
+            c := choose counts.get(w.clone()) {
+                Option::Some(v) => v,
+                Option::None => 0
+            }
+            when c == level {
+                echo "{w}: {c}"
+            }
+        }
+        level -= 1
+    }
+}

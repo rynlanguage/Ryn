@@ -1,0 +1,13 @@
+// test: run
+// err: array index is out of bounds
+// exit: 1
+// out: 4
+
+// A negative index of a signed type is out of bounds, as an index past the end is.
+fun main() {
+    a: [i32; 2] = [4, 5]
+    echo a[0]
+    idx: i32 = -1
+    echo a[idx]
+    echo "unreachable"
+}

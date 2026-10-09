@@ -1,0 +1,7 @@
+// test: fail
+// code: R0425
+use lib::shapes
+fun main() {
+    s := shapes::Rect { w: 2 }
+    echo s.secret()
+}

@@ -1,0 +1,8 @@
+fun main() {
+    code := 3
+    label := choose code {
+        1 => 10,
+        2 => 20
+    }
+    echo label
+}

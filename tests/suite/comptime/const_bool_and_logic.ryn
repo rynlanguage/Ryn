@@ -1,0 +1,8 @@
+// test: run
+// out: true
+const READY: bool = true
+const BLOCKED: bool = false
+const GO: bool = READY && !BLOCKED
+fun main() {
+    echo GO
+}

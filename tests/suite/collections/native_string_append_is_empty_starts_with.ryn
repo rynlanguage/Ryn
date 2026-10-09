@@ -1,0 +1,28 @@
+// test: run
+// out: true
+// out: false
+// out: false
+// out: true
+// out: true
+// out: false
+// out: abcdef
+// out: true
+// out: true
+// exit: 0
+fun main() {
+    mut text := String("")
+    echo text.is_empty()
+    echo text.starts_with("a")
+    prefix := String("ab")
+    text.append("abc")
+    echo text.is_empty()
+    echo text.starts_with("ab")
+    echo text.starts_with(prefix)
+    echo text.starts_with("abd")
+    more := String("def")
+    text.append(more)
+    echo text
+    empty := String("")
+    echo text.starts_with(empty)
+    echo empty.is_empty()
+}

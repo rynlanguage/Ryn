@@ -1,0 +1,9 @@
+// test: fail
+// code: R0248
+fun f() -> &i32 {
+    x: i32 = 1
+    return &x
+}
+fun main() {
+    echo 1
+}

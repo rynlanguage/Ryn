@@ -1,0 +1,6 @@
+name: path-dependency
+version: 0.1.0
+owner: guest
+dependencies:
+  mathlib:
+    path: ./vendor/mathlib

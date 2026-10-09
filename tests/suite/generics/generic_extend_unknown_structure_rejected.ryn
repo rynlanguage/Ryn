@@ -1,0 +1,9 @@
+// test: fail
+// code: R0243
+struct Plain { n: i32 }
+extend<T> Plain<T> {
+    pub fun get(self) -> i32 { return 1 }
+}
+fun main() {
+    echo 1
+}

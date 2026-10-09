@@ -1,0 +1,16 @@
+// test: run
+// out: cleanup
+// out: 1
+// out: cleanup
+// out: 2
+fun f(early: bool) -> i32 {
+    defer { echo "cleanup" }
+    when early {
+        return 1
+    }
+    return 2
+}
+fun main() {
+    echo f(true)
+    echo f(false)
+}

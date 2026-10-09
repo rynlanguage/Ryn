@@ -1,0 +1,8 @@
+// test: fail
+struct Stack<T> { items: Vec<T> }
+fun size<T>(s: Stack<T>) -> u64 {
+    return s.items.len()
+}
+fun main() {
+    echo size(5 as i32)
+}

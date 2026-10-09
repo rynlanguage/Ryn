@@ -1,0 +1,7 @@
+// test: fail
+// code: R0011
+// msg: directly followed by letters
+fun main() {
+    x := 12abc
+    echo x
+}

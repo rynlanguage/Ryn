@@ -1,0 +1,6 @@
+// test: run
+// out: 200
+const LIMIT: u8 = 200
+fun main() {
+    echo LIMIT
+}

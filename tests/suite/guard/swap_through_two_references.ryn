@@ -1,0 +1,15 @@
+// test: run
+// out: 2
+// out: 1
+fun swap(a: &mut i32, b: &mut i32) {
+    t := *a
+    *a = *b
+    *b = t
+}
+fun main() {
+    mut x: i32 = 1
+    mut y: i32 = 2
+    swap(&mut x, &mut y)
+    echo x
+    echo y
+}

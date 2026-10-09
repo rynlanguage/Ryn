@@ -274,13 +274,13 @@ pub extern "C" fn ryn_vec_sort(pointer: *mut RynVec, kind: u64) {
             5 => u32::from_ne_bytes(left[..4].try_into().unwrap())
                 .cmp(&u32::from_ne_bytes(right[..4].try_into().unwrap())),
             6 => (i64::from_ne_bytes(left) as i64).cmp(&(i64::from_ne_bytes(right) as i64)),
-            7 => left.cmp(&right),
+            7 => u64::from_ne_bytes(left).cmp(&u64::from_ne_bytes(right)),
             8 => f32::from_bits(u32::from_ne_bytes(left[..4].try_into().unwrap())).total_cmp(
                 &f32::from_bits(u32::from_ne_bytes(right[..4].try_into().unwrap())),
             ),
             9 => f64::from_bits(u64::from_ne_bytes(left))
                 .total_cmp(&f64::from_bits(u64::from_ne_bytes(right))),
-            11 => left[0].cmp(&right[0]),
+            11 => u64::from_ne_bytes(left).cmp(&u64::from_ne_bytes(right)),
             12 => super::strings::compare_owned(
                 u64::from_ne_bytes(left) as usize as *const super::strings::RynString,
                 u64::from_ne_bytes(right) as usize as *const super::strings::RynString,

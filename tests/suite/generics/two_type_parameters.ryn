@@ -1,0 +1,10 @@
+// test: run
+// out: 1
+// out: x
+fun first<A, B>(a: A, b: B) -> A {
+    a
+}
+fun main() {
+    echo first(1 as i32, true)
+    echo first(String("x"), 2 as i64)
+}

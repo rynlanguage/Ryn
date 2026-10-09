@@ -1,0 +1,14 @@
+// test: fail
+// code: R0251
+fun pick(a: &i32, b: &i32) -> &i32 {
+    return b
+}
+fun main() {
+    mut x: i32 = 1
+    mut r := &x
+    when true {
+        mut y: i32 = 7
+        r = pick(&x, &y)
+    }
+    echo *r
+}

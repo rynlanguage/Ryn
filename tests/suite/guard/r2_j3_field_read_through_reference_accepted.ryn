@@ -1,0 +1,17 @@
+// test: run
+// out: 3
+// out: 7
+// out: abc
+struct P {
+    name: String
+    n: i32
+}
+fun read(r: &P) -> i32 {
+    echo r.name.char_count()
+    return r.n
+}
+fun main() {
+    s := P { name: String("abc"), n: 7 }
+    echo read(&s)
+    echo s.name
+}

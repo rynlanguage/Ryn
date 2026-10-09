@@ -1,0 +1,7 @@
+// test: run
+// out: 1
+const DEBUG: bool = false
+fun main() {
+    x := when DEBUG { missing_fn() } else { 1 }
+    echo x
+}

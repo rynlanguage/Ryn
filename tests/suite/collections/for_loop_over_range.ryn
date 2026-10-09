@@ -1,0 +1,12 @@
+// test: run
+// out: 16
+fun main() {
+    mut sum: i64 = 0
+    for i in 0..5 {
+        sum += i
+    }
+    for i in 1..=3 {
+        sum += i
+    }
+    echo sum
+}

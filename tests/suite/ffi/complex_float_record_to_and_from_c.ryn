@@ -1,0 +1,19 @@
+// test: run
+// out: 1.5
+// out: -2.5
+// out: 5
+// out: 25
+#[repr(C)]
+struct ComplexF {
+    re: f32,
+    im: f32
+}
+extern "C" fun conjf(z: ComplexF) -> ComplexF;
+extern "C" fun cabsf(z: ComplexF) -> f32;
+fun main() {
+    c := conjf(ComplexF { re: 1.5, im: 2.5 })
+    echo c.re
+    echo c.im
+    echo cabsf(ComplexF { re: 3.0, im: 4.0 })
+    echo cabsf(ComplexF { re: 0.0, im: 5.0 }) * cabsf(ComplexF { re: 0.0, im: 5.0 })
+}

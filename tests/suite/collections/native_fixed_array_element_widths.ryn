@@ -1,0 +1,54 @@
+// test: run
+// out: -1
+// out: -128
+// out: 125
+// out: 65534
+// out: 0
+// out: 800000000
+// out: 20
+// out: 0
+// out: 99
+// out: 119
+// out: 99
+
+// Elements keep their own width and sign: a narrow element is loaded sign- or zero-extended, and an array assigned
+// from another array is a copy. Loops write and read arrays through indexes.
+
+fun main() {
+    mut s: [i8; 3] = [-1, 127, -128]
+    echo s[0]
+    echo s[2]
+    s[1] = s[1] - 2
+    echo s[1]
+    w: [u16; 2] = [65535, 1]
+    echo w[0] - w[1]
+    h: [i16; 2] = [-300, 300]
+    echo h[0] + h[1]
+    d: [u32; 2] = [4000000000, 5]
+    echo d[0] / d[1]
+    mut e: [i32; 3] = [0; 3]
+    mut i: i64 = 0
+    while i < 3 {
+        e[i] = (i as i32) * 10
+        i += 1
+    }
+    echo e[2]
+    f: [i32; 3] = e
+    e[0] = 99
+    echo f[0]
+    echo e[0]
+    mut count: i32 = 0
+    for j in 0..3 {
+        when j == 1 {
+            continue
+        }
+        count += e[j]
+    }
+    echo count
+    for j in 0..3 {
+        when e[j] == 10 {
+            break
+        }
+        echo e[j]
+    }
+}

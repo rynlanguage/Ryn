@@ -1,0 +1,12 @@
+// test: run
+// out: true
+// out: false
+// out: 0
+fun main() {
+    mut m := Map<i32, i32>()
+    m.insert(7, 70)
+    echo m.contains_key(7)
+    echo m.contains_key(8)
+    m.clear()
+    echo m.len()
+}

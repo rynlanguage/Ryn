@@ -1,0 +1,15 @@
+// test: run
+// out: true
+// out: héllo
+// out: wörld
+// out: 13
+// out: false
+// exit: 0
+fun main() {
+    path := "/tmp/ryn_native_fsio_probe.txt"
+    echo write_file(path, "héllo\nwörld")
+    text := read_file(path)
+    echo text
+    echo text.len()
+    echo write_file("/nonexistent-dir/x.txt", "data")
+}

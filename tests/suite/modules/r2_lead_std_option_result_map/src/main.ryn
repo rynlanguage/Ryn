@@ -1,0 +1,14 @@
+// test: run
+// out: 8
+// out: 10
+use std::option
+use std::result
+fun double(x: i32) -> i32 { return x * 2 }
+fun main() {
+    o: Option<i32> = Option::Some(4)
+    m := option::map(o, double)
+    echo choose m { Option::Some(x) => x, Option::None => 0 }
+    r: Result<i32, i32> = Result::Ok(5)
+    q := result::map(r, double)
+    echo choose q { Result::Ok(x) => x, Result::Err(e) => e }
+}

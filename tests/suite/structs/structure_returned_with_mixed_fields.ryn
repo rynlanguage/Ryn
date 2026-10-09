@@ -1,0 +1,23 @@
+// test: run
+// out: true 200 -5
+// out: 9
+// out: false
+// out: hi there
+struct Mixed { flag: bool, small: u8, big: i64 }
+
+fun mixed(f: bool, s: u8, b: i64) -> Mixed {
+    return Mixed { flag: f, small: s, big: b }
+}
+
+fun greet() -> str {
+    return "hi"
+}
+
+fun main() {
+    m := mixed(true, 200, 0 - 5)
+    print("{} {} {}", m.flag, m.small, m.big)
+    print("{}", mixed(false, 9, 1).small)
+    print("{}", mixed(false, 9, 1).flag)
+    t := greet()
+    print("{} there", t)
+}

@@ -1,0 +1,58 @@
+// test: run
+// out: 35
+// out: 20
+// out: 67
+// out: 7
+// out: 0
+// exit: 0
+struct Point { x: i64, y: i64 }
+
+struct Frame {
+    origin: Point,
+    tag: i64,
+}
+
+enum Maybe {
+    Has(Point),
+    Nothing,
+}
+
+fun inner_sum(f: &Frame) -> i64 {
+    return f.origin.x + f.origin.y + f.tag
+}
+
+fun origin_of(f: &Frame) -> Point {
+    return f.origin
+}
+
+fun wrap(p: &Point) -> Maybe {
+    return Maybe::Has(*p)
+}
+
+fun find(flag: bool) -> Option<Point> {
+    when flag {
+        return Option::Some(Point { x: 3, y: 4 })
+    }
+    return Option::None
+}
+
+fun sum_found(flag: bool) -> Option<i64> {
+    p := find(flag)?
+    return Option::Some(p.x + p.y)
+}
+
+fun main() {
+    frame := Frame { origin: Point { x: 10, y: 20 }, tag: 5 }
+    echo inner_sum(&frame)
+    copied := origin_of(&frame)
+    echo copied.y
+    point := Point { x: 6, y: 7 }
+    m := wrap(&point)
+    picked := choose m {
+        Maybe::Has(q) => q.x * 10 + q.y,
+        Maybe::Nothing => 0,
+    }
+    echo picked
+    echo choose sum_found(true) { Option::Some(v) => v, Option::None => 0 }
+    echo choose sum_found(false) { Option::Some(v) => v, Option::None => 0 }
+}

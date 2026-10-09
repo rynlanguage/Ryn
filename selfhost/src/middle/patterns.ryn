@@ -1,0 +1,504 @@
+// The pattern checks of the bootstrap's pattern pass (`src/patterns.rs`) on a `choose` as the syntax tree keeps its arms:
+// wildcards, bindings, literals, tuples and variants. The pass's matrix compile is followed for its errors and for the arms
+// it never reaches. A `choose` with a structure pattern, or with a variant that carries a pattern, is declined: the bootstrap
+// pass decides it alone, and so does a `choose` with no literal or nested arm, which the pass does not rewrite.
+//
+// The first error of the program is returned, as a diagnostic in the form `lower::diagnostic` writes.
+
+use middle::ast
+use middle::lower
+
+// A node of a pattern: kind 0 a wildcard, 1 a binding, 2 a literal (its text), 3 a tuple (its elements), 4 a variant (its
+// payload patterns).
+pub struct PatNode {
+    kind: u64,
+    text: String,
+    children: Vec<u64>,
+}
+
+// A row of the matrix: the index of its arm in the `choose`, and one pattern node per column.
+pub struct Row {
+    index: u64,
+    pats: Vec<u64>,
+}
+
+pub struct PatternChecks {
+    program: ast::Program,
+    nodes: Vec<PatNode>,
+    used: Vec<bool>,
+    current: Vec<u64>,
+    text: String,
+    at: u64,
+}
+
+// The first error among the `choose` expressions of the program, in the order they were written, or nothing.
+pub fun check_program(program: ast::Program) -> Option<String> {
+    mut checks := PatternChecks { program: program, nodes: Vec(), used: Vec(), current: Vec(), text: String(""), at: 0 }
+    return checks.first_error()
+}
+
+// The declined outcome: the subset does not decide the choose.
+fun declined() -> String {
+    return String("unsupported")
+}
+
+fun is_declined(text: String) -> bool {
+    return !text.starts_with("diagnostic ")
+}
+
+fun pattern_error(start: u64, end: u64, message: String, help: String) -> String {
+    return lower::diagnostic("R0235", start, end, message, help)
+}
+
+extend PatternChecks {
+    fun first_error(mut self) -> Option<String> {
+        mut index: u64 = 0
+        while index < self.program.exprs.len() {
+            found := self.expression_error(index)
+            when found.is_some() {
+                return found
+            }
+            index += 1
+        }
+        return Option::None
+    }
+
+    // The error of one expression: a `choose` is checked; any other expression has none.
+    fun expression_error(mut self, index: u64) -> Option<String> {
+        choose self.program.exprs[index] {
+            ast::ExprTree::ChooseE(value, arms, span) => self.report(self.check_choose(arms)),
+            _ => Option::None,
+        }
+    }
+
+    // A diagnostic, or nothing: a declined check reports nothing, and the bootstrap pass decides the program.
+    fun report(self, outcome: Result<bool, String>) -> Option<String> {
+        when outcome.is_err() {
+            failure := outcome.unwrap_err()
+            when is_declined(failure.clone()) {
+                return Option::None
+            }
+            return Option::Some(failure)
+        }
+        return Option::None
+    }
+
+    fun span_of_arm(self, index: u64) -> ast::Span {
+        arm := self.program.arms[self.current[index]]
+        return arm.span
+    }
+
+    fun add_node(mut self, kind: u64, text: String, children: Vec<u64>) -> u64 {
+        self.nodes.push(PatNode { kind: kind, text: text, children: children })
+        return self.nodes.len() - 1
+    }
+
+    fun kind_of(self, node: u64) -> u64 {
+        return self.nodes[node].kind
+    }
+
+    // The pattern of an arm: a wildcard, a literal, a nested pattern (parsed from its text), or a variant with its payload.
+    fun arm_pattern(mut self, arm: u64) -> Result<u64, String> {
+        record := self.program.arms[arm]
+        when record.enum_name.is_none() {
+            return Result::Ok(self.add_node(0, String(""), Vec()))
+        }
+        name := record.enum_name.unwrap()
+        when record.variant.is_none() {
+            return Result::Err(declined())
+        }
+        text := record.variant.unwrap()
+        when name == "$lit" {
+            return Result::Ok(self.add_node(2, text, Vec()))
+        }
+        when name == "$pat" {
+            return self.parse_text(text)
+        }
+        mut payload: Vec<u64> = Vec()
+        for binding in record.bindings {
+            payload.push(self.parse_text(binding)?)
+        }
+        return Result::Ok(self.add_node(4, name, payload))
+    }
+
+    // Parses a whole pattern text, which must be read to its end.
+    fun parse_text(mut self, text: String) -> Result<u64, String> {
+        self.text = text
+        self.at = 0
+        node := self.parse_pattern()?
+        when self.at != self.text.len() {
+            return Result::Err(declined())
+        }
+        return Result::Ok(node)
+    }
+
+    fun peek(self) -> u64 {
+        when self.at >= self.text.len() {
+            return 0
+        }
+        return self.text.byte_at(self.at) as u64
+    }
+
+    fun is_word_byte(byte: u64) -> bool {
+        return byte == 95 || byte == 36 || (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+    }
+
+    fun word(mut self) -> String {
+        start := self.at
+        while self.at < self.text.len() && PatternChecks::is_word_byte(self.text.byte_at(self.at) as u64) {
+            self.at += 1
+        }
+        return self.text.slice(start, self.at)
+    }
+
+    // One pattern: a tuple, a string or character or number literal, `true` or `false`, a wildcard or a name, or a variant
+    // whose path has at least two segments. A structure pattern is declined.
+    fun parse_pattern(mut self) -> Result<u64, String> {
+        when self.at >= self.text.len() {
+            return Result::Err(declined())
+        }
+        byte := self.peek()
+        when byte == 40 {
+            return self.parse_tuple()
+        }
+        when byte == 34 || byte == 39 {
+            return self.parse_quoted(byte)
+        }
+        when byte == 45 || (byte >= 48 && byte <= 57) {
+            start := self.at
+            self.at += 1
+            while self.at < self.text.len() && self.peek() >= 48 && self.peek() <= 57 {
+                self.at += 1
+            }
+            return Result::Ok(self.add_node(2, self.text.slice(start, self.at), Vec()))
+        }
+        first := self.word()
+        when first.is_empty() {
+            return Result::Err(declined())
+        }
+        when first == "true" || first == "false" {
+            return Result::Ok(self.add_node(2, first, Vec()))
+        }
+        when self.peek() == 123 {
+            return Result::Err(declined())
+        }
+        mut segments: Vec<String> = Vec()
+        segments.push(first)
+        while self.at + 1 < self.text.len() && self.peek() == 58 && self.text.byte_at(self.at + 1) == (58 as u8) {
+            self.at += 2
+            next := self.word()
+            when next.is_empty() {
+                return Result::Err(declined())
+            }
+            segments.push(next)
+        }
+        mut payload: Vec<u64> = Vec()
+        when self.peek() == 40 {
+            self.at += 1
+            when self.peek() != 41 {
+                mut more := true
+                while more {
+                    payload.push(self.parse_pattern()?)
+                    when self.peek() == 44 {
+                        self.at += 1
+                    } else {
+                        more = false
+                    }
+                }
+            }
+            when self.peek() != 41 {
+                return Result::Err(declined())
+            }
+            self.at += 1
+        }
+        when segments.len() == 1 {
+            when !payload.is_empty() {
+                return Result::Err(declined())
+            }
+            name := segments[0].clone()
+            when name == "_" {
+                return Result::Ok(self.add_node(0, String(""), Vec()))
+            }
+            return Result::Ok(self.add_node(1, name, Vec()))
+        }
+        variant := segments[segments.len() - 1].clone()
+        return Result::Ok(self.add_node(4, variant, payload))
+    }
+
+    fun parse_tuple(mut self) -> Result<u64, String> {
+        self.at += 1
+        mut elements: Vec<u64> = Vec()
+        when self.peek() != 41 {
+            mut more := true
+            while more {
+                elements.push(self.parse_pattern()?)
+                when self.peek() == 44 {
+                    self.at += 1
+                } else {
+                    more = false
+                }
+            }
+        }
+        when self.peek() != 41 {
+            return Result::Err(declined())
+        }
+        self.at += 1
+        return Result::Ok(self.add_node(3, String(""), elements))
+    }
+
+    // A literal or character: from its quote to the next one of the same kind, both included.
+    fun parse_quoted(mut self, quote: u64) -> Result<u64, String> {
+        start := self.at
+        self.at += 1
+        while self.at < self.text.len() && self.peek() != quote {
+            self.at += 1
+        }
+        self.at += 1
+        mut end := self.at
+        when end > self.text.len() {
+            end = self.text.len()
+        }
+        return Result::Ok(self.add_node(2, self.text.slice(start, end), Vec()))
+    }
+
+    // The matrix of one `choose`: its arms as the rows of one column, compiled as the bootstrap pass compiles them.
+    fun check_choose(mut self, arms: Vec<u64>) -> Result<bool, String> {
+        mut extended := false
+        for arm in arms.clone() {
+            record := self.program.arms[arm]
+            when record.enum_name.is_some() {
+                name := record.enum_name.unwrap()
+                when name == "$lit" || name == "$pat" {
+                    extended = true
+                }
+            }
+        }
+        when !extended {
+            return Result::Ok(false)
+        }
+        self.current = arms.clone()
+        self.used = Vec()
+        mut position: u64 = 0
+        while position < arms.len() {
+            self.used.push(false)
+            position += 1
+        }
+        mut rows: Vec<Row> = Vec()
+        position = 0
+        while position < arms.len() {
+            node := self.arm_pattern(arms[position])?
+            mut pats: Vec<u64> = Vec()
+            pats.push(node)
+            rows.push(Row { index: position, pats: pats })
+            position += 1
+        }
+        self.compile(rows)?
+        position = 0
+        while position < arms.len() {
+            when !self.used[position] {
+                span := self.span_of_arm(position)
+                return Result::Err(pattern_error(span.start, span.end, String("this pattern can never match"), String("an earlier pattern already covers every value it would match")))
+            }
+            position += 1
+        }
+        return Result::Ok(false)
+    }
+
+    // The first column that holds a literal, a tuple or a variant: a wildcard or a name does not decide the branch.
+    fun first_column(self, pats: Vec<u64>) -> Option<u64> {
+        mut column: u64 = 0
+        while column < pats.len() {
+            kind := self.kind_of(pats[column])
+            when kind == 2 || kind == 3 || kind == 4 {
+                return Option::Some(column)
+            }
+            column += 1
+        }
+        return Option::None
+    }
+
+    fun without_column(self, pats: Vec<u64>, column: u64) -> Vec<u64> {
+        mut kept: Vec<u64> = Vec()
+        mut position: u64 = 0
+        while position < pats.len() {
+            when position != column {
+                kept.push(pats[position])
+            }
+            position += 1
+        }
+        return kept
+    }
+
+    // The bootstrap's `compile`. Returns whether the rows reach a body, and records the arms that are reached.
+    fun compile(mut self, rows: Vec<Row>) -> Result<bool, String> {
+        when rows.is_empty() {
+            return Result::Ok(false)
+        }
+        first := rows[0]
+        column := self.first_column(first.pats.clone())
+        when column.is_none() {
+            self.used.set(first.index, true)
+            return Result::Ok(true)
+        }
+        kind := self.kind_of(first.pats[column.unwrap()])
+        when kind == 2 {
+            return self.switch_literals(rows, column.unwrap())
+        }
+        when kind == 3 {
+            return self.switch_tuples(rows, column.unwrap())
+        }
+        return self.switch_variants(rows, column.unwrap())
+    }
+
+    // Literals in one column: a literal, a wildcard or a name; any other pattern in the column is a mixing error.
+    fun switch_literals(mut self, rows: Vec<Row>, column: u64) -> Result<bool, String> {
+        mut literals: Vec<String> = Vec()
+        for row in rows.clone() {
+            node := self.nodes[row.pats[column]]
+            when node.kind == 2 {
+                mut known := false
+                for text in literals.clone() {
+                    when text == node.text {
+                        known = true
+                    }
+                }
+                when !known {
+                    literals.push(node.text)
+                }
+            } else {
+                when node.kind == 3 || node.kind == 4 {
+                    span := self.span_of_arm(row.index)
+                    return Result::Err(pattern_error(span.start, span.end, String("a literal pattern cannot be mixed with other kinds of patterns"), String("")))
+                }
+            }
+        }
+        mut defaults: Vec<Row> = Vec()
+        for row in rows.clone() {
+            kind := self.kind_of(row.pats[column])
+            when kind == 0 || kind == 1 {
+                defaults.push(Row { index: row.index, pats: self.without_column(row.pats.clone(), column) })
+            }
+        }
+        mut boolean := false
+        when literals.len() == 2 && defaults.is_empty() {
+            boolean = (literals[0] == "true" && literals[1] == "false") || (literals[0] == "false" && literals[1] == "true")
+        }
+        mut reached := false
+        mut tests: Vec<String> = Vec()
+        for text in literals.clone() {
+            tests.push(text)
+        }
+        when boolean {
+            last := tests.len() - 1
+            matching := self.rows_with_literal(rows.clone(), column, tests[last].clone(), false)
+            reached = self.compile(matching)?
+            tests = self.first_literals(tests.clone(), last)
+        } else {
+            reached = self.compile(defaults)?
+        }
+        when !reached {
+            first := rows[0]
+            span := self.span_of_arm(first.index)
+            return Result::Err(pattern_error(span.start, span.end, String("literal patterns must be followed by a `_` arm"), String("integers and characters cannot be matched exhaustively")))
+        }
+        mut position: u64 = tests.len()
+        while position > 0 {
+            position -= 1
+            matching := self.rows_with_literal(rows.clone(), column, tests[position].clone(), true)
+            self.compile(matching)?
+        }
+        return Result::Ok(true)
+    }
+
+    // The rows of a literal column that are the literal `text` (or any row that is not a literal, when `others` is set),
+    // with the column removed.
+    fun rows_with_literal(self, rows: Vec<Row>, column: u64, text: String, others: bool) -> Vec<Row> {
+        mut matching: Vec<Row> = Vec()
+        for row in rows {
+            node := self.nodes[row.pats[column]]
+            mut keep := false
+            when node.kind == 2 {
+                keep = node.text == text
+            } else {
+                keep = others
+            }
+            when keep {
+                matching.push(Row { index: row.index, pats: self.without_column(row.pats.clone(), column) })
+            }
+        }
+        return matching
+    }
+
+    fun first_literals(self, tests: Vec<String>, last: u64) -> Vec<String> {
+        mut kept: Vec<String> = Vec()
+        mut position: u64 = 0
+        while position < last {
+            kept.push(tests[position].clone())
+            position += 1
+        }
+        return kept
+    }
+
+    // A tuple column: every tuple has the arity of the first, and a wildcard matches each element; any other pattern is a
+    // mixing error. The tuple's elements take the place of the column.
+    fun switch_tuples(mut self, rows: Vec<Row>, column: u64) -> Result<bool, String> {
+        mut arity: u64 = 0
+        mut has_arity := false
+        for row in rows.clone() {
+            node := self.nodes[row.pats[column]]
+            when node.kind == 3 {
+                when has_arity && arity != node.children.len() {
+                    span := self.span_of_arm(row.index)
+                    return Result::Err(pattern_error(span.start, span.end, String("tuple patterns have different lengths"), String("")))
+                }
+                arity = node.children.len()
+                has_arity = true
+            } else {
+                when node.kind != 0 {
+                    span := self.span_of_arm(row.index)
+                    return Result::Err(pattern_error(span.start, span.end, String("this pattern cannot be mixed with a tuple or structure pattern"), String("")))
+                }
+            }
+        }
+        mut specialized: Vec<Row> = Vec()
+        for row in rows {
+            node := self.nodes[row.pats[column]]
+            mut cells: Vec<u64> = Vec()
+            when node.kind == 3 {
+                for child in node.children.clone() {
+                    cells.push(child)
+                }
+            } else {
+                mut position: u64 = 0
+                while position < arity {
+                    cells.push(self.add_node(0, String(""), Vec()))
+                    position += 1
+                }
+            }
+            for rest in self.without_column(row.pats.clone(), column) {
+                cells.push(rest)
+            }
+            specialized.push(Row { index: row.index, pats: cells })
+        }
+        self.compile(specialized)?
+        return Result::Ok(true)
+    }
+
+    // A variant column: only a mixing error is decided here. A variant that carries a pattern is declined.
+    fun switch_variants(mut self, rows: Vec<Row>, column: u64) -> Result<bool, String> {
+        for row in rows {
+            node := self.nodes[row.pats[column]]
+            when node.kind == 4 && !node.children.is_empty() {
+                return Result::Err(declined())
+            }
+            when node.kind == 1 {
+                return Result::Err(declined())
+            }
+            when node.kind == 2 || node.kind == 3 {
+                span := self.span_of_arm(row.index)
+                return Result::Err(pattern_error(span.start, span.end, String("a variant pattern cannot be mixed with other kinds of patterns"), String("")))
+            }
+        }
+        return Result::Err(declined())
+    }
+}

@@ -1,0 +1,11 @@
+// test: run
+// out: 10
+// out: 14
+fun twice(x: i32) -> i32 { return x * 2 }
+fun app<T, U>(value: T, transform: fun(T) -> U) -> U {
+    return transform(value)
+}
+fun main() {
+    echo app(5 as i32, twice)
+    echo app::<i32, i32>(7 as i32, twice)
+}

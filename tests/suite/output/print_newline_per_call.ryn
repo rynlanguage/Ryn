@@ -1,0 +1,7 @@
+// test: run
+// out: one
+// out: two
+fun main() {
+    print("one")
+    print("two")
+}

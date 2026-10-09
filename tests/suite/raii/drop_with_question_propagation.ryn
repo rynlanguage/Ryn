@@ -1,0 +1,25 @@
+// test: run
+// out: drop 9
+// out: drop 1
+// out: true
+#[drop(rel)]
+struct R { h: *i32, id: i32 }
+fun rel(r: R) { echo "drop {r.id}" }
+fun mk(id: i32, p: *i32) -> R { return R { h: p, id: id } }
+fun risky(p: *i32, fail: bool) -> Result<i32, String> {
+    guard := mk(9, p)
+    when fail {
+        return Result::Err(String("failed"))
+    }
+    return Result::Ok(1)
+}
+fun outer(p: *i32) -> Result<i32, String> {
+    guard := mk(1, p)
+    v := risky(p, true)?
+    return Result::Ok(v)
+}
+fun main() {
+    mut x: i32 = 0
+    r := outer(&raw mut x)
+    echo r.is_err()
+}

@@ -10,7 +10,7 @@ use crate::{
     frontend::Frontend,
     lockfile::{resolve_locked_git_dependency, resolve_locked_registry_dependency},
     manifest::{Dependency, Manifest},
-    sema::{self, RynIr},
+    sema::RynIr,
     source::{Diagnostic, SourceFile, Span},
 };
 
@@ -33,6 +33,12 @@ pub(crate) fn check_project(
     project: &Path,
     frontend: &Frontend,
 ) -> Result<(RynIr, Vec<PathBuf>), String> {
+    let (_, source_root, dependency_roots) = project_roots(project)?;
+    let entry = source_root.join("main.ryn");
+    check_entry(&entry, &source_root, &dependency_roots, frontend)
+}
+
+fn project_roots(project: &Path) -> Result<(PathBuf, PathBuf, HashMap<String, PathBuf>), String> {
     let root = fs::canonicalize(project).map_err(|error| {
         format!(
             "error[R0420]: cannot resolve project directory {}: {error}",
@@ -69,7 +75,7 @@ pub(crate) fn check_project(
             entry.display()
         ));
     }
-    check_entry(&entry, &source_root, &dependency_roots, frontend)
+    Ok((root, source_root, dependency_roots))
 }
 
 /// Checks a single source file that imports modules: `std::...` resolves to
@@ -98,6 +104,28 @@ fn check_entry(
     dependency_roots: &HashMap<String, PathBuf>,
     frontend: &Frontend,
 ) -> Result<(RynIr, Vec<PathBuf>), String> {
+    let (program, source_paths, segments) =
+        prepare_entry(entry, source_root, dependency_roots, frontend)?;
+    let ir = frontend
+        .analyze(program, false)
+        .map_err(|mut errors| render_project_diagnostic(errors.remove(0), &segments))?;
+    Ok((ir, source_paths))
+}
+
+/// Loads a project's modules into one specialized program, ready for semantic analysis.
+pub(crate) fn project_program(project: &Path, frontend: &Frontend) -> Result<Program, String> {
+    let (root, source_root, dependency_roots) = project_roots(project)?;
+    let _ = root;
+    let entry = source_root.join("main.ryn");
+    prepare_entry(&entry, &source_root, &dependency_roots, frontend).map(|(program, _, _)| program)
+}
+
+fn prepare_entry(
+    entry: &Path,
+    source_root: &Path,
+    dependency_roots: &HashMap<String, PathBuf>,
+    frontend: &Frontend,
+) -> Result<(Program, Vec<PathBuf>, Vec<Segment>), String> {
     let mut units = Vec::new();
     let mut discovered = HashMap::<PathBuf, String>::new();
     load_module(
@@ -108,6 +136,7 @@ fn check_entry(
         &mut discovered,
         &mut units,
         frontend,
+        &mut Vec::new(),
     )?;
 
     let mut text = String::new();
@@ -124,7 +153,7 @@ fn check_entry(
         }
         for import in &source.program.uses {
             let module_path = import.path.join("::");
-            let Some(module_alias) = import.path.last() else {
+            let Some(module_alias) = import.local_name() else {
                 continue;
             };
             for provider in units.iter().filter(|unit| unit.module_path == module_path) {
@@ -175,6 +204,9 @@ fn check_entry(
         text.push('\n');
     }
 
+    if let Some(path) = std::env::var_os("RYN_DUMP_PROJECT_TEXT") {
+        let _ = fs::write(path, &text);
+    }
     let mut program = frontend.parse_recovering(&text).map_err(|errors| {
         errors
             .into_iter()
@@ -272,8 +304,7 @@ fn check_entry(
     let program = frontend
         .monomorphize(program)
         .map_err(|error| render_project_diagnostic(error, &segments))?;
-    let ir = sema::analyze(program).map_err(|error| render_project_diagnostic(error, &segments))?;
-    Ok((ir, source_paths))
+    Ok((program, source_paths, segments))
 }
 
 fn collect_path_dependencies(
@@ -357,6 +388,7 @@ fn collect_path_dependencies(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_module(
     path: &Path,
     module_path: String,
@@ -365,6 +397,7 @@ fn load_module(
     discovered: &mut HashMap<PathBuf, String>,
     units: &mut Vec<SourceUnit>,
     frontend: &Frontend,
+    importing: &mut Vec<String>,
 ) -> Result<(), String> {
     let canonical = if module_path.starts_with("std::") {
         path.to_path_buf()
@@ -390,11 +423,21 @@ fn load_module(
                 canonical.display()
             ));
         }
-        // Marking before following imports gives module cycles defined behavior:
-        // the graph is loaded once, then all function signatures are resolved together.
+        if let Some(position) = importing.iter().position(|open| *open == module_path) {
+            let mut chain: Vec<String> = importing[position..]
+                .iter()
+                .map(|name| display_module(name))
+                .collect();
+            chain.push(display_module(&module_path));
+            return Err(format!(
+                "error[R0427]: circular module dependency: {}\n  help: move the shared declarations into a module that both import",
+                chain.join(" -> ")
+            ));
+        }
         return Ok(());
     }
     discovered.insert(canonical.clone(), module_path.clone());
+    importing.push(module_path.clone());
     let module_text = if module_path.starts_with("std::") {
         embedded_std_module(&module_path)
             .ok_or_else(|| {
@@ -433,8 +476,10 @@ fn load_module(
             discovered,
             units,
             frontend,
+            importing,
         )?;
     }
+    importing.pop();
     units.push(SourceUnit {
         path: canonical,
         module_path,
@@ -442,6 +487,14 @@ fn load_module(
         program: Rc::new(parsed),
     });
     Ok(())
+}
+
+fn display_module(module_path: &str) -> String {
+    if module_path.is_empty() {
+        "main".into()
+    } else {
+        module_path.into()
+    }
 }
 
 fn resolve_module_file(
@@ -508,6 +561,7 @@ fn embedded_std_module(module_path: &str) -> Option<&'static str> {
         "std::keyboard" => Some(include_str!("../stdlib/std/src/keyboard.ryn")),
         "std::option" => Some(include_str!("../stdlib/std/src/option.ryn")),
         "std::result" => Some(include_str!("../stdlib/std/src/result.ryn")),
+        "std::arena" => Some(include_str!("../stdlib/std/src/arena.ryn")),
         _ => None,
     }
 }

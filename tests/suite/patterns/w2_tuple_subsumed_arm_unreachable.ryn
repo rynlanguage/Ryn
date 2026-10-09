@@ -1,0 +1,13 @@
+// test: fail
+// code: R0235
+// msg: can never match
+fun f(t: (i32, i32)) -> i32 {
+    choose t {
+        (0, _) => 1,
+        (0, 5) => 2,
+        _ => 3
+    }
+}
+fun main() {
+    echo f((0, 5))
+}

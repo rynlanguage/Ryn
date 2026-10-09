@@ -1,0 +1,20 @@
+// test: run
+// out: 2
+// out: 16
+// out: true
+// out: false
+// out: 2
+struct Pair<T> {
+    first: T,
+    second: T
+}
+const PAIR_FIELDS: u64 = field_count::<Pair<i64>>()
+const PAIR_BYTES: u64 = sizeof(Pair<i64>)
+fun main() {
+    static_assert(PAIR_FIELDS == 2)
+    echo PAIR_FIELDS
+    echo PAIR_BYTES
+    echo has_field::<Pair<i64>>("first")
+    echo has_field::<Pair<i64>>("third")
+    echo field_count::<Pair<bool>>()
+}

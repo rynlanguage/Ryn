@@ -1,0 +1,12 @@
+// test: run
+// out: 9
+struct Stack<T> { items: Vec<T> }
+fun wrap<T>(value: T) -> Stack<T> {
+    mut s := Stack::<T> { items: Vec<T>() }
+    s.items.push(value)
+    return s
+}
+fun main() {
+    u: Stack<i32> = wrap(9 as i32)
+    echo u.items.index(0)
+}

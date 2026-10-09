@@ -1,0 +1,19 @@
+// test: run
+// out: b 1
+// out: d 1
+// out: d 2
+// out: end
+fun main() {
+    mut i: i32 = 0
+    while true {
+        defer {
+            echo "d {i}"
+        }
+        i += 1
+        when i == 2 {
+            break
+        }
+        echo "b {i}"
+    }
+    echo "end"
+}

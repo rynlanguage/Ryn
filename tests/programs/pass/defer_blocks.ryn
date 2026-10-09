@@ -1,0 +1,46 @@
+fun work() -> i32 {
+    defer {
+        echo "first registered"
+    }
+    defer {
+        echo "second registered"
+    }
+    echo "body"
+    return 7
+}
+
+fun counted() -> i32 {
+    mut x: i32 = 1
+    defer {
+        x = 99
+        echo "cleanup sees 99"
+    }
+    return x
+}
+
+fun main() -> i32 {
+    echo work()
+    echo counted()
+    mut i: i32 = 0
+    while i < 3 {
+        defer {
+            echo "end iteration"
+        }
+        when i == 1 {
+            i += 1
+            continue
+        }
+        echo i
+        i += 1
+    }
+    mut tries: i32 = 0
+    while true {
+        defer {
+            echo "left loop"
+        }
+        tries += 1
+        break
+    }
+    echo tries
+    return 0
+}

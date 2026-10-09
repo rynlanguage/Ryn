@@ -1,0 +1,9 @@
+// test: run
+// out: 12
+// out: 65
+extern "C" fun sqrt(value: f64) -> f64;
+extern "C" fun toupper(c: i32) -> i32;
+fun main() {
+    echo sqrt(144.0)
+    echo toupper(97)
+}

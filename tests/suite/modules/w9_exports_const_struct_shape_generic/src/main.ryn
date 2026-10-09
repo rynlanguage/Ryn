@@ -1,0 +1,24 @@
+// test: run
+// out: 10
+// out: 7
+// out: 14
+// out: 5
+// out: 9
+use kit
+struct Local {
+    a: i32,
+    b: i32
+}
+extend Local {
+    pub fun sum(self) -> i32 {
+        return self.a + self.b
+    }
+}
+fun main() {
+    echo kit::LIMIT
+    p := kit::Pair { a: 3, b: 4 }
+    echo p.sum()
+    echo kit::total(p) + kit::total(Local { a: 4, b: 3 }) + 0
+    echo kit::first::<i32>(5)
+    echo kit::total(Local { a: 4, b: 5 })
+}

@@ -1,0 +1,688 @@
+// Checks textual IR written by `ryn::ir_codec::encode_ir` against the grammar that the
+// Rust decoder accepts. It consumes the same tokens in the same order as the decoder and
+// reports the byte offset where the text stops matching.
+
+use std::fs
+
+struct Reader {
+    text: String,
+    at: u64,
+}
+
+extend Reader {
+    fun skip_spaces(mut self) {
+        while self.at < self.text.len() && self.text.byte_at(self.at) == (32 as u8) {
+            self.at += 1
+        }
+    }
+
+    // The next space-delimited token.
+    fun token(mut self) -> Result<String, String> {
+        self.skip_spaces()
+        start := self.at
+        while self.at < self.text.len() && self.text.byte_at(self.at) != (32 as u8) {
+            self.at += 1
+        }
+        when start == self.at {
+            return Result::Err(String("unexpected end of IR text"))
+        }
+        return Result::Ok(self.text.slice(start, self.at))
+    }
+
+    fun expect_word(mut self, expected: str) -> Result<bool, String> {
+        found := self.token()?
+        when found != expected {
+            return Result::Err(String("unexpected word in IR text"))
+        }
+        return Result::Ok(true)
+    }
+
+    fun uint(mut self) -> Result<u64, String> {
+        token := self.token()?
+        parsed := token.try_parse::<u64>()
+        when parsed.is_none() {
+            return Result::Err(String("expected an unsigned integer"))
+        }
+        return Result::Ok(parsed.unwrap())
+    }
+
+    fun boolean(mut self) -> Result<bool, String> {
+        value := self.uint()?
+        when value == 0 {
+            return Result::Ok(false)
+        }
+        when value == 1 {
+            return Result::Ok(true)
+        }
+        return Result::Err(String("expected a boolean"))
+    }
+
+    fun span(mut self) -> Result<bool, String> {
+        self.uint()?
+        self.uint()?
+        return Result::Ok(true)
+    }
+
+    // A length-prefixed string: `<byte length>:<bytes>`.
+    fun string(mut self) -> Result<bool, String> {
+        self.skip_spaces()
+        digits_start := self.at
+        while self.at < self.text.len() && self.text.byte_at(self.at) >= (48 as u8) && self.text.byte_at(self.at) <= (57 as u8) {
+            self.at += 1
+        }
+        when digits_start == self.at || self.at >= self.text.len() || self.text.byte_at(self.at) != (58 as u8) {
+            return Result::Err(String("expected a length-prefixed string"))
+        }
+        length := self.text.slice(digits_start, self.at).try_parse::<u64>()
+        when length.is_none() {
+            return Result::Err(String("string length is out of range"))
+        }
+        bytes := length.unwrap()
+        self.at += 1
+        self.at += bytes
+        when self.at > self.text.len() {
+            return Result::Err(String("string extends past the end of the IR text"))
+        }
+        return Result::Ok(true)
+    }
+
+    // An optional value: `-` for none, `+` followed by the value.
+    fun optional_uint(mut self) -> Result<bool, String> {
+        marker := self.token()?
+        when marker == "-" {
+            return Result::Ok(false)
+        }
+        when marker == "+" {
+            self.uint()?
+            return Result::Ok(true)
+        }
+        return Result::Err(String("expected an optional value"))
+    }
+
+    fun ir(mut self) -> Result<bool, String> {
+        self.uint()?
+        self.optional_uint()?
+        struct_count := self.uint()?
+        mut index: u64 = 0
+        while index < struct_count {
+            self.struct_definition()?
+            index += 1
+        }
+        enum_count := self.uint()?
+        index = 0
+        while index < enum_count {
+            self.enum_definition()?
+            index += 1
+        }
+        function_count := self.uint()?
+        index = 0
+        while index < function_count {
+            self.function_definition()?
+            index += 1
+        }
+        return Result::Ok(true)
+    }
+
+    fun struct_definition(mut self) -> Result<bool, String> {
+        self.string()?
+        field_count := self.uint()?
+        mut index: u64 = 0
+        while index < field_count {
+            self.string()?
+            self.ty()?
+            self.uint()?
+            self.boolean()?
+            index += 1
+        }
+        self.uint()?
+        self.boolean()?
+        self.optional_uint()?
+        self.boolean()?
+        self.boolean()?
+        self.string()?
+        return Result::Ok(true)
+    }
+
+    fun enum_definition(mut self) -> Result<bool, String> {
+        self.string()?
+        variant_count := self.uint()?
+        mut variant: u64 = 0
+        while variant < variant_count {
+            self.string()?
+            field_count := self.uint()?
+            mut field: u64 = 0
+            while field < field_count {
+                self.ty()?
+                field += 1
+            }
+            variant += 1
+        }
+        return Result::Ok(true)
+    }
+
+    fun optional_type(mut self) -> Result<bool, String> {
+        marker := self.token()?
+        when marker == "-" {
+            return Result::Ok(false)
+        }
+        when marker == "+" {
+            self.ty()?
+            return Result::Ok(true)
+        }
+        return Result::Err(String("expected an optional type"))
+    }
+
+    fun local_type(mut self) -> Result<bool, String> {
+        tag := self.token()?
+        when tag == "I8" || tag == "I16" || tag == "I32" || tag == "I64" || tag == "F32" || tag == "F64" || tag == "Ptr" || tag == "OwnedPtr" {
+            return Result::Ok(true)
+        }
+        return Result::Err(String("unknown local type"))
+    }
+
+    fun function_definition(mut self) -> Result<bool, String> {
+        parameter_count := self.uint()?
+        mut index: u64 = 0
+        while index < parameter_count {
+            self.uint()?
+            self.ty()?
+            index += 1
+        }
+        marker := self.token()?
+        when marker == "+" {
+            self.string()?
+        }
+        when marker != "+" && marker != "-" {
+            return Result::Err(String("expected an optional symbol"))
+        }
+        self.optional_type()?
+        self.optional_uint()?
+        value_marker := self.token()?
+        when value_marker == "+" {
+            self.expression()?
+        }
+        when value_marker != "+" && value_marker != "-" {
+            return Result::Err(String("expected an optional return value"))
+        }
+        self.statements()?
+        local_count := self.uint()?
+        index = 0
+        while index < local_count {
+            self.local_type()?
+            index += 1
+        }
+        owned_count := self.uint()?
+        index = 0
+        while index < owned_count {
+            self.optional_type()?
+            index += 1
+        }
+        addressed_count := self.uint()?
+        index = 0
+        while index < addressed_count {
+            self.optional_type()?
+            index += 1
+        }
+        return Result::Ok(true)
+    }
+
+    fun ty(mut self) -> Result<bool, String> {
+        tag := self.token()?
+        when tag == "I8" || tag == "I16" || tag == "I32" || tag == "I64" || tag == "U8" || tag == "U16" || tag == "U32" || tag == "U64" || tag == "F32" || tag == "F64" || tag == "Str" || tag == "OwnedString" || tag == "Char" || tag == "Bool" {
+            return Result::Ok(true)
+        }
+        when tag == "Struct" || tag == "Enum" {
+            self.uint()?
+            return Result::Ok(true)
+        }
+        when tag == "Vec" || tag == "Slice" || tag == "RawPointer" {
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "Array" {
+            self.ty()?
+            self.uint()?
+            return Result::Ok(true)
+        }
+        when tag == "Map" || tag == "Set" {
+            self.ty()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "Reference" {
+            self.ty()?
+            self.boolean()?
+            return Result::Ok(true)
+        }
+        when tag == "FunctionPointer" {
+            parameter_count := self.uint()?
+            mut index: u64 = 0
+            while index < parameter_count {
+                self.ty()?
+                index += 1
+            }
+            self.optional_type()?
+            self.boolean()?
+            return Result::Ok(true)
+        }
+        return Result::Err(String("unknown type"))
+    }
+
+    fun statements(mut self) -> Result<bool, String> {
+        count := self.uint()?
+        mut index: u64 = 0
+        while index < count {
+            self.statement()?
+            index += 1
+        }
+        return Result::Ok(true)
+    }
+
+    fun expressions(mut self) -> Result<bool, String> {
+        count := self.uint()?
+        mut index: u64 = 0
+        while index < count {
+            self.expression()?
+            index += 1
+        }
+        return Result::Ok(true)
+    }
+
+    fun statement(mut self) -> Result<bool, String> {
+        tag := self.token()?
+        when tag == "Block" {
+            return self.statements()
+        }
+        when tag == "Drop" {
+            count := self.uint()?
+            mut index: u64 = 0
+            while index < count {
+                self.uint()?
+                self.ty()?
+                index += 1
+            }
+            return Result::Ok(true)
+        }
+        when tag == "Let" || tag == "Assign" {
+            self.uint()?
+            self.ty()?
+            self.expression()?
+            self.span()?
+            return Result::Ok(true)
+        }
+        when tag == "ArrayAssign" {
+            self.uint()?
+            self.ty()?
+            self.uint()?
+            self.expression()?
+            self.expression()?
+            self.span()?
+            return Result::Ok(true)
+        }
+        when tag == "DereferenceAssign" {
+            self.expression()?
+            self.ty()?
+            self.expression()?
+            return Result::Ok(true)
+        }
+        when tag == "FieldAssign" {
+            self.uint()?
+            self.ty()?
+            self.expression()?
+            return Result::Ok(true)
+        }
+        when tag == "ReferenceFieldAssign" {
+            self.expression()?
+            self.uint()?
+            self.uint()?
+            self.ty()?
+            self.expression()?
+            return Result::Ok(true)
+        }
+        when tag == "Print" {
+            self.expression()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "PrintTemplate" {
+            count := self.uint()?
+            mut index: u64 = 0
+            while index < count {
+                self.print_part()?
+                index += 1
+            }
+            return Result::Ok(true)
+        }
+        when tag == "CallStatement" {
+            self.call_target()?
+            return self.expressions()
+        }
+        when tag == "IfStatement" {
+            self.expression()?
+            self.statements()?
+            return self.statements()
+        }
+        when tag == "While" {
+            self.statements()?
+            self.expression()?
+            return self.statements()
+        }
+        when tag == "For" {
+            self.uint()?
+            self.uint()?
+            self.ty()?
+            self.expression()?
+            self.expression()?
+            self.boolean()?
+            return self.statements()
+        }
+        when tag == "Break" || tag == "Continue" {
+            return Result::Ok(true)
+        }
+        when tag == "Return" {
+            return self.optional_expression()
+        }
+        return Result::Err(String("unknown statement"))
+    }
+
+    fun optional_expression(mut self) -> Result<bool, String> {
+        marker := self.token()?
+        when marker == "-" {
+            return Result::Ok(false)
+        }
+        when marker == "+" {
+            self.expression()?
+            return Result::Ok(true)
+        }
+        return Result::Err(String("expected an optional value"))
+    }
+
+    fun print_part(mut self) -> Result<bool, String> {
+        tag := self.token()?
+        when tag == "Text" {
+            return self.string()
+        }
+        when tag == "Value" {
+            self.expression()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        return Result::Err(String("unknown print part"))
+    }
+
+    fun call_target(mut self) -> Result<bool, String> {
+        tag := self.token()?
+        when tag == "Function" || tag == "TryReadFile" || tag == "ReadFileResult" {
+            self.uint()?
+            return Result::Ok(true)
+        }
+        when tag == "VecSlice" || tag == "IndirectFunctionPointer" {
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "ArgumentCount" || tag == "Argument" || tag == "SliceLen" {
+            return Result::Ok(true)
+        }
+        when tag == "String" || tag == "Filesystem" || tag == "System" {
+            self.token()?
+            return Result::Ok(true)
+        }
+        when tag == "Vec" {
+            self.token()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "Map" || tag == "Set" {
+            self.token()?
+            self.ty()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "EnumNew" {
+            self.uint()?
+            self.uint()?
+            return Result::Ok(true)
+        }
+        when tag == "EnumPredicate" {
+            self.token()?
+            self.uint()?
+            return Result::Ok(true)
+        }
+        when tag == "EnumUnwrapOr" {
+            self.uint()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "EnumUnwrap" {
+            self.uint()?
+            self.ty()?
+            self.boolean()?
+            self.uint()?
+            self.token()?
+            return Result::Ok(true)
+        }
+        when tag == "VecGetOption" {
+            self.ty()?
+            self.uint()?
+            self.boolean()?
+            return Result::Ok(true)
+        }
+        return Result::Err(String("unknown call target"))
+    }
+
+    fun expression(mut self) -> Result<bool, String> {
+        tag := self.token()?
+        when tag == "Integer" {
+            self.token()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "Float" {
+            self.uint()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "String" {
+            return self.string()
+        }
+        when tag == "Character" {
+            self.uint()?
+            return Result::Ok(true)
+        }
+        when tag == "Move" {
+            self.uint()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "Boolean" {
+            return self.boolean()
+        }
+        when tag == "Local" || tag == "Field" || tag == "ReferenceField" || tag == "ValueAddress" || tag == "AddressOf" || tag == "SliceElementAddress" {
+            return self.spanned_expression(tag)
+        }
+        when tag == "StructValue" {
+            self.uint()?
+            count := self.uint()?
+            mut index: u64 = 0
+            while index < count {
+                self.uint()?
+                self.expression()?
+                index += 1
+            }
+            return Result::Ok(true)
+        }
+        when tag == "Call" {
+            self.call_target()?
+            self.expressions()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "If" {
+            self.expression()?
+            self.expression()?
+            self.expression()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "EnumMatch" {
+            self.expression()?
+            self.uint()?
+            count := self.uint()?
+            mut index: u64 = 0
+            while index < count {
+                self.match_arm()?
+                index += 1
+            }
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "Propagate" {
+            self.expression()?
+            self.uint()?
+            self.uint()?
+            self.ty()?
+            self.optional_type()?
+            self.uint()?
+            self.uint()?
+            self.uint()?
+            return self.statements()
+        }
+        when tag == "ArrayValue" {
+            return self.expressions()
+        }
+        when tag == "ArrayRepeat" {
+            self.expression()?
+            self.uint()?
+            return Result::Ok(true)
+        }
+        when tag == "ArrayAsSlice" {
+            self.expression()?
+            self.ty()?
+            self.uint()?
+            return Result::Ok(true)
+        }
+        when tag == "ArrayIndex" {
+            self.expression()?
+            self.expression()?
+            self.ty()?
+            self.uint()?
+            return Result::Ok(true)
+        }
+        when tag == "SliceIndex" {
+            self.expression()?
+            self.expression()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "Dereference" || tag == "Negate" || tag == "BitNot" {
+            self.expression()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "StringFindOption" {
+            self.expression()?
+            self.uint()?
+            return Result::Ok(true)
+        }
+        when tag == "StringAsStr" || tag == "Not" {
+            return self.expression()
+        }
+        when tag == "Binary" {
+            self.token()?
+            self.expression()?
+            self.expression()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "FunctionAddress" {
+            self.uint()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        when tag == "Cast" {
+            self.expression()?
+            self.ty()?
+            self.ty()?
+            return Result::Ok(true)
+        }
+        return Result::Err(String("unknown expression"))
+    }
+
+    // Expressions that end with a span. Their fields follow the Rust encoder's order.
+    fun spanned_expression(mut self, tag: String) -> Result<bool, String> {
+        when tag == "Local" {
+            self.uint()?
+            self.ty()?
+            return self.span()
+        }
+        when tag == "Field" || tag == "ReferenceField" {
+            self.expression()?
+            self.uint()?
+            self.uint()?
+            self.ty()?
+            self.span()?
+            when tag == "ReferenceField" {
+                self.boolean()?
+            }
+            return Result::Ok(true)
+        }
+        when tag == "ValueAddress" {
+            self.expression()?
+            self.ty()?
+            self.ty()?
+            return self.span()
+        }
+        when tag == "AddressOf" {
+            self.uint()?
+            self.ty()?
+            self.ty()?
+            return self.span()
+        }
+        // SliceElementAddress: the slice, the index, the element type, the span.
+        self.expression()?
+        self.expression()?
+        self.ty()?
+        return self.span()
+    }
+
+    fun match_arm(mut self) -> Result<bool, String> {
+        self.optional_uint()?
+        count := self.uint()?
+        mut index: u64 = 0
+        while index < count {
+            self.uint()?
+            self.ty()?
+            self.uint()?
+            index += 1
+        }
+        return self.expression()
+    }
+}
+
+fun main() -> i32 {
+    when arg_count() != 1 {
+        echo "usage: ryn-ir-check <file.ir>"
+        return 2
+    }
+    text := fs::read_text(arg(0))
+    mut reader := Reader { text: text, at: 0 }
+    checked := reader.expect_word("Ir")
+    when checked.is_err() {
+        echo "invalid IR text: missing the Ir header"
+        return 1
+    }
+    result := reader.ir()
+    when result.is_err() {
+        echo "invalid IR text near byte offset"
+        echo reader.at
+        return 1
+    }
+    reader.skip_spaces()
+    when reader.at != reader.text.len() {
+        echo "invalid IR text: trailing text at byte offset"
+        echo reader.at
+        return 1
+    }
+    echo "ok"
+    return 0
+}

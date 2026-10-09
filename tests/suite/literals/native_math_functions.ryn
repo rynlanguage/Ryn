@@ -1,0 +1,61 @@
+// test: run
+// out: 1.4142135623730951
+// out: 1.4142135623730951
+// out: -3
+// out: -2
+// out: -3
+// out: 3
+// out: 0
+// out: 3.25
+// out: 1
+// out: 2
+// out: -1
+// out: 5
+// out: 1
+// out: NaN
+// out: 3
+// out: 3
+// out: 0
+// out: 1
+// out: 0
+// out: 18446744073709552000
+// out: 18446744000000000000
+// out: 9223372036854776000
+// out: 18446744073709549568
+// out: 10000000000000000000
+// out: -9223372036854775807
+
+// The `std::math` builtins and float-to-integer conversions, on the native backend as in the Rust runtime.
+use std::math
+
+fun main() {
+    mut zero: f64 = 0.0
+    nan := zero / zero
+    echo math::sqrt(2.0)
+    echo math::pow(2.0, 0.5)
+    echo math::floor(-2.5)
+    echo math::ceil(-2.5)
+    echo math::round(-2.5)
+    echo math::round(2.5)
+    echo math::abs(-0.0)
+    echo math::abs(-3.25)
+    echo math::min(nan, 1.0)
+    echo math::max(2.0, nan)
+    echo math::min(-1.0, 4.0)
+    echo math::clamp(7.0, 1.0, 5.0)
+    echo math::clamp(-7.0, 1.0, 5.0)
+    echo math::clamp(3.0, 5.0, 1.0)
+    echo math::log2(8.0)
+    echo math::log10(1000.0)
+    echo math::sin(0.0)
+    echo math::cos(0.0)
+    echo math::log(1.0)
+    big: u64 = 18446744073709551615
+    echo big as f64
+    echo big as f32
+    half: u64 = 9223372036854775809
+    echo half as f64
+    echo 18446744073709549568.0 as u64
+    echo 1e19 as u64
+    echo -1e19 as i64
+}

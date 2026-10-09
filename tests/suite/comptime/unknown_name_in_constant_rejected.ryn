@@ -1,0 +1,6 @@
+// test: fail
+// code: R0461
+const BAD: i32 = missing + 1
+fun main() {
+    echo BAD
+}

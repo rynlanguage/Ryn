@@ -1,0 +1,11 @@
+// test: fail
+// code: R0240
+struct P { name: String }
+fun eat(p: P) {
+    echo p.name
+}
+fun main() {
+    p := P { name: String("a") }
+    eat(p)
+    eat(p)
+}

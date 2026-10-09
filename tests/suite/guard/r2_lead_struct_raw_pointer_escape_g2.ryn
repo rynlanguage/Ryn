@@ -1,0 +1,14 @@
+// test: fail
+// code: R0252
+// msg: would outlive its block
+struct H { p: *i32 }
+fun main() {
+    mut y: i32 = 1
+    mut h := H { p: &raw mut y }
+    when true {
+        mut x: i32 = 5
+        k := H { p: &raw mut x }
+        h = k
+    }
+    echo *h.p
+}

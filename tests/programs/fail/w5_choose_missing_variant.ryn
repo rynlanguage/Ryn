@@ -1,0 +1,12 @@
+enum Shape {
+    Dot,
+    Box
+}
+
+fun main() {
+    figure := Shape::Dot
+    size := choose figure {
+        Shape::Dot => 1
+    }
+    echo size
+}

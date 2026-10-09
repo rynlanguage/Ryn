@@ -1,0 +1,14 @@
+// test: fail
+// code: R0240
+// msg: cannot move a value out of a reference
+fun eat(s: String) {
+    echo s
+}
+fun take(r: &String) {
+    eat(*r)
+}
+fun main() {
+    s := String("a")
+    take(&s)
+    echo s
+}

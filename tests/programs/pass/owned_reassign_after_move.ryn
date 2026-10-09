@@ -1,0 +1,13 @@
+fun shout(text: String) -> String {
+    return text
+}
+
+fun main() {
+    mut name := String("ryn")
+    name = shout(name)
+    echo name
+    let_copy := name
+    name = String("again")
+    echo name
+    echo let_copy
+}

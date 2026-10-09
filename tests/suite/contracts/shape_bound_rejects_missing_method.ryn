@@ -1,0 +1,14 @@
+// test: fail
+// code: R0450
+shape Show {
+    fun show(self) -> i32
+}
+struct B {
+    n: i32
+}
+fun total<T: Show>(a: T) -> i32 {
+    a.show()
+}
+fun main() {
+    echo total(B { n: 1 })
+}

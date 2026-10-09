@@ -1,0 +1,32 @@
+// test: run
+// out: one
+// out: 2
+// out: three
+// out: 3
+// out: two
+// out: 2
+// out: y
+// exit: 0
+struct Entry {
+    name: String,
+    tags: Vec<String>,
+    count: i64,
+}
+
+fun main() {
+    mut tags: Vec<String> = Vec()
+    tags.push(String("x"))
+    tags.push(String("y"))
+    mut entries: Vec<Entry> = Vec()
+    entries.push(Entry { name: String("one"), tags: tags, count: 1 })
+    entries.push(Entry { name: String("two"), tags: Vec(), count: 2 })
+    mut copied := entries.clone()
+    copied.set(0, Entry { name: String("three"), tags: Vec(), count: 3 })
+    echo entries.index(0).name
+    echo entries.index(0).tags.len()
+    echo copied.index(0).name
+    echo copied.index(0).count
+    echo copied.index(1).name
+    echo copied.len()
+    echo entries.index(0).tags.index(1)
+}

@@ -49,6 +49,16 @@ struct Parser<'a> {
     generic_struct_keys: HashMap<String, String>,
     generic_struct_placeholder_keys: HashMap<String, String>,
     generic_struct_placeholders: HashMap<String, (String, Vec<TypeName>)>,
+    /// `extend<T> Template<T> { ... }` blocks, replayed once per concrete instance.
+    generic_extends: HashMap<String, Vec<GenericExtend>>,
+    /// `extend ... as Shape` records of generic instances, collected next to `extends`.
+    generated_extends: Vec<ExtendDef>,
+    generic_struct_instances: Vec<(String, Vec<TypeName>, String)>,
+    type_bindings: HashMap<String, TypeName>,
+    generated_functions: Vec<Function>,
+    instantiation_depth: usize,
+    /// Constants declared as a bare integer literal; they may be used as array lengths.
+    integer_constants: HashMap<String, u64>,
     generic_structs: Vec<StructDef>,
     generic_enum_keys: HashMap<String, String>,
     generic_enum_placeholder_keys: HashMap<String, String>,
@@ -58,6 +68,20 @@ struct Parser<'a> {
     namespace_path: Vec<String>,
     generic_type_parameters: HashSet<String>,
     custom_drop_types: HashSet<String>,
+    /// True while parsing a `when`/`while`/`for` header or a `when`-expression
+    /// condition, where `Name {` starts the controlled block rather than a
+    /// structure literal.
+    condition_context: bool,
+}
+
+#[derive(Clone)]
+struct GenericExtend {
+    parameters: Vec<String>,
+    /// The shape named by `extend<T> Name<T> as Shape`, already qualified.
+    as_shape: Option<String>,
+    /// The tokens of the block body, up to and including its closing `}`.
+    body: Vec<Token>,
+    name_span: Span,
 }
 
 #[derive(Clone, Copy)]
@@ -68,7 +92,8 @@ enum ControlMarker {
 }
 
 enum ForHeader {
-    Range(Expression, Expression),
+    // The flag is true for `start..=end`, which includes the end value.
+    Range(Expression, Expression, bool),
     Each(Expression),
 }
 
@@ -126,6 +151,13 @@ impl Parser<'_> {
             generic_struct_keys: HashMap::new(),
             generic_struct_placeholder_keys: HashMap::new(),
             generic_struct_placeholders: HashMap::new(),
+            generic_extends: HashMap::new(),
+            generated_extends: Vec::new(),
+            generic_struct_instances: Vec::new(),
+            type_bindings: HashMap::new(),
+            generated_functions: Vec::new(),
+            instantiation_depth: 0,
+            integer_constants: HashMap::new(),
             generic_structs: Vec::new(),
             generic_enum_keys: HashMap::new(),
             generic_enum_placeholder_keys: HashMap::new(),
@@ -135,6 +167,7 @@ impl Parser<'_> {
             namespace_path: Vec::new(),
             generic_type_parameters: HashSet::new(),
             custom_drop_types,
+            condition_context: false,
         }
     }
 
@@ -178,11 +211,17 @@ impl Parser<'_> {
                 continue;
             }
             let mut derives = Vec::new();
+            let mut derive_span = None;
             let (repr_c, drop_function) = if matches!(self.peek().kind, TokenKind::Hash) {
                 if self.next_attribute_is_drop() {
                     (false, Some(self.drop_attribute()?))
                 } else if self.next_attribute_is_derive() {
+                    let hash = self.peek().span.start;
                     derives = self.derive_attribute()?;
+                    derive_span = Some(Span {
+                        start: hash,
+                        end: self.tokens[self.at - 1].span.end,
+                    });
                     (false, None)
                 } else {
                     (self.repr_c_attribute()?, None)
@@ -200,10 +239,13 @@ impl Parser<'_> {
             {
                 return Err(self.error("`#[repr(C)]` applies only to structs"));
             }
+            if let Some(span) = derive_span
+                && !matches!(self.peek().kind, TokenKind::Struct)
+            {
+                return Err(derive_outside_struct(span));
+            }
             if matches!(self.peek().kind, TokenKind::Use) {
-                if public {
-                    return Err(self.error("`pub use` is not supported"));
-                }
+                // Imports are visible project-wide, so `pub use` is the same as `use`.
                 uses.push(self.use_decl()?);
             } else if matches!(self.peek().kind, TokenKind::Struct) {
                 let mut definition = self.struct_def(public, repr_c, drop_function)?;
@@ -264,6 +306,11 @@ impl Parser<'_> {
                     _ => return Err(self.error("expected `\"C\"` after `extern`")),
                 }
                 functions.push(self.function(public, true)?);
+            } else if matches!(self.peek().kind, TokenKind::Const) {
+                if repr_c {
+                    return Err(self.error("`#[repr(C)]` applies only to structs"));
+                }
+                functions.push(self.top_level_constant(public)?);
             } else {
                 if repr_c {
                     return Err(self.error("`#[repr(C)]` applies only to structs"));
@@ -274,6 +321,8 @@ impl Parser<'_> {
         enums.extend(self.generic_enums);
         structs.extend(self.generic_structs);
         structs.extend(self.tuple_type_structs);
+        extends.extend(self.generated_extends);
+        functions.extend(self.generated_functions);
         Ok(Program {
             uses,
             structs,
@@ -307,11 +356,17 @@ impl Parser<'_> {
             }
             let result = (|| {
                 let mut derives = Vec::new();
+                let mut derive_span = None;
                 let (repr_c, drop_function) = if matches!(self.peek().kind, TokenKind::Hash) {
                     if self.next_attribute_is_drop() {
                         (false, Some(self.drop_attribute()?))
                     } else if self.next_attribute_is_derive() {
+                        let hash = self.peek().span.start;
                         derives = self.derive_attribute()?;
+                        derive_span = Some(Span {
+                            start: hash,
+                            end: self.tokens[self.at - 1].span.end,
+                        });
                         (false, None)
                     } else {
                         (self.repr_c_attribute()?, None)
@@ -330,7 +385,12 @@ impl Parser<'_> {
                 {
                     return Err(self.error("`#[repr(C)]` applies only to structs"));
                 }
-                if matches!(self.peek().kind, TokenKind::Use) && !public {
+                if let Some(span) = derive_span
+                    && !matches!(self.peek().kind, TokenKind::Struct)
+                {
+                    return Err(derive_outside_struct(span));
+                }
+                if matches!(self.peek().kind, TokenKind::Use) {
                     self.use_decl().map(|declaration| uses.push(declaration))
                 } else if matches!(self.peek().kind, TokenKind::Struct) {
                     self.struct_def(public, repr_c, drop_function)
@@ -371,6 +431,9 @@ impl Parser<'_> {
                             .map(|function| functions.push(function)),
                         _ => Err(self.error("expected `\"C\"` after `extern`")),
                     }
+                } else if matches!(self.peek().kind, TokenKind::Const) {
+                    self.top_level_constant(public)
+                        .map(|function| functions.push(function))
                 } else {
                     self.function(public, false)
                         .map(|function| functions.push(function))
@@ -395,6 +458,8 @@ impl Parser<'_> {
             enums.extend(self.generic_enums);
             structs.extend(self.generic_structs);
             structs.extend(self.tuple_type_structs);
+            extends.extend(self.generated_extends);
+            functions.extend(self.generated_functions);
             Ok(Program {
                 uses,
                 structs,
@@ -517,6 +582,9 @@ impl Parser<'_> {
                     }
                     if matches!(self.peek().kind, TokenKind::Comma) {
                         self.next();
+                        if matches!(self.peek().kind, TokenKind::RParen) {
+                            break;
+                        }
                     } else {
                         break;
                     }
@@ -541,13 +609,45 @@ impl Parser<'_> {
                 let mut body = Vec::new();
                 while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
                     let statement_start = self.at;
-                    match self.statement() {
-                        Ok(statement) => body.push(statement),
-                        Err(diagnostic) if self.recovering => {
-                            self.recovery_diagnostics.push(diagnostic);
-                            self.synchronize_statement(statement_start, true);
+                    // Mirrors the function body loop: a final expression is the
+                    // implicit result, recorded as a `return` of that value.
+                    let starts_statement = self.starts_statement(return_type.is_none())
+                        || self.call_is_statement_before_result(return_type.is_some());
+                    let is_tail_if_expression = return_type.is_some()
+                        && matches!(self.peek().kind, TokenKind::If)
+                        && self.if_expression_reaches_function_end();
+                    if starts_statement && !is_tail_if_expression {
+                        match self.statement_into(&mut body) {
+                            Ok(()) => {}
+                            Err(diagnostic) if self.recovering => {
+                                self.recovery_diagnostics.push(diagnostic);
+                                self.synchronize_statement(statement_start, true);
+                            }
+                            Err(diagnostic) => return Err(diagnostic),
                         }
-                        Err(diagnostic) => return Err(diagnostic),
+                    } else {
+                        match self.expression(0) {
+                            Ok(expression) => {
+                                if (return_type.is_none()
+                                    || !matches!(self.peek().kind, TokenKind::RBrace))
+                                    && is_call_statement(&expression)
+                                {
+                                    body.push(self.expression_statement(expression)?);
+                                    continue;
+                                }
+                                let span = expression.span();
+                                body.push(Statement::Return {
+                                    value: Some(expression),
+                                    span,
+                                });
+                                break;
+                            }
+                            Err(diagnostic) if self.recovering => {
+                                self.recovery_diagnostics.push(diagnostic);
+                                self.synchronize_statement(statement_start, true);
+                            }
+                            Err(diagnostic) => return Err(diagnostic),
+                        }
                     }
                 }
                 self.expect(
@@ -594,7 +694,7 @@ impl Parser<'_> {
             .span
             .start;
         if matches!(self.peek().kind, TokenKind::Less) {
-            return Err(self.error("generic `extend` blocks are not supported yet"));
+            return self.generic_extend_def(start);
         }
         let receiver_type = self.type_name()?;
         let type_name = match &receiver_type {
@@ -680,6 +780,226 @@ impl Parser<'_> {
         ))
     }
 
+    /// `extend<T> Template<T> { ... }`: remember the block; it is parsed again, with the
+    /// parameters bound to concrete types, for every instance of the template.
+    fn generic_extend_def(
+        &mut self,
+        start: usize,
+    ) -> Result<(ExtendDef, Vec<Function>), Diagnostic> {
+        self.next();
+        let mut parameters = Vec::new();
+        loop {
+            let (parameter, span) = self.ident("expected generic type parameter")?;
+            if parameters.contains(&parameter) || is_builtin_type_name(&parameter) {
+                return Err(Diagnostic {
+                    code: "R0260",
+                    message: format!("invalid or duplicate generic parameter `{parameter}`"),
+                    span,
+                    help: Some("choose a unique non-builtin type parameter name".into()),
+                });
+            }
+            parameters.push(parameter);
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.next();
+            } else {
+                break;
+            }
+        }
+        self.expect_type_greater("expected `>` after generic type parameters")?;
+        let (written, name_span) = self.ident("expected the generic structure to extend")?;
+        let template_name = if written.contains("::") || self.namespace_path.is_empty() {
+            written
+        } else {
+            format!("{}::{written}", self.namespace_path.join("::"))
+        };
+        if !self.generic_struct_templates.contains_key(&template_name) {
+            return Err(Diagnostic {
+                code: "R0243",
+                message: format!(
+                    "`extend<...>` names `{template_name}`, which is not a generic structure"
+                ),
+                span: name_span,
+                help: Some("declare the generic structure before extending it".into()),
+            });
+        }
+        self.expect(
+            |k| matches!(k, TokenKind::Less),
+            "expected `<` after the generic structure name",
+        )?;
+        for parameter in &parameters {
+            let (argument, span) = self.ident("expected a type parameter of the `extend` block")?;
+            if argument != *parameter {
+                return Err(Diagnostic {
+                    code: "R0243",
+                    message: format!(
+                        "`extend<...>` must repeat its parameters in order, expected `{parameter}`"
+                    ),
+                    span,
+                    help: Some("write `extend<T> Name<T> { ... }`".into()),
+                });
+            }
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.next();
+            }
+        }
+        self.expect_type_greater("expected `>` after the extend type arguments")?;
+        let mut as_shape = None;
+        if matches!(self.peek().kind, TokenKind::As) {
+            self.next();
+            let (shape_name, _) = self.ident("expected shape name after `as`")?;
+            as_shape = Some(self.qualified_declaration_name(shape_name));
+        }
+        self.expect(
+            |k| matches!(k, TokenKind::LBrace),
+            "expected `{` after the extend type",
+        )?;
+        let mut body = Vec::new();
+        let mut depth = 1usize;
+        while depth > 0 {
+            match self.peek().kind {
+                TokenKind::LBrace => depth += 1,
+                TokenKind::RBrace => depth -= 1,
+                TokenKind::Eof => {
+                    return Err(self.error("expected `}` after extend members"));
+                }
+                _ => {}
+            }
+            // Consuming a token blanks it, so keep a copy for the replays.
+            body.push(self.peek().clone());
+            self.next();
+        }
+        let end = self.tokens[self.at - 1].span.end;
+        let extension = GenericExtend {
+            parameters,
+            as_shape,
+            body,
+            name_span,
+        };
+        self.generic_extends
+            .entry(template_name.clone())
+            .or_default()
+            .push(extension.clone());
+        let instances: Vec<(Vec<TypeName>, String)> = self
+            .generic_struct_instances
+            .iter()
+            .filter(|(template, _, _)| *template == template_name)
+            .map(|(_, arguments, internal)| (arguments.clone(), internal.clone()))
+            .collect();
+        for (arguments, internal) in instances {
+            self.instantiate_extend(&extension, &arguments, &internal)?;
+        }
+        Ok((
+            ExtendDef {
+                type_name: TypeName::Named(template_name, name_span),
+                as_shape: None,
+                functions: Vec::new(),
+                constants: Vec::new(),
+                module_path: String::new(),
+                span: Span { start, end },
+            },
+            Vec::new(),
+        ))
+    }
+
+    /// Parses the members of a generic `extend` block for one instance of its structure.
+    fn instantiate_extend(
+        &mut self,
+        extension: &GenericExtend,
+        arguments: &[TypeName],
+        internal: &str,
+    ) -> Result<(), Diagnostic> {
+        if self.instantiation_depth >= 16 {
+            return Err(Diagnostic {
+                code: "R0010",
+                message: "generic `extend` instantiation is nested too deeply".into(),
+                span: extension.name_span,
+                help: None,
+            });
+        }
+        self.instantiation_depth += 1;
+        let saved_at = self.at;
+        let saved_history = self.control_history.len();
+        let eof_span = extension
+            .body
+            .last()
+            .map_or(Span::default(), |token| token.span);
+        let mut replay = extension.body.clone();
+        replay.push(Token {
+            kind: TokenKind::Eof,
+            span: eof_span,
+        });
+        std::mem::swap(&mut self.tokens, &mut replay);
+        let saved_bindings = std::mem::take(&mut self.type_bindings);
+        self.type_bindings = extension
+            .parameters
+            .iter()
+            .cloned()
+            .zip(arguments.iter().cloned())
+            .collect();
+        self.at = 0;
+        let receiver = TypeName::Named(internal.to_owned(), Span::default());
+        let result = (|| -> Result<(), Diagnostic> {
+            let mut constants = Vec::new();
+            while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+                let member_public = if matches!(self.peek().kind, TokenKind::Pub) {
+                    self.next();
+                    true
+                } else {
+                    false
+                };
+                match self.peek().kind {
+                    TokenKind::Fn => {
+                        let function = self.function_with_self(
+                            member_public,
+                            false,
+                            Some(receiver.clone()),
+                            Some(internal.to_owned()),
+                        )?;
+                        self.generated_functions.push(function);
+                    }
+                    TokenKind::Const => constants.push(self.constant_def(member_public)?),
+                    _ => return Err(self.error("expected `fun` or `const` inside `extend`")),
+                }
+            }
+            for constant in constants {
+                let qualified =
+                    self.qualified_declaration_name(format!("{internal}::{}", constant.name));
+                self.generated_functions.push(Function {
+                    name: qualified,
+                    extern_c: false,
+                    external_symbol: None,
+                    type_parameters: Vec::new(),
+                    type_parameter_bounds: Vec::new(),
+                    public: constant.public,
+                    module_path: String::new(),
+                    parameters: Vec::new(),
+                    return_type: Some(constant.ty),
+                    body: Vec::new(),
+                    return_value: Some(constant.value),
+                    span: constant.span,
+                });
+            }
+            Ok(())
+        })();
+        std::mem::swap(&mut self.tokens, &mut replay);
+        self.control_history.truncate(saved_history);
+        self.at = saved_at;
+        self.type_bindings = saved_bindings;
+        self.instantiation_depth -= 1;
+        result?;
+        if let Some(shape) = &extension.as_shape {
+            self.generated_extends.push(ExtendDef {
+                type_name: TypeName::Named(internal.to_owned(), extension.name_span),
+                as_shape: Some(shape.clone()),
+                functions: Vec::new(),
+                constants: Vec::new(),
+                module_path: String::new(),
+                span: extension.name_span,
+            });
+        }
+        Ok(())
+    }
+
     fn constant_def(&mut self, public: bool) -> Result<ConstantDef, Diagnostic> {
         let start = self
             .expect(|k| matches!(k, TokenKind::Const), "expected `const`")?
@@ -709,6 +1029,39 @@ impl Parser<'_> {
         })
     }
 
+    /// A top-level `const` becomes a parameterless function that returns its
+    /// value and carries the `$const` marker; the compile-time pass folds it
+    /// into its uses.
+    fn top_level_constant(&mut self, public: bool) -> Result<Function, Diagnostic> {
+        let constant = self.constant_def(public)?;
+        if let Expression::Integer(value, _) = &constant.value {
+            self.integer_constants.insert(constant.name.clone(), *value);
+        }
+        Ok(Function {
+            name: self.qualified_declaration_name(constant.name),
+            extern_c: false,
+            external_symbol: Some("$const".into()),
+            type_parameters: Vec::new(),
+            type_parameter_bounds: Vec::new(),
+            public: constant.public,
+            module_path: String::new(),
+            parameters: Vec::new(),
+            return_type: Some(constant.ty),
+            body: Vec::new(),
+            return_value: Some(constant.value),
+            span: constant.span,
+        })
+    }
+
+    /// An array length: an integer literal or a constant declared as one earlier.
+    fn array_length(&self, kind: &TokenKind) -> Option<u64> {
+        match kind {
+            TokenKind::Integer(length) => Some(*length),
+            TokenKind::Ident(name) => self.integer_constants.get(name).copied(),
+            _ => None,
+        }
+    }
+
     fn qualified_declaration_name(&self, name: String) -> String {
         if self.namespace_path.is_empty() {
             name
@@ -731,8 +1084,16 @@ impl Parser<'_> {
             path.push(segment);
             end = segment_span.end;
         }
+        let mut alias = None;
+        if matches!(self.peek().kind, TokenKind::As) {
+            self.next();
+            let (name, name_span) = self.ident("expected an alias name after `as`")?;
+            alias = Some(name);
+            end = name_span.end;
+        }
         Ok(UseDecl {
             path,
+            alias,
             span: Span { start, end },
         })
     }
@@ -885,7 +1246,10 @@ impl Parser<'_> {
                 code: "R0014",
                 message: "unsupported attribute".into(),
                 span: attribute.span,
-                help: Some("the supported derivable traits are `Clone`, `Eq`, and `Hash`".into()),
+                help: Some(
+                    "the supported derivable traits are `Clone`, `Default`, `Eq`, and `Hash`"
+                        .into(),
+                ),
             });
         }
         self.expect(
@@ -895,13 +1259,14 @@ impl Parser<'_> {
         let mut derives = Vec::new();
         while !matches!(self.peek().kind, TokenKind::RParen | TokenKind::Eof) {
             let (name, span) = self.ident("expected a trait name in `derive`")?;
-            if !matches!(name.as_str(), "Clone" | "Eq" | "Hash") {
+            if !matches!(name.as_str(), "Clone" | "Default" | "Eq" | "Hash") {
                 return Err(Diagnostic {
                     code: "R0014",
                     message: format!("unsupported derive `{name}`"),
                     span,
                     help: Some(
-                        "the supported derivable traits are `Clone`, `Eq`, and `Hash`".into(),
+                        "the supported derivable traits are `Clone`, `Default`, `Eq`, and `Hash`"
+                            .into(),
                     ),
                 });
             }
@@ -1068,6 +1433,7 @@ impl Parser<'_> {
             repr_c,
             drop_function,
             module_path: String::new(),
+            display: String::new(),
             span: Span { start, end },
         })
     }
@@ -1132,6 +1498,9 @@ impl Parser<'_> {
                             fields.push(self.type_name()?);
                             if matches!(self.peek().kind, TokenKind::Comma) {
                                 self.next();
+                                if matches!(self.peek().kind, TokenKind::RParen) {
+                                    break;
+                                }
                             } else {
                                 break;
                             }
@@ -1378,15 +1747,8 @@ impl Parser<'_> {
                     Err(diagnostic) => return Err(diagnostic),
                 }
                 if matches!(self.peek().kind, TokenKind::Comma) {
+                    // A trailing comma before `)` is allowed, as in call arguments.
                     self.next();
-                    if matches!(self.peek().kind, TokenKind::RParen) {
-                        let diagnostic = self.error("expected parameter name");
-                        if self.recovering {
-                            self.recovery_diagnostics.push(diagnostic);
-                            break;
-                        }
-                        return Err(diagnostic);
-                    }
                 } else if matches!(self.peek().kind, TokenKind::RParen | TokenKind::Eof) {
                     break;
                 } else if self.recovering {
@@ -1473,8 +1835,8 @@ impl Parser<'_> {
                 && matches!(self.peek().kind, TokenKind::If)
                 && self.if_expression_reaches_function_end();
             if starts_statement && !is_tail_if_expression {
-                match self.statement() {
-                    Ok(statement) => body.push(statement),
+                match self.statement_into(&mut body) {
+                    Ok(()) => {}
                     Err(diagnostic) if self.recovering => {
                         self.recovery_diagnostics.push(diagnostic);
                         self.synchronize_statement(statement_start, return_type.is_none());
@@ -1702,12 +2064,15 @@ impl Parser<'_> {
                 "expected `;` between the array element type and length",
             )?;
             let length_token = self.next();
-            let TokenKind::Integer(length) = length_token.kind else {
+            let Some(length) = self.array_length(&length_token.kind) else {
                 return Err(Diagnostic {
                     code: "R0012",
                     message: "expected a non-negative integer array length".into(),
                     span: length_token.span,
-                    help: Some("array lengths must be integer literals".into()),
+                    help: Some(
+                        "array lengths must be integer literals or constants declared as one"
+                            .into(),
+                    ),
                 });
             };
             let length = usize::try_from(length).map_err(|_| Diagnostic {
@@ -1846,6 +2211,7 @@ impl Parser<'_> {
                 };
                 Ok(TypeName::Named(internal, span))
             }
+            _ if self.type_bindings.contains_key(&name) => Ok(self.type_bindings[&name].clone()),
             _ if self.generic_type_parameters.contains(&name) => {
                 Ok(TypeName::Parameter(name, span))
             }
@@ -2003,11 +2369,30 @@ impl Parser<'_> {
                 .insert(name.clone(), (template_name.to_owned(), arguments.to_vec()));
             self.generic_struct_placeholder_keys
                 .insert(key, name.clone());
+            // The specializer unifies this placeholder with concrete instances, so it needs
+            // the placeholder's fields; it removes the definition again before analysis.
+            let substitutions = template
+                .type_parameters
+                .iter()
+                .cloned()
+                .zip(arguments.iter().cloned())
+                .collect::<HashMap<_, _>>();
+            let mut placeholder = template;
+            placeholder.name = name.clone();
+            placeholder.type_parameters.clear();
+            placeholder.public = false;
+            placeholder.module_path.clear();
+            for field in &mut placeholder.fields {
+                substitute_type_parameters(&mut field.ty, &substitutions);
+                self.resolve_generic_placeholders(&mut field.ty, &substitutions)?;
+            }
+            self.generic_structs.push(placeholder);
             return Ok(name);
         }
         if let Some(name) = self.generic_struct_keys.get(&key) {
             return Ok(name.clone());
         }
+        let display = key.clone();
         let internal_name = format!(
             "$RynStruct#{}",
             self.generic_struct_keys.len() + self.generic_struct_placeholders.len()
@@ -2024,11 +2409,25 @@ impl Parser<'_> {
         specialized.type_parameters.clear();
         specialized.public = false;
         specialized.module_path.clear();
+        specialized.display = display;
         for field in &mut specialized.fields {
             substitute_type_parameters(&mut field.ty, &substitutions);
             self.resolve_generic_placeholders(&mut field.ty, &substitutions)?;
         }
         self.generic_structs.push(specialized);
+        self.generic_struct_instances.push((
+            template_name.to_owned(),
+            arguments.to_vec(),
+            internal_name.clone(),
+        ));
+        let extensions = self
+            .generic_extends
+            .get(template_name)
+            .cloned()
+            .unwrap_or_default();
+        for extension in extensions {
+            self.instantiate_extend(&extension, arguments, &internal_name)?;
+        }
         Ok(internal_name)
     }
 
@@ -2068,10 +2467,31 @@ impl Parser<'_> {
             if let Some(name) = self.generic_enum_placeholder_keys.get(&key) {
                 return Ok(name.clone());
             }
-            let name = format!("$RynEnumParam#{}", self.generic_enum_placeholders.len());
+            let name = format!(
+                "$RynEnumParam#{template_name}#{}",
+                self.generic_enum_placeholders.len()
+            );
             self.generic_enum_placeholders
                 .insert(name.clone(), (template_name.to_owned(), arguments.to_vec()));
             self.generic_enum_placeholder_keys.insert(key, name.clone());
+            let substitutions = template
+                .type_parameters
+                .iter()
+                .cloned()
+                .zip(arguments.iter().cloned())
+                .collect::<HashMap<_, _>>();
+            let mut placeholder = template;
+            placeholder.name = name.clone();
+            placeholder.type_parameters.clear();
+            placeholder.public = false;
+            placeholder.module_path.clear();
+            for variant in &mut placeholder.variants {
+                for field in &mut variant.fields {
+                    substitute_type_parameters(field, &substitutions);
+                    self.resolve_generic_placeholders(field, &substitutions)?;
+                }
+            }
+            self.generic_enums.push(placeholder);
             return Ok(name);
         }
         if let Some(name) = self.generic_enum_keys.get(&key) {
@@ -2109,6 +2529,14 @@ impl Parser<'_> {
             TypeName::Named(name, _) => {
                 self.generic_struct_placeholders.contains_key(name)
                     || self.generic_enum_placeholders.contains_key(name)
+                    // A tuple is named by its field types, so it is unresolved when a field is.
+                    || self.tuple_type_structs.iter().any(|tuple| {
+                        &tuple.name == name
+                            && tuple
+                                .fields
+                                .iter()
+                                .any(|field| self.contains_unresolved_generic_type(&field.ty))
+                    })
             }
             TypeName::Vec(element, _)
             | TypeName::Set(element, _)
@@ -2193,6 +2621,7 @@ impl Parser<'_> {
                 repr_c: false,
                 drop_function: None,
                 module_path: String::new(),
+                display: String::new(),
                 span,
             });
             name
@@ -2235,12 +2664,14 @@ impl Parser<'_> {
                 | TokenKind::Echo
                 | TokenKind::If
                 | TokenKind::While
+                | TokenKind::Defer
                 | TokenKind::For
                 | TokenKind::Break
                 | TokenKind::Continue
                 | TokenKind::Return
                 | TokenKind::Star
-        ) || self.field_assignment_start()
+        ) || self.unsafe_block_start()
+            || self.field_assignment_start()
             || self.short_declaration_start()
             || self.index_assignment_start()
             || (matches!(self.peek().kind, TokenKind::Ident(_))
@@ -2267,6 +2698,292 @@ impl Parser<'_> {
                     self.tokens.get(self.at + 1).map(|t| &t.kind),
                     Some(TokenKind::LParen | TokenKind::Dot)
                 ))
+            || self.destructure_declaration_start()
+    }
+
+    /// The token index just past a destructuring pattern that starts at `index`.
+    /// A pattern is a binding, a tuple of at least two patterns, or a structure
+    /// pattern `Name { field, mut field, field: pattern }`.
+    fn destructure_pattern_end(&self, index: usize) -> Option<usize> {
+        let kind = |at: usize| self.tokens.get(at).map(|token| &token.kind);
+        match kind(index)? {
+            TokenKind::Ident(_) if !matches!(kind(index + 1), Some(TokenKind::LBrace)) => {
+                Some(index + 1)
+            }
+            TokenKind::Mut if matches!(kind(index + 1), Some(TokenKind::Ident(_))) => {
+                Some(index + 2)
+            }
+            TokenKind::Ident(_) => {
+                let mut at = index + 2;
+                loop {
+                    if matches!(kind(at), Some(TokenKind::RBrace)) {
+                        return Some(at + 1);
+                    }
+                    if matches!(kind(at), Some(TokenKind::DotDot))
+                        && matches!(kind(at + 1), Some(TokenKind::RBrace))
+                    {
+                        return Some(at + 2);
+                    }
+                    if matches!(kind(at), Some(TokenKind::Mut)) {
+                        at += 1;
+                    }
+                    if !matches!(kind(at), Some(TokenKind::Ident(_))) {
+                        return None;
+                    }
+                    at += 1;
+                    if matches!(kind(at), Some(TokenKind::Colon)) {
+                        at = self.destructure_pattern_end(at + 1)?;
+                    }
+                    match kind(at)? {
+                        TokenKind::Comma => at += 1,
+                        TokenKind::RBrace => return Some(at + 1),
+                        _ => return None,
+                    }
+                }
+            }
+            TokenKind::LParen => {
+                let mut at = index + 1;
+                let mut count = 0usize;
+                loop {
+                    at = self.destructure_pattern_end(at)?;
+                    count += 1;
+                    match kind(at)? {
+                        TokenKind::Comma => at += 1,
+                        TokenKind::RParen if count >= 2 => return Some(at + 1),
+                        _ => return None,
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// A tuple or structure pattern followed by `:=` at a statement start.
+    fn destructure_declaration_start(&self) -> bool {
+        let compound = match self.peek().kind {
+            TokenKind::LParen => true,
+            TokenKind::Ident(_) => matches!(
+                self.tokens.get(self.at + 1).map(|token| &token.kind),
+                Some(TokenKind::LBrace)
+            ),
+            _ => false,
+        };
+        compound
+            && self.destructure_pattern_end(self.at).is_some_and(|end| {
+                matches!(
+                    self.tokens.get(end).map(|token| &token.kind),
+                    Some(TokenKind::Define)
+                )
+            })
+    }
+
+    fn consume_mut(&mut self) -> bool {
+        if matches!(self.peek().kind, TokenKind::Mut) {
+            self.next();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Parses the tuple or structure pattern after `:=`'s left side. Every bound
+    /// name becomes a declaration that reads its element of `temporary`. Returns
+    /// the structure name when the pattern names one.
+    fn destructure_body(
+        &mut self,
+        temporary: &str,
+    ) -> Result<(Option<TypeName>, Vec<Statement>), Diagnostic> {
+        let mut annotation = None;
+        let mut statements = Vec::new();
+        if matches!(self.peek().kind, TokenKind::LParen) {
+            self.next();
+            let mut index = 0usize;
+            loop {
+                statements.extend(self.destructure_element(temporary, &format!("_{index}"))?);
+                index += 1;
+                if !matches!(self.peek().kind, TokenKind::Comma) {
+                    break;
+                }
+                self.next();
+            }
+            self.expect(
+                |kind| matches!(kind, TokenKind::RParen),
+                "expected `)` after tuple destructuring names",
+            )?;
+        } else {
+            let (name, span) = self.ident("expected a structure name in destructuring")?;
+            annotation = Some(TypeName::Named(name, span));
+            self.expect(
+                |kind| matches!(kind, TokenKind::LBrace),
+                "expected `{` after the structure name",
+            )?;
+            while !matches!(self.peek().kind, TokenKind::RBrace) {
+                if matches!(self.peek().kind, TokenKind::DotDot) {
+                    // `..` ignores the remaining fields.
+                    self.next();
+                    break;
+                }
+                statements.extend(self.destructure_field(temporary)?);
+                if !matches!(self.peek().kind, TokenKind::Comma) {
+                    break;
+                }
+                self.next();
+            }
+            self.expect(
+                |kind| matches!(kind, TokenKind::RBrace),
+                "expected `}` after structure destructuring fields",
+            )?;
+        }
+        Ok((annotation, statements))
+    }
+
+    /// One field of a structure pattern: `name`, `mut name`, or `name: pattern`.
+    fn destructure_field(&mut self, temporary: &str) -> Result<Vec<Statement>, Diagnostic> {
+        let start = self.peek().span.start;
+        let mutable = self.consume_mut();
+        let (field, field_span) = self.ident("expected a field name in destructuring")?;
+        if matches!(self.peek().kind, TokenKind::Colon) {
+            if mutable {
+                return Err(Diagnostic {
+                    code: "R0010",
+                    message: "`mut` goes before the binding name in a destructuring field".into(),
+                    span: field_span,
+                    help: None,
+                });
+            }
+            self.next();
+            return self.destructure_element(temporary, &field);
+        }
+        let span = Span {
+            start,
+            end: field_span.end,
+        };
+        Ok(vec![Statement::Let {
+            name: field.clone(),
+            mutable,
+            annotation: None,
+            value: Self::destructure_field_access(temporary, &field, span),
+            span,
+        }])
+    }
+
+    /// One element of a tuple or structure pattern, read from `parent.field`.
+    fn destructure_element(
+        &mut self,
+        parent: &str,
+        field: &str,
+    ) -> Result<Vec<Statement>, Diagnostic> {
+        let start = self.peek().span.start;
+        let nested = matches!(self.peek().kind, TokenKind::LParen)
+            || (matches!(self.peek().kind, TokenKind::Ident(_))
+                && matches!(
+                    self.tokens.get(self.at + 1).map(|token| &token.kind),
+                    Some(TokenKind::LBrace)
+                ));
+        if nested {
+            let temporary = format!("__destructure_{start}");
+            let (annotation, mut statements) = self.destructure_body(&temporary)?;
+            let end = self.tokens[self.at - 1].span.end;
+            let span = Span { start, end };
+            statements.insert(
+                0,
+                Statement::Let {
+                    name: temporary.clone(),
+                    mutable: false,
+                    annotation,
+                    value: Self::destructure_field_access(parent, field, span),
+                    span,
+                },
+            );
+            return Ok(statements);
+        }
+        let mutable = self.consume_mut();
+        let (name, name_span) = self.ident("expected a name in destructuring")?;
+        if name == "_" {
+            return Ok(Vec::new());
+        }
+        let span = Span {
+            start,
+            end: name_span.end,
+        };
+        Ok(vec![Statement::Let {
+            name,
+            mutable,
+            annotation: None,
+            value: Self::destructure_field_access(parent, field, span),
+            span,
+        }])
+    }
+
+    /// `pattern := value` for a tuple or structure pattern. The value is stored in
+    /// a temporary, and each bound name is declared from one of its fields.
+    fn destructure_declaration(&mut self) -> Result<Vec<Statement>, Diagnostic> {
+        let start = self.peek().span.start;
+        let temporary = format!("__destructure_{start}");
+        let (annotation, mut statements) = self.destructure_body(&temporary)?;
+        self.expect(
+            |kind| matches!(kind, TokenKind::Define),
+            "expected `:=` after the destructuring pattern",
+        )?;
+        let value = self.expression(0)?;
+        let end = value.span().end;
+        statements.insert(
+            0,
+            Statement::Let {
+                name: temporary,
+                mutable: false,
+                annotation,
+                value,
+                span: Span { start, end },
+            },
+        );
+        Ok(statements)
+    }
+
+    fn destructure_field_access(parent: &str, field: &str, span: Span) -> Expression {
+        Expression::Field {
+            value: Box::new(Expression::Name(parent.to_string(), span)),
+            name: field.to_string(),
+            name_span: span,
+            span,
+        }
+    }
+
+    /// At `?` in `?.name`, where no call follows the name: an optional field
+    /// access. `?.name(...)` and `?.name::<T>(...)` keep the propagation meaning.
+    fn optional_field_follows(&self) -> bool {
+        matches!(
+            self.tokens.get(self.at + 1).map(|token| &token.kind),
+            Some(TokenKind::Dot)
+        ) && matches!(
+            self.tokens.get(self.at + 2).map(|token| &token.kind),
+            Some(TokenKind::Ident(_) | TokenKind::Integer(_))
+        ) && !matches!(
+            self.tokens.get(self.at + 3).map(|token| &token.kind),
+            Some(TokenKind::LParen | TokenKind::ColonColon)
+        )
+    }
+
+    /// Whether the next token is on a later line than the token before it. A
+    /// `(` in that position starts a new statement instead of calling the
+    /// expression above it.
+    fn at_line_start(&self) -> bool {
+        self.at > 0
+            && self
+                .source
+                .get(self.tokens[self.at - 1].span.end..self.peek().span.start)
+                .is_some_and(|gap| gap.contains('\n'))
+    }
+
+    /// Parses one statement and appends it; a destructuring declaration expands
+    /// to several statements.
+    fn statement_into(&mut self, statements: &mut Vec<Statement>) -> Result<(), Diagnostic> {
+        if self.destructure_declaration_start() {
+            statements.extend(self.destructure_declaration()?);
+        } else {
+            statements.push(self.statement()?);
+        }
+        Ok(())
     }
 
     fn starts_expression(&self) -> bool {
@@ -2380,11 +3097,13 @@ impl Parser<'_> {
         match self.peek().kind {
             TokenKind::Mut => self.declaration_statement(),
             TokenKind::Star => self.dereference_assignment(),
+            TokenKind::Ident(_) if self.unsafe_block_start() => self.unsafe_block(),
             TokenKind::Ident(_) if self.short_declaration_start() => self.declaration_statement(),
             TokenKind::Ident(_) if self.index_assignment_start() => self.index_assignment(),
             TokenKind::Echo => self.echo_statement(),
             TokenKind::If => self.if_statement(),
             TokenKind::While => self.while_statement(),
+            TokenKind::Defer => self.defer_statement(),
             TokenKind::For => self.for_statement(),
             TokenKind::Break => Ok(Statement::Break(self.next().span)),
             TokenKind::Continue => Ok(Statement::Continue(self.next().span)),
@@ -2566,9 +3285,53 @@ impl Parser<'_> {
         })
     }
 
+    /// Parses the expression of a `when`/`while`/`for` header, where a `{`
+    /// after a name opens the controlled block instead of a structure literal.
+    fn condition_expression(&mut self) -> Result<Expression, Diagnostic> {
+        let saved = std::mem::replace(&mut self.condition_context, true);
+        let result = self.expression(0);
+        self.condition_context = saved;
+        result
+    }
+
+    /// True when the `{` at the cursor opens a structure literal rather than
+    /// a block. In a condition, `name { field: type = ...` is a declaration
+    /// that starts the block, and `name {}` is an empty block.
+    fn struct_literal_brace_ahead(&self) -> bool {
+        match (
+            self.tokens.get(self.at + 1).map(|token| &token.kind),
+            self.tokens.get(self.at + 2).map(|token| &token.kind),
+        ) {
+            (Some(TokenKind::RBrace), _) => !self.condition_context,
+            (Some(TokenKind::Ident(_)), Some(TokenKind::Colon)) => {
+                !self.condition_context || !self.typed_declaration_after_colon(self.at + 2)
+            }
+            _ => false,
+        }
+    }
+
+    /// Scans from the `:` of `name: value` to the end of that field. An `=`
+    /// before the field ends means the brace opened a declaration block.
+    fn typed_declaration_after_colon(&self, colon: usize) -> bool {
+        let mut depth = 0usize;
+        for token in &self.tokens[colon + 1..] {
+            match token.kind {
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket => depth = depth.saturating_sub(1),
+                TokenKind::RBrace if depth == 0 => return false,
+                TokenKind::RBrace => depth -= 1,
+                TokenKind::Comma if depth == 0 => return false,
+                TokenKind::Equal if depth == 0 => return true,
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn condition_before_block(&mut self) -> Result<(Expression, bool), Diagnostic> {
         let expression_start = self.at;
-        match self.expression(0) {
+        match self.condition_expression() {
             Ok(condition) => Ok((condition, false)),
             Err(diagnostic) if self.recovering => {
                 let brace_consumed = self
@@ -2684,8 +3447,8 @@ impl Parser<'_> {
         let mut statements = Vec::new();
         while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
             let statement_start = self.at;
-            match self.statement() {
-                Ok(statement) => statements.push(statement),
+            match self.statement_into(&mut statements) {
+                Ok(()) => {}
                 Err(diagnostic) if self.recovering => {
                     self.recovery_diagnostics.push(diagnostic);
                     self.synchronize_statement(statement_start, true);
@@ -2698,6 +3461,49 @@ impl Parser<'_> {
             "expected `}` to close block",
         )?;
         Ok(statements)
+    }
+
+    /// `unsafe { ... }` marks code that works with raw pointers. It is optional: the block is an
+    /// ordinary scope, written as `when true { ... }` in the tree.
+    fn unsafe_block_start(&self) -> bool {
+        matches!(&self.peek().kind, TokenKind::Ident(name) if name == "unsafe")
+            && matches!(
+                self.tokens.get(self.at + 1).map(|token| &token.kind),
+                Some(TokenKind::LBrace)
+            )
+    }
+
+    fn unsafe_block(&mut self) -> Result<Statement, Diagnostic> {
+        let keyword = self.next().span;
+        self.expect(
+            |kind| matches!(kind, TokenKind::LBrace),
+            "expected `{` after `unsafe`",
+        )?;
+        let body = self.block_statements_after_open()?;
+        let end = self.tokens[self.at - 1].span.end;
+        Ok(Statement::If {
+            condition: Expression::Boolean(true, keyword),
+            then_body: body,
+            else_body: Vec::new(),
+            span: Span {
+                start: keyword.start,
+                end,
+            },
+        })
+    }
+
+    fn defer_statement(&mut self) -> Result<Statement, Diagnostic> {
+        let start = self.next().span.start;
+        self.expect(
+            |kind| matches!(kind, TokenKind::LBrace),
+            "expected `{` after `defer`",
+        )?;
+        let body = self.block_statements_after_open()?;
+        let end = self.tokens[self.at - 1].span.end;
+        Ok(Statement::Defer {
+            body,
+            span: Span { start, end },
+        })
     }
 
     fn while_statement(&mut self) -> Result<Statement, Diagnostic> {
@@ -2725,17 +3531,15 @@ impl Parser<'_> {
                 |kind| matches!(kind, TokenKind::In),
                 "expected `in` after the `for` loop variable",
             )?;
-            let collection_or_start = self.expression(0)?;
-            if matches!(self.peek().kind, TokenKind::DotDot) {
-                self.next();
-                let range_end = self.expression(0)?;
-                Ok((
-                    name,
-                    name_span,
-                    ForHeader::Range(collection_or_start, range_end),
-                ))
-            } else {
-                Ok((name, name_span, ForHeader::Each(collection_or_start)))
+            // A range expression is a numeric loop; any other value is iterated.
+            match self.condition_expression()? {
+                Expression::Range {
+                    start,
+                    end,
+                    inclusive,
+                    ..
+                } => Ok((name, name_span, ForHeader::Range(*start, *end, inclusive))),
+                collection => Ok((name, name_span, ForHeader::Each(collection))),
             }
         })();
         // A valid expression parser may stop before an unexpected token. Make
@@ -2773,7 +3577,7 @@ impl Parser<'_> {
                 (
                     "_error".into(),
                     error_span,
-                    ForHeader::Range(placeholder, Expression::Integer(0, error_span)),
+                    ForHeader::Range(placeholder, Expression::Integer(0, error_span), false),
                     body,
                 )
             }
@@ -2781,11 +3585,12 @@ impl Parser<'_> {
         };
         let end = self.tokens[self.at - 1].span.end;
         Ok(match header {
-            ForHeader::Range(range_start, range_end) => Statement::For {
+            ForHeader::Range(range_start, range_end, inclusive) => Statement::For {
                 name,
                 name_span,
                 start: range_start,
                 end: range_end,
+                inclusive,
                 body,
                 span: Span { start, end },
             },
@@ -3103,6 +3908,161 @@ impl Parser<'_> {
         Ok(Statement::Print(value, Span { start, end }))
     }
 
+    /// Whether the next tokens spell an integer, character or boolean literal pattern.
+    fn literal_pattern_ahead(&self) -> bool {
+        match self.peek().kind {
+            TokenKind::Integer(_)
+            | TokenKind::Character(_)
+            | TokenKind::True
+            | TokenKind::False => true,
+            TokenKind::Minus => matches!(
+                self.tokens.get(self.at + 1).map(|token| &token.kind),
+                Some(TokenKind::Integer(_))
+            ),
+            _ => false,
+        }
+    }
+
+    /// Whether the next tokens start a tuple, structure, or string pattern.
+    fn compound_pattern_ahead(&self) -> bool {
+        match self.peek().kind {
+            TokenKind::LParen | TokenKind::String(_) => true,
+            TokenKind::Ident(_) => matches!(
+                self.tokens.get(self.at + 1).map(|token| &token.kind),
+                Some(TokenKind::LBrace | TokenKind::FatArrow)
+            ),
+            _ => false,
+        }
+    }
+
+    /// Consumes a literal pattern and returns its canonical text: decimal
+    /// digits with an optional `-`, `'<code point>'` for a character, or
+    /// `true` / `false`.
+    fn literal_pattern_text(&mut self) -> Result<String, Diagnostic> {
+        let negative = matches!(self.peek().kind, TokenKind::Minus);
+        if negative {
+            self.next();
+        }
+        let token = self.next();
+        Ok(match token.kind {
+            TokenKind::Integer(value) if negative => format!("-{value}"),
+            TokenKind::Integer(value) => value.to_string(),
+            TokenKind::Character(ch) => format!("'{}'", u32::from(ch)),
+            TokenKind::True => "true".to_owned(),
+            TokenKind::False => "false".to_owned(),
+            _ => {
+                return Err(Diagnostic {
+                    code: "R0010",
+                    message: "expected a literal pattern".into(),
+                    span: token.span,
+                    help: None,
+                });
+            }
+        })
+    }
+
+    /// One payload position of a variant pattern: a binding name, `_`, a
+    /// literal, or a nested `Enum::Variant(...)` pattern. Anything but a plain
+    /// name is returned as canonical pattern text for the pattern pass.
+    fn sub_pattern(&mut self) -> Result<String, Diagnostic> {
+        if self.literal_pattern_ahead() {
+            return self.literal_pattern_text();
+        }
+        if let TokenKind::String(value) = &self.peek().kind {
+            let bytes = value
+                .bytes()
+                .map(|byte| byte.to_string())
+                .collect::<Vec<_>>()
+                .join(".");
+            self.next();
+            return Ok(format!("\"{bytes}\""));
+        }
+        if matches!(self.peek().kind, TokenKind::LParen) {
+            self.next();
+            let mut text = String::from("(");
+            if !matches!(self.peek().kind, TokenKind::RParen) {
+                loop {
+                    text.push_str(&self.sub_pattern()?);
+                    if matches!(self.peek().kind, TokenKind::Comma) {
+                        self.next();
+                        text.push(',');
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect(
+                |kind| matches!(kind, TokenKind::RParen),
+                "expected `)` after tuple pattern",
+            )?;
+            text.push(')');
+            return Ok(text);
+        }
+        if matches!(self.peek().kind, TokenKind::Ident(_))
+            && matches!(
+                self.tokens.get(self.at + 1).map(|token| &token.kind),
+                Some(TokenKind::LBrace)
+            )
+        {
+            let mut text = self.ident("expected structure name in pattern")?.0;
+            self.next();
+            text.push('{');
+            if !matches!(self.peek().kind, TokenKind::RBrace) {
+                loop {
+                    text.push_str(&self.ident("expected field name in pattern")?.0);
+                    if matches!(self.peek().kind, TokenKind::Colon) {
+                        self.next();
+                        text.push(':');
+                        text.push_str(&self.sub_pattern()?);
+                    }
+                    if matches!(self.peek().kind, TokenKind::Comma) {
+                        self.next();
+                        text.push(',');
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect(
+                |kind| matches!(kind, TokenKind::RBrace),
+                "expected `}` after structure pattern",
+            )?;
+            text.push('}');
+            return Ok(text);
+        }
+        let (first, _) = self.ident("expected binding name")?;
+        if !matches!(self.peek().kind, TokenKind::ColonColon) {
+            return Ok(first);
+        }
+        let mut text = first;
+        while matches!(self.peek().kind, TokenKind::ColonColon) {
+            self.next();
+            text.push_str("::");
+            text.push_str(&self.ident("expected pattern path segment after `::`")?.0);
+        }
+        if matches!(self.peek().kind, TokenKind::LParen) {
+            self.next();
+            text.push('(');
+            if !matches!(self.peek().kind, TokenKind::RParen) {
+                loop {
+                    text.push_str(&self.sub_pattern()?);
+                    if matches!(self.peek().kind, TokenKind::Comma) {
+                        self.next();
+                        text.push(',');
+                    } else {
+                        break;
+                    }
+                }
+            }
+            self.expect(
+                |kind| matches!(kind, TokenKind::RParen),
+                "expected `)` after bindings",
+            )?;
+            text.push(')');
+        }
+        Ok(text)
+    }
+
     fn print_template(
         &self,
         value: &str,
@@ -3244,7 +4204,7 @@ impl Parser<'_> {
         if matches!(self.peek().kind, TokenKind::Semicolon) {
             self.next();
             let length_token = self.next();
-            let TokenKind::Integer(length) = length_token.kind else {
+            let Some(length) = self.array_length(&length_token.kind) else {
                 return Err(Diagnostic {
                     code: "R0012",
                     message: "expected a non-negative integer array length".into(),
@@ -3501,7 +4461,7 @@ impl Parser<'_> {
                         span,
                     )?];
                 }
-                if matches!(self.peek().kind, TokenKind::LParen) {
+                if matches!(self.peek().kind, TokenKind::LParen) && !self.at_line_start() {
                     self.next();
                     let mut arguments = Vec::new();
                     if !matches!(self.peek().kind, TokenKind::RParen) {
@@ -3531,14 +4491,7 @@ impl Parser<'_> {
                         },
                     }
                 } else if matches!(self.peek().kind, TokenKind::LBrace)
-                    && matches!(
-                        self.tokens.get(self.at + 1).map(|token| &token.kind),
-                        Some(TokenKind::Ident(_))
-                    )
-                    && matches!(
-                        self.tokens.get(self.at + 2).map(|token| &token.kind),
-                        Some(TokenKind::Colon)
-                    )
+                    && self.struct_literal_brace_ahead()
                 {
                     self.next();
                     let mut fields = Vec::new();
@@ -3593,7 +4546,7 @@ impl Parser<'_> {
                 kind: TokenKind::Choose,
                 span,
             } => {
-                let value = self.expression(0)?;
+                let value = self.condition_expression()?;
                 self.expect(
                     |kind| matches!(kind, TokenKind::LBrace),
                     "expected `{` after `choose` value",
@@ -3608,6 +4561,12 @@ impl Parser<'_> {
                         ) {
                             self.next();
                             (None, None, Vec::new())
+                        } else if self.literal_pattern_ahead() {
+                            let literal = self.literal_pattern_text()?;
+                            (Some("$lit".to_owned()), Some(literal), Vec::new())
+                        } else if self.compound_pattern_ahead() {
+                            let text = self.sub_pattern()?;
+                            (Some("$pat".to_owned()), Some(text), Vec::new())
                         } else {
                             let (first, _) = self.ident("expected enum name in pattern")?;
                             let mut path = vec![first];
@@ -3660,7 +4619,7 @@ impl Parser<'_> {
                                 self.next();
                                 if !matches!(self.peek().kind, TokenKind::RParen) {
                                     loop {
-                                        bindings.push(self.ident("expected binding name")?.0);
+                                        bindings.push(self.sub_pattern()?);
                                         if matches!(self.peek().kind, TokenKind::Comma) {
                                             self.next();
                                         } else {
@@ -3732,7 +4691,7 @@ impl Parser<'_> {
             Token {
                 kind: TokenKind::Ident(name),
                 span,
-            } if matches!(self.peek().kind, TokenKind::LParen) => {
+            } if matches!(self.peek().kind, TokenKind::LParen) && !self.at_line_start() => {
                 self.next();
                 let mut arguments = Vec::new();
                 let mut closing_consumed = None;
@@ -3806,14 +4765,7 @@ impl Parser<'_> {
                 kind: TokenKind::Ident(name),
                 span,
             } if matches!(self.peek().kind, TokenKind::LBrace)
-                && matches!(
-                    self.tokens.get(self.at + 1).map(|token| &token.kind),
-                    Some(TokenKind::Ident(_))
-                )
-                && matches!(
-                    self.tokens.get(self.at + 2).map(|token| &token.kind),
-                    Some(TokenKind::Colon)
-                ) =>
+                && self.struct_literal_brace_ahead() =>
             {
                 self.next();
                 let mut fields = Vec::new();
@@ -4022,6 +4974,17 @@ impl Parser<'_> {
                     first
                 }
             }
+            token if is_reserved_keyword(&token.kind) => {
+                return Err(Diagnostic {
+                    code: "R0012",
+                    message: format!(
+                        "`{}` is a reserved keyword",
+                        &self.source[token.span.start..token.span.end]
+                    ),
+                    span: token.span,
+                    help: Some("choose a different name for this binding".into()),
+                });
+            }
             token => {
                 return Err(Diagnostic {
                     code: "R0012",
@@ -4056,6 +5019,21 @@ impl Parser<'_> {
                     index: Box::new(index),
                     span: Span { start, end },
                 };
+                continue;
+            }
+            if matches!(self.peek().kind, TokenKind::Question) && self.optional_field_follows() {
+                if postfix_depth >= MAX_EXPRESSION_DEPTH {
+                    return Err(self.nesting_error("optional field access"));
+                }
+                postfix_depth += 1;
+                self.next();
+                self.next();
+                let (name, name_span) = self.field_name_after_dot()?;
+                let span = Span {
+                    start: left.span().start,
+                    end: name_span.end,
+                };
+                left = Expression::optional_field(left, name, name_span, span);
                 continue;
             }
             if matches!(self.peek().kind, TokenKind::Question) {
@@ -4099,7 +5077,7 @@ impl Parser<'_> {
                     start: left.span().start,
                     end: field_span.end,
                 };
-                left = if matches!(self.peek().kind, TokenKind::LParen) {
+                left = if matches!(self.peek().kind, TokenKind::LParen) && !self.at_line_start() {
                     self.next();
                     let mut arguments = Vec::new();
                     while !matches!(self.peek().kind, TokenKind::RParen | TokenKind::Eof) {
@@ -4162,6 +5140,61 @@ impl Parser<'_> {
             {
                 break;
             }
+            // `start..end` and `start..=end` bind looser than arithmetic. The end side
+            // stops before another range, so `a..b..c` is `(a..b)..c`, which the range
+            // checks reject.
+            if matches!(self.peek().kind, TokenKind::DotDot | TokenKind::DotDotEqual) {
+                if min_precedence > 0 {
+                    break;
+                }
+                let inclusive = matches!(self.peek().kind, TokenKind::DotDotEqual);
+                self.next();
+                let end = self.expression(1)?;
+                let span = Span {
+                    start: left.span().start,
+                    end: end.span().end,
+                };
+                left = Expression::Range {
+                    start: Box::new(left),
+                    end: Box::new(end),
+                    inclusive,
+                    span,
+                };
+                continue;
+            }
+            // `|>` and `??` bind loosest, so `a || b ?? c` is `(a || b) ?? c`. Both are
+            // left-associative: the right side stops before another `|>` or `??`.
+            if matches!(
+                self.peek().kind,
+                TokenKind::PipeGreater | TokenKind::QuestionQuestion
+            ) {
+                if min_precedence > 0 {
+                    break;
+                }
+                let pipe = matches!(self.peek().kind, TokenKind::PipeGreater);
+                self.next();
+                let right = self.expression(1)?;
+                let span = Span {
+                    start: left.span().start,
+                    end: right.span().end,
+                };
+                left = if pipe {
+                    Expression::pipe_into(left, right, span).map_err(|(target_span, message)| {
+                        Diagnostic {
+                            code: "R0265",
+                            message,
+                            span: target_span,
+                            help: Some(
+                                "write `value |> function` or `value |> function(arguments)`"
+                                    .into(),
+                            ),
+                        }
+                    })?
+                } else {
+                    Expression::coalesce(left, right, span)
+                };
+                continue;
+            }
             let (op, precedence) = match self.peek().kind {
                 TokenKind::OrOr => (BinaryOp::Or, 1),
                 TokenKind::AndAnd => (BinaryOp::And, 2),
@@ -4203,7 +5236,7 @@ impl Parser<'_> {
     }
 
     fn if_expression(&mut self, start: usize) -> Result<Expression, Diagnostic> {
-        let condition = self.expression(0)?;
+        let condition = self.condition_expression()?;
         let then_value = self.expression_block("expected `{` after when-expression condition")?;
         self.expect(
             |kind| matches!(kind, TokenKind::Else),
@@ -4326,6 +5359,46 @@ impl Parser<'_> {
 
 /// Calls, method calls, and `?` applied to either may stand alone as
 /// statements.
+/// Keywords that cannot be used as names or start an expression.
+fn is_reserved_keyword(kind: &TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Fn
+            | TokenKind::Mut
+            | TokenKind::If
+            | TokenKind::Else
+            | TokenKind::While
+            | TokenKind::For
+            | TokenKind::In
+            | TokenKind::Break
+            | TokenKind::Continue
+            | TokenKind::Return
+            | TokenKind::Echo
+            | TokenKind::Struct
+            | TokenKind::As
+            | TokenKind::Enum
+            | TokenKind::TypeAlias
+            | TokenKind::Use
+            | TokenKind::Namespace
+            | TokenKind::Pub
+            | TokenKind::Extend
+            | TokenKind::Shape
+            | TokenKind::Const
+            | TokenKind::Choose
+            | TokenKind::Defer
+    )
+}
+
+/// `#[derive]` is only meaningful on structs; other declarations would drop it silently.
+fn derive_outside_struct(span: Span) -> Diagnostic {
+    Diagnostic {
+        code: "R0010",
+        message: "`#[derive]` applies only to structs".into(),
+        span,
+        help: Some("move the derive attribute onto a `struct`".into()),
+    }
+}
+
 fn is_call_statement(expression: &Expression) -> bool {
     match expression {
         Expression::Call { .. } | Expression::MethodCall { .. } => true,
@@ -4559,7 +5632,8 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].span.start <= pair[1].span.start)
         );
-        assert!(parse("fun broken(value: i32,) { }").is_err());
+        // A trailing comma before `)` is accepted, as in call arguments.
+        assert!(parse("fun broken(value: i32,) { }").is_ok());
 
         let missing_comma = parse_recovering("fun broken(first: i32 second: i32) { }")
             .expect_err("function parameters still require commas");

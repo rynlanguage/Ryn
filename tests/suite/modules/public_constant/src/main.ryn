@@ -1,0 +1,8 @@
+// test: run
+// out: 50
+// out: 100
+use limits
+fun main() {
+    echo limits::MAX_USERS
+    echo limits::MAX_USERS * 2
+}

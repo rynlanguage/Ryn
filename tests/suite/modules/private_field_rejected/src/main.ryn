@@ -1,0 +1,7 @@
+// test: fail
+// code: R0426
+use util
+fun main() {
+    p := util::make()
+    echo p.secret
+}

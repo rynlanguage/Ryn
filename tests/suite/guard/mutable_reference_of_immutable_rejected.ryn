@@ -1,0 +1,9 @@
+// test: fail
+// code: R0206
+fun set(v: &mut i32) {
+    *v = 1
+}
+fun main() {
+    x: i32 = 1
+    set(&mut x)
+}

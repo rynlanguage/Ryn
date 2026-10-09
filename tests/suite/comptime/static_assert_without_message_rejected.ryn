@@ -1,0 +1,6 @@
+// test: fail
+// msg: static assertion failed
+// code: R0460
+fun main() {
+    static_assert(1 > 2)
+}

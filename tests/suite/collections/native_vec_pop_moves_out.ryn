@@ -1,0 +1,47 @@
+// test: run
+// out: 7
+// out: 30
+// out: 2
+// out: 20
+// out: 10
+// out: -1
+// out: 0
+// out: bob
+// out: 1
+// out: 56
+// out: 0
+// exit: 0
+struct Point {
+    x: i64,
+    y: i64,
+}
+
+fun maybe_point(flag: bool) -> Option<Point> {
+    when flag {
+        return Option::Some(Point { x: 1, y: 2 })
+    }
+    return Option::None
+}
+
+fun main() {
+    echo choose maybe_point(false) { Option::Some(p) => p.x, Option::None => 7 }
+    mut nums: Vec<i64> = Vec()
+    nums.push(10)
+    nums.push(20)
+    nums.push(30)
+    echo choose nums.pop() { Option::Some(x) => x, Option::None => -1 }
+    echo nums.len()
+    echo choose nums.pop() { Option::Some(x) => x, Option::None => -1 }
+    echo choose nums.pop() { Option::Some(x) => x, Option::None => -1 }
+    echo choose nums.pop() { Option::Some(x) => x, Option::None => -1 }
+    echo nums.len()
+    mut names: Vec<String> = Vec()
+    names.push(String("ann"))
+    names.push(String("bob"))
+    echo choose names.pop() { Option::Some(s) => s, Option::None => String("none") }
+    echo names.len()
+    mut points: Vec<Point> = Vec()
+    points.push(Point { x: 5, y: 6 })
+    echo choose points.pop() { Option::Some(p) => p.x * 10 + p.y, Option::None => 0 }
+    echo choose points.pop() { Option::Some(p) => p.x, Option::None => 0 }
+}

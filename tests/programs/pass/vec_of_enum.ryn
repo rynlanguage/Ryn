@@ -1,0 +1,40 @@
+enum Figure {
+    Dot,
+    Circle(i32),
+    Label(String)
+}
+
+fun describe(figure: Figure) -> String {
+    choose figure {
+        Figure::Dot => String("dot"),
+        Figure::Circle(radius) => String(radius),
+        Figure::Label(text) => text
+    }
+}
+
+fun main() {
+    mut figures: Vec<Figure> = Vec()
+    figures.push(Figure::Circle(4))
+    figures.push(Figure::Label(String("tag")))
+    figures.push(Figure::Dot)
+    echo figures.len()
+    echo describe(figures[0])
+
+    copied := figures[1]
+    echo describe(copied)
+
+    figures.set(0, Figure::Circle(9))
+    echo describe(figures[0])
+
+    mut snapshot := figures.clone()
+    figures.set(0, Figure::Dot)
+    echo describe(snapshot[0])
+    echo describe(figures[0])
+
+    popped: Option<Figure> = snapshot.pop()
+    echo choose popped {
+        Option::Some(figure) => describe(figure),
+        Option::None => String("none")
+    }
+    echo snapshot.len()
+}

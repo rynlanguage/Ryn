@@ -1,0 +1,17 @@
+// test: run
+// out: 3
+shape Show {
+    fun show(self) -> i32
+}
+struct A {
+    n: i32
+}
+extend A {
+    fun show(self) -> i32 { self.n }
+}
+fun total<T: Show>(a: T, b: T) -> i32 {
+    a.show() + b.show()
+}
+fun main() {
+    echo total(A { n: 1 }, A { n: 2 })
+}

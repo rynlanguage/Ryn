@@ -1,0 +1,11 @@
+// test: run
+// out: before
+// exit: 1
+// err: wanted ok
+fun bad() -> Result<i32, String> {
+    return Result::Err(String("bad"))
+}
+fun main() {
+    print("before")
+    echo bad().expect("wanted ok")
+}

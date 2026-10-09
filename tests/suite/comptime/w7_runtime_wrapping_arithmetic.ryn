@@ -1,0 +1,32 @@
+// test: run
+// out: 24464
+// out: 24464
+// out: 0
+// out: 1
+// out: -2
+// out: -9223372036854775808
+// out: 44
+// out: 127
+// out: -32768
+// out: 4294967295
+fun main() {
+    mut a: i16 = 300
+    echo a * a
+    mut b: u16 = 300
+    echo b * b
+    mut c: i32 = 65536
+    echo c * c
+    mut d: u32 = 4294967295
+    echo d * d
+    mut e: i64 = 9223372036854775807
+    echo e * 2
+    echo e + 1
+    mut f: u8 = 200
+    echo f + 100
+    mut g: i8 = -128
+    echo g - 1
+    mut h: i16 = -32768
+    echo -h
+    mut k: u32 = 0
+    echo k - 1
+}

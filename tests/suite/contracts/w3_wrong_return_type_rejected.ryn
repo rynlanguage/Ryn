@@ -1,0 +1,16 @@
+// test: fail
+// code: R0450
+shape Show {
+    fun show(self) -> i32
+}
+struct B {
+    n: i32,
+}
+extend B as Show {
+    fun show(self) -> String {
+        String("x")
+    }
+}
+fun main() {
+    echo 1
+}

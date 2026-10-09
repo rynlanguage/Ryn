@@ -1,0 +1,17 @@
+// test: run
+// out: 5
+// out: 9
+enum Shape {
+    Pair(i32, i32,),
+    Single(i32,),
+}
+fun total(value: Shape) -> i32 {
+    return choose value {
+        Shape::Pair(a, b) => a + b,
+        Shape::Single(a) => a,
+    }
+}
+fun main() {
+    echo total(Shape::Pair(2, 3))
+    echo total(Shape::Single(9))
+}

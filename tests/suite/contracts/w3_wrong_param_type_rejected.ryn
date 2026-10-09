@@ -1,0 +1,19 @@
+// test: fail
+// code: R0450
+shape Scale {
+    fun scale(self, k: i32) -> i32
+}
+struct B {
+    n: i32,
+}
+extend B {
+    fun scale(self, k: bool) -> i32 {
+        self.n
+    }
+}
+fun use_it<T: Scale>(a: T) -> i32 {
+    a.scale(2)
+}
+fun main() {
+    echo use_it(B { n: 1 })
+}

@@ -1,0 +1,8 @@
+struct Point {
+    x: i32
+}
+
+fun main() {
+    point := Point { x: 1, x: 2 }
+    echo point.x
+}

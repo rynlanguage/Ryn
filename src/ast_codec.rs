@@ -224,6 +224,9 @@ impl Encoder {
         self.line();
         self.strings(&declaration.path);
         self.span(declaration.span);
+        self.option(declaration.alias.as_ref(), |encoder, name| {
+            encoder.string(name);
+        });
     }
 
     fn struct_def(&mut self, definition: &StructDef) {
@@ -238,6 +241,7 @@ impl Encoder {
         });
         self.strings(&definition.derives);
         self.string(&definition.module_path);
+        self.string(&definition.display);
         self.span(definition.span);
     }
 
@@ -560,15 +564,22 @@ impl Encoder {
                 self.statements(body);
                 self.span(*span);
             }
+            Statement::Defer { body, span } => {
+                self.word("Defer");
+                self.statements(body);
+                self.span(*span);
+            }
             Statement::For {
                 name,
                 name_span,
                 start,
                 end,
+                inclusive,
                 body,
                 span,
             } => {
-                self.word("For");
+                // An inclusive range has its own tag, so the exclusive `For` layout is unchanged.
+                self.word(if *inclusive { "ForInclusive" } else { "For" });
                 self.string(name);
                 self.span(*name_span);
                 self.expression(start);
@@ -688,6 +699,18 @@ impl Encoder {
                 self.expression(value);
                 self.string(name);
                 self.span(*name_span);
+                self.span(*span);
+            }
+            Expression::Range {
+                start,
+                end,
+                inclusive,
+                span,
+            } => {
+                self.word("Range");
+                self.expression(start);
+                self.expression(end);
+                self.boolean(*inclusive);
                 self.span(*span);
             }
             Expression::If {
@@ -995,10 +1018,10 @@ impl<'a> Decoder<'a> {
     }
 
     fn use_decl(&mut self) -> Decoded<UseDecl> {
-        Ok(UseDecl {
-            path: self.strings()?,
-            span: self.span()?,
-        })
+        let path = self.strings()?;
+        let span = self.span()?;
+        let alias = self.option(Self::string)?;
+        Ok(UseDecl { path, alias, span })
     }
 
     fn struct_def(&mut self) -> Decoded<StructDef> {
@@ -1011,6 +1034,7 @@ impl<'a> Decoder<'a> {
             drop_function: self.option(Self::string)?,
             derives: self.strings()?,
             module_path: self.string()?,
+            display: self.string()?,
             span: self.span()?,
         })
     }
@@ -1258,11 +1282,25 @@ impl<'a> Decoder<'a> {
                 body: self.statements()?,
                 span: self.span()?,
             },
+            "Defer" => Statement::Defer {
+                body: self.statements()?,
+                span: self.span()?,
+            },
             "For" => Statement::For {
                 name: self.string()?,
                 name_span: self.span()?,
                 start: self.expression()?,
                 end: self.expression()?,
+                inclusive: false,
+                body: self.statements()?,
+                span: self.span()?,
+            },
+            "ForInclusive" => Statement::For {
+                name: self.string()?,
+                name_span: self.span()?,
+                start: self.expression()?,
+                end: self.expression()?,
+                inclusive: true,
                 body: self.statements()?,
                 span: self.span()?,
             },
@@ -1346,6 +1384,33 @@ impl<'a> Decoder<'a> {
                 right: self.boxed_expression()?,
                 span: self.span()?,
             },
+            // The self-hosted parser sends `|>` and `??` as these tags; they are rewritten
+            // exactly as the bootstrap parser rewrites them, so both trees are identical.
+            "Pipe" => {
+                let value = self.expression()?;
+                let target = self.expression()?;
+                let span = self.span()?;
+                Expression::pipe_into(value, target, span).map_err(|(_, message)| message)?
+            }
+            "Coalesce" => {
+                let value = self.expression()?;
+                let fallback = self.expression()?;
+                let span = self.span()?;
+                Expression::coalesce(value, fallback, span)
+            }
+            "Range" => Expression::Range {
+                start: self.boxed_expression()?,
+                end: self.boxed_expression()?,
+                inclusive: self.boolean()?,
+                span: self.span()?,
+            },
+            "OptionalField" => {
+                let value = self.expression()?;
+                let name = self.string()?;
+                let name_span = self.span()?;
+                let span = self.span()?;
+                Expression::optional_field(value, name, name_span, span)
+            }
             "Negate" => Expression::Negate(self.boxed_expression()?, self.span()?),
             "Not" => Expression::Not(self.boxed_expression()?, self.span()?),
             "BitNot" => Expression::BitNot(self.boxed_expression()?, self.span()?),

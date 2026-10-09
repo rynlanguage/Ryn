@@ -1,0 +1,7 @@
+// test: fail
+// code: R0462
+const A: i32 = B + 1
+const B: i32 = A + 1
+fun main() {
+    echo A
+}

@@ -1,0 +1,10 @@
+// test: run
+// out: 23
+// out: ryn
+fun identity<T>(value: T) -> T {
+    value
+}
+fun main() {
+    echo identity(23 as i32)
+    echo identity(String("ryn"))
+}

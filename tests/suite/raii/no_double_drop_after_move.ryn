@@ -1,0 +1,15 @@
+// test: run
+// out: consumed
+// out: drop 4
+#[drop(rel)]
+struct R { h: *i32, id: i32 }
+fun rel(r: R) { echo "drop {r.id}" }
+fun mk(id: i32, p: *i32) -> R { return R { h: p, id: id } }
+fun consume(r: R) {
+    echo "consumed"
+}
+fun main() {
+    mut x: i32 = 0
+    a := mk(4, &raw mut x)
+    consume(a)
+}

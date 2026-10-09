@@ -1,0 +1,7 @@
+pub struct P {
+    pub open: i32,
+    secret: i32
+}
+pub fun make() -> P {
+    return P { open: 1, secret: 2 }
+}

@@ -1,0 +1,19 @@
+pub const LIMIT: i32 = 10
+pub struct Pair {
+    pub a: i32,
+    pub b: i32
+}
+extend Pair {
+    pub fun sum(self) -> i32 {
+        return self.a + self.b
+    }
+}
+pub shape Summable {
+    fun sum(self) -> i32
+}
+pub fun total<T: Summable>(v: T) -> i32 {
+    return v.sum()
+}
+pub fun first<T>(value: T) -> T {
+    return value
+}

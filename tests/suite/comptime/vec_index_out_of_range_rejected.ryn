@@ -1,0 +1,12 @@
+// test: fail
+// msg: out of range
+// code: R0464
+fun pick() -> u64 {
+    mut v: Vec<u64> = Vec()
+    v.push(1)
+    return v.index(3)
+}
+const BAD: u64 = pick()
+fun main() {
+    echo BAD
+}

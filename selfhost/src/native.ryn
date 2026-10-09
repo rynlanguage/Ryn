@@ -1,0 +1,43 @@
+// The native driver: reads the typed IR of a program (the text `ryn check` writes to `ryn.ir`), generates its code with the Ryn
+// backend (`back/gen.ryn`), and writes the bytes to standard output.
+//
+//     native <ryn.ir>          the relocatable object
+//     native <ryn.ir> exe      a static executable, for a program that needs no C library (the caller marks the file executable)
+//
+// A program outside the backend's subset is declined: the reason goes to standard error and the status is 3.
+
+use middle::ir
+use back::gen
+
+extern "C" fun putchar(value: i32) -> i32;
+
+fun produce(program: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>, String> {
+    when libc {
+        return gen::generate_libc(program)
+    }
+    when executable {
+        return gen::generate_executable(program)
+    }
+    return gen::generate(program)
+}
+
+fun main() -> i32 {
+    text := read_file(arg(0))
+    decoded := ir::decode_ir(text)
+    when decoded.is_err() {
+        eprint("NOT HANDLED: the IR does not decode")
+        return 3
+    }
+    generated := produce(decoded.unwrap(), arg_count() >= 2 && arg(1) == "exe", arg_count() >= 2 && arg(1) == "libc")
+    when generated.is_err() {
+        eprint("NOT HANDLED: {}", generated.unwrap_err())
+        return 3
+    }
+    bytes := generated.unwrap()
+    mut at: u64 = 0
+    while at < bytes.len() {
+        putchar(bytes[at] as i32)
+        at += 1
+    }
+    return 0
+}

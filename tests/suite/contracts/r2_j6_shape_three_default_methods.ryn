@@ -1,0 +1,42 @@
+// test: run
+// out: 10
+// out: 15
+// out: 20
+// out: 2
+// out: 100
+// out: 4
+shape Gauge {
+    fun level(self) -> i32
+    fun doubled(self) -> i32 => self.level() * 2
+    fun tripled(self) -> i32 => self.level() * 3
+    fun quadrupled(self) -> i32 => self.level() * 4
+}
+struct Meter {
+    v: i32,
+}
+extend Meter {
+    fun level(self) -> i32 {
+        return self.v
+    }
+}
+struct Dial {
+    v: i32,
+}
+extend Dial {
+    fun level(self) -> i32 {
+        return self.v
+    }
+    fun tripled(self) -> i32 {
+        return 100
+    }
+}
+fun main() {
+    m := Meter { v: 5 }
+    echo m.doubled()
+    echo m.tripled()
+    echo m.quadrupled()
+    d := Dial { v: 1 }
+    echo d.doubled()
+    echo d.tripled()
+    echo d.quadrupled()
+}

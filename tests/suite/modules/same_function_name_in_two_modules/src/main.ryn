@@ -1,0 +1,9 @@
+// test: run
+// out: 1
+// out: 2
+use first
+use second
+fun main() {
+    echo first::value()
+    echo second::value()
+}

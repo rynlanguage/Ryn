@@ -1,0 +1,10 @@
+// test: fail
+// code: R0248
+fun leak() -> *i32 {
+    mut x: i32 = 5
+    return &raw mut x
+}
+fun main() {
+    p := leak()
+    echo *p
+}

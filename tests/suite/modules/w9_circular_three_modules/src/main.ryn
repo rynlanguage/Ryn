@@ -1,0 +1,6 @@
+// test: fail
+// code: R0427
+use ring::one
+fun main() {
+    echo one::f()
+}

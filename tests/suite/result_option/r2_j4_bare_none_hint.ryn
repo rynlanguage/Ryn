@@ -1,0 +1,7 @@
+// test: fail
+// code: R0203
+// msg: write the empty option as `Option::None`
+fun main() {
+    x := None
+    echo 1
+}

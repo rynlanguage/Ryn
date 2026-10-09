@@ -1,0 +1,50 @@
+// test: run
+// out: 5
+// out: a
+// out: b
+// out:
+// out: c
+// out:
+// out: 2
+// out: a,b
+// out: c,
+// out: 2
+// out:
+// out: x
+// out: 2
+// out: héllo
+// out: wörld
+// out: 5
+// out:
+// out: h
+// out: é
+// out: y
+// out:
+// out: 1
+// out: abc
+// out: 1
+// out:
+// out: 2
+// out: aXb
+// out: c
+// exit: 0
+fun dump(parts: Vec<String>) {
+    echo parts.len()
+    mut i: u64 = 0
+    while i < parts.len() {
+        echo parts.index(i)
+        i += 1
+    }
+}
+
+fun main() {
+    text := String("a,b,,c,")
+    dump(text.split(","))
+    dump(text.split(String(",,")))
+    dump(String(",x").split(","))
+    dump(String("héllo wörld").split(" "))
+    dump(String("héy").split(""))
+    dump(String("abc").split("x"))
+    dump(String("").split(","))
+    dump(String("aXbXXc").split(String("XX")))
+}

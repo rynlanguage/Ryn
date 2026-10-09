@@ -1,0 +1,8 @@
+// test: run
+// out: boom
+fun err() -> Result<i32, String> {
+    return Result::Err(String("boom"))
+}
+fun main() {
+    echo err().unwrap_err()
+}

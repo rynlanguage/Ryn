@@ -1,0 +1,11 @@
+struct B {
+    n: i32,
+}
+
+fun f<T: Missing>(x: T) -> i32 {
+    return 1
+}
+
+fun main() {
+    echo f(B { n: 1 })
+}

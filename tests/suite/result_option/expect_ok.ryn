@@ -1,0 +1,8 @@
+// test: run
+// out: 5
+fun ok() -> Result<i32, String> {
+    return Result::Ok(5)
+}
+fun main() {
+    echo ok().expect("must succeed")
+}

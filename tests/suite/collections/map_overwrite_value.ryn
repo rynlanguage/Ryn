@@ -1,0 +1,10 @@
+// test: run
+// out: 1
+// out: 11
+fun main() {
+    mut m := Map<i32, i32>()
+    m.insert(1, 10)
+    m.insert(1, 11)
+    echo m.len()
+    echo choose m.get(1) { Option::Some(v) => v, Option::None => 0 }
+}

@@ -1,0 +1,24 @@
+// test: run
+// out: 100000
+// out: 0
+#[drop(bump)]
+struct Counter { h: *i64 }
+fun bump(c: Counter) {
+    *c.h = *c.h + 1
+}
+fun main() {
+    mut hits: i64 = 0
+    mut m := Map<i64, Counter>()
+    mut i: i64 = 0
+    while i < 100000 {
+        m.insert(i, Counter { h: &raw mut hits })
+        i += 1
+    }
+    mut j: i64 = 0
+    while j < 100000 {
+        m.remove(j)
+        j += 1
+    }
+    echo hits
+    echo m.len()
+}

@@ -1,0 +1,10 @@
+// test: run
+// out: debug
+const DEBUG: bool = true
+fun main() {
+    when DEBUG {
+        echo "debug"
+    } else {
+        x: i32 = "text"
+    }
+}

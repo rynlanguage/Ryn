@@ -1,0 +1,26 @@
+// test: run
+// out: true
+// out: true
+// out: true
+// out: true
+// out: 3
+// exit: 0
+struct Label {
+    name: str,
+    id: i64,
+}
+
+fun is_hello(text: str) -> bool {
+    return text == "hello"
+}
+
+fun main() {
+    lbl := Label { name: "hello", id: 3 }
+    echo is_hello(lbl.name)
+    echo lbl.name == "hello"
+    copied := lbl.name
+    echo copied == "hello"
+    other := Label { name: "bye", id: 1 }
+    echo other.name != lbl.name
+    echo lbl.id
+}

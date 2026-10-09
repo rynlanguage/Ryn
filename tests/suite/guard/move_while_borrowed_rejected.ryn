@@ -1,0 +1,8 @@
+// test: fail
+// code: R0249
+fun main() {
+    mut s := String("a")
+    r := &s
+    t := s
+    echo 1
+}

@@ -1,0 +1,44 @@
+// test: run
+// out: true
+// out: 0
+// out: 294
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(p: *u8);
+extern "C" fun qsort(base: *u8, count: u64, size: u64, compare: extern "C" fun(*u8, *u8) -> i32);
+fun by_value(a: *u8, b: *u8) -> i32 {
+    x := *(a as *i32)
+    y := *(b as *i32)
+    when x < y {
+        return -1
+    }
+    when x > y {
+        return 1
+    }
+    return 0
+}
+fun main() {
+    n := 300
+    buf := malloc((n * 4) as u64)
+    base := buf as u64
+    mut i := 0
+    while i < n {
+        p := (base + (i * 4) as u64) as *i32
+        *p = ((n - i) * 7 % 301) as i32
+        i += 1
+    }
+    qsort(buf, n as u64, 4 as u64, by_value)
+    mut ok := true
+    mut k := 1
+    while k < n {
+        a := *((base + ((k - 1) * 4) as u64) as *i32)
+        b := *((base + (k * 4) as u64) as *i32)
+        when a > b {
+            ok = false
+        }
+        k += 1
+    }
+    echo ok
+    echo *(buf as *i32)
+    echo *((base + ((n - 1) * 4) as u64) as *i32)
+    free(buf)
+}

@@ -1,0 +1,68 @@
+// test: run
+// out: 6
+// out: 4 5 6
+// out: 42
+// out: 1 2 3
+// out: 5
+// out: 100
+// out: 50
+// out: 100
+// out: 5
+// out: 100
+// out: 5
+// out: 5
+// out: 45
+// out: 114
+// out: false
+// out: 0
+// out: true
+// out: 5
+// exit: 0
+struct Shape { id: i64, w: i64, h: i64 }
+
+fun area(s: Shape) -> i64 {
+    return s.w * s.h
+}
+
+fun main() {
+    mut shapes: Vec<Shape> = Vec()
+    mut i: i64 = 0
+    while i < 6 {
+        shapes.push(Shape { id: i, w: i + 1, h: i + 2 })
+        i += 1
+    }
+    echo shapes.len()
+    s := shapes.index(4)
+    print("{} {} {}", s.id, s.w, s.h)
+    echo area(shapes.index(5))
+    shapes.set(0, Shape { id: 100, w: 2, h: 3 })
+    t := shapes.take(1)
+    print("{} {} {}", t.id, t.w, t.h)
+    echo shapes.len()
+    echo shapes.index(0).id
+    shapes.insert(0, Shape { id: 50, w: 1, h: 1 })
+    echo shapes.index(0).id
+    echo shapes.index(1).id
+    shapes.take(0)
+    echo shapes.len()
+    echo shapes.index(0).id
+    copied := shapes.clone()
+    echo copied.len()
+    echo copied.index(4).id
+    mut total: i64 = 0
+    for k in 0..shapes.len() {
+        cell := shapes.index(k)
+        total += cell.w + cell.h
+    }
+    echo total
+    mut seen: i64 = 0
+    for item in shapes.clone() {
+        seen += item.id
+    }
+    echo seen
+    echo shapes.is_empty()
+    shapes.clear()
+    echo shapes.len()
+    echo shapes.is_empty()
+    echo copied.len()
+}

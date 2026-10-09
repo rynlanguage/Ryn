@@ -1,0 +1,9 @@
+// test: fail
+struct Pair<T> {
+    first: T,
+    second: T
+}
+fun main() {
+    p := Pair::<i32> { first: 1, second: true }
+    echo p.first
+}

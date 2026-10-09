@@ -1,0 +1,13 @@
+// test: fail
+// code: R0255
+#[drop(done)]
+struct Named { h: *i32, label: String }
+fun done(n: Named) {
+    echo "released"
+}
+fun main() {
+    mut x: i32 = 0
+    n := Named { h: &raw mut x, label: String("file") }
+    taken := n.label
+    echo taken
+}

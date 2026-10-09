@@ -1,0 +1,17 @@
+// test: run
+// out: outer begin
+// out: end
+// out: drop 2
+// out: drop 1
+#[drop(rel)]
+struct R { h: *i64, id: i64 }
+fun rel(r: R) { echo "drop {r.id}" }
+fun mk(id: i64, p: *i64) -> R { return R { h: p, id: id } }
+struct Pair { first: R, second: R }
+fun main() {
+    mut x: i64 = 0
+    p := &raw mut x
+    pr := Pair { first: mk(1, p), second: mk(2, p) }
+    echo "outer begin"
+    echo "end"
+}

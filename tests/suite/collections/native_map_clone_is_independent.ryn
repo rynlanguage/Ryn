@@ -1,0 +1,40 @@
+// test: run
+// out: 100
+// out: 99
+// out: v
+// out: changed
+// out: v
+// out: false
+// out: 300
+// out: 1
+// out: 999
+// out: 99
+fun main() {
+    mut m := Map<String, String>()
+    mut i: i64 = 0
+    while i < 100 {
+        m.insert(String(i), String("v") )
+        i += 1
+    }
+    mut copy := m.clone()
+    m.insert(String(5), String("changed"))
+    m.remove(String(6))
+    echo copy.len()
+    echo m.len()
+    echo choose copy.get(String(5)) { Option::Some(v) => v, Option::None => String("none") }
+    echo choose m.get(String(5)) { Option::Some(v) => v, Option::None => String("none") }
+    echo choose copy.get(String(6)) { Option::Some(v) => v, Option::None => String("none") }
+    echo m.contains_key(String(6))
+    mut n := Map<i64, i64>()
+    mut j: i64 = 0
+    while j < 300 {
+        n.insert(j * 3, j)
+        j += 1
+    }
+    mut nc := n.clone()
+    nc.insert(3, 999)
+    echo nc.len()
+    echo choose n.get(3) { Option::Some(v) => v, Option::None => -1 }
+    echo choose nc.get(3) { Option::Some(v) => v, Option::None => -1 }
+    echo choose nc.get(297) { Option::Some(v) => v, Option::None => -1 }
+}

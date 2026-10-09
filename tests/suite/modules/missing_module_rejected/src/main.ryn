@@ -1,0 +1,6 @@
+// test: fail
+// code: R0420
+use nothing
+fun main() {
+    echo 1
+}

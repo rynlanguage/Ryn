@@ -1,0 +1,17 @@
+// test: run
+// out: 7
+// out: 2.5
+// out: 16
+use std::arena
+struct Node {
+    id: i32,
+    weight: f64
+}
+fun main() {
+    mut a := arena::Arena::with_capacity(128 as u64)
+    n := arena::alloc(&mut a, Node { id: 7, weight: 2.5 })
+    node := *n
+    echo node.id
+    echo node.weight
+    echo a.used()
+}

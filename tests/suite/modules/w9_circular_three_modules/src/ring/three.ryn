@@ -1,0 +1,4 @@
+use ring::one
+pub fun h() -> i32 {
+    return one::f()
+}

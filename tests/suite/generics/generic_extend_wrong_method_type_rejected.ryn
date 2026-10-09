@@ -1,0 +1,11 @@
+// test: fail
+struct Stack<T> { items: Vec<T> }
+extend<T> Stack<T> {
+    pub fun push_item(mut self, v: T) { self.items.push(v) }
+    pub fun size(self) -> u64 { return self.items.len() }
+    pub fun top(self) -> T { return self.items.index(self.items.len() - 1) }
+}
+fun main() {
+    mut s := Stack::<i32> { items: Vec<i32>() }
+    s.push_item(true)
+}

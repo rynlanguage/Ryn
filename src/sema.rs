@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     ast::{
-        BinaryOp, EnumDef, Expression, Function, PrintPart, Program, ShapeDef, Statement,
-        StructDef, TypeName, VariantDef,
+        BinaryOp, ChooseArm, EnumDef, Expression, Function, PrintPart, Program, ShapeDef,
+        Statement, StructDef, TypeName, VariantDef,
     },
     filesystem_ops::FilesystemOp,
     map_ops::MapOp,
@@ -92,6 +92,25 @@ fn is_c_abi_parameter(ty: Type, structs: &[RynStruct]) -> bool {
     is_c_abi_scalar(ty)
         || matches!(ty, Type::Char | Type::RawPointer(_))
         || is_c_abi_record(ty, structs)
+        || is_c_callback(ty, structs)
+}
+
+/// A callback parameter: a pointer to an `extern "C"` function whose own signature is C-compatible.
+fn is_c_callback(ty: Type, structs: &[RynStruct]) -> bool {
+    let Type::FunctionPointer(id) = ty else {
+        return false;
+    };
+    let signature = function_pointer_info(id);
+    signature.extern_c
+        && signature
+            .parameters
+            .iter()
+            .all(|ty| is_c_abi_scalar(*ty) || matches!(ty, Type::Char | Type::RawPointer(_)))
+        && signature.result.is_none_or(|ty| {
+            is_c_abi_scalar(ty)
+                || matches!(ty, Type::Char | Type::RawPointer(_))
+                || is_c_abi_record(ty, structs)
+        })
 }
 
 fn signature_has_record(signature: &FunctionPointerSignature) -> bool {
@@ -129,7 +148,8 @@ fn c_abi_packed_record_layout(
         aggregate_align = aggregate_align.max(align);
     }
     let size = align_up(offset, aggregate_align);
-    matches!(size, 1 | 2 | 4 | 8).then_some((size, layout))
+    (matches!(size, 1 | 2 | 4 | 8) || (cfg!(not(windows)) && (9..=16).contains(&size)))
+        .then_some((size, layout))
 }
 
 fn c_abi_scalar_field_layout(ty: Type) -> Option<(usize, usize)> {
@@ -549,6 +569,8 @@ pub enum IrExpression {
         success_variant: usize,
         failure_variant: usize,
         output_failure_variant: usize,
+        // `defer` bodies that the early return leaves, run before the function returns.
+        deferred: Vec<IrStatement>,
     },
     ArrayValue(Vec<IrExpression>),
     /// One evaluated element, replicated `length` times. The element is copyable.
@@ -682,6 +704,8 @@ pub enum IrStatement {
         ty: Type,
         start: IrExpression,
         end: IrExpression,
+        // `start..=end` includes `end`; codegen stops before incrementing past it.
+        inclusive: bool,
         body: Vec<IrStatement>,
     },
     Break,
@@ -833,6 +857,24 @@ struct Binding {
     mutable: bool,
 }
 
+// A `defer` body with the names that were visible where it was written. It is lowered again
+// at every place it runs, always with that same name environment.
+#[derive(Clone)]
+struct DeferredBody {
+    body: Vec<Statement>,
+    names: HashMap<String, Binding>,
+}
+
+// An exit statement preceded by the `defer` bodies that it leaves; a plain exit when none.
+fn exit_after(leaving: Vec<IrStatement>, exit: IrStatement) -> IrStatement {
+    if leaving.is_empty() {
+        return exit;
+    }
+    let mut statements = leaving;
+    statements.push(exit);
+    IrStatement::Block(statements)
+}
+
 type LoweredMethod = Result<Option<(IrCallTarget, Vec<IrExpression>, Option<Type>)>, Diagnostic>;
 
 #[derive(Clone)]
@@ -927,6 +969,9 @@ fn analyze_with_recovery(
     recover_errors: bool,
 ) -> Result<RynIr, Vec<Diagnostic>> {
     program = crate::generics::monomorphize(program).map_err(|diagnostic| vec![diagnostic])?;
+    crate::comptime::evaluate(&mut program).map_err(|diagnostic| vec![diagnostic])?;
+    crate::comptime::derive_defaults(&mut program).map_err(|diagnostic| vec![diagnostic])?;
+    crate::patterns::desugar(&mut program).map_err(|diagnostic| vec![diagnostic])?;
     if !program.enums.iter().any(is_option_u64_ast) {
         program.enums.push(EnumDef {
             name: "$RynOption#FindU64".into(),
@@ -1169,7 +1214,7 @@ fn analyze_with_recovery(
     }
     for import in &program.uses {
         let module_path = import.path.join("::");
-        let Some(alias) = import.path.last() else {
+        let Some(alias) = import.local_name() else {
             continue;
         };
         for (index, definition) in program
@@ -1309,7 +1354,7 @@ fn analyze_with_recovery(
     }
     let mut structs = resolve_struct_layouts(&program.structs, &struct_ids, &enum_ids)
         .map_err(|error| vec![error])?;
-    let enums = resolve_enum_layouts(&program.enums, &structs, &struct_ids, &enum_ids)
+    let mut enums = resolve_enum_layouts(&program.enums, &structs, &struct_ids, &enum_ids)
         .map_err(|error| vec![error])?;
     for definition in &structs {
         for field in &definition.fields {
@@ -1440,14 +1485,14 @@ fn analyze_with_recovery(
     }
     for import in &program.uses {
         let module_path = import.path.join("::");
-        let Some(alias) = import.path.last() else {
+        let Some(alias) = import.local_name() else {
             continue;
         };
         let prefix = format!("{module_path}::");
         for function in program
             .functions
             .iter()
-            .filter(|function| function.public && function.module_path == module_path)
+            .filter(|function| function.module_path == module_path)
         {
             let Some(suffix) = function.name.strip_prefix(&prefix) else {
                 continue;
@@ -1660,6 +1705,7 @@ fn analyze_with_recovery(
                 .with_help("add a top-level `fun main() { ... }` function"),
         ]);
     };
+    validate_shape_declarations(&program.shapes).map_err(|diagnostic| vec![diagnostic])?;
     let shape_table = build_shape_table(&program.shapes, &struct_ids, &enum_ids);
     for extend in &program.extends {
         let Some(shape_name) = &extend.as_shape else {
@@ -1718,7 +1764,7 @@ fn analyze_with_recovery(
             &signatures,
             &mut structs,
             &struct_ids,
-            &enums,
+            &mut enums,
             &enum_ids,
             &function_module_paths,
             &function_visibility,
@@ -1751,6 +1797,34 @@ fn analyze_with_recovery(
     Ok(ir)
 }
 
+/// Rejects shapes that are declared twice in one module or that list a method twice.
+fn validate_shape_declarations(shapes: &[ShapeDef]) -> Result<(), Diagnostic> {
+    let mut seen = HashSet::new();
+    for shape in shapes {
+        if !seen.insert((shape.module_path.clone(), shape.name.clone())) {
+            return Err(diag(
+                "R0453",
+                format!("shape `{}` is declared more than once", shape.name),
+                shape.span,
+            ));
+        }
+        let mut methods = HashSet::new();
+        for method in &shape.methods {
+            if !methods.insert(method.name.as_str()) {
+                return Err(diag(
+                    "R0453",
+                    format!(
+                        "shape `{}` requires method `{}` more than once",
+                        shape.name, method.name
+                    ),
+                    shape.span,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_shape_table(
     shapes: &[ShapeDef],
     struct_ids: &HashMap<String, usize>,
@@ -1774,17 +1848,19 @@ fn build_shape_table(
             let mut parameter_types = Vec::new();
             let mut self_mutable = false;
             for (index, parameter) in method.parameters.iter().enumerate() {
+                // A shape's receiver is typed `Self`, which only resolves at conformance time,
+                // so its mutability is read from the written type.
+                if index == 0 && parameter.name == "self" {
+                    if let TypeName::Reference(_, mutable, _) = &parameter.ty {
+                        self_mutable = *mutable;
+                    }
+                    continue;
+                }
                 let resolved =
                     resolve_type_name_scoped(&parameter.ty, struct_ids, enum_ids, namespace);
                 let Ok(resolved) = resolved else {
                     continue;
                 };
-                if index == 0 && parameter.name == "self" {
-                    if let Type::Reference(_, mutable) = resolved {
-                        self_mutable = mutable;
-                    }
-                    continue;
-                }
                 parameter_types.push(resolved);
             }
             let return_type = method.return_type.as_ref().and_then(|name| {
@@ -1935,17 +2011,16 @@ fn materialize_shape_defaults(
             {
                 continue;
             }
-            for (method_name, requirement) in requirements {
+            // Walk the shape's declared methods so default functions get stable
+            // indices; iterating the requirement map would vary between runs.
+            for method in &shape.methods {
+                let method_name = &method.name;
+                let Some(requirement) = requirements.get(method_name) else {
+                    continue;
+                };
                 if struct_has_method(definition, method_name, signatures) {
                     continue;
                 }
-                let Some(method) = shape
-                    .methods
-                    .iter()
-                    .find(|method| &method.name == method_name)
-                else {
-                    continue;
-                };
                 let (default_body, default_value) =
                     match (&method.default_body, &method.default_value) {
                         (Some(body), _) => (body.clone(), None),
@@ -2164,12 +2239,18 @@ struct Analyzer<'a> {
     signatures: &'a HashMap<String, FunctionSignature>,
     structs: &'a mut Vec<RynStruct>,
     struct_ids: &'a HashMap<String, usize>,
-    enums: &'a [RynEnum],
+    enums: &'a mut Vec<RynEnum>,
     enum_ids: &'a HashMap<String, usize>,
     function_module_paths: &'a [String],
     function_visibility: &'a [bool],
     shapes: &'a ShapeTable,
     loop_depth: usize,
+    // `defer` blocks waiting for their enclosing block to end, one frame per open block.
+    defer_frames: Vec<Vec<DeferredBody>>,
+    // For each open loop, the index of the first frame that belongs to its body.
+    loop_defer_bases: Vec<usize>,
+    // Non-zero while a `defer` body is being lowered: control may not leave it.
+    defer_nesting: usize,
     function_name: String,
     module_path: String,
     return_type: Option<Type>,
@@ -2181,12 +2262,79 @@ struct Analyzer<'a> {
 }
 
 impl<'a> Analyzer<'a> {
+    /// The `Option<payload>` enum. It is created the first time the program
+    /// uses a payload type without an expected `Option` type.
+    fn option_enum_for(&mut self, payload: Type) -> usize {
+        if let Some(enum_id) = self
+            .enums
+            .iter()
+            .position(|definition| is_option_of(definition, payload))
+        {
+            return enum_id;
+        }
+        let enum_id = self.enums.len();
+        self.enums.push(RynEnum {
+            name: format!("$RynOption#inferred{enum_id}"),
+            variants: vec![
+                RynEnumVariant {
+                    name: "Some".into(),
+                    fields: vec![payload],
+                },
+                RynEnumVariant {
+                    name: "None".into(),
+                    fields: Vec::new(),
+                },
+            ],
+        });
+        enum_id
+    }
+
+    /// The structure that holds a range of `elem` values: `start`, `end` and
+    /// `inclusive`. It is created the first time the program builds such a range.
+    fn range_struct_for(&mut self, elem: Type) -> usize {
+        if let Some(struct_id) = self.structs.iter().position(|definition| {
+            definition.name.starts_with("$RynRange#")
+                && definition.fields.len() == 3
+                && definition.fields[0].ty == elem
+                && definition.fields[1].ty == elem
+                && definition.fields[2].ty == Type::Bool
+        }) {
+            return struct_id;
+        }
+        let mut slot_offset = 0;
+        let fields = [("start", elem), ("end", elem), ("inclusive", Type::Bool)]
+            .into_iter()
+            .map(|(name, ty)| {
+                let field = RynStructField {
+                    name: name.into(),
+                    ty,
+                    slot_offset,
+                    public: true,
+                };
+                slot_offset += storage_slot_width(ty, self.structs);
+                field
+            })
+            .collect();
+        let struct_id = self.structs.len();
+        self.structs.push(RynStruct {
+            name: format!("$RynRange#inferred{struct_id}"),
+            fields,
+            slot_count: slot_offset,
+            repr_c: false,
+            drop_function: None,
+            derives_clone: false,
+            derives_hash: false,
+            module_path: String::new(),
+        });
+        struct_id
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         signatures: &'a HashMap<String, FunctionSignature>,
         structs: &'a mut Vec<RynStruct>,
         struct_ids: &'a HashMap<String, usize>,
-        enums: &'a [RynEnum],
+        enums: &'a mut Vec<RynEnum>,
         enum_ids: &'a HashMap<String, usize>,
         function_module_paths: &'a [String],
         function_visibility: &'a [bool],
@@ -2207,6 +2355,9 @@ impl<'a> Analyzer<'a> {
             function_visibility,
             shapes,
             loop_depth: 0,
+            defer_frames: Vec::new(),
+            loop_defer_bases: Vec::new(),
+            defer_nesting: 0,
             function_name: String::new(),
             module_path: String::new(),
             return_type: None,
@@ -2302,8 +2453,14 @@ impl<'a> Analyzer<'a> {
             });
         }
         let (parameters, body_always_returns) = self.prepare_function(&function)?;
-        let statements = self.block(std::mem::take(&mut function.body))?;
-        self.finish_function(function, parameters, body_always_returns, statements)
+        let (statements, deferred) = self.lower_statements(std::mem::take(&mut function.body))?;
+        self.finish_function(
+            function,
+            parameters,
+            body_always_returns,
+            statements,
+            deferred,
+        )
     }
 
     fn function_recovering(
@@ -2317,14 +2474,20 @@ impl<'a> Analyzer<'a> {
             .prepare_function(&function)
             .map_err(|error| vec![error])?;
         self.recover_block_errors = true;
-        let (statements, top_level_declaration_failed) =
-            self.recover_block(std::mem::take(&mut function.body), true);
+        let (statements, top_level_declaration_failed, deferred) =
+            self.recover_statements(std::mem::take(&mut function.body), true);
         let mut diagnostics = std::mem::take(&mut self.recovery_diagnostics);
         if top_level_declaration_failed {
             diagnostics.sort_by_key(|diagnostic| diagnostic.span.start);
             return Err(diagnostics);
         }
-        let finished = self.finish_function(function, parameters, body_always_returns, statements);
+        let finished = self.finish_function(
+            function,
+            parameters,
+            body_always_returns,
+            statements,
+            deferred,
+        );
         diagnostics.extend(std::mem::take(&mut self.recovery_diagnostics));
         match finished {
             Ok(function) if diagnostics.is_empty() => Ok(function),
@@ -2388,6 +2551,18 @@ impl<'a> Analyzer<'a> {
             if bounds.is_empty() {
                 continue;
             }
+            for shape_name in bounds {
+                if self.shapes.get(shape_name).is_none() {
+                    return Err(diag(
+                        "R0452",
+                        format!("unknown shape `{shape_name}` in the bound on `{type_name}`"),
+                        function.span,
+                    )
+                    .with_help(
+                        "declare the shape with `shape Name { ... }` before using it as a bound",
+                    ));
+                }
+            }
             let Some(struct_id) = self.scoped_struct_id(type_name) else {
                 continue;
             };
@@ -2414,9 +2589,13 @@ impl<'a> Analyzer<'a> {
         parameters: Vec<LocalBinding>,
         body_always_returns: bool,
         mut statements: Vec<IrStatement>,
+        deferred: Vec<DeferredBody>,
     ) -> Result<RynFunction, Diagnostic> {
         let return_type = self.return_type;
-        let return_value = match (return_type, function.return_value) {
+        // The function's own `defer` blocks stay pending while the result is lowered, so a `?`
+        // in the result expression runs them too.
+        self.defer_frames.push(deferred.clone());
+        let mut return_value = match (return_type, function.return_value) {
             (Some(expected), Some(value)) => {
                 let span = value.span();
                 let (value, actual) = self.expression(value, Some(expected))?;
@@ -2474,6 +2653,30 @@ impl<'a> Analyzer<'a> {
             }
             (None, None) => None,
         };
+        self.defer_frames.pop();
+        if !deferred.is_empty() {
+            // The result is computed first, so the deferred bodies run after it and cannot change it.
+            let leaving = self.lower_frame(deferred)?;
+            return_value = match return_value {
+                Some(value) => {
+                    let ty = return_type.expect("a function result has a declared type");
+                    let slot = self.allocate(ty);
+                    statements.push(IrStatement::Let {
+                        slot,
+                        ty,
+                        value,
+                        span: function.span,
+                    });
+                    Some(IrExpression::Local {
+                        slot,
+                        ty,
+                        span: function.span,
+                    })
+                }
+                None => None,
+            };
+            statements.extend(leaving);
+        }
         let mut returned_reference_parameters = Vec::new();
         collect_reference_returns(&statements, &parameters, &mut returned_reference_parameters);
         if let Some(value) = &return_value {
@@ -2605,12 +2808,37 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn enter_loop(&mut self) {
+        self.loop_depth += 1;
+        self.loop_defer_bases.push(self.defer_frames.len());
+    }
+
+    fn exit_loop(&mut self) {
+        self.loop_depth -= 1;
+        self.loop_defer_bases.pop();
+    }
+
     fn block(&mut self, body: Vec<Statement>) -> Result<Vec<IrStatement>, Diagnostic> {
         if !self.recover_block_errors {
-            return body.into_iter().map(|stmt| self.statement(stmt)).collect();
+            let (mut statements, frame) = self.lower_statements(body)?;
+            statements.extend(self.lower_frame(frame)?);
+            return Ok(statements);
         }
 
         Ok(self.recover_block(body, false).0)
+    }
+
+    // Lowers a block's statements inside a new `defer` frame and returns that frame unlowered,
+    // so the caller decides where its deferred bodies run.
+    fn lower_statements(
+        &mut self,
+        body: Vec<Statement>,
+    ) -> Result<(Vec<IrStatement>, Vec<DeferredBody>), Diagnostic> {
+        self.defer_frames.push(Vec::new());
+        let lowered: Result<Vec<IrStatement>, Diagnostic> =
+            body.into_iter().map(|stmt| self.statement(stmt)).collect();
+        let frame = self.defer_frames.pop().unwrap_or_default();
+        Ok((lowered?, frame))
     }
 
     fn recover_block(
@@ -2618,12 +2846,28 @@ impl<'a> Analyzer<'a> {
         body: Vec<Statement>,
         function_body: bool,
     ) -> (Vec<IrStatement>, bool) {
+        let (mut statements, stopped_on_declaration, frame) =
+            self.recover_statements(body, function_body);
+        match self.lower_frame(frame) {
+            Ok(deferred) => statements.extend(deferred),
+            Err(diagnostic) => self.recovery_diagnostics.push(diagnostic),
+        }
+        (statements, stopped_on_declaration)
+    }
+
+    fn recover_statements(
+        &mut self,
+        body: Vec<Statement>,
+        function_body: bool,
+    ) -> (Vec<IrStatement>, bool, Vec<DeferredBody>) {
+        self.defer_frames.push(Vec::new());
         let mut statements = Vec::with_capacity(body.len());
         let mut stopped_on_declaration = false;
         for statement in body {
             let names_before = self.names.clone();
             let local_type_count = self.local_types.len();
             let loop_depth = self.loop_depth;
+            let loop_bases = self.loop_defer_bases.len();
             let failed_declaration_blocks_recovery = matches!(
                 &statement,
                 Statement::Let { name, .. } if !self.names.contains_key(name)
@@ -2635,6 +2879,7 @@ impl<'a> Analyzer<'a> {
                     self.local_types.truncate(local_type_count);
                     self.owned_slot_types.truncate(local_type_count);
                     self.loop_depth = loop_depth;
+                    self.loop_defer_bases.truncate(loop_bases);
                     self.recovery_diagnostics.push(diagnostic);
                     if failed_declaration_blocks_recovery {
                         stopped_on_declaration = true;
@@ -2643,7 +2888,51 @@ impl<'a> Analyzer<'a> {
                 }
             }
         }
-        (statements, function_body && stopped_on_declaration)
+        let frame = self.defer_frames.pop().unwrap_or_default();
+        (statements, function_body && stopped_on_declaration, frame)
+    }
+
+    // Lowers the deferred bodies of one frame in reverse registration order, which is the
+    // order they run when their block ends.
+    fn lower_frame(&mut self, frame: Vec<DeferredBody>) -> Result<Vec<IrStatement>, Diagnostic> {
+        let mut statements = Vec::new();
+        for deferred in frame.into_iter().rev() {
+            statements.extend(self.lower_deferred_body(deferred)?);
+        }
+        Ok(statements)
+    }
+
+    // The deferred bodies that run when control leaves the frames from `first_frame` onward:
+    // innermost frame first, and within a frame the most recently registered body first.
+    fn leaving_defers(&mut self, first_frame: usize) -> Result<Vec<IrStatement>, Diagnostic> {
+        let mut leaving = Vec::new();
+        for frame in self.defer_frames[first_frame.min(self.defer_frames.len())..]
+            .iter()
+            .rev()
+        {
+            leaving.extend(frame.iter().rev().cloned());
+        }
+        let mut statements = Vec::new();
+        for deferred in leaving {
+            statements.extend(self.lower_deferred_body(deferred)?);
+        }
+        Ok(statements)
+    }
+
+    fn lower_deferred_body(
+        &mut self,
+        deferred: DeferredBody,
+    ) -> Result<Vec<IrStatement>, Diagnostic> {
+        let outer_names = std::mem::replace(&mut self.names, deferred.names);
+        let outer_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
+        let outer_loop_bases = std::mem::take(&mut self.loop_defer_bases);
+        self.defer_nesting += 1;
+        let result = self.block(deferred.body);
+        self.defer_nesting -= 1;
+        self.loop_defer_bases = outer_loop_bases;
+        self.loop_depth = outer_loop_depth;
+        self.names = outer_names;
+        result
     }
 
     fn check_discarded_expression(&mut self, expression: Expression) {
@@ -2666,9 +2955,9 @@ impl<'a> Analyzer<'a> {
                 mutable: false,
             },
         );
-        self.loop_depth += 1;
+        self.enter_loop();
         let _ = self.block(body);
-        self.loop_depth -= 1;
+        self.exit_loop();
         self.names = outer_names;
     }
 
@@ -3352,6 +3641,16 @@ impl<'a> Analyzer<'a> {
                 arguments,
                 span,
                 ..
+            } if matches!(name.as_str(), "print" | "eprint" | "write")
+                && !self.signatures.contains_key(&name) =>
+            {
+                self.lower_output_call(&name, arguments, span)
+            }
+            Statement::Call {
+                name,
+                arguments,
+                span,
+                ..
             } => {
                 let (target, arguments, _) = self.lower_call(name, arguments, span)?;
                 Ok(IrStatement::Call { target, arguments })
@@ -3519,9 +3818,9 @@ impl<'a> Analyzer<'a> {
                     Err(error) if self.recover_block_errors => {
                         self.pending_statements.clear();
                         let outer_names = self.names.clone();
-                        self.loop_depth += 1;
+                        self.enter_loop();
                         let _ = self.block(body);
-                        self.loop_depth -= 1;
+                        self.exit_loop();
                         self.names = outer_names;
                         return Err(error);
                     }
@@ -3537,17 +3836,17 @@ impl<'a> Analyzer<'a> {
                     .with_help("use a boolean expression, such as a comparison, for the condition");
                     if self.recover_block_errors {
                         let outer_names = self.names.clone();
-                        self.loop_depth += 1;
+                        self.enter_loop();
                         let _ = self.block(body);
-                        self.loop_depth -= 1;
+                        self.exit_loop();
                         self.names = outer_names;
                     }
                     return Err(error);
                 }
                 let outer_names = self.names.clone();
-                self.loop_depth += 1;
+                self.enter_loop();
                 let body = self.block(body);
-                self.loop_depth -= 1;
+                self.exit_loop();
                 let body = body?;
                 self.names = outer_names;
                 Ok(IrStatement::While {
@@ -3561,6 +3860,7 @@ impl<'a> Analyzer<'a> {
                 name_span,
                 start,
                 end,
+                inclusive,
                 body,
                 ..
             } => {
@@ -3656,9 +3956,9 @@ impl<'a> Analyzer<'a> {
                         mutable: false,
                     },
                 );
-                self.loop_depth += 1;
+                self.enter_loop();
                 let body = self.block(body);
-                self.loop_depth -= 1;
+                self.exit_loop();
                 self.names = outer_names;
                 let body = body?;
                 Ok(with_setup(
@@ -3669,6 +3969,7 @@ impl<'a> Analyzer<'a> {
                         ty,
                         start,
                         end,
+                        inclusive,
                         body,
                     },
                 ))
@@ -3692,9 +3993,9 @@ impl<'a> Analyzer<'a> {
                             self.recovery_diagnostics.push(error);
                         }
                         let outer = self.names.clone();
-                        self.loop_depth += 1;
+                        self.enter_loop();
                         let _ = self.block(body);
-                        self.loop_depth -= 1;
+                        self.exit_loop();
                         self.names = outer;
                     }
                     return Err(error);
@@ -3707,16 +4008,21 @@ impl<'a> Analyzer<'a> {
                     Type::Slice(elem_id) => vec_elem(elem_id),
                     Type::OwnedString => Type::Char,
                     Type::Str => Type::Char,
+                    Type::Struct(struct_id)
+                        if self.structs[struct_id].name.starts_with("$RynRange#") =>
+                    {
+                        self.structs[struct_id].fields[0].ty
+                    }
                     _ => {
                         return Err(diag(
                             "R0206",
                             format!(
-                                "`for element in ...` requires a Vec, String, or str, found `{}`",
+                                "`for element in ...` requires a Vec, String, str, or range, found `{}`",
                                 type_name(collection_type)
                             ),
                             collection_span,
                         )
-                        .with_help("iterate a `Vec<T>`, `String`, or `str` directly, or use a numeric range with `..`"));
+                        .with_help("iterate a `Vec<T>`, `String`, `str`, or range value directly, or use a numeric range with `..`"));
                     }
                 };
                 let vector_slot = self.allocate(collection_type);
@@ -3732,9 +4038,9 @@ impl<'a> Analyzer<'a> {
                         mutable: false,
                     },
                 );
-                self.loop_depth += 1;
+                self.enter_loop();
                 let body = self.block(body);
-                self.loop_depth -= 1;
+                self.exit_loop();
                 self.names = outer_names;
                 let body = body?;
 
@@ -3743,6 +4049,64 @@ impl<'a> Analyzer<'a> {
                     ty: collection_type,
                     span: collection_span,
                 };
+                if let Type::Struct(struct_id) = collection_type
+                    && self.structs[struct_id].name.starts_with("$RynRange#")
+                {
+                    // A range value holds its bounds in fields. Its loop checks
+                    // `inclusive` when it starts, so `..` and `..=` each get a For.
+                    let range_value = IrExpression::Local {
+                        slot: vector_slot,
+                        ty: collection_type,
+                        span: collection_span,
+                    };
+                    let field = |field_index: usize, ty: Type| IrExpression::Field {
+                        value: Box::new(range_value.clone()),
+                        struct_id,
+                        field_index,
+                        ty,
+                        span: collection_span,
+                    };
+                    let cursor_slot = self.allocate(elem);
+                    let cursor_end_slot = self.allocate(elem);
+                    let item = IrStatement::Let {
+                        slot: item_slot,
+                        ty: elem,
+                        value: IrExpression::Local {
+                            slot: cursor_slot,
+                            ty: elem,
+                            span: collection_span,
+                        },
+                        span: name_span,
+                    };
+                    let mut loop_body = Vec::with_capacity(body.len() + 1);
+                    loop_body.push(item);
+                    loop_body.extend(body);
+                    let loop_for = |inclusive: bool, body: Vec<IrStatement>| IrStatement::For {
+                        slot: cursor_slot,
+                        end_slot: cursor_end_slot,
+                        ty: elem,
+                        start: field(0, elem),
+                        end: field(1, elem),
+                        inclusive,
+                        body,
+                    };
+                    return Ok(with_setup(
+                        setup,
+                        IrStatement::Block(vec![
+                            IrStatement::Let {
+                                slot: vector_slot,
+                                ty: collection_type,
+                                value: collection,
+                                span: collection_span,
+                            },
+                            IrStatement::If {
+                                condition: field(2, Type::Bool),
+                                then_body: vec![loop_for(true, loop_body.clone())],
+                                else_body: vec![loop_for(false, loop_body)],
+                            },
+                        ]),
+                    ));
+                }
                 let (length, item_value) = match collection_type {
                     Type::Vec(elem_id) => (
                         IrExpression::Call {
@@ -3839,30 +4203,72 @@ impl<'a> Analyzer<'a> {
                             ty: Type::U64,
                             start: IrExpression::Integer(0, Type::U64),
                             end: length,
+                            inclusive: false,
                             body: loop_body,
                         },
                     ]),
                 ))
             }
+            Statement::Defer { body, span } => {
+                if matches!(self.return_type, Some(Type::Reference(_, _))) {
+                    return Err(diag(
+                        "R0269",
+                        "a function returning a reference cannot use `defer`",
+                        span,
+                    )
+                    .with_help("return an owned value, or move the cleanup to the caller"));
+                }
+                let deferred = DeferredBody {
+                    body,
+                    names: self.names.clone(),
+                };
+                // Lower the body now, so its own errors are reported where it is written.
+                self.lower_deferred_body(deferred.clone())?;
+                match self.defer_frames.last_mut() {
+                    Some(frame) => frame.push(deferred),
+                    None => {
+                        return Err(diag("R0270", "`defer` must be inside a block", span));
+                    }
+                }
+                Ok(IrStatement::Block(Vec::new()))
+            }
             Statement::Break(span) => {
                 if self.loop_depth == 0 {
+                    if self.defer_nesting > 0 {
+                        return Err(diag("R0268", "`break` cannot leave a `defer` block", span)
+                            .with_help("move the loop inside the `defer` block"));
+                    }
                     return Err(
                         diag("R0016", "`break` can only be used inside a loop", span)
                             .with_help("move `break` into the body of a `while` or `for` loop"),
                     );
                 }
-                Ok(IrStatement::Break)
+                let first_frame = self.loop_defer_bases.last().copied().unwrap_or(0);
+                let leaving = self.leaving_defers(first_frame)?;
+                Ok(exit_after(leaving, IrStatement::Break))
             }
             Statement::Continue(span) => {
                 if self.loop_depth == 0 {
+                    if self.defer_nesting > 0 {
+                        return Err(
+                            diag("R0268", "`continue` cannot leave a `defer` block", span)
+                                .with_help("move the loop inside the `defer` block"),
+                        );
+                    }
                     return Err(
                         diag("R0017", "`continue` can only be used inside a loop", span)
                             .with_help("move `continue` into the body of a `while` or `for` loop"),
                     );
                 }
-                Ok(IrStatement::Continue)
+                let first_frame = self.loop_defer_bases.last().copied().unwrap_or(0);
+                let leaving = self.leaving_defers(first_frame)?;
+                Ok(exit_after(leaving, IrStatement::Continue))
             }
             Statement::Return { value, span } => {
+                if self.defer_nesting > 0 {
+                    return Err(diag("R0267", "`return` cannot leave a `defer` block", span)
+                        .with_help("return from the enclosing function after the `defer` block"));
+                }
                 let value = match (self.return_type, value) {
                     (None, Some(value)) => {
                         let error = diag(
@@ -3912,7 +4318,29 @@ impl<'a> Analyzer<'a> {
                         Some(value)
                     }
                 };
-                Ok(IrStatement::Return { value })
+                let leaving = self.leaving_defers(0)?;
+                let Some(value) = value else {
+                    return Ok(exit_after(leaving, IrStatement::Return { value: None }));
+                };
+                if leaving.is_empty() {
+                    return Ok(IrStatement::Return { value: Some(value) });
+                }
+                // The value is computed before the `defer` blocks run, so they cannot change it.
+                let ty = self
+                    .return_type
+                    .expect("a returned value has a declared result type");
+                let slot = self.allocate(ty);
+                let mut statements = vec![IrStatement::Let {
+                    slot,
+                    ty,
+                    value,
+                    span,
+                }];
+                statements.extend(leaving);
+                statements.push(IrStatement::Return {
+                    value: Some(IrExpression::Local { slot, ty, span }),
+                });
+                Ok(IrStatement::Block(statements))
             }
         }
     }
@@ -3922,6 +4350,35 @@ impl<'a> Analyzer<'a> {
         value: &IrExpression,
         span: Span,
     ) -> Result<(), Diagnostic> {
+        if matches!(self.return_type, Some(Type::RawPointer(_))) {
+            // The address of a local is gone when the function returns.
+            let escapes = |expression: &IrExpression| {
+                matches!(
+                    expression,
+                    IrExpression::AddressOf {
+                        pointer_type: Type::RawPointer(_),
+                        ..
+                    }
+                )
+            };
+            let bad = match value {
+                IrExpression::If {
+                    then_value,
+                    else_value,
+                    ..
+                } => escapes(then_value) || escapes(else_value),
+                other => escapes(other),
+            };
+            if bad {
+                return Err(diag(
+                    "R0248",
+                    "a raw pointer to a local value cannot escape its stack frame",
+                    span,
+                )
+                .with_help("return a pointer that was passed in, or allocate storage that outlives the function"));
+            }
+            return Ok(());
+        }
         if !matches!(self.return_type, Some(Type::Reference(_, _))) {
             return Ok(());
         }
@@ -3963,6 +4420,64 @@ impl<'a> Analyzer<'a> {
             )
             .with_help("return a reference derived directly from a reference parameter"))
         }
+    }
+
+    /// Checks a tuple or structure pattern (see `patterns::shape_probe`) against the type of the
+    /// scrutinee, then lowers only the pattern's body.
+    fn pattern_shape(
+        &mut self,
+        value: Expression,
+        arm: ChooseArm,
+        expected: Option<Type>,
+    ) -> Result<(IrExpression, Type), Diagnostic> {
+        let span = arm.span;
+        let (_, actual) = self.expression(value, None)?;
+        let base = match actual {
+            Type::Reference(target, _) => pointer_target(target),
+            other => other,
+        };
+        let mismatch = |wanted: &str| {
+            diag(
+                "R0235",
+                "pattern does not match the type of the value",
+                span,
+            )
+            .with_help(format!(
+                "{wanted} needs a value of that shape, but this value has type `{}`",
+                type_name(actual)
+            ))
+        };
+        match arm
+            .variant
+            .as_deref()
+            .and_then(|v| v.strip_prefix("tuple:"))
+        {
+            Some(arity) => {
+                let wanted: usize = arity.parse().unwrap_or(0);
+                match base {
+                    Type::Struct(id) if self.structs[id].name.starts_with("$RynTuple#") => {
+                        let have = self.structs[id].fields.len();
+                        if have != wanted {
+                            return Err(diag(
+                                "R0235",
+                                format!(
+                                    "tuple pattern has {wanted} element(s) but the value has {have}"
+                                ),
+                                span,
+                            )
+                            .with_help("list one pattern per tuple element"));
+                        }
+                    }
+                    _ => return Err(mismatch("a tuple pattern")),
+                }
+            }
+            None => {
+                if !matches!(base, Type::Struct(_)) {
+                    return Err(mismatch("a structure pattern"));
+                }
+            }
+        }
+        self.expression(arm.body, expected)
     }
 
     fn expression(
@@ -4029,6 +4544,27 @@ impl<'a> Analyzer<'a> {
                             self.coerce_function_pointer(&name, &expected_type, span)?
                     {
                         return Ok((coerced, expected_type));
+                    }
+                    // `null` is the zero address of whatever raw pointer type the context expects.
+                    if name == "null" {
+                        if let Some(target @ Type::RawPointer(_)) = expected {
+                            return Ok((
+                                IrExpression::Cast {
+                                    value: Box::new(IrExpression::Integer(0, Type::U64)),
+                                    source: Type::U64,
+                                    target,
+                                },
+                                target,
+                            ));
+                        }
+                        return Err(diag(
+                            "R0203",
+                            "`null` needs a raw pointer type from its context",
+                            span,
+                        )
+                        .with_help(
+                            "pass it where a `*T` is expected, assign it to a `*T` variable, or write `(0 as u64) as *T`",
+                        ));
                     }
                     return Err(self.unknown_variable(&name, span));
                 };
@@ -4185,6 +4721,49 @@ impl<'a> Analyzer<'a> {
                         ty: pointee,
                     },
                     pointee,
+                ))
+            }
+            Expression::Range {
+                start,
+                end,
+                inclusive,
+                span,
+            } => {
+                let (start_value, start_ty) = self.expression(*start, None)?;
+                if !is_integer(start_ty) {
+                    return Err(diag(
+                        "R0206",
+                        format!(
+                            "range bounds must be integers, found `{}`",
+                            type_name(start_ty)
+                        ),
+                        span,
+                    )
+                    .with_help("use integer bounds such as `0..10`"));
+                }
+                let (end_value, end_ty) = self.expression(*end, Some(start_ty))?;
+                if end_ty != start_ty {
+                    return Err(diag(
+                        "R0205",
+                        format!(
+                            "range end has type `{}` but the start has type `{}`",
+                            type_name(end_ty),
+                            type_name(start_ty)
+                        ),
+                        span,
+                    ));
+                }
+                let struct_id = self.range_struct_for(start_ty);
+                Ok((
+                    IrExpression::StructValue {
+                        struct_id,
+                        fields: vec![
+                            (0, start_value),
+                            (1, end_value),
+                            (2, IrExpression::Boolean(inclusive)),
+                        ],
+                    },
+                    Type::Struct(struct_id),
                 ))
             }
             Expression::Tuple(elements, span) => {
@@ -4489,6 +5068,18 @@ impl<'a> Analyzer<'a> {
                 let (index, index_ty) = self.expression(*index, None)?;
                 if !is_integer(index_ty) {
                     return Err(diag("R0242", "array index must be an integer", span));
+                }
+                if let IrExpression::Integer(value, _) = &index
+                    && (*value < 0 || *value >= length as i128)
+                {
+                    return Err(diag(
+                        "R0257",
+                        format!(
+                            "array index {value} is out of bounds for an array of length {length}"
+                        ),
+                        span,
+                    )
+                    .with_help("valid indices are 0 up to the length minus one"));
                 }
                 Ok((
                     IrExpression::ArrayIndex {
@@ -4819,7 +5410,18 @@ impl<'a> Analyzer<'a> {
                     }
                     _ => None,
                 });
-                let enum_id = self.scoped_enum_id(&enum_name).or(expected_generic_id);
+                let mut inferred_payload = None;
+                let enum_id = match self.scoped_enum_id(&enum_name).or(expected_generic_id) {
+                    Some(enum_id) => Some(enum_id),
+                    // Without an expected type, `Option::Some(value)` takes its
+                    // `Option<T>` from the payload's type.
+                    None if enum_name == "Option" && variant == "Some" && arguments.len() == 1 => {
+                        let (value, payload) = self.expression(arguments[0].clone(), None)?;
+                        inferred_payload = Some((value, payload));
+                        Some(self.option_enum_for(payload))
+                    }
+                    None => None,
+                };
                 let Some(enum_id) = enum_id else {
                     // `Type::CONSTANT` lowers to a zero-argument function; the
                     // parser sees the same `Type::Name` path as enum variants.
@@ -4829,6 +5431,28 @@ impl<'a> Analyzer<'a> {
                     {
                         return Ok(constant);
                     }
+                    // A lowercase path head names a module (`helper::CONST`); enums and
+                    // structures are written in CamelCase.
+                    let module_prefix = format!("{enum_name}::");
+                    let is_module = enum_name.starts_with(|ch: char| ch.is_ascii_lowercase())
+                        || self
+                            .signatures
+                            .keys()
+                            .any(|name| name.starts_with(&module_prefix))
+                        || self
+                            .structs
+                            .iter()
+                            .any(|definition| definition.name.starts_with(&module_prefix));
+                    if is_module {
+                        return Err(diag(
+                            "R0230",
+                            format!("unknown item `{variant}` in module `{enum_name}`"),
+                            span,
+                        )
+                        .with_help(format!(
+                            "declare `{variant}` as a public item of module `{enum_name}`, or check its spelling"
+                        )));
+                    }
                     return Err(diag("R0230", format!("unknown enum `{enum_name}`"), span)
                         .with_help(if matches!(enum_name.as_str(), "Option" | "Result") {
                             "give this generic variant an expected `Option<T>` or `Result<T, E>` type"
@@ -4836,17 +5460,13 @@ impl<'a> Analyzer<'a> {
                             "declare the enum before constructing it"
                         }));
                 };
-                let definition = &self.enums[enum_id];
+                let definition = self.enums[enum_id].clone();
                 let Some(variant_index) = definition
                     .variants
                     .iter()
                     .position(|candidate| candidate.name == *variant)
                 else {
-                    return Err(diag(
-                        "R0233",
-                        format!("enum `{enum_name}` has no variant `{variant}`"),
-                        span,
-                    ));
+                    return Err(unknown_variant(&definition, &enum_name, &variant, span));
                 };
                 let variant_definition = &definition.variants[variant_index];
                 if variant_definition.fields.iter().any(|field| {
@@ -4879,6 +5499,15 @@ impl<'a> Analyzer<'a> {
                 let mut lowered = Vec::new();
                 for (index, argument) in arguments.into_iter().enumerate() {
                     let field_ty = variant_definition.fields[index];
+                    if index == 0
+                        && let Some((value, payload)) = inferred_payload.take()
+                    {
+                        // The inferred enum was built from this payload type, so it
+                        // was lowered once already.
+                        debug_assert_eq!(payload, field_ty);
+                        lowered.push(value);
+                        continue;
+                    }
                     let (value, actual) = self.expression(argument, Some(field_ty))?;
                     if actual != field_ty {
                         return Err(diag(
@@ -4906,6 +5535,13 @@ impl<'a> Analyzer<'a> {
                 ))
             }
             Expression::Propagate(value, span) => {
+                if self.defer_nesting > 0 {
+                    return Err(diag("R0268", "`?` cannot leave a `defer` block", span)
+                        .with_help("handle the error inside the `defer` block"));
+                }
+                // The early return from `?` runs every `defer` block that is pending in this
+                // function, so those bodies are lowered here and carried by the expression.
+                let deferred = self.leaving_defers(0)?;
                 let (value, input_type) = self.expression(*value, None)?;
                 let Type::Enum(input_enum) = input_type else {
                     return Err(diag(
@@ -5028,11 +5664,16 @@ impl<'a> Analyzer<'a> {
                         success_variant,
                         failure_variant,
                         output_failure_variant,
+                        deferred,
                     },
                     success_type,
                 ))
             }
             Expression::Choose { value, arms, span } => {
+                if arms.len() == 1 && arms[0].enum_name.as_deref() == Some("$shape") {
+                    let arm = arms.into_iter().next().expect("one probe arm");
+                    return self.pattern_shape(*value, arm, expected);
+                }
                 if arms
                     .iter()
                     .position(|arm| arm.variant.is_none())
@@ -5045,7 +5686,7 @@ impl<'a> Analyzer<'a> {
                     return Err(diag("R0234", "`choose` requires an enum value", span)
                         .with_help("match one of this enum's variants over a value of enum type"));
                 };
-                let definition = &self.enums[enum_id];
+                let definition = self.enums[enum_id].clone();
                 let mut covered = vec![false; definition.variants.len()];
                 let mut has_wildcard = false;
                 for arm in &arms {
@@ -5079,9 +5720,10 @@ impl<'a> Analyzer<'a> {
                                 .iter()
                                 .position(|candidate| candidate.name == variant_name)
                             else {
-                                return Err(diag(
-                                    "R0233",
-                                    format!("enum `{name}` has no variant `{variant_name}`"),
+                                return Err(unknown_variant(
+                                    &definition,
+                                    name,
+                                    variant_name,
                                     arm.span,
                                 ));
                             };
@@ -5167,7 +5809,7 @@ impl<'a> Analyzer<'a> {
                             });
                         }
                     }
-                    let arm_result = self.expression(arm.body, common);
+                    let arm_result = self.expression(arm.body, common.or(expected));
                     let (body_ir, body_ty) = arm_result?;
                     match common {
                         Some(expected) if expected != body_ty => {
@@ -5306,7 +5948,8 @@ impl<'a> Analyzer<'a> {
                     }
                     return Err(error);
                 }
-                let (then_value, then_ty) = match self.expression(*then_value, expected) {
+                let then_source = (*then_value).clone();
+                let (mut then_value, mut then_ty) = match self.expression(*then_value, expected) {
                     Ok(result) => result,
                     Err(error) if self.recover_block_errors => {
                         if let Err(diagnostic) = self.expression(*else_value, expected) {
@@ -5318,6 +5961,16 @@ impl<'a> Analyzer<'a> {
                 };
                 let else_span = else_value.span();
                 let (else_value, else_ty) = self.expression(*else_value, Some(then_ty))?;
+                // An untyped numeric literal in the first branch takes the type of the second.
+                if else_ty != then_ty
+                    && expected.is_none()
+                    && matches!(then_source, Expression::Integer(..) | Expression::Float(..))
+                    && (is_integer(else_ty) || matches!(else_ty, Type::F32 | Type::F64))
+                    && let Ok((retyped, retyped_ty)) = self.expression(then_source, Some(else_ty))
+                {
+                    then_value = retyped;
+                    then_ty = retyped_ty;
+                }
                 if else_ty != then_ty {
                     return Err(diag(
                         "R0205",
@@ -5511,6 +6164,32 @@ impl<'a> Analyzer<'a> {
             } => {
                 let left_span = left.span();
                 let right_span = right.span();
+                // `id<i32>(1)` parses as a comparison; generic arguments are written with `::`.
+                if let (BinaryOp::Lt, Expression::Name(callee, _), Expression::Name(type_word, _)) =
+                    (&op, &*left, &*right)
+                    && !self.names.contains_key(callee)
+                    && matches!(
+                        type_word.as_str(),
+                        "i8" | "i16"
+                            | "i32"
+                            | "i64"
+                            | "u8"
+                            | "u16"
+                            | "u32"
+                            | "u64"
+                            | "f32"
+                            | "f64"
+                            | "bool"
+                            | "char"
+                            | "str"
+                            | "String"
+                    )
+                {
+                    return Err(diag("R0203", format!("unknown variable `{callee}`"), left_span)
+                        .with_help(format!(
+                            "generic arguments are written after `::`, e.g. `{callee}::<{type_word}>(...)`"
+                        )));
+                }
                 let bitwise = matches!(
                     op,
                     BinaryOp::BitAnd
@@ -5577,8 +6256,13 @@ impl<'a> Analyzer<'a> {
                 };
                 // Without a syntactic hint, the checked left operand types a
                 // literal on the right: `self.byte(i) != 123` compares `u32`s.
-                let left_context =
-                    (is_numeric(left_ty) && (!bitwise || is_integer(left_ty))).then_some(left_ty);
+                let left_context = (is_numeric(left_ty) && (!bitwise || is_integer(left_ty)))
+                    .then_some(left_ty)
+                    .or_else(|| {
+                        (matches!(left_ty, Type::RawPointer(_))
+                            && matches!(op, BinaryOp::Eq | BinaryOp::Ne))
+                        .then_some(left_ty)
+                    });
                 let (right, right_ty) = self.expression(
                     *right,
                     if shift {
@@ -6077,6 +6761,9 @@ impl<'a> Analyzer<'a> {
 
     fn unknown_variable(&self, name: &str, span: Span) -> Diagnostic {
         let diagnostic = diag("R0203", format!("unknown variable `{name}`"), span);
+        if let Some(hint) = bare_variant_hint(name) {
+            return diagnostic.with_help(hint);
+        }
         match closest_name(name, self.names.keys().map(String::as_str)) {
             Some(suggestion) => diagnostic.with_help(format!("did you mean `{suggestion}`?")),
             None => diagnostic,
@@ -7185,6 +7872,14 @@ impl<'a> Analyzer<'a> {
                     )
                     && vec_struct_fields_supported(&self.structs[id], self.structs)
             }
+            Type::Enum(_) => !contains_custom_drop(
+                elem,
+                self.structs,
+                self.enums,
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+                0,
+            ),
             _ => false,
         };
         if matches!(name.as_str(), "get" | "first" | "last") {
@@ -7554,6 +8249,8 @@ impl<'a> Analyzer<'a> {
         }
         let result = if operation == MapOp::Insert {
             Some(Type::Bool)
+        } else if operation == MapOp::Clone {
+            Some(Type::Set(map_id))
         } else {
             result
         };
@@ -7906,6 +8603,159 @@ impl<'a> Analyzer<'a> {
             function: function_index,
             ty: *target,
         }))
+    }
+
+    /// Lowers the built-in output calls `print`, `eprint` and `write`.
+    ///
+    /// The first argument is a format string literal whose `{}` placeholders
+    /// consume the remaining arguments in order; `{{` and `}}` write braces.
+    /// `print` writes a line to stdout, `write` writes to stdout without a
+    /// newline, and `eprint` writes a line to stderr.
+    fn lower_output_call(
+        &mut self,
+        name: &str,
+        arguments: Vec<Expression>,
+        span: Span,
+    ) -> Result<IrStatement, Diagnostic> {
+        let mut arguments = arguments.into_iter();
+        let format = match arguments.next() {
+            Some(Expression::String(format, _)) => format,
+            _ => {
+                return Err(diag(
+                    "R0210",
+                    format!("`{name}` expects a format string literal as its first argument"),
+                    span,
+                )
+                .with_help(format!("write `{name}(\"value: {{}}\", value)`")));
+            }
+        };
+        let values: Vec<Expression> = arguments.collect();
+        let mut pieces: Vec<Option<String>> = Vec::new();
+        let mut text = String::new();
+        let mut placeholders = 0;
+        let mut chars = format.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '{' if chars.peek() == Some(&'{') => {
+                    chars.next();
+                    text.push('{');
+                }
+                '}' if chars.peek() == Some(&'}') => {
+                    chars.next();
+                    text.push('}');
+                }
+                '{' if chars.peek() == Some(&'}') => {
+                    chars.next();
+                    if !text.is_empty() {
+                        pieces.push(Some(std::mem::take(&mut text)));
+                    }
+                    pieces.push(None);
+                    placeholders += 1;
+                }
+                '{' | '}' => {
+                    return Err(diag(
+                        "R0014",
+                        format!("malformed format string in `{name}`"),
+                        span,
+                    )
+                    .with_help("use `{}` for a value and `{{` or `}}` for literal braces"));
+                }
+                other => text.push(other),
+            }
+        }
+        if !text.is_empty() {
+            pieces.push(Some(text));
+        }
+        if placeholders != values.len() {
+            return Err(diag(
+                "R0208",
+                format!(
+                    "`{name}` format string has {placeholders} placeholder(s) but {} value(s) were given",
+                    values.len()
+                ),
+                span,
+            ));
+        }
+        let mut values = values.into_iter();
+        if name == "print" {
+            let mut parts = Vec::new();
+            for piece in pieces {
+                match piece {
+                    Some(text) => parts.push(IrPrintPart::Text(text)),
+                    None => {
+                        let expression = values.next().expect("placeholder count was checked");
+                        let (value, ty) = self.expression(expression, None)?;
+                        if type_contains_vec(ty, self.structs) {
+                            return Err(diag(
+                                "R0234",
+                                "`print` cannot print `Vec` values yet",
+                                span,
+                            )
+                            .with_help("iterate the values manually and print each element"));
+                        }
+                        parts.push(IrPrintPart::Value { value, ty });
+                    }
+                }
+            }
+            return Ok(IrStatement::PrintTemplate(parts));
+        }
+        let sink = if name == "eprint" {
+            "__io_stderr_write"
+        } else {
+            "__io_stdout_write"
+        };
+        let mut statements = Vec::new();
+        let mut emit = |analyzer: &mut Self, argument: Expression| -> Result<(), Diagnostic> {
+            let (target, arguments, _) = analyzer.lower_call(sink.into(), vec![argument], span)?;
+            statements.push(IrStatement::Call { target, arguments });
+            Ok(())
+        };
+        for piece in pieces {
+            match piece {
+                Some(text) => emit(self, Expression::String(text, span))?,
+                None => {
+                    let expression = values.next().expect("placeholder count was checked");
+                    let (_, ty) = self.expression(expression.clone(), None)?;
+                    let text = match ty {
+                        Type::Str | Type::OwnedString => expression,
+                        Type::Bool => Expression::If {
+                            condition: Box::new(expression),
+                            then_value: Box::new(Expression::String("true".into(), span)),
+                            else_value: Box::new(Expression::String("false".into(), span)),
+                            span,
+                        },
+                        Type::I8
+                        | Type::I16
+                        | Type::I32
+                        | Type::I64
+                        | Type::U8
+                        | Type::U16
+                        | Type::U32
+                        | Type::U64
+                        | Type::F32
+                        | Type::F64 => Expression::Call {
+                            name: "String".into(),
+                            type_arguments: Vec::new(),
+                            arguments: vec![expression],
+                            span,
+                        },
+                        _ => {
+                            return Err(diag(
+                                "R0234",
+                                format!("`{name}` cannot format this type yet"),
+                                span,
+                            )
+                            .with_help("use numbers, `bool`, `str` or `String`"));
+                        }
+                    };
+                    emit(self, text)?;
+                }
+            }
+        }
+        if name == "eprint" {
+            emit(self, Expression::String("\n".into(), span))?;
+        }
+        Ok(IrStatement::Block(statements))
     }
 
     fn lower_call(
@@ -8738,6 +9588,9 @@ impl<'a> Analyzer<'a> {
                     .into_iter()
                     .filter(|builtin| !self.signatures.contains_key(*builtin)),
             );
+            if let Some(hint) = bare_variant_hint(&name) {
+                return Err(diagnostic.with_help(hint));
+            }
             return Err(match closest_name(&name, candidates) {
                 Some(suggestion) => diagnostic.with_help(format!("did you mean `{suggestion}`?")),
                 None => diagnostic,
@@ -9093,6 +9946,16 @@ fn resolve_type_name_scoped(
                     Some(id) => Type::Struct(*id),
                     None => match enums.get(name) {
                         Some(id) => Type::Enum(*id),
+                        None if name.starts_with("$RynStructParam#") => {
+                            return Err(diag(
+                                "R0262",
+                                "a generic structure has no instance for the inferred type arguments",
+                                *span,
+                            )
+                            .with_help(
+                                "name the instance once in the program, for example `value: Box<i32> = make(1)` or `Box::<i32> { ... }`",
+                            ));
+                        }
                         None => {
                             return Err(diag("R0230", format!("unknown type `{name}`"), *span)
                                 .with_help(
@@ -9359,14 +10222,15 @@ fn validate_vec_elem(elem: &Type, span: Span) -> Result<(), Diagnostic> {
         | Type::Char
         | Type::OwnedString
         | Type::Map(_)
-        | Type::Struct(_) => Ok(()),
+        | Type::Struct(_)
+        | Type::Enum(_) => Ok(()),
         other => Err(diag(
             "R0234",
             format!("`Vec<{}>` is not supported yet", type_name(*other)),
             span,
         )
         .with_help(
-            "supported element types are integers, floats, `bool`, `char`, and `String` for now",
+            "supported element types are integers, floats, `bool`, `char`, `String`, maps, structures, and enums for now",
         )),
     }
 }
@@ -10411,6 +11275,33 @@ fn integer_bounds(ty: Type) -> (i128, i128) {
         _ => unreachable!("integer bounds requested for non-integer type"),
     }
 }
+/// Hint for a variant of a generic enum written without its enum name, such as `None`.
+fn bare_variant_hint(name: &str) -> Option<&'static str> {
+    match name {
+        "None" => Some("write the empty option as `Option::None`"),
+        "Some" => Some("write a present option as `Option::Some(value)`"),
+        "Ok" => Some("write a success result as `Result::Ok(value)`"),
+        "Err" => Some("write a failed result as `Result::Err(error)`"),
+        _ => None,
+    }
+}
+
+/// `R0233` for a variant name the enum does not declare, listing the declared variants.
+fn unknown_variant(definition: &RynEnum, enum_name: &str, variant: &str, span: Span) -> Diagnostic {
+    let valid = definition
+        .variants
+        .iter()
+        .map(|candidate| format!("`{}`", candidate.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    diag(
+        "R0233",
+        format!("enum `{enum_name}` has no variant `{variant}`"),
+        span,
+    )
+    .with_help(format!("the variants of `{enum_name}` are {valid}"))
+}
+
 fn diag(code: &'static str, message: impl Into<String>, span: Span) -> Diagnostic {
     Diagnostic {
         code,

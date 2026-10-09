@@ -1,0 +1,10 @@
+// test: fail
+// code: R0467
+// msg: cannot assign to the constant `LIMIT`
+const LIMIT: i64 = 10
+fun main() {
+    when true {
+        LIMIT += 1
+    }
+    echo LIMIT
+}

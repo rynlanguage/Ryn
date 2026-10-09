@@ -1,0 +1,24 @@
+// test: run
+// out: rel 5 L
+// out: after
+// out: rel 6 L
+// out: end
+#[drop(rel)]
+struct R {
+    h: *i32
+    id: i32
+    label: String
+}
+fun rel(r: R) {
+    echo "rel {r.id} {r.label}"
+}
+fun mk(id: i32, p: *i32) -> R {
+    return R { h: p, id: id, label: String("L") }
+}
+fun main() {
+    mut x: i32 = 0
+    mk(5, &raw mut x)
+    echo "after"
+    mk(6, &raw mut x)
+    echo "end"
+}

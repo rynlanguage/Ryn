@@ -1,0 +1,6 @@
+// test: fail
+// code: R0247
+extern "C" fun takes(text: String) -> i32;
+fun main() {
+    echo 1
+}

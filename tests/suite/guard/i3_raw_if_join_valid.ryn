@@ -1,0 +1,16 @@
+// test: run
+// out: 8
+fun main() {
+    mut x: i32 = 1
+    mut y: i32 = 2
+    mut t: i32 = 0
+    mut p: *i32 = &raw mut x
+    when t == 0 {
+        p = &raw mut y
+    }
+    when true {
+        q := p
+        *q = 7
+    }
+    echo x + y
+}

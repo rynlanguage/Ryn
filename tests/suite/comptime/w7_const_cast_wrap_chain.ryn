@@ -1,0 +1,15 @@
+// test: run
+// out: -56
+// out: 4464
+// out: 4294967295
+// out: 1
+const A: i8 = 200 as i8
+const B: u16 = 70000 as u16
+const C: u32 = (0 - 1) as u32
+const D: i64 = 4294967297 as i32 as i64
+fun main() {
+    echo A
+    echo B
+    echo C
+    echo D
+}

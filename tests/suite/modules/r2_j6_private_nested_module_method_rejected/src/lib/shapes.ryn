@@ -1,0 +1,6 @@
+pub struct Rect { pub w: i32 }
+extend Rect {
+    fun secret(self) -> i32 {
+        return self.w
+    }
+}

@@ -1,0 +1,12 @@
+fun report(text: String) {
+    echo text
+}
+
+fun main() -> i32 {
+    text := String("owned")
+    defer {
+        echo text
+    }
+    echo "body"
+    return 0
+}

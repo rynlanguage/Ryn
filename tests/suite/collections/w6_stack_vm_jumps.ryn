@@ -1,0 +1,147 @@
+// test: run
+// out: dropped 0
+// out: 15
+// out: sum
+// out: halted after 52 steps
+// out: underflow
+// out: error: stack underflow
+// out: loop
+// out: error: step limit
+enum Op { Push(i64), Add, Sub, Dup, Swap, Over, Drop, Jz(u64), Jmp(u64), Print, Halt }
+
+struct Vm { prog: Vec<Op>, stack: Vec<i64>, pc: u64, steps: u64 }
+
+extend Vm {
+    fun pop(mut self) -> Result<i64, String> {
+        n := self.stack.len()
+        when n == 0 {
+            return Result::Err(String("stack underflow"))
+        }
+        return Result::Ok(self.stack.take(n - 1))
+    }
+    fun arith(mut self, k: i64) -> Result<bool, String> {
+        b := self.pop()?
+        a := self.pop()?
+        self.stack.push(choose k { 0 => a + b, _ => a - b })
+        return Result::Ok(true)
+    }
+    fun shuffle(mut self, k: i64) -> Result<bool, String> {
+        b := self.pop()?
+        when k == 0 {
+            self.stack.push(b)
+            self.stack.push(b)
+            return Result::Ok(true)
+        }
+        a := self.pop()?
+        when k == 1 {
+            self.stack.push(b)
+            self.stack.push(a)
+        } else {
+            self.stack.push(a)
+            self.stack.push(b)
+            self.stack.push(a)
+        }
+        return Result::Ok(true)
+    }
+    fun step(mut self) -> Result<bool, String> {
+        when self.pc >= self.prog.len() {
+            return Result::Err(String("pc out of range"))
+        }
+        op := self.prog.index(self.pc)
+        self.pc += 1
+        self.steps += 1
+        when self.steps > 1000 {
+            return Result::Err(String("step limit"))
+        }
+        return choose op {
+            Op::Push(v) => self.push_value(v),
+            Op::Add => self.arith(0),
+            Op::Sub => self.arith(1),
+            Op::Dup => self.shuffle(0),
+            Op::Swap => self.shuffle(1),
+            Op::Over => self.shuffle(2),
+            Op::Drop => self.discard(),
+            Op::Jz(t) => self.branch_if_zero(t),
+            Op::Jmp(t) => self.jump(t),
+            Op::Print => self.print_top(),
+            Op::Halt => Result::Ok(false)
+        }
+    }
+    fun push_value(mut self, v: i64) -> Result<bool, String> {
+        self.stack.push(v)
+        return Result::Ok(true)
+    }
+    fun discard(mut self) -> Result<bool, String> {
+        x := self.pop()?
+        echo "dropped {x}"
+        return Result::Ok(true)
+    }
+    fun print_top(mut self) -> Result<bool, String> {
+        x := self.pop()?
+        echo x
+        return Result::Ok(true)
+    }
+    fun branch_if_zero(mut self, target: u64) -> Result<bool, String> {
+        x := self.pop()?
+        when x == 0 {
+            self.pc = target
+        }
+        return Result::Ok(true)
+    }
+    fun jump(mut self, target: u64) -> Result<bool, String> {
+        self.pc = target
+        return Result::Ok(true)
+    }
+    fun run(mut self) -> Result<u64, String> {
+        mut running := true
+        while running { running = self.step()? }
+        return Result::Ok(self.steps)
+    }
+}
+
+// stack holds [acc, n]; loop until n == 0, then acc is printed
+fun sum_program() -> Vec<Op> {
+    mut p: Vec<Op> = Vec()
+    p.push(Op::Push(0))
+    p.push(Op::Push(5))
+    p.push(Op::Dup)
+    p.push(Op::Jz(11))
+    p.push(Op::Swap)
+    p.push(Op::Over)
+    p.push(Op::Add)
+    p.push(Op::Swap)
+    p.push(Op::Push(1))
+    p.push(Op::Sub)
+    p.push(Op::Jmp(2))
+    p.push(Op::Drop)
+    p.push(Op::Print)
+    p.push(Op::Halt)
+    return p
+}
+
+fun report(label: String, r: Result<u64, String>) {
+    echo label
+    when r.is_ok() {
+        n := r.unwrap()
+        echo "halted after {n} steps"
+    } else {
+        e := r.unwrap_err()
+        echo "error: {e}"
+    }
+}
+
+fun main() {
+    mut under: Vec<Op> = Vec()
+    under.push(Op::Push(1))
+    under.push(Op::Add)
+    under.push(Op::Halt)
+    mut looping: Vec<Op> = Vec()
+    looping.push(Op::Jmp(0))
+
+    mut a := Vm { prog: sum_program(), stack: Vec(), pc: 0, steps: 0 }
+    report(String("sum"), a.run())
+    mut b := Vm { prog: under, stack: Vec(), pc: 0, steps: 0 }
+    report(String("underflow"), b.run())
+    mut c := Vm { prog: looping, stack: Vec(), pc: 0, steps: 0 }
+    report(String("loop"), c.run())
+}

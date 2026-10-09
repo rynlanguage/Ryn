@@ -1,0 +1,32 @@
+// test: run
+// out: -3
+// out: -1
+// out: -4
+// out: 1
+// out: -2147483648
+// out: 4611686018427387904
+// out: -3
+// out: -1
+// out: -4
+// out: 1
+const A: i32 = -7 / 2
+const B: i32 = -7 % 2
+const C: i32 = -8 >> 1
+const D: i32 = 7 % -3
+const E: i32 = -2147483648
+const F: i64 = 1 << 62
+fun neg(x: i32) -> i32 {
+    return x
+}
+fun main() {
+    echo A
+    echo B
+    echo C
+    echo D
+    echo E
+    echo F
+    echo neg(-7) / 2
+    echo neg(-7) % 2
+    echo neg(-8) >> 1
+    echo neg(7) % -3
+}

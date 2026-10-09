@@ -1,0 +1,23 @@
+// test: run
+// out: drop 1
+// out: 7
+// out: late
+// out: drop 1
+// out: 8
+#[drop(rel)]
+struct R { h: *i32, id: i32 }
+fun rel(r: R) { echo "drop {r.id}" }
+fun mk(id: i32, p: *i32) -> R { return R { h: p, id: id } }
+fun f(p: *i32, early: bool) -> i32 {
+    a := mk(1, p)
+    when early {
+        return 7
+    }
+    echo "late"
+    return 8
+}
+fun main() {
+    mut x: i32 = 0
+    echo f(&raw mut x, true)
+    echo f(&raw mut x, false)
+}

@@ -1,0 +1,9 @@
+// test: run
+// out: 5
+// out: 20
+fun main() {
+    a: Option<i32> = Option::Some(5)
+    b: Option<i32> = Option::None
+    echo a ?? 20
+    echo b ?? 20
+}

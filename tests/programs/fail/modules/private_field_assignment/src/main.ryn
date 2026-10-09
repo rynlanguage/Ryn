@@ -1,0 +1,11 @@
+// test: fail
+// code: R0426
+use util
+fun bump(p: &mut util::P) {
+    p.secret = 3
+}
+fun main() {
+    mut p := util::make()
+    bump(&mut p)
+    echo p.open
+}

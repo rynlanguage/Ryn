@@ -1,0 +1,43 @@
+struct Point {
+    x: i32,
+    y: i32
+}
+
+struct Outer {
+    name: String,
+    point: Point
+}
+
+fun describe(value: Option<i32>) -> i32 {
+    choose value {
+        Option::Some(number) => number,
+        Option::None => -1
+    }
+}
+
+fun main() {
+    maybe := Option::Some(Point { x: 4, y: 5 })
+    echo describe(maybe?.x)
+    missing: Option<Point> = Option::None
+    echo describe(missing?.x)
+    nested := Option::Some(Outer { name: String("box"), point: Point { x: 7, y: 8 } })
+    echo describe(nested?.point?.y)
+    named := Option::Some(Outer { name: String("box"), point: Point { x: 7, y: 8 } })
+    echo choose named?.name {
+        Option::Some(name) => name,
+        Option::None => String("none")
+    }
+    nothing: Option<Outer> = Option::None
+    echo choose nothing?.name {
+        Option::Some(name) => name,
+        Option::None => String("none")
+    }
+    echo choose Option::Some(3) {
+        Option::Some(number) => number,
+        Option::None => 0
+    }
+    echo choose Option::Some(String("text")) {
+        Option::Some(text) => text,
+        Option::None => String("none")
+    }
+}

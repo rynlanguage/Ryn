@@ -1,0 +1,11 @@
+// test: run
+// out: 42
+// out: hello
+// out: true
+// out: 2.5
+fun main() {
+    echo 42 as i32
+    echo "hello"
+    echo true
+    echo 2.5 as f64
+}

@@ -1,0 +1,45 @@
+// test: run
+// out: start
+// out: inner
+// out: 2
+// out: moved
+// out: 104
+// out: 4
+// out: 5
+// out: end
+// out: 3
+// out: 1
+extern "C" fun malloc(size: u64) -> *u8;
+
+#[drop(release_guard)]
+struct Guard {
+    handle: *u8,
+    id: i32
+}
+
+fun release_guard(guard: Guard) {
+    echo guard.id
+}
+
+fun make(id: i32) -> Guard {
+    return Guard { handle: malloc(1), id: id }
+}
+
+fun consume(guard: Guard) {
+    echo guard.id + 100
+}
+
+fun main() {
+    outer := make(1)
+    echo "start"
+    when true {
+        inner := make(2)
+        echo "inner"
+    }
+    moved := make(3)
+    kept := moved
+    echo "moved"
+    consume(make(4))
+    make(5)
+    echo "end"
+}

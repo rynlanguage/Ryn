@@ -1,0 +1,18 @@
+struct Rect {
+    w: i64
+}
+
+extend Rect {
+    fun grow(mut self, k: i64) -> i64 {
+        self.w = self.w * k
+        return self.w
+    }
+}
+
+fun scaled(rect: Rect) -> i64 {
+    return rect.grow(2)
+}
+
+fun main() {
+    echo scaled(Rect { w: 3 })
+}

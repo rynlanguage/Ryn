@@ -1,0 +1,14 @@
+// test: run
+// out: two
+const MODE: i32 = 2
+fun main() {
+    when MODE == 1 {
+        echo "one"
+    } else when MODE == 2 {
+        echo "two"
+    } else when MODE == 3 {
+        bad_name_here()
+    } else {
+        echo "other"
+    }
+}

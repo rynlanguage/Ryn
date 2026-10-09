@@ -1,0 +1,15 @@
+// test: run
+// out: a
+// out: ok
+fun eat(s: String) {
+    echo s
+}
+fun main() {
+    a := String("a")
+    when false {
+        eat(a)
+    } else {
+        eat(a)
+    }
+    echo "ok"
+}

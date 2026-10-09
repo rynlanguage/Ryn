@@ -1,0 +1,7 @@
+// test: fail
+// code: R0210
+// msg: write a present option as `Option::Some(value)`
+fun main() {
+    x := Some(3)
+    echo 1
+}

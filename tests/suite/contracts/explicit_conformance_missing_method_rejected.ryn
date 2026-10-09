@@ -1,0 +1,13 @@
+// test: fail
+shape Sized {
+    fun size(self) -> i32
+}
+struct Crate {
+    n: i32,
+}
+extend Crate as Sized {
+    fun other(self) -> i32 { 1 }
+}
+fun main() {
+    echo 1
+}

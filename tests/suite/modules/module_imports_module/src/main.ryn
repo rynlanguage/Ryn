@@ -1,0 +1,6 @@
+// test: run
+// out: 42
+use outer
+fun main() {
+    echo outer::twice_inner()
+}

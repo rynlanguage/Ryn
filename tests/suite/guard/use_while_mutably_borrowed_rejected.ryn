@@ -1,0 +1,8 @@
+// test: fail
+// code: R0249
+fun main() {
+    mut x: i32 = 1
+    r := &mut x
+    echo x
+    *r = 3
+}

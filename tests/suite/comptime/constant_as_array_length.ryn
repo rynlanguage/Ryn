@@ -1,0 +1,14 @@
+// test: run
+// out: 7
+// out: 16
+// out: 1
+const SIZE: u64 = 4
+const COUNT: i32 = 3
+fun main() {
+    mut a: [i32; SIZE] = [0; SIZE]
+    a[2] = 7
+    b: [u8; COUNT] = [1; COUNT]
+    echo a[2]
+    echo sizeof([i32; SIZE])
+    echo b[2]
+}

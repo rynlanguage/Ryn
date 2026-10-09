@@ -1,0 +1,11 @@
+// test: fail
+// msg: no instance
+// code: R0262
+struct Box<T> { value: T }
+fun make<T>(v: T) -> Box<T> {
+    return Box::<T> { value: v }
+}
+fun main() {
+    b := make(5 as i32)
+    echo b.value
+}

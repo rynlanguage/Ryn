@@ -1,0 +1,75 @@
+// test: run
+// out: 20
+// out: 30
+// out: 40
+// out: 50
+// out: 60
+// out: 65
+// out: 70
+// out: 80
+// out: 4
+// out: 8
+use std::arena
+
+struct Node {
+    key: i64,
+    left: *Node,
+    right: *Node
+}
+
+fun nil() -> *Node {
+    return (0 as u64) as *Node
+}
+
+fun is_nil(p: *Node) -> bool {
+    return (p as u64) == 0
+}
+
+fun new_node(a: &mut arena::Arena, key: i64) -> *Node {
+    return arena::alloc(a, Node { key: key, left: nil(), right: nil() })
+}
+
+fun insert(a: &mut arena::Arena, root: *Node, key: i64) -> *Node {
+    when is_nil(root) {
+        return new_node(a, key)
+    }
+    mut n := *root
+    when key < n.key {
+        n.left = insert(a, n.left, key)
+        *root = n
+    } else when key > n.key {
+        n.right = insert(a, n.right, key)
+        *root = n
+    }
+    return root
+}
+
+fun in_order(node: *Node) {
+    when is_nil(node) {
+        return
+    }
+    in_order((*node).left)
+    echo (*node).key
+    in_order((*node).right)
+}
+
+fun height(node: *Node) -> i64 {
+    when is_nil(node) {
+        return 0
+    }
+    l := height((*node).left)
+    r := height((*node).right)
+    return 1 + when l > r { l } else { r }
+}
+
+fun main() {
+    mut a := arena::Arena::with_capacity(4096 as u64)
+    mut root := nil()
+    keys := [50, 30, 70, 20, 40, 60, 80, 30, 65]
+    for i in 0..9 {
+        root = insert(&mut a, root, keys[i])
+    }
+    in_order(root)
+    echo height(root)
+    echo a.count()
+}

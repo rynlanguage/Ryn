@@ -1,0 +1,6 @@
+name: outer
+version: 0.1.0
+owner: guest
+dependencies:
+  inner:
+    path: ../inner

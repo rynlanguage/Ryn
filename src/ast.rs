@@ -1,6 +1,6 @@
 use crate::source::Span;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Program {
     pub uses: Vec<UseDecl>,
     pub structs: Vec<StructDef>,
@@ -28,10 +28,19 @@ pub struct ShapeMethod {
     pub default_value: Option<Expression>,
     pub span: Span,
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct UseDecl {
     pub path: Vec<String>,
+    /// `use a::b as c` makes the module available as `c` instead of `b`.
+    pub alias: Option<String>,
     pub span: Span,
+}
+
+impl UseDecl {
+    /// The name the importing code uses for the module: the alias, or the last path segment.
+    pub fn local_name(&self) -> Option<&String> {
+        self.alias.as_ref().or_else(|| self.path.last())
+    }
 }
 #[derive(Clone, Debug)]
 pub struct TypeAliasDef {
@@ -67,6 +76,9 @@ pub struct StructDef {
     pub drop_function: Option<String>,
     pub derives: Vec<String>,
     pub module_path: String,
+    /// For an instance of a generic structure (`Box<i32>`): its readable name before the
+    /// type arguments are replaced by their own instance names. Empty otherwise.
+    pub display: String,
     pub span: Span,
 }
 #[derive(Clone, Debug)]
@@ -196,6 +208,14 @@ pub enum Expression {
         name_span: Span,
         span: Span,
     },
+    /// `start..end` or `start..=end` as a value: a structure with `start`, `end`
+    /// and `inclusive` fields. A `for` loop header reads the bounds directly.
+    Range {
+        start: Box<Expression>,
+        end: Box<Expression>,
+        inclusive: bool,
+        span: Span,
+    },
     If {
         condition: Box<Expression>,
         then_value: Box<Expression>,
@@ -274,6 +294,115 @@ pub struct ChooseArm {
 }
 
 impl Expression {
+    /// Rewrites `value |> target`. A function name becomes `name(value)`, and a
+    /// call receives `value` as its first argument, so the pipe adds no node of
+    /// its own. Any other right side is rejected at its own span.
+    pub fn pipe_into(
+        value: Expression,
+        target: Expression,
+        span: Span,
+    ) -> Result<Expression, (Span, String)> {
+        match target {
+            Expression::Name(name, _) => Ok(Expression::Call {
+                name,
+                type_arguments: Vec::new(),
+                arguments: vec![value],
+                span,
+            }),
+            Expression::Call {
+                name,
+                type_arguments,
+                mut arguments,
+                ..
+            } => {
+                arguments.insert(0, value);
+                Ok(Expression::Call {
+                    name,
+                    type_arguments,
+                    arguments,
+                    span,
+                })
+            }
+            other => Err((
+                other.span(),
+                "the right side of `|>` must be a function name or a function call".to_owned(),
+            )),
+        }
+    }
+
+    /// Rewrites `value ?? fallback` as a `choose` over an `Option`. The fallback
+    /// is only evaluated in the `None` arm, so it is lazy. The bound name cannot
+    /// be written in source, so it cannot clash with a user variable.
+    pub fn coalesce(value: Expression, fallback: Expression, span: Span) -> Expression {
+        let bound = "$coalesce".to_owned();
+        Expression::Choose {
+            value: Box::new(value),
+            arms: vec![
+                ChooseArm {
+                    enum_name: Some("Option".to_owned()),
+                    variant: Some("Some".to_owned()),
+                    bindings: vec![bound.clone()],
+                    body: Expression::Name(bound, span),
+                    span,
+                },
+                ChooseArm {
+                    enum_name: Some("Option".to_owned()),
+                    variant: Some("None".to_owned()),
+                    bindings: Vec::new(),
+                    body: fallback,
+                    span,
+                },
+            ],
+            span,
+        }
+    }
+
+    /// Rewrites `value?.name` into a `choose` over `Option`: a `Some` payload is
+    /// read through `name` and wrapped again, and `None` stays `None`.
+    pub fn optional_field(
+        value: Expression,
+        name: String,
+        name_span: Span,
+        span: Span,
+    ) -> Expression {
+        let bound = "$chain".to_owned();
+        Expression::Choose {
+            value: Box::new(value),
+            arms: vec![
+                ChooseArm {
+                    enum_name: Some("Option".to_owned()),
+                    variant: Some("Some".to_owned()),
+                    bindings: vec![bound.clone()],
+                    body: Expression::EnumConstruct {
+                        enum_name: "Option".to_owned(),
+                        variant: "Some".to_owned(),
+                        arguments: vec![Expression::Field {
+                            value: Box::new(Expression::Name(bound, name_span)),
+                            name,
+                            name_span,
+                            span: name_span,
+                        }],
+                        span,
+                    },
+                    span,
+                },
+                ChooseArm {
+                    enum_name: Some("Option".to_owned()),
+                    variant: Some("None".to_owned()),
+                    bindings: Vec::new(),
+                    body: Expression::EnumConstruct {
+                        enum_name: "Option".to_owned(),
+                        variant: "None".to_owned(),
+                        arguments: Vec::new(),
+                        span,
+                    },
+                    span,
+                },
+            ],
+            span,
+        }
+    }
+
     pub fn span(&self) -> Span {
         match self {
             Self::Integer(_, span)
@@ -288,7 +417,7 @@ impl Expression {
             | Self::Dereference(_, span)
             | Self::Cast(_, _, span) => *span,
             Self::AddressOf { span, .. } => *span,
-            Self::LayoutOf { span, .. } => *span,
+            Self::LayoutOf { span, .. } | Self::Range { span, .. } => *span,
             Self::Binary { span, .. } => *span,
             Self::Call { span, .. } => *span,
             Self::MethodCall { span, .. } => *span,
@@ -375,11 +504,19 @@ pub enum Statement {
         body: Vec<Statement>,
         span: Span,
     },
+    // `defer { ... }` runs its block when the enclosing block is left, in reverse order of
+    // declaration, on normal exit, `return`, `break` and `continue`.
+    Defer {
+        body: Vec<Statement>,
+        span: Span,
+    },
     For {
         name: String,
         name_span: Span,
         start: Expression,
         end: Expression,
+        // `start..=end` includes `end`; `start..end` stops before it.
+        inclusive: bool,
         body: Vec<Statement>,
         span: Span,
     },

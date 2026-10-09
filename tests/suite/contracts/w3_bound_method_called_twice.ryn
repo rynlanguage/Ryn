@@ -1,0 +1,20 @@
+// test: run
+// out: 4
+shape Show {
+    fun show(self) -> i32
+}
+struct B {
+    n: i32,
+}
+extend B {
+    fun show(self) -> i32 {
+        self.n
+    }
+}
+fun f<T: Show>(a: T) -> i32 {
+    a.show()
+    a.show()
+}
+fun main() {
+    echo f(B { n: 4 })
+}

@@ -1,0 +1,9 @@
+// test: run
+// out: 2
+struct Pair { a: i32, b: i32 }
+fun fields<T>(value: T) -> u64 {
+    return field_count::<T>()
+}
+fun main() {
+    echo fields(Pair { a: 1, b: 2 })
+}

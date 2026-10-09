@@ -1,0 +1,11 @@
+// test: fail
+// code: R0010
+// msg: applies only to structs
+#[derive(Default)]
+enum Mode {
+    On,
+    Off,
+}
+fun main() {
+    echo 1
+}

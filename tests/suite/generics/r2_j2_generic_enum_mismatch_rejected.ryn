@@ -1,0 +1,15 @@
+// test: fail
+// code: R0263
+// msg: generic argument has type `Other` but the parameter pattern is `Outcome`
+enum Outcome<T> { Value(T), Empty }
+enum Other<T> { Value(T), Empty }
+fun tag<T>(o: Outcome<T>) -> i32 {
+    choose o {
+        Outcome::Value(_) => 1,
+        Outcome::Empty => 0
+    }
+}
+fun main() {
+    o: Other<i32> = Other::Value(3 as i32)
+    echo tag(o)
+}

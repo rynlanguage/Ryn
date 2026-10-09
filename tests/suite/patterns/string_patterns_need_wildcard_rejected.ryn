@@ -1,0 +1,9 @@
+// test: fail
+// msg: `_` arm
+// code: R0235
+fun main() {
+    echo choose "a" {
+        "a" => 1,
+        "b" => 2
+    }
+}

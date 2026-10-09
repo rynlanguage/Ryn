@@ -1,0 +1,4 @@
+use ring::three
+pub fun g() -> i32 {
+    return three::h()
+}

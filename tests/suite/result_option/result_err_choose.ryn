@@ -1,0 +1,11 @@
+// test: run
+// out: bad:3
+fun make() -> Result<i32, String> {
+    return Result::Err(String("bad"))
+}
+fun main() {
+    echo choose make() {
+        Result::Ok(v) => String("ok"),
+        Result::Err(m) => m.concat(String(":3"))
+    }
+}

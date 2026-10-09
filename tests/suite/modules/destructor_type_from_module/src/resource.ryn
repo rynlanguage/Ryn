@@ -1,0 +1,10 @@
+#[drop(close)]
+pub struct Handle {
+    pub h: *i32
+}
+fun close(handle: Handle) {
+    echo "closed"
+}
+pub fun open(p: *i32) -> Handle {
+    return Handle { h: p }
+}

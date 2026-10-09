@@ -1,0 +1,5 @@
+// test: run
+// out: 1 true text
+fun main() {
+    write("{} {} {}\n", 1 as i32, true, "text")
+}

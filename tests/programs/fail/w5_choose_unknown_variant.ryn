@@ -1,0 +1,14 @@
+enum Mode {
+    Read,
+    Write
+}
+
+fun main() {
+    mode := Mode::Read
+    code := choose mode {
+        Mode::Read => 0,
+        Mode::Execute => 1,
+        _ => 2
+    }
+    echo code
+}

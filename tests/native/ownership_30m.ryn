@@ -1,0 +1,16 @@
+extern "C" fun ryn_native_live_allocations() -> u64;
+extern "C" fun ryn_native_live_bytes() -> u64;
+fun text() -> String { return String("abcdefghijklmnop") }
+fun main() {
+    allocations := ryn_native_live_allocations()
+    bytes := ryn_native_live_bytes()
+    mut total: u64 = 0
+    mut i: u64 = 0
+    while i < 30000000 {
+        total += text().len()
+        i += 1
+    }
+    echo total
+    echo ryn_native_live_allocations() - allocations
+    echo ryn_native_live_bytes() - bytes
+}

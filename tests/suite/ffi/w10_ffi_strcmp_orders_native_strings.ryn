@@ -1,0 +1,32 @@
+// test: run
+// out: true
+// out: true
+// out: true
+// out: 0
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(p: *u8);
+extern "C" fun strcmp(a: *u8, b: *u8) -> i32;
+fun put8(address: u64, value: u8) {
+    p := address as *u8
+    *p = value
+}
+fun main() {
+    abc := malloc(4 as u64)
+    base := abc as u64
+    put8(base, 97 as u8)
+    put8(base + 1 as u64, 98 as u8)
+    put8(base + 2 as u64, 99 as u8)
+    put8(base + 3 as u64, 0 as u8)
+    abd := malloc(4 as u64)
+    other := abd as u64
+    put8(other, 97 as u8)
+    put8(other + 1 as u64, 98 as u8)
+    put8(other + 2 as u64, 100 as u8)
+    put8(other + 3 as u64, 0 as u8)
+    echo strcmp(abc, abd) < 0
+    echo strcmp(abd, abc) > 0
+    echo strcmp(abc, abc) == 0
+    echo strcmp(abc, abc)
+    free(abc)
+    free(abd)
+}

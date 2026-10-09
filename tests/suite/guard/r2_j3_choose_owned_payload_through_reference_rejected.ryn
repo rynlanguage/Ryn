@@ -1,0 +1,19 @@
+// test: fail
+// code: R0240
+// msg: cannot move an owned payload out of a reference
+enum Outcome {
+    Value(i32),
+    Text(String),
+    Empty,
+}
+fun kind(o: &Outcome) -> i32 {
+    choose *o {
+        Outcome::Value(v) => v,
+        Outcome::Text(t) => 2,
+        Outcome::Empty => 0,
+    }
+}
+fun main() {
+    e := Outcome::Text(String("x"))
+    echo kind(&e)
+}

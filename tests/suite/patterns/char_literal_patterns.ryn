@@ -1,0 +1,16 @@
+// test: run
+// out: 1
+// out: 2
+// out: 0
+fun kind(c: char) -> i32 {
+    choose c {
+        'a' => 1,
+        'b' => 2,
+        _ => 0
+    }
+}
+fun main() {
+    echo kind('a')
+    echo kind('b')
+    echo kind('z')
+}

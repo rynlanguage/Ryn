@@ -1,0 +1,25 @@
+// test: run
+// out: 0
+// out: 300000000
+// out: 0
+// out: 4096
+use std::arena
+fun main() {
+    mut a := arena::Arena::with_capacity(4096 as u64)
+    mut i: i64 = 0
+    mut fails: i64 = 0
+    mut sum: i64 = 0
+    while i < 100000 {
+        p := a.alloc_bytes(3000 as u64, 8 as u64)
+        when pointer_is_null(p) {
+            fails += 1
+        }
+        sum += a.used() as i64
+        a.reset()
+        i += 1
+    }
+    echo fails
+    echo sum
+    echo a.used()
+    echo a.remaining()
+}

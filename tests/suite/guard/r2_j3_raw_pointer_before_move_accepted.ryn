@@ -1,0 +1,11 @@
+// test: run
+// out: false
+// out: 1
+fun main() {
+    mut v: Vec<i32> = Vec()
+    v.push(3)
+    p := &raw mut v
+    echo pointer_is_null(p as *u8)
+    w := v
+    echo w.len()
+}

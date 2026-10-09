@@ -1,0 +1,9 @@
+// test: run
+// out: 4
+// out: 100
+fun main() {
+    a: Option<i32> = Option::Some(4)
+    b: Option<i32> = Option::None
+    echo a.unwrap_or(100)
+    echo b.unwrap_or(100)
+}

@@ -1,0 +1,13 @@
+// test: run
+// out: using
+// out: closing file
+#[drop(done)]
+struct Named { h: *i32, label: String }
+fun done(n: Named) {
+    echo "closing {n.label}"
+}
+fun main() {
+    mut x: i32 = 0
+    n := Named { h: &raw mut x, label: String("file") }
+    echo "using"
+}

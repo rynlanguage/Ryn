@@ -1,0 +1,7 @@
+// test: fail
+// msg: unsupported derive
+#[derive(Magic)]
+struct S { n: i32 }
+fun main() {
+    echo 1
+}

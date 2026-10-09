@@ -1,0 +1,7 @@
+// test: fail
+// code: R0012
+const SIZE: u64 = 2 + 2
+fun main() {
+    a: [i32; SIZE] = [0; 4]
+    echo 1
+}

@@ -1,0 +1,14 @@
+// test: run
+// out: 13
+struct Box<T> { v: T }
+struct Pair<A, B> { first: A, second: B }
+extend<T> Box<T> {
+    pub fun with(self, other: T) -> Pair<T, T> {
+        return Pair::<T, T> { first: self.v, second: other }
+    }
+}
+fun main() {
+    b := Box::<i32> { v: 4 }
+    p := b.with(9)
+    echo p.first + p.second
+}

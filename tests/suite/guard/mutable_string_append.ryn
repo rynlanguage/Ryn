@@ -1,0 +1,7 @@
+// test: run
+// out: ab
+fun main() {
+    mut s := String("a")
+    s.append("b")
+    echo s
+}

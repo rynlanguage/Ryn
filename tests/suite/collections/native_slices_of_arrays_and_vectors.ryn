@@ -1,0 +1,46 @@
+// test: run
+// out: 18
+// out: 60
+// out: 5
+// out: 15
+// out: 9
+// out: 2
+// out: 24
+// out: 0
+
+// Slices on the native backend: views of arrays (a local, a literal) and of vectors (whole and ranges), their length,
+// indexing, and passing them on to another function.
+
+fun total(values: &[i32]) -> i32 {
+    mut t: i32 = 0
+    for v in values {
+        t += v
+    }
+    return t
+}
+
+fun middle(values: &[i32]) -> i32 {
+    return values[values.len() / 2]
+}
+
+fun forward(values: &[i32]) -> i32 {
+    return total(values) * 2
+}
+
+fun main() {
+    a: [i32; 4] = [3, 4, 5, 6]
+    echo total(a)
+    echo total([10, 20, 30])
+    echo middle(a)
+    mut v: Vec<i32> = Vec()
+    v.push(1)
+    v.push(2)
+    v.push(3)
+    v.push(4)
+    v.push(5)
+    echo total(v.as_slice())
+    echo total(v.slice(1, 4))
+    echo middle(v.slice(0, 3))
+    echo forward(v.slice(2, 5))
+    echo v.slice(2, 2).len()
+}

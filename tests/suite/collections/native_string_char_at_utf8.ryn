@@ -1,0 +1,19 @@
+// test: run
+// exit: 1
+// err: String character index is out of bounds
+// out: a
+// out: é
+// out: €
+// out: 𝄞
+// out: z
+// out: 5
+fun main() {
+    s := String("aé€𝄞z")
+    echo s.char_at(0)
+    echo s.char_at(1)
+    echo s.char_at(2)
+    echo s.char_at(3)
+    echo s.char_at(4)
+    echo s.char_count()
+    echo s.char_at(5)
+}

@@ -1,0 +1,21 @@
+// test: run
+// out: 9
+// out: 20
+// out: 14
+struct Rect { w: i64, h: i64 }
+extend Rect {
+    fun area(self) -> i64 { return self.w * self.h }
+}
+enum Shape { Box(Rect), Dot }
+enum Wrap { Inner(Shape), Empty }
+fun main() {
+    s := Shape::Box(Rect { w: 3, h: 3 })
+    a := choose s { Shape::Box(x) => x.area(), Shape::Dot => 0 }
+    echo a
+    p: Option<Rect> = Option::Some(Rect { w: 4, h: 5 })
+    b := choose p { Option::Some(x) => x.area(), Option::None => 0 }
+    echo b
+    w := Wrap::Inner(Shape::Box(Rect { w: 2, h: 7 }))
+    c := choose w { Wrap::Inner(Shape::Box(r)) => r.area(), Wrap::Inner(Shape::Dot) => 0, Wrap::Empty => 0 }
+    echo c
+}

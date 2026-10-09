@@ -1,0 +1,11 @@
+// test: fail
+// code: R0235
+fun f(a: bool, b: bool) -> i32 {
+    choose (a, b) {
+        (true, _) => 1,
+        (false, true) => 2
+    }
+}
+fun main() {
+    echo f(false, false)
+}

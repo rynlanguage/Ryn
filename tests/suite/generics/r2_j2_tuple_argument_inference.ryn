@@ -1,0 +1,11 @@
+// test: run
+// out: 1
+// out: 5
+// out: 5
+fun id<T>(v: T) -> T { return v }
+fun first<A, B>(p: (A, B)) -> A { return p.0 }
+fun main() {
+    echo id((1 as i32, 2 as i32)).0
+    echo first((5 as i32, true))
+    echo first::<i32, bool>((5 as i32, true))
+}

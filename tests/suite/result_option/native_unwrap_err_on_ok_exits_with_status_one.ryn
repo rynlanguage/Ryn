@@ -1,0 +1,11 @@
+// test: run
+// out: before
+// exit: 1
+// err: called Result extraction on the wrong variant
+fun good() -> Result<i32, String> {
+    return Result::Ok(3)
+}
+fun main() {
+    print("before")
+    echo good().unwrap_err()
+}

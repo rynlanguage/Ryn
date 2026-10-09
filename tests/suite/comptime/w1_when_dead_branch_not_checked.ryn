@@ -1,0 +1,10 @@
+// test: run
+// out: live
+const DEBUG: bool = false
+fun main() {
+    when DEBUG {
+        echo 5 + "x"
+    } else {
+        echo "live"
+    }
+}

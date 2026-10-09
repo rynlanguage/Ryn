@@ -1,0 +1,8 @@
+struct Box<T> {
+    value: T,
+}
+
+fun main() {
+    b := Box::<i32> { value: 7 }
+    echo b.value
+}

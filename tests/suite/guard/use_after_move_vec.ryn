@@ -1,0 +1,7 @@
+// test: fail
+// code: R0240
+fun main() {
+    mut v: Vec<i32> = Vec()
+    w := v
+    v.push(1)
+}

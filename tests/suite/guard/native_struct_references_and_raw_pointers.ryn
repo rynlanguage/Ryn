@@ -1,0 +1,32 @@
+// test: run
+// out: 9
+// out: 6
+// out: 12
+// out: 3
+// out: 40
+// out: 50
+extern "C" fun malloc(size: u64) -> *u8;
+struct Pair {
+    x: i32,
+    y: i64,
+}
+fun bump(p: &mut Pair) {
+    p.y = p.y + 1
+    p.x = 9
+}
+fun read(p: &Pair) -> i64 {
+    return p.y * 2
+}
+fun main() {
+    mut q := Pair { x: 1, y: 5 }
+    bump(&mut q)
+    echo q.x
+    echo q.y
+    echo read(&q)
+    r := malloc(16 as u64) as *Pair
+    *r = Pair { x: 3, y: 40 }
+    echo (*r).x
+    echo (*r).y
+    *r = Pair { x: 4, y: 50 }
+    echo (*r).y
+}

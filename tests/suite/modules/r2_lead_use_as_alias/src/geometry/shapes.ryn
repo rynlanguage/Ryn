@@ -1,0 +1,4 @@
+pub struct Point { pub x: i32, pub y: i32 }
+pub fun origin() -> Point { return Point { x: 0, y: 0 } }
+pub fun sum(p: Point) -> i32 { return p.x + p.y }
+pub const SIDES: i32 = 4

@@ -1,0 +1,14 @@
+// test: run
+// out: 6
+// out: 5
+// out: é
+// out: 195
+// out: él
+fun main() {
+    s := String("héllo")
+    echo s.len()
+    echo s.char_count()
+    echo s.char_at(1)
+    echo s.byte_at(1)
+    echo s.substring(1, 3)
+}

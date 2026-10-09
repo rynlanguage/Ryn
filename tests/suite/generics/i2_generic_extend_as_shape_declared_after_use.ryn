@@ -1,0 +1,18 @@
+// test: run
+// out: 8
+// out: 4
+shape Sized {
+    fun size(self) -> i32
+}
+struct Box<T> { value: T, n: i32 }
+fun measure<U: Sized>(v: U) -> i32 {
+    return v.size()
+}
+fun main() {
+    a := Box::<i32> { value: 1, n: 4 }
+    echo measure(a)
+    echo a.n
+}
+extend<T> Box<T> as Sized {
+    pub fun size(self) -> i32 { return self.n * 2 }
+}

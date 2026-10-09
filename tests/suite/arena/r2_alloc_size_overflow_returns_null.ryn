@@ -1,0 +1,19 @@
+// test: run
+// out: false
+// out: true
+// out: true
+// out: 8
+// out: 1
+use std::arena
+
+fun main() {
+    mut a := arena::Arena::with_capacity(4096 as u64)
+    p := a.alloc_bytes(8 as u64, 1 as u64)
+    echo pointer_is_null(p)
+    q := a.alloc_bytes(18446744073709551612 as u64, 1 as u64)
+    echo pointer_is_null(q)
+    r := a.alloc_bytes(8 as u64, 9223372036854775808 as u64)
+    echo pointer_is_null(r)
+    echo a.used()
+    echo a.count()
+}

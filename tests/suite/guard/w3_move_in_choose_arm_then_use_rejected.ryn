@@ -1,0 +1,16 @@
+// test: fail
+// code: R0240
+fun eat(s: String) -> i32 {
+    echo s
+    return 1
+}
+fun main() {
+    s := String("a")
+    n: i32 = 1
+    v := choose n {
+        1 => eat(s),
+        _ => 2,
+    }
+    echo s
+    echo v
+}

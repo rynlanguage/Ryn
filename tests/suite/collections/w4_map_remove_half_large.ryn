@@ -1,0 +1,22 @@
+// test: run
+// out: 2500
+// out: 14997
+// out: -1
+fun main() {
+    mut m := Map<i64, i64>()
+    mut i: i64 = 0
+    while i < 5000 {
+        m.insert(i, i * 3)
+        i += 1
+    }
+    mut j: i64 = 0
+    while j < 5000 {
+        when j % 2 == 0 {
+            m.remove(j)
+        }
+        j += 1
+    }
+    echo m.len()
+    echo choose m.get(4999) { Option::Some(v) => v, Option::None => -1 }
+    echo choose m.get(4998) { Option::Some(v) => v, Option::None => -1 }
+}

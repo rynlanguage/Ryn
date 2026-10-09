@@ -1,0 +1,12 @@
+// test: run
+// out: 0
+// out: false
+#[derive(Default)]
+struct Inner { n: i32 }
+#[derive(Default)]
+struct Outer { inner: Inner, flag: bool }
+fun main() {
+    o := Outer::default()
+    echo o.inner.n
+    echo o.flag
+}

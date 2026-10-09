@@ -1,0 +1,9 @@
+enum Mode {
+    Read,
+    Write
+}
+
+fun main() {
+    mode := Mode::Execute
+    echo 0
+}

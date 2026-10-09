@@ -1,0 +1,11 @@
+fun main() {
+    mut values: Vec<Option<i32>> = Vec()
+    values.push(Option::Some(3))
+    values.push(Option::None)
+    values.push(Option::Some(8))
+    echo values.len()
+    copied := values[2]
+    echo choose copied { Option::Some(number) => number, Option::None => 0 }
+    last: Option<Option<i32>> = values.last()
+    echo choose last { Option::Some(inner) => choose inner { Option::Some(n) => n, Option::None => -1 }, Option::None => -2 }
+}

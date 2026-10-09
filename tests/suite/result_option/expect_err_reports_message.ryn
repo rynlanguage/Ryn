@@ -1,0 +1,9 @@
+// test: run
+// exit: 1
+// err: must succeed
+fun err() -> Result<i32, String> {
+    return Result::Err(String("e"))
+}
+fun main() {
+    echo err().expect("must succeed")
+}

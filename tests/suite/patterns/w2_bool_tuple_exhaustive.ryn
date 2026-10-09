@@ -1,0 +1,18 @@
+// test: run
+// out: 1
+// out: 1
+// out: 2
+// out: 3
+fun f(a: bool, b: bool) -> i32 {
+    choose (a, b) {
+        (true, _) => 1,
+        (false, true) => 2,
+        (false, false) => 3
+    }
+}
+fun main() {
+    echo f(true, false)
+    echo f(true, true)
+    echo f(false, true)
+    echo f(false, false)
+}

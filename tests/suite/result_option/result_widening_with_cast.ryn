@@ -1,0 +1,12 @@
+// test: run
+// out: 42
+fun parse() -> Result<i32, String> {
+    return Result::Ok(41)
+}
+fun wide() -> Result<i64, String> {
+    v: i32 = parse()?
+    return Result::Ok(v as i64 + 1)
+}
+fun main() {
+    echo wide().unwrap()
+}

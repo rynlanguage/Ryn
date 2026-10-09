@@ -1,0 +1,9 @@
+// test: run
+// out: hi!
+// out: 3
+const GREETING: String = String("hi").concat("!")
+const LEN: u64 = GREETING.char_count()
+fun main() {
+    echo GREETING
+    echo LEN
+}

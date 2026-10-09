@@ -1,0 +1,19 @@
+// test: fail
+// code: R0450
+// msg: must take `mut self` to satisfy `Bump`
+shape Bump {
+    fun bump(mut self) -> i32
+}
+struct C {
+    n: i32
+}
+extend C {
+    fun bump(self) -> i32 { self.n }
+}
+fun apply<T: Bump>(c: T) -> i32 {
+    c.bump()
+}
+fun main() {
+    c := C { n: 1 }
+    echo apply(c)
+}

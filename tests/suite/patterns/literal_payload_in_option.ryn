@@ -1,0 +1,16 @@
+// test: run
+// out: 100
+// out: 9
+// out: -1
+fun f(o: Option<i32>) -> i32 {
+    choose o {
+        Option::Some(0) => 100,
+        Option::Some(n) => n,
+        Option::None => -1
+    }
+}
+fun main() {
+    echo f(Option::Some(0))
+    echo f(Option::Some(9))
+    echo f(Option::None)
+}

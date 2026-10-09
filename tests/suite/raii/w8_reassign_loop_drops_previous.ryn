@@ -1,0 +1,17 @@
+// test: run
+// out: 100000
+#[drop(bump)]
+struct Counter { h: *i64 }
+fun bump(c: Counter) {
+    *c.h = *c.h + 1
+}
+fun main() {
+    mut hits: i64 = 0
+    mut c := Counter { h: &raw mut hits }
+    mut i: i64 = 0
+    while i < 100000 {
+        c = Counter { h: &raw mut hits }
+        i += 1
+    }
+    echo hits
+}

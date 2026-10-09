@@ -7,16 +7,19 @@ use std::{
 pub mod ast;
 pub mod ast_codec;
 pub mod codegen;
+pub mod comptime;
 pub mod filesystem_ops;
 pub mod frontend;
 pub mod generics;
 mod guard;
+pub mod ir_codec;
 pub mod lexer;
 pub mod lockfile;
 pub mod manifest;
 pub mod map_ops;
 mod modules;
 pub mod parser;
+pub mod patterns;
 pub mod pe_linker;
 pub mod registry;
 pub mod sema;
@@ -24,6 +27,7 @@ pub mod source;
 pub mod string_ops;
 pub mod system_ops;
 pub mod vector_ops;
+pub mod visit;
 
 /// Checks Ryn source and returns its typed intermediate representation.
 ///
@@ -89,6 +93,14 @@ pub fn check_project_with_frontend(
     modules::check_project(project.as_ref(), frontend).map(|(ir, _)| ir)
 }
 
+/// Loads a project's modules into one specialized program, as semantic analysis receives it.
+pub fn load_project_program(
+    project: impl AsRef<Path>,
+    frontend: &frontend::Frontend,
+) -> Result<ast::Program, String> {
+    modules::project_program(project.as_ref(), frontend)
+}
+
 /// Checks a source file, parsing it with `frontend`.
 ///
 /// The bootstrap parser gathers independent syntax errors; the self-hosted
@@ -101,7 +113,7 @@ pub fn check_source_with_frontend(
     let program = frontend
         .monomorphize(program)
         .map_err(|error| vec![error])?;
-    sema::analyze_recovering(program)
+    frontend.analyze(program, true)
 }
 
 /// Compiles a project and its imported Ryn modules into a native executable.
@@ -280,7 +292,9 @@ pub fn compile_source_with_frontend(
     let program = frontend
         .monomorphize(program)
         .map_err(CompileError::Source)?;
-    let ir = sema::analyze(program).map_err(CompileError::Source)?;
+    let ir = frontend
+        .analyze(program, false)
+        .map_err(|mut errors| CompileError::Source(errors.remove(0)))?;
     codegen::build_native_with_optimize(&ir, output, optimize.codegen_value())
         .map_err(CompileError::Native)
 }

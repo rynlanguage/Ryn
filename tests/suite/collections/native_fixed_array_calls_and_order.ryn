@@ -1,0 +1,47 @@
+// test: run
+// out: call
+// out: call
+// out: 1
+// out: 2
+// out: call
+// out: call
+// out: 3
+// out: 3
+// out: 6
+// out: 9
+// out: 7
+// out: 10
+
+// Array items are evaluated left to right, a repeated item once, and arrays come from and go to calls.
+
+fun call(n: i64) -> i64 {
+    echo "call"
+    return n
+}
+
+fun make(start: i64) -> [i64; 3] {
+    return [start, start + 1, start + 2]
+}
+
+fun total(values: [i64; 3]) -> i64 {
+    return values[0] + values[1] + values[2]
+}
+
+fun main() {
+    mut a: [i64; 2] = [0; 2]
+    a = [call(1), call(2)]
+    echo a[0]
+    echo a[1]
+    echo "call"
+    mut r: [i64; 2] = [0; 2]
+    r = [call(3); 2]
+    echo r[0]
+    echo r[1]
+    echo total(make(1))
+    m := make(2)
+    echo total(m)
+    b: [i64; 3] = make(4)
+    echo b[2] + 1
+    c := make(5)
+    echo c[0] + c[1] - c[2] + 6
+}
