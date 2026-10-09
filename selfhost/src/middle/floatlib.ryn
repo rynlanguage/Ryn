@@ -1,0 +1,543 @@
+// Exact conversions between decimal text and IEEE double precision numbers, written with big integers so that they need no C
+// library: `format_f64` gives the text Rust's `Display` gives a double (the shortest digits that read back as the same
+// number, never an exponent), and `parse_f64` reads the decimal text of a number into the double nearest to it (ties to
+// even), as Rust's `str::parse::<f64>` does. Both work on the bits of the double (a `u64`).
+//
+// A big integer is a `Vec<u32>` of 32-bit words, least significant first, with no zero word at the end (zero is empty).
+
+// ---- big integers -------------------------------------------------------------------------------------------------
+
+fun big_trim(words: Vec<u32>) -> Vec<u32> {
+    mut out := words
+    while out.len() > 0 && out[out.len() - 1] == 0 {
+        out.pop()
+    }
+    return out
+}
+
+fun big_from_u64(value: u64) -> Vec<u32> {
+    mut out: Vec<u32> = Vec()
+    out.push((value & 4294967295) as u32)
+    out.push((value >> (32 as u32)) as u32)
+    return big_trim(out)
+}
+
+// `a * m` for a small `m`.
+fun big_mul_small(a: Vec<u32>, m: u32) -> Vec<u32> {
+    mut out: Vec<u32> = Vec()
+    mut carry: u64 = 0
+    mut i: u64 = 0
+    while i < a.len() {
+        product := (a[i] as u64) * (m as u64) + carry
+        out.push((product & 4294967295) as u32)
+        carry = product >> (32 as u32)
+        i += 1
+    }
+    when carry > 0 {
+        out.push(carry as u32)
+    }
+    return big_trim(out)
+}
+
+// `a + b`.
+fun big_add(a: Vec<u32>, b: Vec<u32>) -> Vec<u32> {
+    mut out: Vec<u32> = Vec()
+    mut carry: u64 = 0
+    mut i: u64 = 0
+    while i < a.len() || i < b.len() {
+        mut sum: u64 = carry
+        when i < a.len() {
+            sum += a[i] as u64
+        }
+        when i < b.len() {
+            sum += b[i] as u64
+        }
+        out.push((sum & 4294967295) as u32)
+        carry = sum >> (32 as u32)
+        i += 1
+    }
+    when carry > 0 {
+        out.push(carry as u32)
+    }
+    return out
+}
+
+// `a - b`, for `a >= b`.
+fun big_sub(a: Vec<u32>, b: Vec<u32>) -> Vec<u32> {
+    mut out: Vec<u32> = Vec()
+    mut borrow: u64 = 0
+    mut i: u64 = 0
+    while i < a.len() {
+        mut take: u64 = borrow
+        when i < b.len() {
+            take += b[i] as u64
+        }
+        mut word: u64 = a[i] as u64
+        when word >= take {
+            word -= take
+            borrow = 0
+        } else {
+            word = word + 4294967296 - take
+            borrow = 1
+        }
+        out.push(word as u32)
+        i += 1
+    }
+    return big_trim(out)
+}
+
+// `a << bits`.
+fun big_shl(a: Vec<u32>, bits: u64) -> Vec<u32> {
+    when a.len() == 0 {
+        return a
+    }
+    words := bits / 32
+    shift := (bits % 32) as u32
+    mut out: Vec<u32> = Vec()
+    mut z: u64 = 0
+    while z < words {
+        out.push(0)
+        z += 1
+    }
+    mut carry: u64 = 0
+    mut i: u64 = 0
+    while i < a.len() {
+        wide := ((a[i] as u64) << shift) | carry
+        out.push((wide & 4294967295) as u32)
+        carry = wide >> (32 as u32)
+        i += 1
+    }
+    when carry > 0 {
+        out.push(carry as u32)
+    }
+    return out
+}
+
+// -1, 0 or 1 as `a` is below, equal to or above `b`.
+fun big_cmp(a: Vec<u32>, b: Vec<u32>) -> i32 {
+    when a.len() != b.len() {
+        when a.len() < b.len() {
+            return -1
+        }
+        return 1
+    }
+    mut i: u64 = a.len()
+    while i > 0 {
+        i -= 1
+        when a[i] != b[i] {
+            when a[i] < b[i] {
+                return -1
+            }
+            return 1
+        }
+    }
+    return 0
+}
+
+// The number of bits of `a` (zero for zero).
+fun big_bits(a: Vec<u32>) -> u64 {
+    when a.len() == 0 {
+        return 0
+    }
+    top := a[a.len() - 1]
+    mut n: u64 = 0
+    mut v: u32 = top
+    while v > 0 {
+        v = v >> (1 as u32)
+        n += 1
+    }
+    return (a.len() - 1) * 32 + n
+}
+
+// `a * 10^k`.
+fun big_mul_pow10(a: Vec<u32>, k: u64) -> Vec<u32> {
+    mut out := a
+    mut left: u64 = k
+    while left >= 9 {
+        out = big_mul_small(out, 1000000000)
+        left -= 9
+    }
+    mut step: u32 = 1
+    mut i: u64 = 0
+    while i < left {
+        step = step * 10
+        i += 1
+    }
+    when left > 0 {
+        out = big_mul_small(out, step)
+    }
+    return out
+}
+
+fun big_is_zero(a: Vec<u32>) -> bool {
+    return a.len() == 0
+}
+
+// ---- the text of a double ------------------------------------------------------------------------------------------
+
+fun repeat_zeros(count: u64) -> String {
+    mut out := String("")
+    mut i: u64 = 0
+    while i < count {
+        out.push('0')
+        i += 1
+    }
+    return out
+}
+
+// The text Rust's `Display` gives a double with the bits `bits`.
+pub fun format_f64(bits: u64) -> String {
+    negative := (bits >> (63 as u32)) == 1
+    biased := ((bits >> (52 as u32)) & 2047) as u64
+    fraction := bits & 4503599627370495
+    mut out := String("")
+    when biased == 2047 {
+        when fraction != 0 {
+            return String("NaN")
+        }
+        when negative {
+            return String("-inf")
+        }
+        return String("inf")
+    }
+    when negative {
+        out.push('-')
+    }
+    when biased == 0 && fraction == 0 {
+        out.push('0')
+        return out
+    }
+    // The value is `mant * 2^exp`.
+    mut mant: u64 = fraction
+    mut exp: i64 = 0
+    mut minus: u64 = 1
+    mut plus: u64 = 1
+    mut inclusive: bool = false
+    when biased == 0 {
+        exp = -1074
+        inclusive = (mant & 1) == 0
+        mant = mant << (1 as u32)
+        exp -= 1
+    } else {
+        mant = mant | 4503599627370496
+        exp = (biased as i64) - 1075
+        inclusive = (mant & 1) == 0
+        when fraction == 0 && biased > 1 {
+            mant = mant << (2 as u32)
+            exp -= 2
+            plus = 2
+        } else {
+            mant = mant << (1 as u32)
+            exp -= 1
+        }
+    }
+    mut r := big_from_u64(mant)
+    mut scale := big_from_u64(1)
+    mut m_minus := big_from_u64(minus)
+    mut m_plus := big_from_u64(plus)
+    when exp < 0 {
+        scale = big_shl(scale, (0 - exp) as u64)
+    } else {
+        shift := exp as u64
+        r = big_shl(r, shift)
+        m_minus = big_shl(m_minus, shift)
+        m_plus = big_shl(m_plus, shift)
+    }
+    // k estimates the decimal exponent: the value is below 10^k and at least 10^(k-1).
+    mut k: i64 = (((big_bits(big_from_u64(mant)) as i64) - 1 + exp) * 1292913986) / 4294967296 + 1
+    when k >= 0 {
+        scale = big_mul_pow10(scale, k as u64)
+    } else {
+        factor := (0 - k) as u64
+        r = big_mul_pow10(r, factor)
+        m_minus = big_mul_pow10(m_minus, factor)
+        m_plus = big_mul_pow10(m_plus, factor)
+    }
+    // The estimate may be one too small or one too large: fix it so that (r + plus) is below scale.
+    mut high := big_add(r.clone(), m_plus.clone())
+    mut c := big_cmp(scale.clone(), high.clone())
+    mut too_small: bool = c < 0
+    when inclusive && c == 0 {
+        too_small = true
+    }
+    while too_small {
+        scale = big_mul_small(scale, 10)
+        k += 1
+        high = big_add(r.clone(), m_plus.clone())
+        c = big_cmp(scale.clone(), high.clone())
+        too_small = c < 0
+        when inclusive && c == 0 {
+            too_small = true
+        }
+    }
+    // Too large when ten times the high end is still below the scale.
+    mut again: bool = true
+    while again {
+        ten := big_mul_small(big_add(r.clone(), m_plus.clone()), 10)
+        cc := big_cmp(scale.clone(), ten)
+        mut too_big: bool = cc > 0
+        when !inclusive && cc == 0 {
+            too_big = false
+        }
+        when too_big {
+            r = big_mul_small(r, 10)
+            m_minus = big_mul_small(m_minus, 10)
+            m_plus = big_mul_small(m_plus, 10)
+            k -= 1
+        } else {
+            again = false
+        }
+    }
+    // The first digit is the integer part of ten times the value over 10^k.
+    r = big_mul_small(r, 10)
+    m_minus = big_mul_small(m_minus, 10)
+    m_plus = big_mul_small(m_plus, 10)
+    // The digits, one at a time, until the rest is within the interval of numbers that read back as this one.
+    mut digits: Vec<u8> = Vec()
+    mut down: bool = false
+    mut up: bool = false
+    mut finished: bool = false
+    while !finished {
+        mut digit: u8 = 0
+        while big_cmp(r.clone(), scale.clone()) >= 0 {
+            r = big_sub(r, scale.clone())
+            digit += 1
+        }
+        cd := big_cmp(r.clone(), m_minus.clone())
+        down = cd < 0
+        when inclusive && cd == 0 {
+            down = true
+        }
+        cu := big_cmp(scale.clone(), big_add(r.clone(), m_plus.clone()))
+        up = cu < 0
+        when inclusive && cu == 0 {
+            up = true
+        }
+        digits.push(digit + 48)
+        when down || up {
+            finished = true
+        } else {
+            r = big_mul_small(r, 10)
+            m_minus = big_mul_small(m_minus, 10)
+            m_plus = big_mul_small(m_plus, 10)
+        }
+    }
+    // Stopping inside the digits: round the last one up when the rest is at least half.
+    when up {
+        twice := big_shl(r.clone(), 1)
+        round_up := !down || big_cmp(twice, scale.clone()) >= 0
+        when round_up {
+            mut at: u64 = digits.len()
+            mut carrying: bool = true
+            while carrying && at > 0 {
+                at -= 1
+                when digits[at] == 57 {
+                    digits.set(at, 48)
+                } else {
+                    digits.set(at, digits[at] + 1)
+                    carrying = false
+                }
+            }
+            when carrying {
+                digits.insert(0, 49)
+                k += 1
+            }
+        }
+    }
+    count := digits.len()
+    mut text := String("")
+    for d in digits {
+        text.push(char_from_u32(d as u32))
+    }
+    when k <= 0 {
+        out.append("0.")
+        out.append(repeat_zeros((0 - k) as u64))
+        out.append(text)
+        return out
+    }
+    kk := k as u64
+    when count <= kk {
+        out.append(text)
+        out.append(repeat_zeros(kk - count))
+        return out
+    }
+    out.append(text.slice(0, kk))
+    out.push('.')
+    out.append(text.slice(kk, count))
+    return out
+}
+
+// ---- reading a double ------------------------------------------------------------------------------------------------
+
+
+// The double nearest to `numerator / denominator` (both positive big integers), as bits, rounding ties to even.
+fun round_ratio(numerator: Vec<u32>, denominator: Vec<u32>) -> u64 {
+    // The binary exponent of the quotient is near the difference of the sizes; the unit of the last place is 2^e.
+    mut e: i64 = (big_bits(numerator.clone()) as i64) - (big_bits(denominator.clone()) as i64) - 53
+    when e < -1074 {
+        e = -1074
+    }
+    mut quotient: u64 = 0
+    mut remainder: Vec<u32> = Vec()
+    mut divisor: Vec<u32> = Vec()
+    mut settled: bool = false
+    while !settled {
+        mut top: Vec<u32> = numerator.clone()
+        mut bottom: Vec<u32> = denominator.clone()
+        when e >= 0 {
+            bottom = big_shl(bottom, e as u64)
+        } else {
+            top = big_shl(top, (0 - e) as u64)
+        }
+        quotient = 0
+        mut bit: u64 = 56
+        while true {
+            shifted := big_shl(bottom.clone(), bit)
+            when big_cmp(top.clone(), shifted.clone()) >= 0 {
+                top = big_sub(top, shifted)
+                quotient = quotient | ((1 as u64) << (bit as u32))
+            }
+            when bit == 0 {
+                break
+            }
+            bit -= 1
+        }
+        remainder = top
+        divisor = bottom
+        // The quotient must have 53 bits, unless the exponent is the smallest.
+        when quotient >= 9007199254740992 {
+            e += 1
+        } else when quotient < 4503599627370496 && e > -1074 {
+            e -= 1
+        } else {
+            settled = true
+        }
+    }
+    twice := big_shl(remainder, 1)
+    c := big_cmp(twice, divisor)
+    when c > 0 || (c == 0 && (quotient & 1) == 1) {
+        quotient += 1
+        when quotient == 9007199254740992 {
+            quotient = 4503599627370496
+            e += 1
+        }
+    }
+    when quotient < 4503599627370496 {
+        return quotient
+    }
+    when e > 971 {
+        return 9218868437227405312
+    }
+    biased := (e + 1075) as u64
+    return (biased << (52 as u32)) | (quotient - 4503599627370496)
+}
+
+// The bits of the double nearest to the decimal number `text` (an optional sign, digits with an optional point, and an
+// optional exponent; also `inf`, `infinity` and `nan` in any case), or nothing when the text is not such a number.
+pub fun parse_f64(text: str) -> Option<u64> {
+    source := String(text)
+    n := source.len()
+    mut at: u64 = 0
+    mut negative: bool = false
+    when n > 0 && (source.byte_at(0) == 45 || source.byte_at(0) == 43) {
+        negative = source.byte_at(0) == 45
+        at = 1
+    }
+    when at >= n {
+        return Option::None
+    }
+    mut sign_bit: u64 = 0
+    when negative {
+        sign_bit = 9223372036854775808
+    }
+    lowered := source.slice(at, n).to_lower()
+    when lowered == "inf" || lowered == "infinity" {
+        return Option::Some(sign_bit | 9218868437227405312)
+    }
+    when lowered == "nan" {
+        return Option::Some(9221120237041090560)
+    }
+    // Digits of the mantissa without the point, and the exponent that moves the point to the end of them.
+    mut digits: Vec<u8> = Vec()
+    mut seen: u64 = 0
+    mut after_point: u64 = 0
+    mut point: bool = false
+    mut looking: bool = true
+    while looking && at < n {
+        c := source.byte_at(at)
+        when c >= 48 && c <= 57 {
+            digits.push(c)
+            seen += 1
+            when point {
+                after_point += 1
+            }
+            at += 1
+        } else when c == 46 && !point {
+            point = true
+            at += 1
+        } else {
+            looking = false
+        }
+    }
+    when seen == 0 {
+        return Option::None
+    }
+    mut exponent: i64 = 0
+    when at < n && (source.byte_at(at) == 101 || source.byte_at(at) == 69) {
+        at += 1
+        mut exponent_negative: bool = false
+        when at < n && (source.byte_at(at) == 45 || source.byte_at(at) == 43) {
+            exponent_negative = source.byte_at(at) == 45
+            at += 1
+        }
+        mut exponent_digits: u64 = 0
+        while at < n && source.byte_at(at) >= 48 && source.byte_at(at) <= 57 {
+            when exponent < 100000000 {
+                exponent = exponent * 10 + ((source.byte_at(at) - 48) as i64)
+            }
+            exponent_digits += 1
+            at += 1
+        }
+        when exponent_digits == 0 {
+            return Option::None
+        }
+        when exponent_negative {
+            exponent = 0 - exponent
+        }
+    }
+    when at != n {
+        return Option::None
+    }
+    exponent = exponent - (after_point as i64)
+    // Leading zeros do not count; a zero mantissa is a zero.
+    mut first: u64 = 0
+    while first < digits.len() && digits[first] == 48 {
+        first += 1
+    }
+    when first == digits.len() {
+        return Option::Some(sign_bit)
+    }
+    significant := (digits.len() - first) as i64
+    magnitude := significant + exponent
+    when magnitude > 310 {
+        return Option::Some(sign_bit | 9218868437227405312)
+    }
+    when magnitude < -330 {
+        return Option::Some(sign_bit)
+    }
+    mut number: Vec<u32> = Vec()
+    mut index: u64 = first
+    while index < digits.len() {
+        number = big_mul_small(number, 10)
+        number = big_add(number, big_from_u64((digits[index] - 48) as u64))
+        index += 1
+    }
+    mut numerator: Vec<u32> = number
+    mut denominator: Vec<u32> = big_from_u64(1)
+    when exponent >= 0 {
+        numerator = big_mul_pow10(numerator, exponent as u64)
+    } else {
+        denominator = big_mul_pow10(denominator, (0 - exponent) as u64)
+    }
+    return Option::Some(sign_bit | round_ratio(numerator, denominator))
+}

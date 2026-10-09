@@ -1,0 +1,216 @@
+// The methods the compiler provides on `String`, `Vec`, and numbers: the operation each name
+// stands for, its parameters after the receiver, its result, and which parameter takes ownership
+// of its argument. Mirrors `StringOp::parameters/result` and `VecOp::parameters/result`.
+//
+// Each row is `name;operation;parameters;result;owning parameter`. Parameters are separated by
+// commas, a type word may hold spaces, `E` stands for the element type of a `Vec`, and `VE` for
+// the `Vec` itself. The owning parameter is the position that takes ownership of its argument
+// (99 for none); a `MethodRow` carries it as a bit mask.
+
+pub struct MethodRow {
+    pub op: String,
+    pub params: Vec<String>,
+    pub ret: String,
+    pub owning: u64,
+}
+
+// The methods of `Map` and `Set`; `K` and `V` stand for the key and value types, `VK` and `VV` for
+// vectors of them, and `M` for the map itself.
+fun map_rows() -> Vec<String> {
+    mut rows: Vec<String> = Vec()
+    rows.push(String("len;Len;;U64;99"))
+    rows.push(String("is_empty;IsEmpty;;Bool;99"))
+    rows.push(String("clone;Clone;;M;99"))
+    rows.push(String("clear;Clear;;;99"))
+    rows.push(String("contains_key;ContainsKey;K;Bool;99"))
+    rows.push(String("contains;ContainsKey;K;Bool;99"))
+    rows.push(String("insert;Insert;K,V;Bool;99"))
+    rows.push(String("add;Insert;K,V;Bool;99"))
+    rows.push(String("get;Get;K;;99"))
+    rows.push(String("remove;Remove;K;Bool;99"))
+    rows.push(String("keys;Keys;;VK;99"))
+    rows.push(String("values;Values;;VV;99"))
+    return rows
+}
+
+// The `Map` method with this name for keys `key` and values `value`; `map` is the map type word.
+// Insert takes ownership of both arguments.
+pub fun map_method(name: String, key: String, value: String, map: String) -> Option<MethodRow> {
+    rows := map_rows()
+    for row in rows {
+        fields := row.split(";")
+        when fields[0] == name {
+            mut params: Vec<String> = Vec()
+            for word in words(fields[2].clone()) {
+                when word == "K" {
+                    params.push(key.clone())
+                } else {
+                    params.push(value.clone())
+                }
+            }
+            mut ret := fields[3].clone()
+            when ret == "M" {
+                ret = map
+            } else when ret == "VK" {
+                ret = String("Vec ")
+                ret.append(key.clone())
+            } else when ret == "VV" {
+                ret = String("Vec ")
+                ret.append(value.clone())
+            }
+            mut owning: u64 = 0
+            when fields[1] == "Insert" {
+                owning = 3
+            }
+            return Option::Some(MethodRow { op: fields[1].clone(), params: params, ret: ret, owning: owning })
+        }
+    }
+    return Option::None
+}
+
+fun words(text: String) -> Vec<String> {
+    when text.is_empty() {
+        return Vec()
+    }
+    return text.split(",")
+}
+
+fun string_rows() -> Vec<String> {
+    mut rows: Vec<String> = Vec()
+    rows.push(String("clone;Clone;;OwnedString;99"))
+    rows.push(String("to_i8;ToI8;;I8;99"))
+    rows.push(String("to_i16;ToI16;;I16;99"))
+    rows.push(String("to_i32;ToI32;;I32;99"))
+    rows.push(String("to_i64;ToI64;;I64;99"))
+    rows.push(String("to_u8;ToU8;;U8;99"))
+    rows.push(String("to_u16;ToU16;;U16;99"))
+    rows.push(String("to_u32;ToU32;;U32;99"))
+    rows.push(String("to_u64;ToU64;;U64;99"))
+    rows.push(String("to_f32;ToF32;;F32;99"))
+    rows.push(String("to_f64;ToF64;;F64;99"))
+    rows.push(String("len;Len;;U64;99"))
+    rows.push(String("char_count;CharCount;;U64;99"))
+    rows.push(String("byte_at;ByteAt;U64;U8;99"))
+    rows.push(String("char_at;CharAt;U64;Char;99"))
+    rows.push(String("slice;Slice;U64,U64;OwnedString;99"))
+    rows.push(String("slice_chars;SliceChars;U64,U64;OwnedString;99"))
+    rows.push(String("substring;SliceChars;U64,U64;OwnedString;99"))
+    rows.push(String("trim;Trim;;OwnedString;99"))
+    rows.push(String("trim_start;TrimStart;;OwnedString;99"))
+    rows.push(String("trim_end;TrimEnd;;OwnedString;99"))
+    rows.push(String("is_empty;IsEmpty;;Bool;99"))
+    rows.push(String("to_lower;ToLower;;OwnedString;99"))
+    rows.push(String("to_upper;ToUpper;;OwnedString;99"))
+    rows.push(String("replace;ReplaceStr;Str,Str;OwnedString;99"))
+    rows.push(String("lines;Lines;;Vec OwnedString;99"))
+    rows.push(String("chars;Chars;;Vec Char;99"))
+    rows.push(String("bytes;Bytes;;Vec U8;99"))
+    rows.push(String("repeat;Repeat;U64;OwnedString;99"))
+    rows.push(String("reverse;Reverse;;OwnedString;99"))
+    rows.push(String("clear;Clear;;;99"))
+    rows.push(String("push;Push;Char;;99"))
+    return rows
+}
+
+// Methods whose operation and parameter depend on whether the argument is a `String` or a `str`:
+// the operation name without its `Str`/`String` ending, and the result.
+fun string_pair_rows() -> Vec<String> {
+    mut rows: Vec<String> = Vec()
+    rows.push(String("append;Append;;"))
+    rows.push(String("concat;Concat;;OwnedString"))
+    rows.push(String("starts_with;StartsWith;;Bool"))
+    rows.push(String("ends_with;EndsWith;;Bool"))
+    rows.push(String("contains;Contains;;Bool"))
+    rows.push(String("find;Find;;I64"))
+    rows.push(String("split;Split;;Vec OwnedString"))
+    return rows
+}
+
+fun row_of(fields: Vec<String>, op: String, params: Vec<String>, ret: String) -> MethodRow {
+    mut owning: u64 = 0
+    when fields.len() > 4 {
+        parsed := fields[4].try_parse::<u64>()
+        when parsed.is_some() && parsed.unwrap() < 99 {
+            owning = 1 << (parsed.unwrap() as u32)
+        }
+    }
+    return MethodRow { op: op, params: params, ret: ret, owning: owning }
+}
+
+// The `String` method with this name; `owned_argument` picks the `String` form of a method that
+// takes either.
+pub fun string_method(name: String, owned_argument: bool) -> Option<MethodRow> {
+    rows := string_rows()
+    for row in rows {
+        fields := row.split(";")
+        when fields[0] == name {
+            return Option::Some(row_of(fields.clone(), fields[1].clone(), words(fields[2].clone()), fields[3].clone()))
+        }
+    }
+    pairs := string_pair_rows()
+    for row in pairs {
+        fields := row.split(";")
+        when fields[0] == name {
+            mut op := fields[1].clone()
+            mut params: Vec<String> = Vec()
+            when owned_argument {
+                op.append("String")
+                params.push(String("OwnedString"))
+            } else {
+                op.append("Str")
+                params.push(String("Str"))
+            }
+            return Option::Some(MethodRow { op: op, params: params, ret: fields[3].clone(), owning: 0 })
+        }
+    }
+    return Option::None
+}
+
+fun vec_rows() -> Vec<String> {
+    mut rows: Vec<String> = Vec()
+    rows.push(String("clone;Clone;;VE;99"))
+    rows.push(String("len;Len;;U64;99"))
+    rows.push(String("is_empty;IsEmpty;;Bool;99"))
+    rows.push(String("capacity;Capacity;;U64;99"))
+    rows.push(String("reserve;Reserve;U64;;99"))
+    rows.push(String("clear;Clear;;;99"))
+    rows.push(String("push;Push;E;;0"))
+    rows.push(String("insert;Insert;U64,E;;1"))
+    rows.push(String("reverse;Reverse;;;99"))
+    rows.push(String("sort;Sort;;;99"))
+    rows.push(String("contains;Contains;E;Bool;99"))
+    rows.push(String("remove;Take;U64;E;99"))
+    rows.push(String("set;Set;U64,E;;1"))
+    rows.push(String("take;Take;U64;E;99"))
+    rows.push(String("extract;Extract;U64;E;99"))
+    rows.push(String("index;Index;U64;E;99"))
+    return rows
+}
+
+fun substitute(word: String, element: String) -> String {
+    when word == "E" {
+        return element
+    }
+    when word == "VE" {
+        mut vec := String("Vec ")
+        vec.append(element)
+        return vec
+    }
+    return word
+}
+
+// The `Vec` method with this name for elements of type `element`.
+pub fun vec_method(name: String, element: String) -> Option<MethodRow> {
+    rows := vec_rows()
+    for row in rows {
+        fields := row.split(";")
+        when fields[0] == name {
+            mut params: Vec<String> = Vec()
+            for word in words(fields[2].clone()) {
+                params.push(substitute(word, element.clone()))
+            }
+            return Option::Some(row_of(fields.clone(), fields[1].clone(), params, substitute(fields[3].clone(), element)))
+        }
+    }
+    return Option::None
+}

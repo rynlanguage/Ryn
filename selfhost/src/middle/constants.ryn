@@ -1,0 +1,1475 @@
+// The compile-time checks of the bootstrap's compile-time pass (`src/comptime.rs`) for the subset this module evaluates
+// exactly: integer and bool constants declared with `const`, `static_assert` statements, and assignments to constants.
+// Anything else declines the whole check, and the bootstrap pass decides the program alone. A program with modules or
+// imports is also declined, since its names are resolved elsewhere.
+//
+// The first diagnostic is the bootstrap's first: the constants in program order, then each function in order, with its
+// assignments checked before its `static_assert` statements. The check reads the tree before the pass rewrites it.
+
+use middle::ast
+use middle::lower
+
+// A value of the subset: a bool (`boolean`, with its truth in `flag`), or an integer with its type code. The type code is
+// 0 for a literal that has not met a typed operand, and otherwise the code of `int_code`.
+#[derive(Clone)]
+pub struct CValue {
+    boolean: bool,
+    flag: bool,
+    number: i64,
+    ty: u64,
+}
+
+pub struct Constants {
+    program: ast::Program,
+    state: Vec<u64>,
+    values: Vec<CValue>,
+    // The module of the function whose names are being resolved.
+    module: String,
+}
+
+// The first diagnostic of the program's constants and assertions, or nothing when the check finds none or declines.
+pub fun check_program(program: ast::Program) -> Option<String> {
+    mut checks := Constants { program: program, state: Vec(), values: Vec(), module: String("") }
+    return checks.run()
+}
+
+// The declined outcome: the subset does not evaluate the expression.
+fun declined() -> String {
+    return String("unsupported")
+}
+
+fun is_declined(text: String) -> bool {
+    return !text.starts_with("diagnostic ")
+}
+
+fun bool_value(value: bool) -> CValue {
+    return CValue { boolean: true, flag: value, number: 0, ty: 0 }
+}
+
+fun int_value(number: i64, ty: u64) -> CValue {
+    return CValue { boolean: false, flag: false, number: number, ty: ty }
+}
+
+// The type codes: 1 i8, 2 i16, 3 i32, 4 i64, 5 u8, 6 u16, 7 u32, 8 u64; 0 for any other word.
+fun int_code(word: String) -> u64 {
+    when word == "i8" {
+        return 1
+    }
+    when word == "i16" {
+        return 2
+    }
+    when word == "i32" {
+        return 3
+    }
+    when word == "i64" {
+        return 4
+    }
+    when word == "u8" {
+        return 5
+    }
+    when word == "u16" {
+        return 6
+    }
+    when word == "u32" {
+        return 7
+    }
+    when word == "u64" {
+        return 8
+    }
+    return 0
+}
+
+fun int_name(code: u64) -> String {
+    when code == 1 {
+        return String("i8")
+    }
+    when code == 2 {
+        return String("i16")
+    }
+    when code == 3 {
+        return String("i32")
+    }
+    when code == 4 {
+        return String("i64")
+    }
+    when code == 5 {
+        return String("u8")
+    }
+    when code == 6 {
+        return String("u16")
+    }
+    when code == 7 {
+        return String("u32")
+    }
+    return String("u64")
+}
+
+fun int_bits(code: u64) -> u64 {
+    when code == 1 || code == 5 {
+        return 8
+    }
+    when code == 2 || code == 6 {
+        return 16
+    }
+    when code == 3 || code == 7 {
+        return 32
+    }
+    return 64
+}
+
+fun int_signed(code: u64) -> bool {
+    return code >= 1 && code <= 4
+}
+
+fun int_min(code: u64) -> i64 {
+    when code == 1 {
+        return 0 - 128
+    }
+    when code == 2 {
+        return 0 - 32768
+    }
+    when code == 3 {
+        return 0 - 2147483648
+    }
+    when code == 4 {
+        return 0 - 9223372036854775807 - 1
+    }
+    return 0
+}
+
+fun int_max(code: u64) -> i64 {
+    when code == 1 {
+        return 127
+    }
+    when code == 2 {
+        return 32767
+    }
+    when code == 3 {
+        return 2147483647
+    }
+    when code == 5 {
+        return 255
+    }
+    when code == 6 {
+        return 65535
+    }
+    when code == 7 {
+        return 4294967295
+    }
+    return 9223372036854775807
+}
+
+// The decimal text of an integer, with a sign.
+fun signed_text(value: i64) -> String {
+    when value < 0 {
+        mut text := String("-")
+        text.append(String((0 - (value + 1)) as u64 + 1))
+        return text
+    }
+    return String(value as u64)
+}
+
+// `checked_int`: an integer of the type `code` must be in its range; an untyped value is always accepted.
+fun checked_int(value: i64, code: u64, span: ast::Span) -> Result<CValue, String> {
+    when code == 0 {
+        return Result::Ok(int_value(value, 0))
+    }
+    when value < int_min(code) || value > int_max(code) {
+        mut message := signed_text(value)
+        message.append(" does not fit in `")
+        message.append(int_name(code))
+        message.append("` during compile-time evaluation")
+        return Result::Err(lower::diagnostic("R0464", span.start, span.end, message, String("")))
+    }
+    return Result::Ok(int_value(value, code))
+}
+
+// `IntType::wrap`: the value as an `as` cast of the type would keep it. A 64-bit value that does not fit is declined.
+fun wrap_int(value: i64, code: u64) -> Result<i64, String> {
+    when int_bits(code) == 64 {
+        when !int_signed(code) && value < 0 {
+            return Result::Err(declined())
+        }
+        return Result::Ok(value)
+    }
+    mut modulus: i64 = 1
+    mut bit: u64 = 0
+    while bit < int_bits(code) {
+        modulus = modulus * 2
+        bit += 1
+    }
+    mut wrapped := value % modulus
+    when wrapped < 0 {
+        wrapped += modulus
+    }
+    when int_signed(code) && wrapped > int_max(code) {
+        wrapped -= modulus
+    }
+    return Result::Ok(wrapped)
+}
+
+// Whether `value << shift` stays in the range of an i64.
+fun shift_fits(value: i64, shift: u64) -> bool {
+    when shift >= 63 {
+        return value == 0
+    }
+    limit := 9223372036854775807 >> (shift as u32)
+    return value >= 0 - limit && value <= limit
+}
+
+// `coerce`: a value takes the declared type of its constant, which is an integer type or `bool`.
+fun coerce(value: CValue, word: String, span: ast::Span) -> Result<CValue, String> {
+    code := int_code(word.clone())
+    when code > 0 {
+        when value.boolean {
+            mut message := String("expected `")
+            message.append(word)
+            message.append("` but found a bool")
+            return Result::Err(lower::diagnostic("R0464", span.start, span.end, message, String("")))
+        }
+        when value.ty == 0 {
+            return checked_int(value.number, code, span)
+        }
+        when value.ty == code {
+            return Result::Ok(value)
+        }
+        mut message := String("expected `")
+        message.append(word)
+        message.append("` but the value has type `")
+        message.append(int_name(value.ty))
+        message.append("`")
+        return Result::Err(lower::diagnostic("R0464", span.start, span.end, message, String("")))
+    }
+    when word == "bool" {
+        when value.boolean {
+            return Result::Ok(value)
+        }
+        return Result::Err(lower::diagnostic("R0464", span.start, span.end, String("a compile-time value of this type cannot be an integer here"), String("")))
+    }
+    return Result::Err(declined())
+}
+
+fun describe(value: CValue) -> String {
+    when value.boolean {
+        return String("a bool")
+    }
+    return String("an integer")
+}
+
+fun has_name(names: Vec<String>, name: String) -> bool {
+    mut position: u64 = 0
+    while position < names.len() {
+        when names[position] == name {
+            return true
+        }
+        position += 1
+    }
+    return false
+}
+
+fun with_name(names: Vec<String>, name: String) -> Vec<String> {
+    mut found := names
+    found.push(name)
+    return found
+}
+
+// A diagnostic reported by the check, or nothing: a declined check is not a diagnostic.
+fun report(text: String) -> Option<String> {
+    when is_declined(text.clone()) {
+        return Option::None
+    }
+    return Option::Some(text)
+}
+
+extend Constants {
+    fun run(mut self) -> Option<String> {
+        // The derived defaults come first in the bootstrap pass: their error is reported before any constant's.
+        derived := self.derive_check()
+        when derived.is_err() {
+            return report(derived.unwrap_err())
+        }
+        count := self.program.function_defs.len()
+        mut position: u64 = 0
+        while position < count {
+            self.state.push(0)
+            self.values.push(int_value(0, 0))
+            position += 1
+        }
+        // A choose arm that binds a constant's name would make the names of locals unclear here.
+        mut arm: u64 = 0
+        while arm < self.program.arms.len() {
+            record := self.program.arms[arm]
+            for binding in record.bindings.clone() {
+                when self.constant_index(binding.clone()).is_some() {
+                    return Option::None
+                }
+            }
+            arm += 1
+        }
+        // Every constant is evaluated, in program order, before the functions are checked.
+        position = 0
+        while position < self.program.functions.len() {
+            index := self.program.functions[position]
+            when self.is_constant_at(index) {
+                span := self.program.function_defs[index].span
+                evaluated := self.constant_at(index, span)
+                when evaluated.is_err() {
+                    return report(evaluated.unwrap_err())
+                }
+            }
+            position += 1
+        }
+        position = 0
+        while position < self.program.functions.len() {
+            index := self.program.functions[position]
+            when !self.is_constant_at(index) {
+                checked := self.check_function(index)
+                when checked.is_err() {
+                    return report(checked.unwrap_err())
+                }
+            }
+            position += 1
+        }
+        return Option::None
+    }
+
+    // The first function of the program with the name `name`, in program order.
+    fun first_function(self, name: String) -> Option<u64> {
+        mut position: u64 = 0
+        while position < self.program.functions.len() {
+            index := self.program.functions[position]
+            when self.program.function_defs[index].name == name {
+                return Option::Some(index)
+            }
+            position += 1
+        }
+        return Option::None
+    }
+
+    // A constant that the module of the caller may use: a public one, or one of the caller's own module.
+    fun visible_constant(self, index: u64, name: String, span: ast::Span) -> Result<Option<u64>, String> {
+        record := self.program.function_defs[index]
+        when !record.public && record.module_path != self.module {
+            return Result::Err(private_constant_error(name, span))
+        }
+        return Result::Ok(Option::Some(index))
+    }
+
+    // The constant that a name denotes in the module `self.module`, as the bootstrap pass's `resolve_constant`: the
+    // module's own constant of that name, then the program's constant of that name, then a constant of a module that a
+    // `use` names, through its alias. Nothing when the name is no constant.
+    fun resolve_constant(mut self, name: String, span: ast::Span) -> Result<Option<u64>, String> {
+        mut found: Option<u64> = Option::None
+        when !self.module.is_empty() {
+            mut qualified := self.module.clone()
+            qualified.append("::")
+            qualified.append(name.clone())
+            found = self.first_function(qualified)
+        }
+        when found.is_none() {
+            found = self.first_function(name.clone())
+        }
+        when found.is_some() {
+            index := found.unwrap()
+            when self.is_constant_at(index) {
+                return self.visible_constant(index, name, span)
+            }
+        }
+        mut position: u64 = 0
+        while position < self.program.uses.len() {
+            use_index := self.program.uses[position]
+            import := self.program.use_decls[use_index]
+            mut local := String("")
+            when import.alias.is_some() {
+                local = import.alias.unwrap()
+            } else {
+                local = import.path[import.path.len() - 1].clone()
+            }
+            mut prefix := local.clone()
+            prefix.append("::")
+            when name.starts_with(prefix.clone()) {
+                mut module_path := String("")
+                mut part: u64 = 0
+                while part < import.path.len() {
+                    when part > 0 {
+                        module_path.append("::")
+                    }
+                    module_path.append(import.path[part].clone())
+                    part += 1
+                }
+                mut target := module_path.clone()
+                target.append("::")
+                target.append(name.slice(prefix.len(), name.len()))
+                found = self.first_function(target)
+                when found.is_some() {
+                    index := found.unwrap()
+                    when self.is_constant_at(index) {
+                        record := self.program.function_defs[index]
+                        when !record.public {
+                            return Result::Err(private_constant_error(name, span))
+                        }
+                        return Result::Ok(Option::Some(index))
+                    }
+                }
+            }
+            position += 1
+        }
+        return Result::Ok(Option::None)
+    }
+
+    // The index of the constant that `name` names, when the first function of that name is a constant.
+    fun constant_index(mut self, name: String) -> Option<u64> {
+        mut position: u64 = 0
+        while position < self.program.functions.len() {
+            index := self.program.functions[position]
+            when self.program.function_defs[index].name == name {
+                when self.is_constant_at(index) {
+                    return Option::Some(index)
+                }
+                return Option::None
+            }
+            position += 1
+        }
+        return Option::None
+    }
+
+    // The declared type word of a constant; a constant without a type is an `i64`.
+    fun declared_word(mut self, ty: Option<u64>) -> String {
+        when ty.is_none() {
+            return String("i64")
+        }
+        choose self.program.types[ty.unwrap()] {
+            ast::TypeTree::Simple(word) => word,
+            _ => String("?"),
+        }
+    }
+
+    // The value of the constant at `index`, which is evaluated once. `span` is where the constant is used.
+    fun constant_at(mut self, index: u64, span: ast::Span) -> Result<CValue, String> {
+        saved := self.module.clone()
+        record := self.program.function_defs[index]
+        self.module = record.module_path.clone()
+        result := self.constant_value(index, span)
+        self.module = saved
+        return result
+    }
+
+    fun constant_value(mut self, index: u64, span: ast::Span) -> Result<CValue, String> {
+        when self.state[index] == 2 {
+            stored := self.values[index]
+            return Result::Ok(stored)
+        }
+        function := self.program.function_defs[index]
+        when self.state[index] == 1 {
+            mut message := String("constant `")
+            message.append(function.name.clone())
+            message.append("` depends on itself")
+            return Result::Err(lower::diagnostic("R0462", span.start, span.end, message, String("")))
+        }
+        self.state.set(index, 1)
+        declared := self.declared_word(function.return_type)
+        when function.return_value.is_none() {
+            return Result::Err(declined())
+        }
+        value_index := function.return_value.unwrap()
+        value_span := self.span_of(value_index)?
+        value := self.expression(value_index)?
+        converted := coerce(value, declared, value_span)?
+        self.state.set(index, 2)
+        self.values.set(index, converted.clone())
+        return Result::Ok(converted)
+    }
+
+    fun span_of(mut self, index: u64) -> Result<ast::Span, String> {
+        choose self.program.exprs[index] {
+            ast::ExprTree::IntLit(value, span) => Result::Ok(span),
+            ast::ExprTree::BoolLit(value, span) => Result::Ok(span),
+            ast::ExprTree::NameRef(name, span) => Result::Ok(span),
+            ast::ExprTree::NegateE(inner, span) => Result::Ok(span),
+            ast::ExprTree::NotE(inner, span) => Result::Ok(span),
+            ast::ExprTree::BinaryE(op, left, right, span) => Result::Ok(span),
+            ast::ExprTree::CallE(name, type_arguments, arguments, span) => Result::Ok(span),
+            _ => Result::Err(declined()),
+        }
+    }
+
+    // The value of an expression of the subset, in the frame of a constant: no locals are in scope.
+    fun expression(mut self, index: u64) -> Result<CValue, String> {
+        choose self.program.exprs[index] {
+            ast::ExprTree::IntLit(value, span) => integer_literal(value),
+            ast::ExprTree::BoolLit(value, span) => Result::Ok(bool_value(value)),
+            ast::ExprTree::NameRef(name, span) => self.name_value(name, span),
+            ast::ExprTree::NegateE(inner, span) => self.negate(inner, span),
+            ast::ExprTree::NotE(inner, span) => self.not(inner, span),
+            ast::ExprTree::BinaryE(op, left, right, span) => self.binary(op, left, right, span),
+            ast::ExprTree::CallE(name, type_arguments, arguments, span) => self.call_expression(name, type_arguments, arguments, span),
+            _ => Result::Err(declined()),
+        }
+    }
+
+    // A call is a metadata builtin or a function of the program.
+    fun call_expression(mut self, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: ast::Span) -> Result<CValue, String> {
+        when is_metadata_name(name.clone()) {
+            return self.metadata(name, type_arguments, arguments, span)
+        }
+        return self.user_call(name, type_arguments, arguments, span)
+    }
+
+    // A call of a function of the root module with no type parameters. The arguments are evaluated in the caller and
+    // coerced to the parameters' types, then the body runs. The subset runs no body: a body whose first statement is an
+    // `echo` is `R0461` at that statement (the bootstrap's `not_constant` for a statement it does not evaluate), and any
+    // other body is declined.
+    fun user_call(mut self, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: ast::Span) -> Result<CValue, String> {
+        when !type_arguments.is_empty() || !self.module.is_empty() {
+            return Result::Err(declined())
+        }
+        found := self.first_function(name)
+        when found.is_none() {
+            return Result::Err(declined())
+        }
+        function := self.program.function_defs[found.unwrap()]
+        when function.extern_c || !function.type_parameters.is_empty() || !function.module_path.is_empty() || function.parameters.len() != arguments.len() {
+            return Result::Err(declined())
+        }
+        mut position: u64 = 0
+        while position < arguments.len() {
+            value := self.expression(arguments[position])?
+            argument_span := self.span_of(arguments[position])?
+            parameter := self.program.parameters[function.parameters[position]]
+            word := self.declared_word(Option::Some(parameter.ty))
+            coerce(value, word, argument_span)?
+            position += 1
+        }
+        when function.body.is_empty() {
+            return Result::Err(declined())
+        }
+        return self.echo_body(function.body[0])
+    }
+
+    // The first statement of a body: an `echo` cannot be evaluated at compile time; any other statement is declined.
+    fun echo_body(self, index: u64) -> Result<CValue, String> {
+        choose self.program.stmts[index] {
+            ast::Stmt::PrintS(value, span) => Result::Err(not_constant_statement(span)),
+            ast::Stmt::TemplateS(parts, span) => Result::Err(not_constant_statement(span)),
+            _ => Result::Err(declined()),
+        }
+    }
+
+    // A name is a constant or it cannot be evaluated: locals are not in scope at compile time.
+    fun name_value(mut self, name: String, span: ast::Span) -> Result<CValue, String> {
+        resolved := self.resolve_constant(name.clone(), span)?
+        when resolved.is_some() {
+            return self.constant_at(resolved.unwrap(), span)
+        }
+        mut message := String("`")
+        message.append(name)
+        message.append("` cannot be evaluated at compile time")
+        return Result::Err(lower::diagnostic("R0461", span.start, span.end, message, String("compile-time code may use literals, constants, locals declared in the same function, and calls to functions made of the same constructs")))
+    }
+
+    fun negate(mut self, inner: u64, span: ast::Span) -> Result<CValue, String> {
+        value := self.expression(inner)?
+        when value.boolean {
+            return Result::Err(lower::diagnostic("R0464", span.start, span.end, String("cannot negate a bool"), String("")))
+        }
+        when value.number == 0 - 9223372036854775807 - 1 {
+            return Result::Err(declined())
+        }
+        return checked_int(0 - value.number, value.ty, span)
+    }
+
+    fun not(mut self, inner: u64, span: ast::Span) -> Result<CValue, String> {
+        value := self.expression(inner)?
+        when value.boolean {
+            return Result::Ok(bool_value(!value.flag))
+        }
+        return Result::Err(lower::diagnostic("R0464", span.start, span.end, String("`!` needs a bool, found an integer"), String("")))
+    }
+
+    fun binary(mut self, op: String, left: u64, right: u64, span: ast::Span) -> Result<CValue, String> {
+        when op == "And" || op == "Or" {
+            first := self.expression(left)?
+            when !first.boolean {
+                return Result::Err(lower::diagnostic("R0464", span.start, span.end, String("`&&` and `||` need bool operands"), String("")))
+            }
+            when (op == "And") != first.flag {
+                return Result::Ok(bool_value(first.flag))
+            }
+            second := self.expression(right)?
+            when !second.boolean {
+                return Result::Err(lower::diagnostic("R0464", span.start, span.end, String("`&&` and `||` need bool operands"), String("")))
+            }
+            return Result::Ok(bool_value(second.flag))
+        }
+        first := self.expression(left)?
+        second := self.expression(right)?
+        return binary_values(op, first, second, span)
+    }
+}
+
+extend Constants {
+    // Whether the function at `index` is a top-level constant, which carries the `$const` marker.
+    fun is_constant_at(mut self, index: u64) -> bool {
+        function := self.program.function_defs[index]
+        when function.external_symbol.is_none() {
+            return false
+        }
+        return function.external_symbol.unwrap() == "$const"
+    }
+}
+
+fun integer_literal(value: u64) -> Result<CValue, String> {
+    when value > 9223372036854775807 {
+        return Result::Err(declined())
+    }
+    return Result::Ok(int_value(value as i64, 0))
+}
+
+// `binary`: two integers, or two bools, or operands of different kinds.
+fun binary_values(op: String, left: CValue, right: CValue, span: ast::Span) -> Result<CValue, String> {
+    when left.boolean && right.boolean {
+        when op == "Eq" {
+            return Result::Ok(bool_value(left.flag == right.flag))
+        }
+        when op == "Ne" {
+            return Result::Ok(bool_value(left.flag != right.flag))
+        }
+        return Result::Err(lower::diagnostic("R0464", span.start, span.end, String("this operator does not apply to bool values"), String("")))
+    }
+    when left.boolean || right.boolean {
+        mut message := String("operands have different types: ")
+        message.append(describe(left))
+        message.append(" and ")
+        message.append(describe(right))
+        return Result::Err(lower::diagnostic("R0464", span.start, span.end, message, String("")))
+    }
+    return int_binary(op, left, right, span)
+}
+
+// The integer operators, after the operands' types agree.
+fun int_binary(op: String, left: CValue, right: CValue, span: ast::Span) -> Result<CValue, String> {
+    when left.ty != 0 && right.ty != 0 && left.ty != right.ty {
+        mut message := String("operands have different integer types `")
+        message.append(int_name(left.ty))
+        message.append("` and `")
+        message.append(int_name(right.ty))
+        message.append("`")
+        return Result::Err(lower::diagnostic("R0464", span.start, span.end, message, String("")))
+    }
+    mut ty := right.ty
+    when left.ty != 0 {
+        ty = left.ty
+    }
+    a := left.number
+    b := right.number
+    when op == "Add" {
+        when (b > 0 && a > 9223372036854775807 - b) || (b < 0 && a < (0 - 9223372036854775807 - 1) - b) {
+            return Result::Err(declined())
+        }
+        return checked_int(a + b, ty, span)
+    }
+    when op == "Sub" {
+        when (b < 0 && a > 9223372036854775807 + b) || (b > 0 && a < (0 - 9223372036854775807 - 1) + b) {
+            return Result::Err(declined())
+        }
+        return checked_int(a - b, ty, span)
+    }
+    when op == "Mul" {
+        when a > 3037000499 || a < 0 - 3037000499 || b > 3037000499 || b < 0 - 3037000499 {
+            return Result::Err(declined())
+        }
+        return checked_int(a * b, ty, span)
+    }
+    when op == "Div" || op == "Rem" {
+        when b == 0 {
+            return Result::Err(lower::diagnostic("R0464", span.start, span.end, String("division by zero during compile-time evaluation"), String("")))
+        }
+        when a == 0 - 9223372036854775807 - 1 && b == 0 - 1 {
+            return Result::Err(declined())
+        }
+        when op == "Div" {
+            return checked_int(a / b, ty, span)
+        }
+        return checked_int(a % b, ty, span)
+    }
+    when op == "Eq" {
+        return Result::Ok(bool_value(a == b))
+    }
+    when op == "Ne" {
+        return Result::Ok(bool_value(a != b))
+    }
+    when op == "Lt" {
+        return Result::Ok(bool_value(a < b))
+    }
+    when op == "Le" {
+        return Result::Ok(bool_value(a <= b))
+    }
+    when op == "Gt" {
+        return Result::Ok(bool_value(a > b))
+    }
+    when op == "Ge" {
+        return Result::Ok(bool_value(a >= b))
+    }
+    when op == "BitAnd" {
+        return checked_int(a & b, ty, span)
+    }
+    when op == "BitOr" {
+        return checked_int(a | b, ty, span)
+    }
+    when op == "BitXor" {
+        return checked_int(a ^ b, ty, span)
+    }
+    when op == "Shl" || op == "Shr" {
+        mut bits: i64 = 64
+        when ty != 0 {
+            bits = int_bits(ty) as i64
+        }
+        when b < 0 || b >= bits {
+            return Result::Err(lower::diagnostic("R0464", span.start, span.end, String("shift amount is out of range during compile-time evaluation"), String("")))
+        }
+        shift := b as u64
+        mut shifted := a
+        when op == "Shl" {
+            when !shift_fits(a, shift) {
+                return Result::Err(declined())
+            }
+            shifted = a << (shift as u32)
+        } else {
+            shifted = a >> (shift as u32)
+        }
+        when ty == 0 {
+            return checked_int(shifted, 0, span)
+        }
+        wrapped := wrap_int(shifted, ty)?
+        return checked_int(wrapped, ty, span)
+    }
+    when op == "And" || op == "Or" {
+        return Result::Err(lower::diagnostic("R0464", span.start, span.end, String("`&&` and `||` need bool operands"), String("")))
+    }
+    return Result::Err(declined())
+}
+
+extend Constants {
+    // The text of a string literal argument.
+    fun string_text(mut self, index: u64) -> Option<String> {
+        choose self.program.exprs[index] {
+            ast::ExprTree::StrLit(text, span) => Option::Some(text),
+            _ => Option::None,
+        }
+    }
+
+    // Checks one function: its assignments to constants (`R0467`), then its `static_assert` statements.
+    fun check_function(mut self, index: u64) -> Result<bool, String> {
+        function := self.program.function_defs[index]
+        self.module = function.module_path.clone()
+        mut names: Vec<String> = Vec()
+        for parameter in function.parameters.clone() {
+            declaration := self.program.parameters[parameter]
+            names.push(declaration.name.clone())
+        }
+        names = self.declared_names(function.body.clone(), names)
+        self.reject_assignments(function.body.clone(), names.clone())?
+        self.check_assertions(function.body.clone(), names.clone())?
+        // The metadata calls are evaluated after the assertions, in the order the bootstrap rewrite visits them.
+        self.metadata_body(function.body.clone(), names.clone())?
+        when function.return_value.is_some() {
+            self.metadata_expression(function.return_value.unwrap(), names)?
+        }
+        return Result::Ok(false)
+    }
+
+    // The names that the statements of a body declare: `let` names and loop variables, at any depth.
+    fun declared_names(mut self, body: Vec<u64>, names: Vec<String>) -> Vec<String> {
+        mut found := names
+        for index in body {
+            found = self.declared_statement(index, found)
+        }
+        return found
+    }
+
+    fun declared_statement(mut self, index: u64, names: Vec<String>) -> Vec<String> {
+        choose self.program.stmts[index] {
+            ast::Stmt::LetS(name, mutable, annotation, value, span) => with_name(names, name),
+            ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => self.declared_names(body, with_name(names, name)),
+            ast::Stmt::ForEachS(name, name_span, iterable, body, span) => self.declared_names(body, with_name(names, name)),
+            ast::Stmt::IfS(condition, then_body, else_body, span) => self.declared_names(else_body, self.declared_names(then_body, names)),
+            ast::Stmt::WhileS(condition, body, span) => self.declared_names(body, names),
+            ast::Stmt::DeferS(body, span) => self.declared_names(body, names),
+            _ => names,
+        }
+    }
+
+    // `R0467`: an assignment to a constant, unless a local or parameter of the same name takes precedence.
+    fun reject_assignments(mut self, body: Vec<u64>, names: Vec<String>) -> Result<bool, String> {
+        for index in body {
+            checked := self.reject_statement(index, names.clone())
+            when checked.is_err() {
+                return checked
+            }
+        }
+        return Result::Ok(false)
+    }
+
+    fun reject_statement(mut self, index: u64, names: Vec<String>) -> Result<bool, String> {
+        choose self.program.stmts[index] {
+            ast::Stmt::AssignS(name, value, span) => self.assignment_to(name, span, names),
+            ast::Stmt::IndexAssignS(name, position, value, span) => self.assignment_to(name, span, names),
+            ast::Stmt::CompoundS(name, op, value, span) => self.assignment_to(name, span, names),
+            ast::Stmt::FieldAssignS(object, field_names, spans, op, value, span) => self.assignment_to(object, span, names),
+            ast::Stmt::IfS(condition, then_body, else_body, span) => self.reject_pair(then_body, else_body, names),
+            ast::Stmt::WhileS(condition, body, span) => self.reject_assignments(body, names),
+            ast::Stmt::DeferS(body, span) => self.reject_assignments(body, names),
+            ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => self.reject_assignments(body, names),
+            ast::Stmt::ForEachS(name, name_span, iterable, body, span) => self.reject_assignments(body, names),
+            _ => Result::Ok(false),
+        }
+    }
+
+    fun reject_pair(mut self, first: Vec<u64>, second: Vec<u64>, names: Vec<String>) -> Result<bool, String> {
+        checked := self.reject_assignments(first, names.clone())
+        when checked.is_err() {
+            return checked
+        }
+        return self.reject_assignments(second, names)
+    }
+
+    fun assignment_to(mut self, name: String, span: ast::Span, names: Vec<String>) -> Result<bool, String> {
+        when has_name(names, name.clone()) {
+            return Result::Ok(false)
+        }
+        resolved := self.resolve_constant(name.clone(), span)?
+        when resolved.is_none() {
+            return Result::Ok(false)
+        }
+        mut message := String("cannot assign to the constant `")
+        message.append(name)
+        message.append("`")
+        return Result::Err(lower::diagnostic("R0467", span.start, span.end, message, String("constants are fixed at compile time; copy it into a `mut` local first")))
+    }
+
+    // The `static_assert` statements of a body, in order. A `when` on a compile-time condition keeps only the branch it takes.
+    fun check_assertions(mut self, body: Vec<u64>, names: Vec<String>) -> Result<bool, String> {
+        for index in body {
+            checked := self.check_statement(index, names.clone())
+            when checked.is_err() {
+                return checked
+            }
+        }
+        return Result::Ok(false)
+    }
+
+    fun check_statement(mut self, index: u64, names: Vec<String>) -> Result<bool, String> {
+        choose self.program.stmts[index] {
+            ast::Stmt::CallS(name, type_arguments, arguments, span) => self.static_assert_call(name, arguments, span),
+            ast::Stmt::IfS(condition, then_body, else_body, span) => self.check_if(condition, then_body, else_body, names),
+            ast::Stmt::WhileS(condition, body, span) => self.check_assertions(body, names),
+            ast::Stmt::DeferS(body, span) => self.check_assertions(body, names),
+            ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => self.check_assertions(body, names),
+            ast::Stmt::ForEachS(name, name_span, iterable, body, span) => self.check_assertions(body, names),
+            _ => Result::Ok(false),
+        }
+    }
+
+    fun static_assert_call(mut self, name: String, arguments: Vec<u64>, span: ast::Span) -> Result<bool, String> {
+        when name != "static_assert" {
+            return Result::Ok(false)
+        }
+        mut condition: u64 = 0
+        mut message := String("")
+        mut has_message := false
+        mut valid := false
+        when arguments.len() == 1 {
+            condition = arguments[0]
+            valid = true
+        }
+        when arguments.len() == 2 {
+            text := self.string_text(arguments[1])
+            when text.is_some() {
+                condition = arguments[0]
+                message = text.unwrap()
+                has_message = true
+                valid = true
+            }
+        }
+        when !valid {
+            return Result::Err(lower::diagnostic("R0461", span.start, span.end, String("`static_assert` takes a condition and an optional message literal"), String("")))
+        }
+        value := self.expression(condition)?
+        when value.boolean {
+            when value.flag {
+                return Result::Ok(false)
+            }
+            mut text := String("static assertion failed")
+            when has_message {
+                text = String("static assertion failed: ")
+                text.append(message)
+            }
+            return Result::Err(lower::diagnostic("R0460", span.start, span.end, text, String("the condition was evaluated at compile time and is false")))
+        }
+        return Result::Err(lower::diagnostic("R0464", span.start, span.end, String("`static_assert` needs a bool, found an integer"), String("")))
+    }
+
+    // A `when` statement: when its condition names a constant and evaluates, only the branch it takes is checked.
+    fun check_if(mut self, condition: u64, then_body: Vec<u64>, else_body: Vec<u64>, names: Vec<String>) -> Result<bool, String> {
+        kept := self.kept_branch(condition, names.clone())?
+        when kept.is_some() {
+            flag := kept.unwrap()
+            when flag {
+                return self.check_assertions(then_body, names)
+            }
+            return self.check_assertions(else_body, names)
+        }
+        checked := self.check_assertions(then_body, names.clone())
+        when checked.is_err() {
+            return checked
+        }
+        return self.check_assertions(else_body, names)
+    }
+
+    // The branch that a compile-time `when` keeps: Some(true) for the then branch, Some(false) for the else branch. Nothing
+    // when the condition does not name a constant or does not evaluate to a bool; a declined condition declines.
+    fun kept_branch(mut self, condition: u64, names: Vec<String>) -> Result<Option<bool>, String> {
+        mentions := self.mentions_constant(condition, names)?
+        when !mentions {
+            return Result::Ok(Option::None)
+        }
+        outcome := self.expression(condition)
+        when outcome.is_err() {
+            failure := outcome.unwrap_err()
+            when is_declined(failure.clone()) {
+                return Result::Err(failure)
+            }
+            return Result::Ok(Option::None)
+        }
+        value := outcome.unwrap()
+        when value.boolean {
+            return Result::Ok(Option::Some(value.flag))
+        }
+        return Result::Ok(Option::None)
+    }
+
+    // Whether a condition names a constant and no local: a `when` on it is folded by the bootstrap pass.
+    fun mentions_constant(mut self, index: u64, names: Vec<String>) -> Result<bool, String> {
+        flags := self.mention_flags(index, names)?
+        return Result::Ok((flags & 1) == 1 && (flags & 2) == 0)
+    }
+
+    // The names of a condition: bit 1 for a constant (or `comptime`), bit 2 for a local.
+    fun mention_flags(mut self, index: u64, names: Vec<String>) -> Result<u64, String> {
+        choose self.program.exprs[index] {
+            ast::ExprTree::IntLit(value, span) => Result::Ok(0),
+            ast::ExprTree::BoolLit(value, span) => Result::Ok(0),
+            ast::ExprTree::NameRef(name, span) => Result::Ok(self.name_flags(name, span, names)),
+            ast::ExprTree::NegateE(inner, span) => self.mention_flags(inner, names),
+            ast::ExprTree::NotE(inner, span) => self.mention_flags(inner, names),
+            ast::ExprTree::BinaryE(op, left, right, span) => self.binary_flags(left, right, names),
+            ast::ExprTree::CallE(name, type_arguments, arguments, span) => self.call_flags(name, arguments),
+            _ => Result::Err(declined()),
+        }
+    }
+
+    fun name_flags(mut self, name: String, span: ast::Span, names: Vec<String>) -> u64 {
+        when has_name(names, name.clone()) {
+            return 2
+        }
+        resolved := self.resolve_constant(name, span)
+        when resolved.is_ok() {
+            when resolved.unwrap().is_some() {
+                return 1
+            }
+        }
+        return 0
+    }
+
+    fun binary_flags(mut self, left: u64, right: u64, names: Vec<String>) -> Result<u64, String> {
+        first := self.mention_flags(left, names.clone())?
+        second := self.mention_flags(right, names)?
+        return Result::Ok(first | second)
+    }
+
+    // A `comptime` call names a compile-time value; a metadata call names none, when its arguments are string literals.
+    fun call_flags(mut self, name: String, arguments: Vec<u64>) -> Result<u64, String> {
+        when name == "comptime" && arguments.is_empty() {
+            return Result::Ok(1)
+        }
+        when is_metadata_name(name) {
+            for argument in arguments {
+                when self.string_text(argument).is_none() {
+                    return Result::Err(declined())
+                }
+            }
+            return Result::Ok(0)
+        }
+        return Result::Err(declined())
+    }
+}
+
+// The metadata builtins: the number of fields and variants of a type, and whether a structure has a field.
+fun is_metadata_name(name: String) -> bool {
+    return name == "field_count" || name == "variant_count" || name == "has_field"
+}
+
+extend Constants {
+    // The index of the structure named `name`, when the program declares one.
+    fun struct_named(self, name: String) -> Option<u64> {
+        mut position: u64 = 0
+        while position < self.program.structs.len() {
+            index := self.program.structs[position]
+            when self.program.struct_defs[index].name == name {
+                return Option::Some(index)
+            }
+            position += 1
+        }
+        return Option::None
+    }
+
+    fun enum_named(self, name: String) -> Option<u64> {
+        mut position: u64 = 0
+        while position < self.program.enums.len() {
+            index := self.program.enums[position]
+            when self.program.enum_defs[index].name == name {
+                return Option::Some(index)
+            }
+            position += 1
+        }
+        return Option::None
+    }
+
+    // The name a type argument names, when it is a plain name of a declared type.
+    fun type_argument_name(self, index: u64) -> Option<String> {
+        choose self.program.types[index] {
+            ast::TypeTree::NamedTy(name, span) => Option::Some(name),
+            _ => Option::None,
+        }
+    }
+
+    // `field_count`, `variant_count`, and `has_field`, with their diagnostics as the bootstrap pass gives them.
+    fun metadata(mut self, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: ast::Span) -> Result<CValue, String> {
+        when !is_metadata_name(name.clone()) {
+            return Result::Err(declined())
+        }
+        when type_arguments.len() != 1 {
+            mut message := String("`")
+            message.append(name.clone())
+            message.append("` takes exactly one type argument, written `")
+            message.append(name.clone())
+            message.append("::<Type>()`")
+            return Result::Err(lower::diagnostic("R0465", span.start, span.end, message, String("")))
+        }
+        wanted := self.type_argument_name(type_arguments[0])
+        mut structure: Option<u64> = Option::None
+        mut enumeration: Option<u64> = Option::None
+        when wanted.is_some() {
+            text := wanted.unwrap()
+            structure = self.struct_named(text.clone())
+            enumeration = self.enum_named(text)
+        }
+        when name == "field_count" {
+            when structure.is_none() {
+                return Result::Err(lower::diagnostic("R0465", span.start, span.end, String("`field_count` needs a structure type"), String("")))
+            }
+            record := self.program.struct_defs[structure.unwrap()]
+            return Result::Ok(int_value(record.fields.len() as i64, 8))
+        }
+        when name == "has_field" {
+            when structure.is_none() {
+                return Result::Err(lower::diagnostic("R0465", span.start, span.end, String("`has_field` needs a structure type"), String("")))
+            }
+            when arguments.len() != 1 || self.string_text(arguments[0]).is_none() {
+                return Result::Err(lower::diagnostic("R0465", span.start, span.end, String("`has_field` takes the field name as a string literal"), String("")))
+            }
+            field := self.string_text(arguments[0]).unwrap()
+            return Result::Ok(bool_value(self.has_field_named(structure.unwrap(), field)))
+        }
+        when enumeration.is_none() {
+            return Result::Err(lower::diagnostic("R0465", span.start, span.end, String("`variant_count` needs an enumeration type declared in this program"), String("")))
+        }
+        definition := self.program.enum_defs[enumeration.unwrap()]
+        return Result::Ok(int_value(definition.variants.len() as i64, 8))
+    }
+
+    fun has_field_named(self, structure: u64, field: String) -> bool {
+        record := self.program.struct_defs[structure]
+        mut position: u64 = 0
+        while position < record.fields.len() {
+            index := record.fields[position]
+            declaration := self.program.struct_fields[index]
+            when declaration.name == field {
+                return true
+            }
+            position += 1
+        }
+        return false
+    }
+
+    // `R0466`: the fields of a `#[derive(Default)]` structure must each have a default. The structures of the program
+    // are read for it; a field type that this check does not read declines the whole check.
+    fun derive_check(mut self) -> Result<bool, String> {
+        mut position: u64 = 0
+        while position < self.program.structs.len() {
+            index := self.program.structs[position]
+            record := self.program.struct_defs[index]
+            when derives_default(record.derives.clone()) && !self.has_user_default(record.name.clone()) {
+                for field in record.fields.clone() {
+                    declaration := self.program.struct_fields[field]
+                    checked := self.default_of(declaration.ty, declaration.span)?
+                }
+            }
+            position += 1
+        }
+        return Result::Ok(false)
+    }
+
+    // Whether the program defines the default of a structure itself.
+    fun has_user_default(self, name: String) -> bool {
+        mut wanted := name
+        wanted.append("::default")
+        mut position: u64 = 0
+        while position < self.program.functions.len() {
+            index := self.program.functions[position]
+            when self.program.function_defs[index].name == wanted {
+                return true
+            }
+            position += 1
+        }
+        return false
+    }
+
+    // The default of a field of the type at `index`, or the `R0466` diagnostic at `span` when there is none.
+    fun default_of(self, index: u64, span: ast::Span) -> Result<bool, String> {
+        choose self.program.types[index] {
+            ast::TypeTree::Simple(word) => simple_default(word, span),
+            ast::TypeTree::NamedTy(name, named_span) => self.named_default(name, span),
+            ast::TypeTree::ArrayTy(element, length, array_span) => self.default_of(element, span),
+            ast::TypeTree::VecTy(element, vec_span) => Result::Ok(false),
+            _ => Result::Err(declined()),
+        }
+    }
+
+    fun named_default(self, name: String, span: ast::Span) -> Result<bool, String> {
+        when self.struct_named(name.clone()).is_none() {
+            return Result::Err(declined())
+        }
+        index := self.struct_named(name.clone()).unwrap()
+        record := self.program.struct_defs[index]
+        when derives_default(record.derives.clone()) {
+            return Result::Ok(false)
+        }
+        mut message := String("`#[derive(Default)]` cannot build a default for a field of type `")
+        message.append(name)
+        message.append("`")
+        return Result::Err(lower::diagnostic("R0466", span.start, span.end, message, String("")))
+    }
+}
+
+fun derives_default(derives: Vec<String>) -> bool {
+    for name in derives {
+        when name == "Default" {
+            return true
+        }
+    }
+    return false
+}
+
+// The scalar types, `str`, and `String`, which have defaults.
+fun simple_default(word: String, span: ast::Span) -> Result<bool, String> {
+    when int_code(word.clone()) > 0 || word == "f32" || word == "f64" || word == "bool" || word == "char" || word == "str" || word == "String" {
+        return Result::Ok(false)
+    }
+    return Result::Err(declined())
+}
+
+// The children of an expression, in the order the bootstrap visits them. A conditional is not listed here: its branches are
+// chosen by the caller.
+fun single(value: u64) -> Vec<u64> {
+    mut found: Vec<u64> = Vec()
+    found.push(value)
+    return found
+}
+
+fun pair(first: u64, second: u64) -> Vec<u64> {
+    mut found: Vec<u64> = Vec()
+    found.push(first)
+    found.push(second)
+    return found
+}
+
+fun triple(first: u64, second: u64, third: u64) -> Vec<u64> {
+    mut found: Vec<u64> = Vec()
+    found.push(first)
+    found.push(second)
+    found.push(third)
+    return found
+}
+
+fun prefixed(first: u64, rest: Vec<u64>) -> Vec<u64> {
+    mut found: Vec<u64> = Vec()
+    found.push(first)
+    for value in rest {
+        found.push(value)
+    }
+    return found
+}
+
+fun no_children() -> Vec<u64> {
+    return Vec()
+}
+
+extend Constants {
+    // The values of the fields of a structure literal, in the order they are written.
+    fun init_values(self, fields: Vec<u64>) -> Vec<u64> {
+        mut values: Vec<u64> = Vec()
+        for field in fields {
+            init := self.program.inits[field]
+            values.push(init.value)
+        }
+        return values
+    }
+
+    // The expressions of an expression, in order.
+    fun children_of(self, index: u64) -> Vec<u64> {
+        choose self.program.exprs[index] {
+            ast::ExprTree::CallE(name, type_arguments, arguments, span) => arguments,
+            ast::ExprTree::MethodCallE(receiver, name, type_arguments, arguments, span) => prefixed(receiver, arguments),
+            ast::ExprTree::StructLit(name, fields, span) => self.init_values(fields),
+            ast::ExprTree::FieldE(value, name, name_span, span) => single(value),
+            ast::ExprTree::RangeE(start, end, inclusive, span) => pair(start, end),
+            ast::ExprTree::IfE(condition, then_value, else_value, span) => triple(condition, then_value, else_value),
+            ast::ExprTree::BinaryE(op, left, right, span) => pair(left, right),
+            ast::ExprTree::NegateE(inner, span) => single(inner),
+            ast::ExprTree::NotE(inner, span) => single(inner),
+            ast::ExprTree::BitNotE(inner, span) => single(inner),
+            ast::ExprTree::AddressOfE(mutable, raw, inner, span) => single(inner),
+            ast::ExprTree::DerefE(pointer, span) => single(pointer),
+            ast::ExprTree::CastE(value, ty, span) => single(value),
+            ast::ExprTree::TupleE(elements, span) => elements,
+            ast::ExprTree::ArrayE(elements, span) => elements,
+            ast::ExprTree::RepeatE(value, length, span) => pair(value, length),
+            ast::ExprTree::IndexE(value, position, span) => pair(value, position),
+            ast::ExprTree::PropagateE(value, span) => single(value),
+            ast::ExprTree::EnumE(enum_name, variant, arguments, span) => arguments,
+            ast::ExprTree::ChooseE(value, arms, span) => self.choose_children(value, arms),
+            ast::ExprTree::PipeE(value, target, span) => pair(value, target),
+            ast::ExprTree::CoalesceE(value, fallback, span) => pair(value, fallback),
+            ast::ExprTree::OptionalFieldE(value, name, name_span, span) => single(value),
+            _ => no_children(),
+        }
+    }
+
+    // The scrutinee of a `choose` and then the body of each of its arms.
+    fun choose_children(self, value: u64, arms: Vec<u64>) -> Vec<u64> {
+        mut found := single(value)
+        for arm in arms {
+            record := self.program.arms[arm]
+            found.push(record.body)
+        }
+        return found
+    }
+
+    // The condition, then and else branch of a conditional expression.
+    fun if_branches(self, index: u64) -> Option<Vec<u64>> {
+        choose self.program.exprs[index] {
+            ast::ExprTree::IfE(condition, then_value, else_value, span) => Option::Some(triple(condition, then_value, else_value)),
+            _ => Option::None,
+        }
+    }
+
+    // The expression of a template part, when the part is a value.
+    fun value_part(self, part: u64) -> Option<u64> {
+        choose self.program.parts[part] {
+            ast::TemplatePart::ValuePart(value) => Option::Some(value),
+            _ => Option::None,
+        }
+    }
+
+    // The metadata calls of a list of expressions, in order.
+    fun metadata_all(mut self, values: Vec<u64>, names: Vec<String>) -> Result<bool, String> {
+        for value in values {
+            checked := self.metadata_expression(value, names.clone())
+            when checked.is_err() {
+                return checked
+            }
+        }
+        return Result::Ok(false)
+    }
+
+    fun metadata_body(mut self, body: Vec<u64>, names: Vec<String>) -> Result<bool, String> {
+        for index in body {
+            checked := self.metadata_statement(index, names.clone())
+            when checked.is_err() {
+                return checked
+            }
+        }
+        return Result::Ok(false)
+    }
+
+    // The metadata calls of one statement. A `static_assert` statement was removed by the assertion check, so it is skipped.
+    fun metadata_statement(mut self, index: u64, names: Vec<String>) -> Result<bool, String> {
+        choose self.program.stmts[index] {
+            ast::Stmt::LetS(name, mutable, annotation, value, span) => self.metadata_expression(value, names),
+            ast::Stmt::AssignS(name, value, span) => self.metadata_expression(value, names),
+            ast::Stmt::IndexAssignS(name, position, value, span) => self.metadata_all(pair(position, value), names),
+            ast::Stmt::DerefAssignS(pointer, value, span) => self.metadata_all(pair(pointer, value), names),
+            ast::Stmt::FieldAssignS(object, field_names, spans, op, value, span) => self.metadata_expression(value, names),
+            ast::Stmt::CompoundS(name, op, value, span) => self.metadata_expression(value, names),
+            ast::Stmt::PrintS(value, span) => self.metadata_expression(value, names),
+            ast::Stmt::TemplateS(parts, span) => self.metadata_parts(parts, names),
+            ast::Stmt::CallS(name, type_arguments, arguments, span) => self.metadata_call_statement(name, arguments, names),
+            ast::Stmt::MethodCallS(receiver, name, arguments, span) => self.metadata_all(prefixed(receiver, arguments), names),
+            ast::Stmt::IfS(condition, then_body, else_body, span) => self.metadata_if(condition, then_body, else_body, names),
+            ast::Stmt::WhileS(condition, body, span) => self.metadata_while(condition, body, names),
+            ast::Stmt::DeferS(body, span) => self.metadata_body(body, names),
+            ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => self.metadata_for(start, end, body, names),
+            ast::Stmt::ForEachS(name, name_span, iterable, body, span) => self.metadata_foreach(iterable, body, names),
+            ast::Stmt::ReturnS(value, span) => self.metadata_optional(value, names),
+            _ => Result::Ok(false),
+        }
+    }
+
+    fun metadata_call_statement(mut self, name: String, arguments: Vec<u64>, names: Vec<String>) -> Result<bool, String> {
+        when name == "static_assert" {
+            return Result::Ok(false)
+        }
+        return self.metadata_all(arguments, names)
+    }
+
+    fun metadata_parts(mut self, parts: Vec<u64>, names: Vec<String>) -> Result<bool, String> {
+        mut values: Vec<u64> = Vec()
+        for part in parts {
+            when self.value_part(part).is_some() {
+                values.push(self.value_part(part).unwrap())
+            }
+        }
+        return self.metadata_all(values, names)
+    }
+
+    fun metadata_if(mut self, condition: u64, then_body: Vec<u64>, else_body: Vec<u64>, names: Vec<String>) -> Result<bool, String> {
+        kept := self.kept_branch(condition, names.clone())?
+        when kept.is_some() {
+            flag := kept.unwrap()
+            when flag {
+                return self.metadata_body(then_body, names)
+            }
+            return self.metadata_body(else_body, names)
+        }
+        checked := self.metadata_expression(condition, names.clone())
+        when checked.is_err() {
+            return checked
+        }
+        checked_then := self.metadata_body(then_body, names.clone())
+        when checked_then.is_err() {
+            return checked_then
+        }
+        return self.metadata_body(else_body, names)
+    }
+
+    fun metadata_while(mut self, condition: u64, body: Vec<u64>, names: Vec<String>) -> Result<bool, String> {
+        checked := self.metadata_expression(condition, names.clone())
+        when checked.is_err() {
+            return checked
+        }
+        return self.metadata_body(body, names)
+    }
+
+    fun metadata_for(mut self, start: u64, end: u64, body: Vec<u64>, names: Vec<String>) -> Result<bool, String> {
+        checked := self.metadata_all(pair(start, end), names.clone())
+        when checked.is_err() {
+            return checked
+        }
+        return self.metadata_body(body, names)
+    }
+
+    fun metadata_foreach(mut self, iterable: u64, body: Vec<u64>, names: Vec<String>) -> Result<bool, String> {
+        checked := self.metadata_expression(iterable, names.clone())
+        when checked.is_err() {
+            return checked
+        }
+        return self.metadata_body(body, names)
+    }
+
+    fun metadata_optional(mut self, value: Option<u64>, names: Vec<String>) -> Result<bool, String> {
+        when value.is_some() {
+            return self.metadata_expression(value.unwrap(), names)
+        }
+        return Result::Ok(false)
+    }
+
+    // The metadata calls of an expression: its children first, then the expression itself. A conditional whose condition
+    // names a constant keeps only its branch that is taken, as the bootstrap fold does.
+    fun metadata_expression(mut self, index: u64, names: Vec<String>) -> Result<bool, String> {
+        branches := self.if_branches(index)
+        when branches.is_some() {
+            parts := branches.unwrap()
+            kept := self.kept_branch(parts[0], names.clone())?
+            when kept.is_some() {
+                flag := kept.unwrap()
+                when flag {
+                    return self.metadata_expression(parts[1], names)
+                }
+                return self.metadata_expression(parts[2], names)
+            }
+        }
+        checked := self.metadata_all(self.children_of(index), names.clone())
+        when checked.is_err() {
+            return checked
+        }
+        return self.metadata_node(index, names)
+    }
+
+    // A metadata call is evaluated; a `comptime` call is not in this subset.
+    fun metadata_node(mut self, index: u64, names: Vec<String>) -> Result<bool, String> {
+        choose self.program.exprs[index] {
+            ast::ExprTree::CallE(name, type_arguments, arguments, span) => self.metadata_call(name, type_arguments, arguments, span),
+            ast::ExprTree::NameRef(name, span) => self.name_reference(name, span, names),
+            ast::ExprTree::EnumE(enum_name, variant, arguments, span) => self.enum_reference(enum_name, variant, arguments, span),
+            _ => Result::Ok(false),
+        }
+    }
+
+    // A path `module::NAME` with no payload is a constant when it names one; the bootstrap pass resolves it whatever the
+    // locals are.
+    fun enum_reference(mut self, enum_name: String, variant: String, arguments: Vec<u64>, span: ast::Span) -> Result<bool, String> {
+        when !arguments.is_empty() {
+            return Result::Ok(false)
+        }
+        mut qualified := enum_name
+        qualified.append("::")
+        qualified.append(variant)
+        resolved := self.resolve_constant(qualified, span)?
+        return Result::Ok(false)
+    }
+
+    // A name that is not a local of the function is resolved as a constant, as the bootstrap pass's rewrite does: a private
+    // constant of another module is `R0425` at the name.
+    fun name_reference(mut self, name: String, span: ast::Span, names: Vec<String>) -> Result<bool, String> {
+        when has_name(names, name.clone()) {
+            return Result::Ok(false)
+        }
+        resolved := self.resolve_constant(name, span)?
+        return Result::Ok(false)
+    }
+
+    fun metadata_call(mut self, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: ast::Span) -> Result<bool, String> {
+        when name == "comptime" {
+            return Result::Err(declined())
+        }
+        when !is_metadata_name(name.clone()) {
+            return Result::Ok(false)
+        }
+        value := self.metadata(name, type_arguments, arguments, span)?
+        return Result::Ok(false)
+    }
+}
+
+// `R0425` for a constant that another module does not make public, at the name.
+// `R0461` for a statement that the compile-time evaluator does not run, at the statement.
+fun not_constant_statement(span: ast::Span) -> String {
+    return lower::diagnostic("R0461", span.start, span.end, String("this statement cannot be evaluated at compile time"), String("compile-time code may use literals, constants, locals declared in the same function, and calls to functions made of the same constructs"))
+}
+
+fun private_constant_error(name: String, span: ast::Span) -> String {
+    mut message := String("constant `")
+    message.append(name)
+    message.append("` is private to its module")
+    return lower::diagnostic("R0425", span.start, span.end, message, String("mark the constant `pub` to use it from another module"))
+}

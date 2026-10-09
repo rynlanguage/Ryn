@@ -1,0 +1,356 @@
+// rync: the Ryn compiler as one program that needs neither the Rust compiler nor a C library. It reads a program (an entry
+// file and the modules it imports), and writes a static x86-64 Linux executable to standard output.
+//
+//     rync [--stdlib <directory>] <entry.ryn> > program && chmod +x program
+//
+// The pipeline is the compiler's own: the modules are joined into one source text and parsed (`frontend/parser`), each item
+// takes the module it came from, generic functions are specialized (`frontend/generics`), the program is lowered to typed IR
+// (`middle/lower`), and the IR is turned into machine code and linked (`back/gen`, `back/elf`). A module `a::b` is the file
+// `a/b.ryn` (or `a/b/mod.ryn`) next to the entry file; `std::x` is `x.ryn` in the standard library directory.
+//
+// A program with an error is not compiled: the diagnostic text goes to standard error and the status is 1. A valid program that
+// the Ryn backend does not handle gives status 3.
+
+use frontend::parser
+use frontend::generics
+use middle::ast
+use middle::ir
+use middle::lower
+use back::gen
+
+extern "C" fun putchar(value: i32) -> i32;
+
+// One source file of the program.
+struct Unit {
+    path: String,
+    module_path: String,
+    text: String,
+}
+
+struct Loader {
+    source_root: String,
+    std_root: String,
+    units: Vec<Unit>,
+    // The module paths loaded, and those being loaded now (for a cycle).
+    loaded: Vec<String>,
+    importing: Vec<String>,
+    error: String,
+}
+
+
+// The directory part of a path, without the final slash ("" when there is none).
+fun rync_directory_of(path: String) -> String {
+    mut at: u64 = path.len()
+    while at > 0 {
+        at -= 1
+        when path.byte_at(at) == 47 {
+            return path.slice(0, at)
+        }
+    }
+    return String("")
+}
+
+fun rync_join_components(components: Vec<String>, separator: str) -> String {
+    mut out := String("")
+    mut at: u64 = 0
+    while at < components.len() {
+        when at > 0 {
+            out.append(separator)
+        }
+        out.append(components[at].clone())
+        at += 1
+    }
+    return out
+}
+
+// The frontend's output when it begins with the status word " Ok" (the data follows it), and nothing for an error.
+fun rync_after_ok(text: String) -> Option<String> {
+    when text.starts_with(" Ok") {
+        return Option::Some(text)
+    }
+    return Option::None
+}
+
+extend Loader {
+    // The file of module `components`, and the root it is in: `std` modules are in the standard library directory, the others
+    // next to the entry file, as `name.ryn` or `name/mod.ryn`.
+    fun resolve(self, components: Vec<String>) -> Option<String> {
+        mut base := String("")
+        mut first: u64 = 0
+        if_std := components[0] == "std"
+        when if_std {
+            base = self.std_root.clone()
+            first = 1
+        } else {
+            base = self.source_root.clone()
+        }
+        mut at: u64 = first
+        while at < components.len() {
+            base.append("/")
+            base.append(components[at].clone())
+            at += 1
+        }
+        mut file := base.clone()
+        file.append(".ryn")
+        when file_exists(file.clone()) {
+            return Option::Some(file)
+        }
+        when !if_std {
+            mut directory_file := base.clone()
+            directory_file.append("/mod.ryn")
+            when file_exists(directory_file.clone()) {
+                return Option::Some(directory_file)
+            }
+        }
+        return Option::None
+    }
+
+    // Loads the module in `file` after every module it imports, so that the modules are in dependency order.
+    fun load(mut self, file: String, module_path: String) -> bool {
+        mut seen: u64 = 0
+        while seen < self.loaded.len() {
+            when self.loaded[seen] == module_path {
+                return true
+            }
+            seen += 1
+        }
+        mut open: u64 = 0
+        while open < self.importing.len() {
+            when self.importing[open] == module_path {
+                self.error = String("circular module dependency at `")
+                self.error.append(module_path)
+                self.error.append("`")
+                return false
+            }
+            open += 1
+        }
+        self.importing.push(module_path.clone())
+        text := read_file(file.clone())
+        parsed := rync_after_ok(parser::parse(text.clone(), false))
+        when parsed.is_none() {
+            self.error = String("syntax error in ")
+            self.error.append(file)
+            return false
+        }
+        decoded := ast::decode_program(parsed.unwrap())
+        when decoded.is_err() {
+            self.error = String("cannot read the syntax tree of ")
+            self.error.append(file)
+            return false
+        }
+        program := decoded.unwrap()
+        mut use_at: u64 = 0
+        while use_at < program.uses.len() {
+            components := program.use_decls[program.uses[use_at]].path.clone()
+            imported := rync_join_components(components.clone(), "::")
+            found := self.resolve(components)
+            when found.is_none() {
+                self.error = String("module `")
+                self.error.append(imported)
+                self.error.append("` not found, imported from ")
+                self.error.append(file)
+                return false
+            }
+            when !self.load(found.unwrap(), imported) {
+                return false
+            }
+            use_at += 1
+        }
+        self.importing.pop()
+        self.loaded.push(module_path.clone())
+        self.units.push(Unit { path: file, module_path: module_path, text: text })
+        return true
+    }
+}
+
+// The index of the segment holding byte `position`, if any.
+fun rync_segment_of(starts: Vec<u64>, ends: Vec<u64>, position: u64) -> Option<u64> {
+    mut at: u64 = 0
+    while at < starts.len() {
+        when starts[at] <= position && position < ends[at] {
+            return Option::Some(at)
+        }
+        at += 1
+    }
+    return Option::None
+}
+
+// The program of all the units: their texts one after another, each starting in the root namespace, parsed together, with every
+// item marked with its module and the functions of a module named by it.
+fun rync_assemble(units: Vec<Unit>) -> Result<ast::Program, String> {
+    mut text := String("")
+    mut starts: Vec<u64> = Vec()
+    mut ends: Vec<u64> = Vec()
+    mut modules: Vec<String> = Vec()
+    mut at: u64 = 0
+    while at < units.len() {
+        when !text.is_empty() {
+            when !text.ends_with("\n") {
+                text.push('\n')
+            }
+            text.append("namespace;\n")
+        }
+        starts.push(text.len())
+        text.append(units[at].text.clone())
+        ends.push(text.len())
+        modules.push(units[at].module_path.clone())
+        text.push('\n')
+        at += 1
+    }
+    parsed := rync_after_ok(parser::parse(text, false))
+    when parsed.is_none() {
+        return Result::Err(String("syntax error in the program"))
+    }
+    decoded := ast::decode_program(parsed.unwrap())
+    when decoded.is_err() {
+        return Result::Err(String("cannot read the syntax tree"))
+    }
+    mut program := decoded.unwrap()
+    // The names of the root functions, which a module function may not share.
+    mut root_names: Vec<String> = Vec()
+    mut f: u64 = 0
+    while f < program.function_defs.len() {
+        segment := rync_segment_of(starts.clone(), ends.clone(), program.function_defs[f].span.start)
+        when segment.is_some() && modules[segment.unwrap()].is_empty() {
+            root_names.push(program.function_defs[f].name.clone())
+        }
+        f += 1
+    }
+    f = 0
+    while f < program.function_defs.len() {
+        segment := rync_segment_of(starts.clone(), ends.clone(), program.function_defs[f].span.start)
+        when segment.is_some() {
+            module := modules[segment.unwrap()].clone()
+            when !module.is_empty() {
+                mut function := program.function_defs[f]
+                mut taken: u64 = 0
+                while taken < root_names.len() {
+                    when root_names[taken] == function.name {
+                        mut message := String("module function `")
+                        message.append(function.name.clone())
+                        message.append("` conflicts with a root function")
+                        return Result::Err(message)
+                    }
+                    taken += 1
+                }
+                function.module_path = module.clone()
+                mut qualified := module
+                qualified.append("::")
+                qualified.append(function.name.clone())
+                function.name = qualified
+                program.function_defs.set(f, function)
+            }
+        }
+        f += 1
+    }
+    mut s: u64 = 0
+    while s < program.struct_defs.len() {
+        segment := rync_segment_of(starts.clone(), ends.clone(), program.struct_defs[s].span.start)
+        when segment.is_some() {
+            module := modules[segment.unwrap()].clone()
+            mut definition := program.struct_defs[s]
+            definition.module_path = module.clone()
+            when !module.is_empty() && definition.drop_function.is_some() {
+                routine := definition.drop_function.unwrap()
+                when !routine.contains("::") {
+                    mut qualified := module.clone()
+                    qualified.append("::")
+                    qualified.append(routine)
+                    definition.drop_function = Option::Some(qualified)
+                }
+            }
+            program.struct_defs.set(s, definition)
+        }
+        s += 1
+    }
+    mut e: u64 = 0
+    while e < program.enum_defs.len() {
+        segment := rync_segment_of(starts.clone(), ends.clone(), program.enum_defs[e].span.start)
+        when segment.is_some() && !program.enum_defs[e].name.starts_with("$Ryn") {
+            mut definition := program.enum_defs[e]
+            definition.module_path = modules[segment.unwrap()].clone()
+            program.enum_defs.set(e, definition)
+        }
+        e += 1
+    }
+    mut h: u64 = 0
+    while h < program.shape_defs.len() {
+        segment := rync_segment_of(starts.clone(), ends.clone(), program.shape_defs[h].span.start)
+        when segment.is_some() {
+            mut definition := program.shape_defs[h]
+            definition.module_path = modules[segment.unwrap()].clone()
+            program.shape_defs.set(h, definition)
+        }
+        h += 1
+    }
+    mut a: u64 = 0
+    while a < program.alias_defs.len() {
+        segment := rync_segment_of(starts.clone(), ends.clone(), program.alias_defs[a].span.start)
+        when segment.is_some() {
+            mut definition := program.alias_defs[a]
+            definition.module_path = modules[segment.unwrap()].clone()
+            program.alias_defs.set(a, definition)
+        }
+        a += 1
+    }
+    return Result::Ok(program)
+}
+
+fun rync_fail(message: String, code: i32) -> i32 {
+    eprint("rync: {}", message)
+    return code
+}
+
+fun main() -> i32 {
+    mut std_root := String("stdlib/std/src")
+    mut entry := String("")
+    mut position: u32 = 0
+    while position < arg_count() {
+        word := String(arg(position))
+        when word == "--stdlib" && position + 1 < arg_count() {
+            std_root = String(arg(position + 1))
+            position += 2
+        } else {
+            entry = word
+            position += 1
+        }
+    }
+    when entry.is_empty() {
+        return rync_fail(String("usage: rync [--stdlib <directory>] <entry.ryn>"), 2)
+    }
+    mut loader := Loader { source_root: rync_directory_of(entry.clone()), std_root: std_root, units: Vec(), loaded: Vec(), importing: Vec(), error: String("") }
+    when !loader.load(entry, String("")) {
+        return rync_fail(loader.error.clone(), 1)
+    }
+    assembled := rync_assemble(loader.units)
+    when assembled.is_err() {
+        return rync_fail(assembled.unwrap_err(), 1)
+    }
+    specialized := rync_after_ok(generics::specialize(ast::encode_program(assembled.unwrap())))
+    when specialized.is_none() {
+        return rync_fail(String("generic specialization failed"), 1)
+    }
+    decoded := ast::decode_program(specialized.unwrap())
+    when decoded.is_err() {
+        return rync_fail(String("cannot read the specialized syntax tree"), 1)
+    }
+    lowered := lower::lower_program(decoded.unwrap())
+    when lowered.is_err() {
+        return rync_fail(lowered.unwrap_err(), 3)
+    }
+    program := ir::decode_ir(lowered.unwrap())
+    when program.is_err() {
+        return rync_fail(String("the typed IR does not decode"), 3)
+    }
+    linked := gen::generate_executable(program.unwrap())
+    when linked.is_err() {
+        return rync_fail(linked.unwrap_err(), 3)
+    }
+    bytes := linked.unwrap()
+    mut at: u64 = 0
+    while at < bytes.len() {
+        putchar(bytes[at] as i32)
+        at += 1
+    }
+    return 0
+}
