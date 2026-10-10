@@ -15,6 +15,7 @@ use driver::pkg
 use std::fs
 use std::env
 use std::time
+use std::system
 
 fun ryn_usage() -> String {
     return String("usage:\n  ryn new <path>\n  ryn check <file.ryn|project-dir>\n  ryn build <file.ryn|project-dir> [--release] [-o|--output <path>]\n  ryn run <file.ryn|project-dir> [--release] [-o|--output <path>] [-- <program-args...>]\n  ryn clean <project-dir>\n  ryn lock <project-dir>\n  ryn login <token>\n  ryn publish [project-dir]")
@@ -133,6 +134,15 @@ fun ryn_clean(path: String) -> i32 {
     return 0
 }
 
+// The name of an executable on this system: `.exe` is added on Windows.
+fun ryn_executable(name: String) -> String {
+    mut out := name
+    when system::os() == "windows" {
+        out.append(".exe")
+    }
+    return out
+}
+
 // The directory the tool is installed in.
 fun ryn_home() -> String {
     return manifest::directory_of(env::executable_path())
@@ -156,11 +166,11 @@ fun ryn_default_output(input: String, project: bool, release: bool) -> String {
         mut relative := String("build/")
         relative.append(profile)
         relative.append("/")
-        relative.append(name)
+        relative.append(ryn_executable(name))
         return manifest::join_path(input, relative)
     }
     when input.ends_with(".ryn") {
-        return input.slice(0, input.len() - 4)
+        return ryn_executable(input.slice(0, input.len() - 4))
     }
     mut out := input
     out.append(".out")
@@ -193,7 +203,7 @@ fun ryn_dependencies(project: String) -> Vec<String> {
 }
 
 fun ryn_compiler(command: str, input: String, output: String, packages: Vec<String>) -> i32 {
-    compiler := manifest::join_path(ryn_home(), String("rync"))
+    compiler := manifest::join_path(ryn_home(), ryn_executable(String("rync")))
     when !fs::exists(compiler.clone()) {
         mut message := String("error[R0301]: the compiler is not installed at ")
         message.append(compiler)
@@ -383,7 +393,7 @@ fun main() -> i32 {
         return 0
     }
     mut absolute := output
-    when !absolute.starts_with("/") {
+    when !manifest::is_absolute(absolute.clone()) {
         absolute = manifest::join_path(env::current_dir(), absolute)
     }
     code := run_process_args(absolute, program_args)

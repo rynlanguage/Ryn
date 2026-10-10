@@ -218,10 +218,22 @@ pub fun directory_of(path: String) -> String {
     return String("")
 }
 
+// Whether a path starts at a root: `/`, or a drive letter and a colon (`C:/`).
+pub fun is_absolute(path: String) -> bool {
+    when path.starts_with("/") {
+        return true
+    }
+    when path.len() >= 2 && (path.byte_at(1) as u64) == 58 {
+        first := path.byte_at(0) as u64
+        return (first >= 65 && first <= 90) || (first >= 97 && first <= 122)
+    }
+    return false
+}
+
 // `base/relative`, with `.` and `..` components resolved by their text. An absolute `relative` replaces `base`.
 pub fun join_path(base: String, relative: String) -> String {
     mut combined := String("")
-    when relative.starts_with("/") || base.is_empty() {
+    when is_absolute(relative.clone()) || base.is_empty() {
         combined = relative
     } else {
         combined = base

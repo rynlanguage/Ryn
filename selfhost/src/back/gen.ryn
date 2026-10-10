@@ -9197,10 +9197,14 @@ extend Gen {
         windows_call := self.windows && self.freestanding && !rt_provides(name.clone()) && !ffi_helpers::is_helper(name.clone())
         system_number := windows_system_number(name.clone())
         when windows_call && system_number == 0 {
-            when !self.load_windows_arguments(asm, types) {
+            // The arguments stay on the stack as pushed; the call copies them where Windows expects them.
+            self.sync_shadows(asm, false)
+            when !self.windows_import_call(asm, name.clone(), types) {
                 return false
             }
-        } else when !self.load_c_arguments(asm, types) {
+            return self.finish_c_call(asm, result)
+        }
+        when !self.load_c_arguments(asm, types) {
             return false
         }
         self.sync_shadows(asm, false)
@@ -9229,15 +9233,6 @@ extend Gen {
                     asm.mov_ri(x64::Reg::RAX, 0)
                     asm.bind(cwd_done)
                 }
-            } else {
-                imported := self.foreign_symbol(windows_import_name(name))
-                asm.push(x64::Reg::RBP)
-                asm.mov_rr(x64::Reg::RBP, x64::Reg::RSP)
-                asm.alu_ri(4, x64::Reg::RSP, (0 as i64) - 16)
-                asm.alu_ri(5, x64::Reg::RSP, 32)
-                asm.call_symbol(imported)
-                asm.mov_rr(x64::Reg::RSP, x64::Reg::RBP)
-                asm.pop(x64::Reg::RBP)
             }
         } else when self.freestanding && !rt_provides(name.clone()) {
             // A freestanding program cannot make this call: it is built again against the C library.
@@ -9249,13 +9244,12 @@ extend Gen {
         return self.finish_c_call(asm, result)
     }
 
-    // The arguments of a call of a Windows function: the first four go to rcx, rdx, r8 and r9 by position (a float to the
-    // xmm register of its position), and nothing is passed by value that is larger than a register, passed on the stack, or
-    // called back (a function pointer would be called with the System V convention).
-    fun load_windows_arguments(mut self, asm: &mut x64::Asm, types: Vec<u64>) -> bool {
-        when types.len() > 4 {
-            return self.fail("a foreign call with more than four arguments in a Windows program")
-        }
+    // A call of a Windows function with the arguments `types` on the stack (the first pushed first): the first four go to
+    // rcx, rdx, r8 and r9 by position (a float to the xmm register of its position), the rest to the stack above 32 bytes
+    // of shadow space, and the pushed cells are dropped after the call. Nothing is passed by value that is larger than a
+    // register, and no function pointer is passed, since the callee would call it with the System V convention.
+    fun windows_import_call(mut self, asm: &mut x64::Asm, name: String, types: Vec<u64>) -> bool {
+        count := types.len()
         for ty in types.clone() {
             when self.c_classes(ty).len() > 0 || self.cells_of(ty) != 1 {
                 return self.fail("a record argument of a foreign call in a Windows program")
@@ -9264,15 +9258,44 @@ extend Gen {
                 return self.fail("a function pointer argument of a foreign call in a Windows program")
             }
         }
-        mut index: u64 = types.len()
-        while index > 0 {
-            index -= 1
+        // Windows has no symbolic-link query by this name: the call answers -1, as for a path that is not a link.
+        when name == "readlink" {
+            asm.alu_ri(0, x64::Reg::RSP, (8 * count) as i64)
+            asm.mov_ri(x64::Reg::RAX, 18446744073709551615)
+            return true
+        }
+        imported := self.foreign_symbol(windows_import_name(name))
+        mut extra: u64 = 0
+        when count > 4 {
+            extra = count - 4
+        }
+        frame := (32 + 8 * extra + 15) / 16 * 16
+        asm.push(x64::Reg::RBP)
+        asm.mov_rr(x64::Reg::RBP, x64::Reg::RSP)
+        asm.alu_ri(4, x64::Reg::RSP, (0 as i64) - 16)
+        asm.alu_ri(5, x64::Reg::RSP, frame as i64)
+        mut index: u64 = 4
+        while index < count {
+            asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (8 + 8 * (count - 1 - index)) as i64)
+            asm.store(8, x64::Reg::RAX, x64::Reg::RSP, (32 + 8 * (index - 4)) as i64)
+            index += 1
+        }
+        index = 0
+        while index < count && index < 4 {
+            offset := (8 + 8 * (count - 1 - index)) as i64
             when self.is_sse(types[index]) {
-                asm.pop(x64::Reg::RAX)
+                asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, offset)
                 asm.movq_to_xmm(self.word(types[index]) == "F64", index, x64::Reg::RAX)
             } else {
-                asm.pop(windows_argument_register(index))
+                asm.load(8, false, windows_argument_register(index), x64::Reg::RBP, offset)
             }
+            index += 1
+        }
+        asm.call_symbol(imported)
+        asm.mov_rr(x64::Reg::RSP, x64::Reg::RBP)
+        asm.pop(x64::Reg::RBP)
+        when count > 0 {
+            asm.alu_ri(0, x64::Reg::RSP, (8 * count) as i64)
         }
         return true
     }
@@ -12069,6 +12092,12 @@ fun windows_system_number(name: String) -> u64 {
 
 // The import that a C function is called through in a Windows program.
 fun windows_import_name(name: String) -> String {
+    first := name.byte_at(0) as u64
+    when first >= 65 && first <= 90 {
+        mut kernel := String("kernel32!")
+        kernel.append(name)
+        return kernel
+    }
     mut text := String("ucrtbase!")
     // `long` has 32 bits on Windows, so a 64-bit `labs` is `llabs`; some functions have an underscore there.
     when name == "labs" {

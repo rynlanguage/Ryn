@@ -180,7 +180,7 @@ fun trim_end_slash(text: String) -> String {
 }
 
 fun absolute(path: String) -> String {
-    when path.starts_with("/") {
+    when manifest::is_absolute(path.clone()) {
         return manifest::normalize(path)
     }
     return manifest::join_path(env::current_dir(), path)

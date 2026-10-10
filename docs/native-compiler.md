@@ -51,6 +51,29 @@ is a fixed point of the current sources. To replace it, build a new stage2 with 
 current seed, check that stage2 and stage3 are byte-identical, then copy stage2 to
 `bootstrap/rync-seed` and update the digest in the same change.
 
+## Windows x86-64 target
+
+`rync --target windows` writes a PE32+ console executable (`ryn.exe` and `rync.exe` are built this way), and a `rync`
+that runs on Windows targets Windows by default. The code generator is the same; what changes is how the program
+reaches the system:
+
+- The freestanding runtime's Linux system calls are calls of an emulation routine (`back/winrt.ryn`) over `kernel32`:
+  `write`, `read`, `open`, `close`, `lseek`, `mmap`/`munmap`, `exit`, `mkdir`, `rmdir`, `unlink`, `rename`, `chdir`,
+  `getcwd`, `stat`, the command line (UTF-8), and a vectored exception handler that prints the same messages as the
+  Linux SIGSEGV handler for an access violation or a stack overflow.
+- `back/pe.ryn` links the image at a fixed base with import stubs; there are no base relocations.
+- Scalar C functions are imported from `ucrtbase.dll` with the Windows calling convention (up to the stack; no records
+  by value, no function pointers passed to C).
+- `stdlib/std/src/native_windows.ryn` replaces the runtime functions that differ: processes (`CreateProcessW`, pipes),
+  directories, time, the executable and temporary paths, the current directory.
+- Paths use `/` internally; `C:/...` counts as absolute.
+
+What was verified, and how: nothing here was run on Windows itself. The programs were run under Wine 10 in a
+container (`podman`, image `ryn-wine`, `RYN_TEST_TARGET=windows tools/test-native-sources.py`), including the Windows
+`rync.exe` compiling programs under Wine (`RYN_TEST_WINE_COMPILER`). Not done yet: threads, sockets, dynamic libraries,
+keyboard input, callbacks from C (`qsort`), records passed to or returned from C, directory listing through C
+functions, and a run on a real Windows machine.
+
 ## Float text and runtime ownership
 
 The native backend embeds typed IR generated from the same Ryn big-integer

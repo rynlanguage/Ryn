@@ -25,6 +25,10 @@ ROOT = Path(__file__).resolve().parents[1]
 # RYN_TEST_TARGET=windows compiles every program for Windows and runs it under Wine in the container `ryn-wine`
 # (`podman run`), so the result is the behaviour under Wine, not on Windows itself.
 WINDOWS = os.environ.get("RYN_TEST_TARGET") == "windows"
+# RYN_TEST_WINE_COMPILER=/path/to/rync.exe runs that Windows compiler under Wine too (it compiles inside the container).
+WINE_COMPILER = os.environ.get("RYN_TEST_WINE_COMPILER")
+if WINE_COMPILER:
+    WINDOWS = True
 COMPILER = str(Path(sys.argv[1]).resolve())
 STDLIB = str(ROOT / "stdlib/std/src")
 
@@ -70,8 +74,12 @@ def run(path):
     with tempfile.TemporaryDirectory(prefix="ryn-native-source-") as directory:
         executable = Path(directory) / ("program.exe" if WINDOWS else "program")
         build_command = [COMPILER, "build"] + (["--target", "windows"] if WINDOWS else []) + ["--stdlib", STDLIB, "-o", str(executable), str(target)]
+        if WINE_COMPILER:
+            exe = Path(WINE_COMPILER).resolve()
+            relative = os.path.relpath(target, ROOT)
+            build_command = ["podman", "run", "--rm", "--network=none", "-v", f"{exe.parent}:/k:ro,Z", "-v", f"{ROOT}:/repo:ro,Z", "-v", f"{directory}:/w:Z", "-w", "/repo", "ryn-wine", "wine", f"/k/{exe.name}", "build", "--stdlib", "/repo/stdlib/std/src", "-o", "/w/program.exe", relative]
         build = subprocess.run(build_command,
-                               cwd=ROOT, capture_output=True, preexec_fn=limit, timeout=300)
+                               cwd=ROOT, capture_output=True, preexec_fn=None if WINE_COMPILER else limit, timeout=600)
         stderr = build.stderr.decode(errors="replace")
         if case["kind"] == "fail":
             if build.returncode == 0:

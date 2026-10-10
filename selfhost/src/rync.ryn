@@ -34,6 +34,7 @@ use driver::report
 use driver::manifest
 use std::fs
 use std::env
+use std::system
 
 extern "C" fun putchar(value: i32) -> i32;
 extern "C" fun malloc(size: u64) -> *u8;
@@ -530,7 +531,7 @@ fun rync_assign_modules(compilation: Compilation, parsed: ast::Program) -> Resul
             function.module_path = module.clone()
             when !module.is_empty() {
                 // The runtime module may declare C functions that a program declares too.
-                when module != "std::native" {
+                when module != "std::native" && module != "std::native_windows" {
                     for taken in root_names.clone() {
                         when taken == function.name {
                             mut message := String("module function `")
@@ -721,7 +722,7 @@ fun rync_write_executable(path: String, bytes: Vec<u8>) -> bool {
 }
 
 fun rync_absolute(path: String) -> String {
-    when path.starts_with("/") {
+    when manifest::is_absolute(path.clone()) {
         return manifest::normalize(path)
     }
     return manifest::join_path(env::current_dir(), path)
@@ -745,7 +746,8 @@ fun main() -> i32 {
     mut package_roots: Vec<String> = Vec()
     mut position: u32 = 0
     mut seen_command := false
-    mut windows := false
+    // The target is the system the compiler runs on, unless `--target` names the other.
+    mut windows := system::os() == "windows"
     while position < arg_count() {
         word := String(arg(position))
         when word == "--version" || word == "-V" {
@@ -765,7 +767,9 @@ fun main() -> i32 {
             target := String(arg(position + 1))
             when target == "windows" || target == "x86_64-windows" {
                 windows = true
-            } else when target != "linux" && target != "x86_64-linux" {
+            } else when target == "linux" || target == "x86_64-linux" {
+                windows = false
+            } else {
                 return rync_fail(rync_usage(), 2)
             }
             position += 2
@@ -848,6 +852,16 @@ fun main() -> i32 {
     when file_exists(runtime_file.clone()) {
         when !loader.load(runtime_file, String("std::native"), loader.std_root.clone()) {
             return rync_fail(loader.error.clone(), 1)
+        }
+    }
+    // For Windows, the runtime functions that differ there are in a second module, which the lowering prefers.
+    when windows {
+        mut windows_file := loader.std_root.clone()
+        windows_file.append("/native_windows.ryn")
+        when file_exists(windows_file.clone()) {
+            when !loader.load(windows_file, String("std::native_windows"), loader.std_root.clone()) {
+                return rync_fail(loader.error.clone(), 1)
+            }
         }
     }
     loaded_files := loader.found_files.clone()

@@ -38,6 +38,12 @@ archive and no commit for 0.1.6 yet. Items marked "not verified" were not run in
 - New rules in the Ryn analysis: `R0220` for a structure declared twice, and `R0238` for an enum declared twice or named like a structure (before, only the bootstrap reported them); `R0248` for a reference returned from a call, which is rejected whatever its arguments are, as in the bootstrap; `R0225` for an unknown tuple element such as `_2` in a destructuring.
 - With the Ryn analysis alone, the full test suite passes: 405 tests in the default `cargo test` run and 405 in the `RYN_SEMA=ryn-only` run.
 
+### Windows target (experimental)
+
+- `rync --target windows` writes a PE32+ executable; `ryn.exe` and `rync.exe` are built that way and run under Wine
+  (`ryn new`, `check`, `build`, `run` with the program's exit status). See `docs/native-compiler.md`. Verified under Wine
+  only, not on Windows; threads, sockets, dynamic libraries, keyboard input and C callbacks are not available there yet.
+
 ### Language and runtime fixes
 
 - `extend String` methods with `mut self` changed the caller's value unreliably. A statement-level

@@ -4248,8 +4248,9 @@ extend Lowering {
     fun signature_index(self, name: String) -> Result<u64, String> {
         // The native runtime module (`std::native`) calls its own functions first: a program may declare a C function of
         // the same name with another signature.
-        when self.module == "std::native" {
-            mut local := String("std::native::")
+        when self.module == "std::native" || self.module == "std::native_windows" {
+            mut local := self.module.clone()
+            local.append("::")
             local.append(name.clone())
             own := self.signature_exact(local)
             when own.is_ok() {
@@ -5227,7 +5228,13 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
             }
             at += 1
         }
-        found := self.signature_exact(name)
+        // The Windows variant of the runtime function takes the place of the common one.
+        mut windows_name := String("std::native_windows::")
+        windows_name.append(name.slice(13, name.len()))
+        mut found := self.signature_exact(windows_name)
+        when found.is_err() {
+            found = self.signature_exact(name)
+        }
         when found.is_err() {
             return Option::None
         }

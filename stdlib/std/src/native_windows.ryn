@@ -39,6 +39,11 @@ fun word32_at(pointer: *u8, offset: u64) -> u32 {
     return *cell
 }
 
+fun byte_of(pointer: *u8, offset: u64) -> u8 {
+    cell := ((pointer as u64) + offset) as *u8
+    return *cell
+}
+
 fun zeroed(size: u64) -> *u8 {
     block := malloc(size)
     mut at: u64 = 0
@@ -306,4 +311,240 @@ fun capture_program(program: String, arguments: Vec<String>) -> *u8 {
 
 pub fun __rt_system_process_capture(program_given: str, arguments: Vec<String>) -> *u8 {
     return capture_program(String(program_given), arguments)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Directories, paths and time
+
+extern "C" fun FindFirstFileW(pattern: *u8, data: *u8) -> *u8;
+extern "C" fun FindNextFileW(handle: *u8, data: *u8) -> i32;
+extern "C" fun FindClose(handle: *u8) -> i32;
+extern "C" fun WideCharToMultiByte(code_page: u32, flags: u32, wide: *u8, length: i32, text: *u8, capacity: i32, default_char: *u8, used: *u8) -> i32;
+extern "C" fun GetFileAttributesW(path: *u8) -> u32;
+extern "C" fun DeleteFileW(path: *u8) -> i32;
+extern "C" fun RemoveDirectoryW(path: *u8) -> i32;
+extern "C" fun GetModuleFileNameW(module: *u8, buffer: *u8, size: u32) -> u32;
+extern "C" fun GetTempPathW(size: u32, buffer: *u8) -> u32;
+extern "C" fun GetSystemTimePreciseAsFileTime(out: *u8);
+extern "C" fun QueryPerformanceCounter(out: *u8) -> i32;
+extern "C" fun QueryPerformanceFrequency(out: *u8) -> i32;
+extern "C" fun getenv(name: *u8) -> *u8;
+extern "C" fun strlen(text: *u8) -> u64;
+
+// The UTF-8 text of a zero-terminated UTF-16 string, with `/` for the path separators.
+fun text_of_wide(wide: *u8) -> String {
+    size := WideCharToMultiByte(65001 as u32, 0 as u32, wide, -1, 0 as *u8, 0, 0 as *u8, 0 as *u8)
+    when size <= 1 {
+        return String("")
+    }
+    buffer := zeroed((size as u64) + 1)
+    converted := WideCharToMultiByte(65001 as u32, 0 as u32, wide, -1, buffer, size, 0 as *u8, 0 as *u8)
+    mut at: u64 = 0
+    while at < (size as u64) {
+        when (byte_of(buffer, at) as u64) == 92 {
+            cell := ((buffer as u64) + at) as *u8
+            *cell = 47 as u8
+        }
+        at += 1
+    }
+    text := __native_string_from_raw(buffer, (size as u64) - 1)
+    free(buffer)
+    return text
+}
+
+fun join_text(base: String, name: String) -> String {
+    mut out := base.clone()
+    when !out.is_empty() && !out.ends_with("/") {
+        out.append("/")
+    }
+    out.append(name)
+    return out
+}
+
+// The names in a directory, without `.` and `..`; nothing when it cannot be listed.
+fun directory_names(path: String) -> Option<Vec<String>> {
+    mut pattern := path.clone()
+    when !pattern.ends_with("/") {
+        pattern.append("/")
+    }
+    pattern.append("*")
+    wide := wide_text_of(pattern)
+    data := zeroed(600)
+    handle := FindFirstFileW(wide, data)
+    free(wide)
+    when (handle as u64) == 18446744073709551615 {
+        free(data)
+        return Option::None
+    }
+    mut names: Vec<String> = Vec()
+    mut more := true
+    while more {
+        name := text_of_wide(((data as u64) + 44) as *u8)
+        when name != "." && name != ".." {
+            names.push(name)
+        }
+        more = FindNextFileW(handle, data) != 0
+    }
+    closed := FindClose(handle)
+    free(data)
+    return Option::Some(names)
+}
+
+fun text_less(left: String, right: String) -> bool {
+    mut at: u64 = 0
+    while at < left.len() && at < right.len() {
+        a := left.byte_at(at)
+        b := right.byte_at(at)
+        when a != b {
+            return a < b
+        }
+        at += 1
+    }
+    return left.len() < right.len()
+}
+
+pub fun __rt_filesystem_read_dir(path_given: str) -> Vec<String> {
+    path := String(path_given)
+    names := directory_names(path.clone())
+    mut entries: Vec<String> = Vec()
+    when names.is_none() {
+        return entries
+    }
+    for entry in names.unwrap() {
+        entries.push(join_text(path.clone(), entry))
+    }
+    mut at: u64 = 1
+    while at < entries.len() {
+        mut position := at
+        while position > 0 && text_less(entries[position].clone(), entries[position - 1].clone()) {
+            earlier := entries[position - 1].clone()
+            later := entries[position].clone()
+            entries.set(position - 1, later)
+            entries.set(position, earlier)
+            position -= 1
+        }
+        at += 1
+    }
+    return entries
+}
+
+pub fun __rt_filesystem_delete_dir_all(path_given: str) -> bool {
+    path := String(path_given)
+    wide := wide_text_of(path.clone())
+    attributes := GetFileAttributesW(wide)
+    when attributes == 4294967295 {
+        free(wide)
+        return false
+    }
+    when ((attributes as u64) & 16) == 0 {
+        removed := DeleteFileW(wide)
+        free(wide)
+        return removed != 0
+    }
+    names := directory_names(path.clone())
+    when names.is_none() {
+        free(wide)
+        return false
+    }
+    for entry in names.unwrap() {
+        child := join_text(path.clone(), entry)
+        when !__rt_filesystem_delete_dir_all(child) {
+            free(wide)
+            return false
+        }
+    }
+    removed := RemoveDirectoryW(wide)
+    free(wide)
+    return removed != 0
+}
+
+pub fun __rt_system_executable_path() -> String {
+    buffer := zeroed(65536)
+    count := GetModuleFileNameW(0 as *u8, buffer, 32768 as u32)
+    text := text_of_wide(buffer)
+    free(buffer)
+    return text
+}
+
+pub fun __rt_system_temp_dir() -> String {
+    buffer := zeroed(65536)
+    count := GetTempPathW(32768 as u32, buffer)
+    mut text := text_of_wide(buffer)
+    free(buffer)
+    when text.len() > 1 && text.ends_with("/") {
+        text = text.slice(0, text.len() - 1)
+    }
+    return text
+}
+
+pub fun __rt_system_home_dir() -> String {
+    name := c_text_of(String("USERPROFILE"))
+    value := getenv(name)
+    free(name)
+    when (value as u64) == 0 {
+        return String("")
+    }
+    mut text := __native_string_from_raw(value, strlen(value))
+    return text
+}
+
+pub fun __rt_system_time_unix() -> f64 {
+    stamp := zeroed(8)
+    GetSystemTimePreciseAsFileTime(stamp)
+    ticks := word64_at(stamp, 0)
+    free(stamp)
+    return ((ticks - 116444736000000000) as f64) / 10000000.0
+}
+
+pub fun __rt_system_time_monotonic() -> f64 {
+    counter := zeroed(8)
+    frequency := zeroed(8)
+    got := QueryPerformanceCounter(counter)
+    rate := QueryPerformanceFrequency(frequency)
+    seconds := (word64_at(counter, 0) as f64) / (word64_at(frequency, 0) as f64)
+    free(counter)
+    free(frequency)
+    return seconds
+}
+
+pub fun __rt_system_time_elapsed(started: f64) -> f64 {
+    return __rt_system_time_monotonic() - started
+}
+
+pub fun __rt_system_sleep(milliseconds: u64) {
+    Sleep(milliseconds as u32)
+}
+
+pub fun __rt_system_os() -> String {
+    return String("windows")
+}
+
+extern "C" fun GetCurrentDirectoryW(size: u32, buffer: *u8) -> u32;
+extern "C" fun GetFullPathNameW(path: *u8, size: u32, buffer: *u8, file_part: *u8) -> u32;
+
+pub fun __rt_system_current_dir() -> String {
+    buffer := zeroed(65536)
+    count := GetCurrentDirectoryW(32768 as u32, buffer)
+    text := text_of_wide(buffer)
+    free(buffer)
+    return text
+}
+
+// The absolute path of an existing file or directory, or an empty text; links are not resolved.
+pub fun __rt_filesystem_path_canonical(path_given: str) -> String {
+    wide := wide_text_of(String(path_given))
+    attributes := GetFileAttributesW(wide)
+    when attributes == 4294967295 {
+        free(wide)
+        return String("")
+    }
+    buffer := zeroed(65536)
+    count := GetFullPathNameW(wide, 32768 as u32, buffer, 0 as *u8)
+    free(wide)
+    mut text := text_of_wide(buffer)
+    free(buffer)
+    when text.len() > 3 && text.ends_with("/") {
+        text = text.slice(0, text.len() - 1)
+    }
+    return text
 }
