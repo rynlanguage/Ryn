@@ -79,10 +79,16 @@ try {
     Expand-Archive -LiteralPath $archivePath -DestinationPath $extractDir
     $executable = Get-ChildItem -LiteralPath $extractDir -Filter 'ryn.exe' -File -Recurse | Select-Object -First 1
     if (-not $executable) { throw 'The release archive does not contain ryn.exe.' }
+    # `ryn.exe` finds `rync.exe` and `stdlib` next to itself, so the whole directory is installed.
+    $source = $executable.Directory.FullName
+    if (-not (Test-Path -LiteralPath (Join-Path $source 'rync.exe'))) { throw 'The release archive does not contain rync.exe.' }
+    if (-not (Test-Path -LiteralPath (Join-Path $source 'stdlib'))) { throw 'The release archive does not contain the standard library.' }
 
     $null = New-Item -ItemType Directory -Path $InstallDir -Force
+    foreach ($entry in Get-ChildItem -LiteralPath $source) {
+        Copy-Item -LiteralPath $entry.FullName -Destination $InstallDir -Recurse -Force
+    }
     $destination = Join-Path $InstallDir 'ryn.exe'
-    Copy-Item -LiteralPath $executable.FullName -Destination $destination -Force
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $pathEntries = @($userPath -split ';' | Where-Object { $_ })

@@ -79,18 +79,25 @@ expected_hash="$(awk 'NR == 1 { print $1 }' "$checksum_path")"
 printf '%s  %s\n' "$expected_hash" "$archive_path" | sha256sum --check --status || fail 'the downloaded archive failed its SHA-256 check.'
 
 version="${tag#v}"
-member="ryn-$version-linux-x86_64/ryn"
+directory="ryn-$version-linux-x86_64"
 # The listing is read in full before it is searched: `grep -q` exits at the first match and
 # would close the pipe early, so `pipefail` would report the killed `tar` instead of the match.
 archive_listing="$(tar -tzf "$archive_path")" || fail 'the downloaded archive is not readable.'
-grep -Fxq -- "$member" <<<"$archive_listing" || fail 'the release archive does not contain the Ryn executable.'
-tar -xOzf "$archive_path" "$member" > "$work_dir/ryn" || fail 'the Ryn executable could not be extracted from the archive.'
-chmod 0755 "$work_dir/ryn"
-[[ "$("$work_dir/ryn" --version)" == "ryn $version" ]] || fail 'the downloaded executable reported an unexpected version.'
+grep -Fxq -- "$directory/ryn" <<<"$archive_listing" || fail 'the release archive does not contain the Ryn executable.'
+grep -Fxq -- "$directory/rync" <<<"$archive_listing" || fail 'the release archive does not contain the Ryn compiler.'
+# `ryn` finds `rync` and `stdlib` next to itself, so the whole directory is installed, and `ryn` is linked into the bin
+# directory (the link is followed to the real location when it runs).
+tar -xzf "$archive_path" -C "$work_dir" || fail 'the archive could not be extracted.'
+[[ "$("$work_dir/$directory/ryn" --version)" == "ryn $version" ]] || fail 'the downloaded executable reported an unexpected version.'
 
-mkdir -p "$install_dir"
+ryn_home="${RYN_HOME:-${HOME}/.local/share/ryn}"
+mkdir -p "$ryn_home" "$install_dir"
+rm -rf "$ryn_home/$version.new"
+mv "$work_dir/$directory" "$ryn_home/$version.new"
+rm -rf "$ryn_home/$version"
+mv "$ryn_home/$version.new" "$ryn_home/$version"
 install_dir="$(cd "$install_dir" && pwd)"
-install -m 0755 "$work_dir/ryn" "$install_dir/ryn.new"
+ln -sfn "$ryn_home/$version/ryn" "$install_dir/ryn.new"
 mv -f "$install_dir/ryn.new" "$install_dir/ryn"
 
 if [[ "$install_dir" == "$HOME/.local/bin" ]]; then
@@ -108,7 +115,7 @@ EOF
     done
 fi
 
-printf 'Installed Ryn %s to %s/ryn\n' "$version" "$install_dir"
+printf 'Installed Ryn %s to %s (linked from %s/ryn)\n' "$version" "$ryn_home/$version" "$install_dir"
 if [[ ":$PATH:" != *":$install_dir:"* ]]; then
     printf 'Open a new terminal to use ryn from PATH, or run: %s/ryn --version\n' "$install_dir"
 else

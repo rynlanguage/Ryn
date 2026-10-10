@@ -97,7 +97,7 @@ def run(path):
         if build.returncode:
             return "compilefail", path, stderr.strip()[:600]
         if WINDOWS:
-            run_command = ["podman", "run", "--rm", "--network=none", "-v", f"{directory}:/w:Z", "-v", f"{ROOT}:/repo:ro,Z", "-w", "/repo", "ryn-wine", "wine", "/w/program.exe"]
+            run_command = ["wine", str(executable)] if os.environ.get("RYN_TEST_WINE") == "local" else ["podman", "run", "--rm", "--network=none", "-v", f"{directory}:/w:Z", "-v", f"{ROOT}:/repo:ro,Z", "-w", "/repo", "ryn-wine", "wine", "/w/program.exe"]
             result = subprocess.run(run_command, cwd=ROOT, capture_output=True, timeout=120)
             if not result.stdout and result.returncode == 0 and case["out"]:
                 # Wine sometimes starts without output when many containers start at once: one more try.

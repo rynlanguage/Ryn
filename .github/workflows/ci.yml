@@ -12,69 +12,81 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Ryn is built by itself: the committed seed (bootstrap/rync-seed) compiles the compiler, and the result must compile
+# itself to the same bytes. No Rust, Cargo, C compiler or linker is used.
 jobs:
-  validate:
-    name: Validate on ${{ matrix.os }}
-    env:
-      RUST_MIN_STACK: 16777216
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-
-      - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Check workspace
-        run: cargo check --workspace --locked
-
-      - name: Build documentation
-        run: cargo doc --workspace --no-deps
-
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-
-      - name: Run release tests
-        run: cargo test --release --workspace --locked -- --test-threads=4
-
-      - name: Run tests
-        run: cargo test --workspace --locked
-
-  native:
-    name: Native compiler on Linux
+  linux:
+    name: Linux x86_64
     runs-on: ubuntu-latest
-    env:
-      RUST_MIN_STACK: 16777216
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Verify the seed checksum
+        run: cd bootstrap && sha256sum --check rync-seed.sha256
 
-      - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@v2
+      - name: Bootstrap the compiler to a byte-identical fixpoint
+        run: env -i PATH=/usr/bin:/bin HOME="$HOME" tools/bootstrap-native.sh "$PWD/bootstrap/rync-seed" "$RUNNER_TEMP/fixpoint"
 
-      - name: Build the release compiler
-        run: cargo build --release --locked
+      - name: Run the language suite
+        run: |
+          env -i PATH=/usr/bin:/bin HOME="$HOME" TMPDIR="$RUNNER_TEMP" \
+            python3 tools/test-native-sources.py "$RUNNER_TEMP/fixpoint/rync-stage2" $(python3 tools/list-suite.py) tests/native/*.ryn
 
-      - name: Bootstrap the native compiler to a byte-identical fixpoint
-        run: ./target/release/ryn bootstrap --native
+      - name: Build the distribution
+        run: |
+          python3 tools/make-dist.py "$RUNNER_TEMP/fixpoint/rync-stage2" 0.1.6 "$RUNNER_TEMP/dist"
+          mkdir "$RUNNER_TEMP/unpacked"
+          tar -xzf "$RUNNER_TEMP/dist/ryn-0.1.6-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/unpacked"
 
-      - name: Run the native suite, runtime leak and backend tests
-        run: cargo test --release --locked --test suite --test native_hello --test native_runtime_leaks --test backend_selection
+      - name: Run the command-line tests with the built ryn
+        run: RYN_EXPECTED_VERSION=0.1.6 python3 tools/run-tests.py "$RUNNER_TEMP/unpacked/ryn-0.1.6-linux-x86_64/ryn"
+
+      - name: Upload the Windows archive for the Windows job
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-archive
+          path: ${{ runner.temp }}/dist/ryn-0.1.6-windows-x86_64.zip
+
+  windows-wine:
+    name: Windows target under Wine
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Wine
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends wine wine64
+
+      - name: Bootstrap the compiler
+        run: env -i PATH=/usr/bin:/bin HOME="$HOME" tools/bootstrap-native.sh "$PWD/bootstrap/rync-seed" "$RUNNER_TEMP/fixpoint"
+
+      - name: Run the suite as Windows programs under Wine
+        env:
+          RYN_TEST_TARGET: windows
+          RYN_TEST_WINE: local
+          RYN_TEST_JOBS: 2
+          WINEDEBUG: -all
+        run: python3 tools/test-native-sources.py "$RUNNER_TEMP/fixpoint/rync-stage2" $(python3 tools/list-suite.py)
+
+  windows:
+    name: Windows x86_64
+    needs: linux
+    runs-on: windows-latest
+    steps:
+      - name: Download the Windows archive
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-archive
+
+      - name: Run ryn on Windows
+        shell: pwsh
+        run: |
+          Expand-Archive -LiteralPath ryn-0.1.6-windows-x86_64.zip -DestinationPath unpacked
+          $ryn = "unpacked/ryn-0.1.6-windows-x86_64/ryn.exe"
+          & $ryn --version
+          if ($LASTEXITCODE -ne 0) { throw "ryn --version failed" }
+          "fun main() {`n    echo `"hello from windows`"`n}`n" | Set-Content -NoNewline hello.ryn
+          $output = & $ryn run hello.ryn
+          if ($LASTEXITCODE -ne 0) { throw "ryn run failed with exit code $LASTEXITCODE" }
+          if ($output -notcontains 'hello from windows') { throw "unexpected output: $output" }
