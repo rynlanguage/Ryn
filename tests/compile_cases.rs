@@ -5,11 +5,13 @@ use std::{
 };
 
 fn run_check(path: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("check")
-        .arg(path)
-        .output()
-        .expect("ryn process starts")
+    Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("check")
+    .arg(path)
+    .output()
+    .expect("ryn process starts")
 }
 
 #[test]

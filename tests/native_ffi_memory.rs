@@ -13,10 +13,12 @@ fn run(text: &str) -> std::process::Output {
     fs::create_dir_all(&directory).unwrap();
     let path = directory.join("main.ryn");
     fs::write(&path, text).unwrap();
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .args(["run", path.to_str().unwrap()])
-        .output()
-        .unwrap();
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .args(["run", path.to_str().unwrap()])
+    .output()
+    .unwrap();
     let _ = fs::remove_dir_all(directory);
     result
 }

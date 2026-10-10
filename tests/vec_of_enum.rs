@@ -25,7 +25,9 @@ fn run_fixture(name: &str, frontend: Option<&str>) -> std::process::Output {
     let directory = temp_dir("vec-enum");
     let copy = directory.join("main.ryn");
     fs::copy(&source, &copy).expect("fixture is copied");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ryn"));
+    let mut command = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    );
     command.arg("run").arg(&copy);
     if let Some(frontend) = frontend {
         command.arg("--frontend").arg(frontend);

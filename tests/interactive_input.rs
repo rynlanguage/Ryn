@@ -20,14 +20,16 @@ fn source_file(source_text: &str) -> (PathBuf, PathBuf) {
 
 fn run_with_stdin(source_text: &str, input: &[u8]) -> std::process::Output {
     let (directory, source) = source_file(source_text);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(source)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Ryn process starts");
+    let mut child = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(source)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("Ryn process starts");
     child.stdin.take().unwrap().write_all(input).unwrap();
     let output = child.wait_with_output().expect("Ryn process completes");
     let _ = fs::remove_dir_all(directory);
@@ -47,15 +49,17 @@ fn run_project_with_stdin(source_text: &str, input: &[u8]) -> std::process::Outp
     .expect("temporary project manifest is written");
     fs::write(directory.join("src/main.ryn"), source_text)
         .expect("temporary project source is written");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&directory)
-        .current_dir(&directory)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Ryn project process starts");
+    let mut child = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&directory)
+    .current_dir(&directory)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("Ryn project process starts");
     child.stdin.take().unwrap().write_all(input).unwrap();
     let output = child
         .wait_with_output()
@@ -98,14 +102,16 @@ fn line_input_handles_lf_crlf_utf8_blank_lines_sequential_reads_and_eof() {
 fn ask_flushes_prompt_before_waiting_and_stdin_read_still_reads_to_eof() {
     let (directory, source) =
         source_file("fun main() { name := ask(\"Name: \") echo \"Hello {name}!\" }");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&source)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Ryn process starts");
+    let mut child = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&source)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("Ryn process starts");
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     let mut prompt = [0u8; 6];
@@ -141,14 +147,16 @@ fn standard_io_module_exposes_the_console_api() {
         "use std::io\nuse std::env\nuse std::system\nfun main() { io::print(\"Name: \") io::stdout_flush() name := io::read_line() io::println(\"Hello!\") io::eprintln(\"done\") assert(!env::current_dir().is_empty()) assert(!system::os().is_empty()) assert(system::cpu_count() > 0) }",
     )
     .unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&directory)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&directory)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
     child
         .stdin
         .take()
@@ -182,11 +190,13 @@ fn standard_math_module_exposes_f64_operations_and_random_ranges() {
         "use std::math\nfun main() { echo math::sqrt(9.0) echo math::pow(2.0, 3.0) value := math::random_range(2.0, 4.0) assert(value >= 2.0) assert(value < 4.0) }",
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&directory)
-        .output()
-        .unwrap();
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&directory)
+    .output()
+    .unwrap();
     let _ = fs::remove_dir_all(directory);
     assert!(
         output.status.success(),
@@ -313,11 +323,13 @@ fn vec_rejects_sets_until_set_clone_drop_callbacks_are_supported() {
     let (directory, source) = source_file(
         "fun main() { mut set := Set<String>() mut sets := Vec<Set<String>>() sets.push(set) }",
     );
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("check")
-        .arg(&source)
-        .output()
-        .unwrap();
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("check")
+    .arg(&source)
+    .output()
+    .unwrap();
     let _ = fs::remove_dir_all(directory);
     assert!(!output.status.success());
     assert!(
@@ -797,11 +809,13 @@ fn sleep_accepts_duration_suffixes() {
         String::from_utf8_lossy(&output.stderr)
     );
     let (directory, source) = source_file("fun main() { sleep(3min) sleep(1h) }");
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("check")
-        .arg(&source)
-        .output()
-        .unwrap();
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("check")
+    .arg(&source)
+    .output()
+    .unwrap();
     let _ = fs::remove_dir_all(directory);
     assert!(
         output.status.success(),
@@ -824,12 +838,14 @@ fn standard_time_module_exposes_wall_clock_and_monotonic_elapsed_time() {
         "use std::time\nfun main() { assert(time::unix() > 0.0) start := time::instant_now() time::sleep(1ms) assert(time::instant_elapsed(start) >= 0.001) assert(time::monotonic() >= start) instant := time::Instant::now() time::sleep(1ms) assert(instant.elapsed() >= 0.001) current := time::Time::now() assert(current.unix_seconds > 0.0) assert(time::Time::unix() > 0.0) }",
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&directory)
-        .current_dir(&directory)
-        .output()
-        .unwrap();
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&directory)
+    .current_dir(&directory)
+    .output()
+    .unwrap();
     let _ = fs::remove_dir_all(directory);
     assert!(
         output.status.success(),
@@ -852,12 +868,14 @@ fn standard_filesystem_and_path_modules_operate_on_paths() {
         "use std::fs\nuse std::path\nfun main() { assert(fs::create_dir_all(\"build/files\")) assert(fs::write(\"build/files/one.txt\", \"hello\")) assert(fs::File::write(\"build/files/static.txt\", \"static-data\")) assert(fs::File::read_text(\"build/files/static.txt\").contains(\"static-data\")) echo fs::File::read(\"build/files/static.txt\") value := path::new(\"build/files/one.txt\") associated := path::Path::new(\"build/files/one.txt\") assert(associated.exists()) assert(value.exists()) assert(value.is_file()) echo value.filename() echo value.extension() absolute := value.absolute() assert(!absolute.raw.is_empty()) assert(absolute.is_absolute()) canonical := value.canonical() assert(!canonical.raw.is_empty()) assert(fs::copy_file(\"build/files/one.txt\", \"build/files/two.txt\")) assert(fs::rename(\"build/files/two.txt\", \"build/files/three.txt\")) assert(fs::remove_file(\"build/files/one.txt\")) assert(fs::remove_file(\"build/files/three.txt\")) assert(fs::remove_file(\"build/files/static.txt\")) mut writer := fs::File::create(\"build/files/stream.txt\") assert(writer.write(\"first\\r\\n\")) assert(writer.write(\"second\\n\")) assert(writer.flush()) assert(writer.close()) assert(fs::File::append(\"build/files/stream.txt\", \"third\\r\\n\")) mut reader := fs::File::open(\"build/files/stream.txt\") echo reader.read_line() echo reader.read_line() echo reader.read_line() echo reader.read_line() assert(reader.close()) assert(fs::remove_file(\"build/files/stream.txt\")) assert(fs::remove_dir(\"build/files\")) }",
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&directory)
-        .current_dir(&directory)
-        .output()
-        .unwrap();
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&directory)
+    .current_dir(&directory)
+    .output()
+    .unwrap();
     let _ = fs::remove_dir_all(directory);
     assert!(
         output.status.success(),
@@ -896,12 +914,14 @@ fn run_file_handle_project(
     for (name, bytes) in extra {
         fs::write(directory.join(name), bytes).expect("fixture is written");
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&directory)
-        .current_dir(&directory)
-        .output()
-        .expect("Ryn project process completes");
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&directory)
+    .current_dir(&directory)
+    .output()
+    .expect("Ryn project process completes");
     let _ = fs::remove_dir_all(directory);
     output
 }
@@ -1033,12 +1053,14 @@ fn standard_thread_module_spawns_and_joins_a_worker() {
         "use std::thread\ntype Worker = extern \"C\" fun()\nfun worker() { echo \"worker done\" }\nfun main() { mut background := thread::Thread::spawn(worker as Worker) id := background.id() assert(id > 0 as u64) assert(background.join()) echo \"main done\" }",
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&directory)
-        .current_dir(&directory)
-        .output()
-        .unwrap();
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&directory)
+    .current_dir(&directory)
+    .output()
+    .unwrap();
     let _ = fs::remove_dir_all(directory);
     assert!(
         output.status.success(),
@@ -1064,12 +1086,14 @@ fn standard_keyboard_module_exposes_state_queries_and_read_key_type() {
         "use std::keyboard\nfun read_once() -> Key { return keyboard::read_key() }\nfun main() { moving := keyboard::key_down(Key::W) jump := keyboard::key_pressed(Key::Space) released := keyboard::key_released(Key::W) echo \"keyboard api ready\" }",
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&directory)
-        .current_dir(&directory)
-        .output()
-        .unwrap();
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&directory)
+    .current_dir(&directory)
+    .output()
+    .unwrap();
     let _ = fs::remove_dir_all(directory);
     assert!(
         output.status.success(),
@@ -1115,12 +1139,14 @@ fn standard_environment_path_and_file_wrappers_match_listed_names() {
         "use std::env\nuse std::fs\nuse std::path\nfun main() { assert(set_env(\"RYN_API_TEST\", \"ok\")) echo env::env(\"RYN_API_TEST\") assert(remove_env(\"RYN_API_TEST\")) assert(fs::create_dir_all(\"build/files\")) assert(fs::write(\"build/files/a.txt\", \"contents\")) echo fs::read_file(\"build/files/a.txt\") assert(path::exists(\"build/files/a.txt\")) assert(path::is_file(\"build/files/a.txt\")) p := path::from(\"build/files/a.txt\") assert(p.exists()) assert(p.is_file()) assert(fs::remove_file(\"build/files/a.txt\")) assert(fs::remove_dir(\"build/files\")) }",
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&directory)
-        .current_dir(&directory)
-        .output()
-        .unwrap();
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&directory)
+    .current_dir(&directory)
+    .output()
+    .unwrap();
     let _ = fs::remove_dir_all(directory);
     assert!(
         output.status.success(),

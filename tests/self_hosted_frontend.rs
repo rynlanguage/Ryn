@@ -24,13 +24,15 @@ fn run_frontend(source_text: &str, label: &str) -> (String, bool) {
     let _guard = SELF_HOSTED_PROCESS_LOCK
         .lock()
         .expect("self-hosted project invocations are serialized");
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&project)
-        .arg("--")
-        .arg(&source)
-        .output()
-        .expect("ryn process starts");
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&project)
+    .arg("--")
+    .arg(&source)
+    .output()
+    .expect("ryn process starts");
     let _ = fs::remove_dir_all(directory);
     (
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -54,14 +56,16 @@ fn run_type_checker(source_text: &str, label: &str) -> (String, bool) {
     let _guard = SELF_HOSTED_PROCESS_LOCK
         .lock()
         .expect("self-hosted project invocations are serialized");
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&project)
-        .arg("--")
-        .arg("--check")
-        .arg(&source)
-        .output()
-        .expect("ryn process starts");
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&project)
+    .arg("--")
+    .arg("--check")
+    .arg(&source)
+    .output()
+    .expect("ryn process starts");
     let _ = fs::remove_dir_all(directory);
     (
         String::from_utf8_lossy(&output.stdout).into_owned(),

@@ -11,18 +11,19 @@
 // error (diagnostics go to standard error), and `run` returns the program's own status.
 
 use driver::manifest
+use driver::pkg
 use std::fs
 use std::env
 use std::time
 
 fun ryn_usage() -> String {
-    return String("usage:\n  ryn new <path>\n  ryn check <file.ryn|project-dir>\n  ryn build <file.ryn|project-dir> [--release] [-o|--output <path>]\n  ryn run <file.ryn|project-dir> [--release] [-o|--output <path>] [-- <program-args...>]\n  ryn clean <project-dir>")
+    return String("usage:\n  ryn new <path>\n  ryn check <file.ryn|project-dir>\n  ryn build <file.ryn|project-dir> [--release] [-o|--output <path>]\n  ryn run <file.ryn|project-dir> [--release] [-o|--output <path>] [-- <program-args...>]\n  ryn clean <project-dir>\n  ryn lock <project-dir>\n  ryn login <token>\n  ryn publish [project-dir]")
 }
 
 fun ryn_help() -> String {
     mut text := String("Ryn — Reliable. Fast. Native.\n\n")
     text.append(ryn_usage())
-    text.append("\n\nCommands:\n  new <path>        Create a project with a native Hello World example\n  check <source>    Check a .ryn file or project directory\n  build <source>    Compile a .ryn file or project directory\n  run <source>      Compile and run a .ryn file or project directory\n  clean <project>   Remove the project's build directory\n\nA project directory uses src/main.ryn as its entry point.\nProject outputs go under build/debug or build/release; build/cache is reserved for compiler caches.\nAn i32 result from main becomes the process exit code for run.\nPass program arguments to run after --.\nclean removes only the direct build directory and refuses symbolic links.\n\nOptions:\n  --release            Use the project's release output directory\n  -o, --output <path>  Set the executable path for build or run\n  -h, --help           Show this help\n  -V, --version        Show compiler version\n")
+    text.append("\n\nCommands:\n  new <path>        Create a project with a native Hello World example\n  check <source>    Check a .ryn file or project directory\n  build <source>    Compile a .ryn file or project directory\n  run <source>      Compile and run a .ryn file or project directory\n  lock <project>     Resolve and write ryn.lock for supported dependencies\n  login <token>     Save a pods registry token for publishing\n  publish [project] Check, pack and upload the project to the pods registry\n  clean <project>   Remove the project's build directory\n\nA project directory uses src/main.ryn as its entry point.\nProject outputs go under build/debug or build/release; build/cache is reserved for compiler caches.\nAn i32 result from main becomes the process exit code for run.\nPass program arguments to run after --.\nclean removes only the direct build directory and refuses symbolic links.\n\nOptions:\n  --release            Use the project's release output directory\n  -o, --output <path>  Set the executable path for build or run\n  -h, --help           Show this help\n  -V, --version        Show compiler version\n")
     return text
 }
 
@@ -46,6 +47,29 @@ fun ryn_base_name(path: String) -> String {
         start -= 1
     }
     return path.slice(start, end)
+}
+
+// A manifest scalar: plain when it is made of letters, digits, `-` and `_`, double-quoted otherwise.
+fun ryn_yaml_scalar(value: String) -> String {
+    mut plain := !value.is_empty()
+    mut quoted := String("\"")
+    mut at: u64 = 0
+    while at < value.len() {
+        byte := value.byte_at(at) as u64
+        when !((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 45 || byte == 95) {
+            plain = false
+        }
+        when byte == 92 || byte == 34 {
+            quoted.append("\\")
+        }
+        quoted.append(value.slice(at, at + 1))
+        at += 1
+    }
+    quoted.append("\"")
+    when plain {
+        return value
+    }
+    return quoted
 }
 
 fun ryn_new(path: String) -> i32 {
@@ -75,7 +99,7 @@ fun ryn_new(path: String) -> i32 {
         return ryn_fail(String("error[R0401]: cannot write project entry point"))
     }
     mut yaml := String("name: ")
-    yaml.append(name)
+    yaml.append(ryn_yaml_scalar(name))
     yaml.append("\nversion: 0.1.0\nowner: guest\n\ndependencies:\n\nbuild:\n  optimize: speed\n")
     when !fs::write(manifest::join_path(path.clone(), String("ryn.yaml")), yaml) {
         return ryn_fail(String("error[R0401]: cannot write project manifest"))
@@ -95,7 +119,7 @@ fun ryn_clean(path: String) -> i32 {
         echo "no build artifacts in {path}"
         return 0
     }
-    when !fs::is_dir(build.clone()) {
+    when pkg::is_symlink(build.clone()) || !fs::is_dir(build.clone()) {
         mut message := String("error[R0402]: refusing to clean a non-directory or symbolic link at ")
         message.append(build)
         return ryn_fail(message)
@@ -143,7 +167,32 @@ fun ryn_default_output(input: String, project: bool, release: bool) -> String {
     return out
 }
 
-fun ryn_compiler(command: str, input: String, output: String) -> i32 {
+// The packages a project depends on, resolved through `ryn.lock`: a name and a source directory each. The first build of a
+// project with registry dependencies writes the lock file.
+fun ryn_dependencies(project: String) -> Vec<String> {
+    mut none: Vec<String> = Vec()
+    when !fs::is_file(manifest::join_path(project.clone(), String("ryn.yaml"))) {
+        return none
+    }
+    when pkg::uses_registry(project.clone()) && !fs::is_file(manifest::join_path(project.clone(), String("ryn.lock"))) {
+        written := pkg::write_lock(project.clone())
+        when written.is_err() {
+            eprint("{}", written.unwrap_err())
+            return none
+        }
+        path := written.unwrap()
+        eprint("note: created {}\n", path)
+    }
+    resolved := pkg::dependency_directories(project)
+    when resolved.is_err() {
+        eprint("{}\n", resolved.unwrap_err())
+        none.push(String("!"))
+        return none
+    }
+    return resolved.unwrap()
+}
+
+fun ryn_compiler(command: str, input: String, output: String, packages: Vec<String>) -> i32 {
     compiler := manifest::join_path(ryn_home(), String("rync"))
     when !fs::exists(compiler.clone()) {
         mut message := String("error[R0301]: the compiler is not installed at ")
@@ -157,6 +206,15 @@ fun ryn_compiler(command: str, input: String, output: String) -> i32 {
     when !output.is_empty() {
         arguments.push(String("-o"))
         arguments.push(output)
+    }
+    mut at: u64 = 0
+    while at + 1 < packages.len() {
+        mut pair := packages[at].clone()
+        pair.append("=")
+        pair.append(packages[at + 1].clone())
+        arguments.push(String("--package"))
+        arguments.push(pair)
+        at += 2
     }
     arguments.push(input)
     return run_process_args(compiler, arguments)
@@ -186,6 +244,55 @@ fun main() -> i32 {
         }
         return ryn_clean(path)
     }
+    when command == "login" {
+        when arg_count() != 2 {
+            return ryn_fail(ryn_usage())
+        }
+        saved := pkg::login(String(arg(1)))
+        when saved.is_err() {
+            return ryn_fail(saved.unwrap_err())
+        }
+        path := saved.unwrap()
+        echo "saved registry token to {path}"
+        return 0
+    }
+    when command == "lock" {
+        when arg_count() != 2 || !fs::is_dir(String(arg(1))) {
+            return ryn_fail(ryn_usage())
+        }
+        locked := pkg::write_lock(String(arg(1)))
+        when locked.is_err() {
+            return ryn_fail(locked.unwrap_err())
+        }
+        path := locked.unwrap()
+        echo "locked {path}"
+        return 0
+    }
+    when command == "publish" {
+        mut directory := String(".")
+        when arg_count() > 2 {
+            return ryn_fail(ryn_usage())
+        }
+        when arg_count() == 2 {
+            directory = String(arg(1))
+        }
+        when !fs::is_file(manifest::join_path(directory.clone(), String("ryn.yaml"))) {
+            return ryn_fail(ryn_usage())
+        }
+        when fs::is_file(manifest::join_path(directory.clone(), String("src/main.ryn"))) {
+            checked := ryn_compiler("check", directory.clone(), String(""), ryn_dependencies(directory.clone()))
+            when checked != 0 {
+                return checked
+            }
+        }
+        published := pkg::publish(directory)
+        when published.is_err() {
+            return ryn_fail(published.unwrap_err())
+        }
+        url := published.unwrap()
+        echo "published {url}"
+        return 0
+    }
     when command != "check" && command != "build" && command != "run" {
         return ryn_fail(ryn_usage())
     }
@@ -205,6 +312,15 @@ fun main() -> i32 {
         } else when (word == "-o" || word == "--output") && command != "check" && position + 1 < arg_count() && output.is_empty() {
             output = String(arg(position + 1))
             position += 2
+        } else when word == "--backend" && position + 1 < arg_count() {
+            backend := String(arg(position + 1))
+            when backend != "native" {
+                mut message := String("error[R0907]: unknown backend `")
+                message.append(backend)
+                message.append("`; use `native`")
+                return ryn_fail(message)
+            }
+            position += 2
         } else when word == "--release" && command != "check" && !release {
             release = true
             position += 1
@@ -220,9 +336,17 @@ fun main() -> i32 {
     }
     project := fs::is_dir(input.clone())
     when command == "check" {
-        status := ryn_compiler("check", input.clone(), String(""))
+        packages := ryn_dependencies(input.clone())
+        when packages.len() == 1 {
+            return 1
+        }
+        status := ryn_compiler("check", input.clone(), String(""), packages)
         when status == 0 {
-            echo "{input}: ok"
+            mut shown := input.clone()
+            when project {
+                shown = manifest::join_path(input.clone(), String("src/main.ryn"))
+            }
+            echo "{shown}: ok"
         }
         return status
     }
@@ -243,7 +367,11 @@ fun main() -> i32 {
     when !parent.is_empty() {
         made := fs::create_dir_all(parent)
     }
-    status := ryn_compiler("build", input, output.clone())
+    packages := ryn_dependencies(input.clone())
+    when packages.len() == 1 {
+        return 1
+    }
+    status := ryn_compiler("build", input, output.clone(), packages)
     when status != 0 {
         when !scratch.is_empty() {
             removed := fs::remove_dir_all(scratch)

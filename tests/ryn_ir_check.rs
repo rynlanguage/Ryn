@@ -15,12 +15,14 @@ static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 /// Builds the Ryn-written checker with the compiler under test and returns its executable.
 fn build_checker() -> PathBuf {
     let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("selfhost/ir");
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg(&project)
-        .arg("--release")
-        .output()
-        .expect("ryn process starts");
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("build")
+    .arg(&project)
+    .arg("--release")
+    .output()
+    .expect("ryn process starts");
     assert!(
         output.status.success(),
         "the Ryn IR checker should build, stderr:\n{}",

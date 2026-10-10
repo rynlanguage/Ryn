@@ -162,12 +162,14 @@ fn registry_dependencies_lock_fetch_verify_and_publish() {
     .unwrap();
 
     let ryn = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_ryn"))
-            .args(args)
-            .env("RYN_REGISTRY", &registry)
-            .env("RYN_TOKEN", "pods_test_token")
-            .output()
-            .expect("ryn starts")
+        Command::new(
+            std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+        )
+        .args(args)
+        .env("RYN_REGISTRY", &registry)
+        .env("RYN_TOKEN", "pods_test_token")
+        .output()
+        .expect("ryn starts")
     };
     let app_arg = app.to_str().unwrap();
 

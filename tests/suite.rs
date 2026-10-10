@@ -121,7 +121,8 @@ fn collect_cases() -> Vec<Case> {
 }
 
 fn execute(case: &Case, scratch: &Path) -> Result<(), String> {
-    let compiler = env!("CARGO_BIN_EXE_ryn");
+    let compiler =
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string());
     let stem = case
         .path
         .file_stem()

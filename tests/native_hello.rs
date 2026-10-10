@@ -19,11 +19,13 @@ fn run_source(source: &Path) -> std::process::Output {
     let staged_source = directory.join(source.file_name().unwrap_or_default());
     fs::copy(source, &staged_source).expect("Ryn source is staged in the temporary directory");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(staged_source)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(staged_source)
+    .output()
+    .expect("ryn process starts");
     let _ = fs::remove_dir_all(directory);
     result
 }
@@ -32,11 +34,13 @@ fn run_source_text(label: &str, source_text: &str) -> std::process::Output {
     let directory = temp_dir(label);
     let source = directory.join("main.ryn");
     fs::write(&source, source_text).expect("Ryn source is written");
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&source)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&source)
+    .output()
+    .expect("ryn process starts");
     let _ = fs::remove_dir_all(directory);
     result
 }
@@ -317,13 +321,15 @@ fn run_forwards_arguments_to_native_program_including_empty_and_unicode_values()
     )
     .expect("Ryn source is written");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&source)
-        .arg("--")
-        .args(["with spaces", "", "Zażółć 🦀"])
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&source)
+    .arg("--")
+    .args(["with spaces", "", "Zażółć 🦀"])
+    .output()
+    .expect("ryn process starts");
     let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
     assert!(result.status.success(), "compiler/runtime failed: {stderr}");
     assert_eq!(
@@ -449,12 +455,14 @@ fn build_preserves_existing_sibling_intermediate_named_files() {
     fs::write(&wrapper, "keep wrapper").expect("wrapper sentinel is written");
     fs::write(&pdb, "keep debug symbols").expect("PDB sentinel is written");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg("fixture.ryn")
-        .current_dir(&directory)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("build")
+    .arg("fixture.ryn")
+    .current_dir(&directory)
+    .output()
+    .expect("ryn process starts");
     let output = if cfg!(windows) {
         directory.join("fixture.exe")
     } else {
@@ -488,13 +496,15 @@ fn build_accepts_a_custom_output_path() {
     });
     fs::write(&source, "fun main() { echo(\"custom build\") }").expect("Ryn source is written");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg(&source)
-        .arg("--output")
-        .arg(&output)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("build")
+    .arg(&source)
+    .arg("--output")
+    .arg(&output)
+    .output()
+    .expect("ryn process starts");
     let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
     assert!(result.status.success(), "compiler failed: {stderr}");
     assert!(output.exists(), "custom executable was not created");
@@ -520,13 +530,15 @@ fn build_and_run_accept_source_and_output_paths_with_spaces() {
     });
     fs::write(&source, "fun main() { echo(\"spaces-ok\") }").expect("Ryn source is written");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg(&source)
-        .arg("--output")
-        .arg(&output)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("build")
+    .arg(&source)
+    .arg("--output")
+    .arg(&output)
+    .output()
+    .expect("ryn process starts");
     let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
     assert!(result.status.success(), "compiler failed: {stderr}");
     assert!(output.exists(), "native executable was not created");
@@ -548,13 +560,15 @@ fn run_accepts_a_custom_output_path_and_keeps_the_executable() {
         .with_extension(if cfg!(windows) { "exe" } else { "" });
     fs::write(&source, "fun main() { echo(\"custom run\") }").expect("Ryn source is written");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&source)
-        .arg("-o")
-        .arg(&output)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&source)
+    .arg("-o")
+    .arg(&output)
+    .output()
+    .expect("ryn process starts");
     let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
     assert!(result.status.success(), "compiler/runtime failed: {stderr}");
     assert_eq!(String::from_utf8_lossy(&result.stdout), "custom run\n");
@@ -574,11 +588,13 @@ fn run_accepts_a_relative_output_filename_without_a_directory() {
     };
     fs::write(&source, "fun main() { echo(\"relative run\") }").expect("Ryn source is written");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .current_dir(&directory)
-        .args(["run", "fixture.ryn", "--output", output])
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .current_dir(&directory)
+    .args(["run", "fixture.ryn", "--output", output])
+    .output()
+    .expect("ryn process starts");
     let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
     assert!(result.status.success(), "compiler/runtime failed: {stderr}");
     assert_eq!(String::from_utf8_lossy(&result.stdout), "relative run\n");
@@ -597,23 +613,27 @@ fn custom_output_cannot_overwrite_the_source_file() {
     let original = "fun main() { echo(\"source remains intact\") }";
     fs::write(&source, original).expect("Ryn source is written");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg(&source)
-        .arg("--output")
-        .arg(&source)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("build")
+    .arg(&source)
+    .arg("--output")
+    .arg(&source)
+    .output()
+    .expect("ryn process starts");
     let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
     if cfg!(windows) {
         let case_variant = PathBuf::from(source.to_string_lossy().to_uppercase());
-        let alias_result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-            .arg("build")
-            .arg(&source)
-            .arg("-o")
-            .arg(case_variant)
-            .output()
-            .expect("ryn process starts");
+        let alias_result = Command::new(
+            std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+        )
+        .arg("build")
+        .arg(&source)
+        .arg("-o")
+        .arg(case_variant)
+        .output()
+        .expect("ryn process starts");
         let alias_stderr = String::from_utf8_lossy(&alias_result.stderr);
         assert!(!alias_result.status.success());
         assert!(alias_stderr.contains("error[R0303]"), "{alias_stderr}");
@@ -636,20 +656,25 @@ fn failed_linker_removes_its_temporary_build_directory() {
     .expect("source is written");
 
     // The Cranelift backend links with an external driver; the native backend writes the executable itself.
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg("--backend")
-        .arg("cranelift")
-        .arg("fixture.ryn")
-        .current_dir(&directory)
-        .env("RUSTC", env!("CARGO_BIN_EXE_ryn"))
-        // Windows links in-process; select the rustc driver so it can fail.
-        .env("RYN_LINKER", "rustc")
-        .env("TEMP", &directory)
-        .env("TMP", &directory)
-        .env("TMPDIR", &directory)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("build")
+    .arg("--backend")
+    .arg("cranelift")
+    .arg("fixture.ryn")
+    .current_dir(&directory)
+    .env(
+        "RUSTC",
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    // Windows links in-process; select the rustc driver so it can fail.
+    .env("RYN_LINKER", "rustc")
+    .env("TEMP", &directory)
+    .env("TMP", &directory)
+    .env("TMPDIR", &directory)
+    .output()
+    .expect("ryn process starts");
     let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
     let leaked_build_dirs: Vec<_> = fs::read_dir(&directory)
         .expect("temporary workspace remains readable")
@@ -683,19 +708,21 @@ fn failed_native_write_reports_r0301_and_leaves_no_build_directory() {
     // An existing directory cannot be opened for writing as the executable.
     fs::create_dir(directory.join("occupied")).expect("output directory is created");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg("--backend")
-        .arg("native")
-        .arg("fixture.ryn")
-        .arg("-o")
-        .arg("occupied")
-        .current_dir(&directory)
-        .env("TEMP", &directory)
-        .env("TMP", &directory)
-        .env("TMPDIR", &directory)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("build")
+    .arg("--backend")
+    .arg("native")
+    .arg("fixture.ryn")
+    .arg("-o")
+    .arg("occupied")
+    .current_dir(&directory)
+    .env("TEMP", &directory)
+    .env("TMP", &directory)
+    .env("TMPDIR", &directory)
+    .output()
+    .expect("ryn process starts");
     let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
     let entries: Vec<_> = fs::read_dir(&directory)
         .expect("temporary workspace remains readable")
@@ -779,24 +806,28 @@ fn concurrent_builds_to_the_same_output_leave_a_complete_executable() {
     fs::write(&second_source, "fun main() { echo(\"second build\") }")
         .expect("second source is written");
 
-    let first = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg(&first_source)
-        .arg("--output")
-        .arg(&output)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("first ryn process starts");
-    let second = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg(&second_source)
-        .arg("--output")
-        .arg(&output)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("second ryn process starts");
+    let first = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("build")
+    .arg(&first_source)
+    .arg("--output")
+    .arg(&output)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("first ryn process starts");
+    let second = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("build")
+    .arg(&second_source)
+    .arg("--output")
+    .arg(&output)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .expect("second ryn process starts");
     let first = first.wait_with_output().expect("first build completes");
     let second = second.wait_with_output().expect("second build completes");
     assert!(
@@ -1612,11 +1643,13 @@ fn standalone_files_import_std_and_sibling_modules() {
         "use shapes\nuse std::math\n\nfun main() {\n    echo shapes::sides()\n    echo math::sqrt(16.0)\n}\n",
     )
     .unwrap();
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&main)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&main)
+    .output()
+    .expect("ryn process starts");
     let _ = fs::remove_dir_all(&directory);
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(result.status.success(), "stderr: {stderr}");

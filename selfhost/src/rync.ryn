@@ -33,6 +33,7 @@ use back::gen
 use driver::report
 use driver::manifest
 use std::fs
+use std::env
 
 extern "C" fun putchar(value: i32) -> i32;
 extern "C" fun malloc(size: u64) -> *u8;
@@ -256,7 +257,21 @@ extend Loader {
             }
             return false
         }
-        text := read_file(file.clone())
+        read := read_file_result(file.clone())
+        when read.is_err() {
+            code := read.unwrap_err()
+            self.error = String("error[R0001]: cannot read ")
+            self.error.append(file)
+            when code == 3 {
+                self.error.append(": stream did not contain valid UTF-8")
+            } else when code == 2 {
+                self.error.append(": Permission denied (os error 13)")
+            } else {
+                self.error.append(": No such file or directory (os error 2)")
+            }
+            return false
+        }
+        text := read.unwrap()
         parsed_text := parser::parse(text.clone(), true)
         parsed := rync_after_ok(parsed_text.clone())
         when parsed.is_none() {
@@ -358,6 +373,17 @@ extend Compilation {
 
     // A failure of a middle stage: a diagnostic of the program (status 1) or a construct the pipeline lacks (status 3).
     fun stage_failure(self, text: String) -> Failure {
+        all := report::lowered_diagnostics(text.clone())
+        when all.len() > 1 {
+            mut rendered := String("")
+            for each in all {
+                when !rendered.is_empty() {
+                    rendered.append("\n\n")
+                }
+                rendered.append(self.render(each))
+            }
+            return Failure { text: rendered, status: 1 }
+        }
         diagnostic := report::lowered_diagnostic(text.clone())
         when diagnostic.is_some() {
             found := diagnostic.unwrap()
@@ -623,7 +649,7 @@ fun rync_frontend(loader: Loader, recovering: bool) -> Result<Compiled, Failure>
     when desugared.is_err() {
         return Result::Err(compilation.stage_failure(desugared.unwrap_err()))
     }
-    lowered := lower::lower_program(desugared.unwrap())
+    lowered := lower::lower_recovering(desugared.unwrap())
     when lowered.is_err() {
         return Result::Err(compilation.stage_failure(lowered.unwrap_err()))
     }
@@ -692,6 +718,13 @@ fun rync_write_executable(path: String, bytes: Vec<u8>) -> bool {
     }
     free(c_path)
     return written_ok
+}
+
+fun rync_absolute(path: String) -> String {
+    when path.starts_with("/") {
+        return manifest::normalize(path)
+    }
+    return manifest::join_path(env::current_dir(), path)
 }
 
 fun rync_fail(message: String, code: i32) -> i32 {
@@ -766,6 +799,13 @@ fun main() -> i32 {
             message.append(entry_file)
             return rync_fail(message, 1)
         }
+        project_manifest := manifest::read_manifest(read_file(manifest_file.clone()))
+        when project_manifest.name.is_empty() {
+            mut message := String("error[R0410]: invalid ryn.yaml\n  --> ")
+            message.append(manifest_file.clone())
+            message.append("\nmissing field `name`")
+            return rync_fail(message, 1)
+        }
         added := rync_path_dependencies(entry.clone(), package_names.clone())
         when added.is_err() {
             return rync_fail(added.unwrap_err(), 1)
@@ -801,6 +841,7 @@ fun main() -> i32 {
             return rync_fail(loader.error.clone(), 1)
         }
     }
+    loaded_files := loader.found_files.clone()
     analyzed := rync_frontend(loader, checking)
     when analyzed.is_err() {
         failure := analyzed.unwrap_err()
@@ -823,6 +864,16 @@ fun main() -> i32 {
     }
     bytes := linked.unwrap()
     when !output.is_empty() {
+        absolute_output := rync_absolute(output.clone())
+        for source in loaded_files.clone() {
+            when rync_absolute(source.clone()) == absolute_output {
+                mut message := String("error[R0303]: output ")
+                message.append(output.clone())
+                message.append(" would overwrite ")
+                message.append(source)
+                return rync_fail(message, 1)
+            }
+        }
         when !rync_write_executable(output.clone(), bytes) {
             mut message := String("error[R0301]: cannot write the executable ")
             message.append(output)

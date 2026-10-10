@@ -17,12 +17,14 @@ fn errors(source: &str, sema: &str) -> Vec<String> {
     let source_path =
         std::env::temp_dir().join(format!("ryn-recovery-{}-{unique}.ryn", std::process::id()));
     fs::write(&source_path, source).expect("temporary Ryn source is written");
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("check")
-        .arg(&source_path)
-        .env("RYN_SEMA", sema)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("check")
+    .arg(&source_path)
+    .env("RYN_SEMA", sema)
+    .output()
+    .expect("ryn process starts");
     let _ = fs::remove_file(&source_path);
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(

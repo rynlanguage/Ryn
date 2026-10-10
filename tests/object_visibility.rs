@@ -1,11 +1,13 @@
 use std::{fs, path::PathBuf, process::Command};
 
 fn project_check(project: &PathBuf) -> Result<(), String> {
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("check")
-        .arg(project)
-        .output()
-        .expect("ryn process starts");
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("check")
+    .arg(project)
+    .output()
+    .expect("ryn process starts");
     if output.status.success() {
         Ok(())
     } else {
@@ -55,11 +57,13 @@ fn private_fields_are_invisible_outside_their_module_but_methods_work() {
     );
 
     // The pub method works across modules.
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&project)
-        .output()
-        .expect("ryn process starts");
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&project)
+    .output()
+    .expect("ryn process starts");
     assert!(
         output.status.success(),
         "project failed: {}",

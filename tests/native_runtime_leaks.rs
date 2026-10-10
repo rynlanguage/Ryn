@@ -23,13 +23,15 @@ fn build_native(source_text: &str) -> (PathBuf, Output) {
     fs::create_dir_all(&directory).expect("temporary directory is created");
     let source = directory.join("main.ryn");
     fs::write(&source, source_text).expect("Ryn source is written");
-    let build = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg(&source)
-        .arg("-o")
-        .arg(directory.join("program"))
-        .output()
-        .expect("Ryn process starts");
+    let build = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("build")
+    .arg(&source)
+    .arg("-o")
+    .arg(directory.join("program"))
+    .output()
+    .expect("Ryn process starts");
     (directory, build)
 }
 

@@ -23,11 +23,13 @@ impl TestDirectory {
 #[test]
 fn project_imports_generic_type_aliases() {
     let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/module_project");
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&project)
-        .output()
-        .expect("ryn process starts");
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&project)
+    .output()
+    .expect("ryn process starts");
     assert!(
         output.status.success(),
         "project failed: {}",
@@ -39,11 +41,13 @@ fn project_imports_generic_type_aliases() {
 #[test]
 fn imported_module_keeps_private_custom_destructor_attached_to_its_type() {
     let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/module_drop_project");
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&project)
-        .output()
-        .expect("ryn process starts");
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&project)
+    .output()
+    .expect("ryn process starts");
     assert!(
         output.status.success(),
         "project failed: {}",
@@ -55,11 +59,13 @@ fn imported_module_keeps_private_custom_destructor_attached_to_its_type() {
 #[test]
 fn path_library_exposes_an_owned_path_type_through_a_project_dependency() {
     let project = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/path_project");
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&project)
-        .output()
-        .expect("ryn process starts");
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&project)
+    .output()
+    .expect("ryn process starts");
     assert!(
         output.status.success(),
         "project failed: {}",
@@ -82,11 +88,13 @@ fn new_project_can_be_checked_built_and_run_from_its_directory() {
     let temporary = TestDirectory::new("project-workflow");
     let project = temporary.0.join("hello Ryn");
 
-    let created = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("new")
-        .arg(&project)
-        .output()
-        .expect("ryn process starts");
+    let created = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("new")
+    .arg(&project)
+    .output()
+    .expect("ryn process starts");
     assert!(
         created.status.success(),
         "project creation failed: {}",
@@ -108,12 +116,14 @@ fn new_project_can_be_checked_built_and_run_from_its_directory() {
         assert!(project.join("build").join(directory).is_dir());
     }
 
-    let checked = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("check")
-        .arg(".")
-        .current_dir(&project)
-        .output()
-        .expect("ryn process starts");
+    let checked = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("check")
+    .arg(".")
+    .current_dir(&project)
+    .output()
+    .expect("ryn process starts");
     assert!(
         checked.status.success(),
         "project check failed: {}",
@@ -121,12 +131,14 @@ fn new_project_can_be_checked_built_and_run_from_its_directory() {
     );
     assert!(String::from_utf8_lossy(&checked.stdout).contains("main.ryn: ok"));
 
-    let built = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg(".")
-        .current_dir(&project)
-        .output()
-        .expect("ryn process starts");
+    let built = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("build")
+    .arg(".")
+    .current_dir(&project)
+    .output()
+    .expect("ryn process starts");
     assert!(
         built.status.success(),
         "project build failed: {}",
@@ -138,13 +150,15 @@ fn new_project_can_be_checked_built_and_run_from_its_directory() {
     }
     assert!(executable.is_file());
 
-    let released = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg("--release")
-        .arg(".")
-        .current_dir(&project)
-        .output()
-        .expect("ryn process starts");
+    let released = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("build")
+    .arg("--release")
+    .arg(".")
+    .current_dir(&project)
+    .output()
+    .expect("ryn process starts");
     assert!(
         released.status.success(),
         "release build failed: {}",
@@ -156,12 +170,14 @@ fn new_project_can_be_checked_built_and_run_from_its_directory() {
     }
     assert!(release_executable.is_file());
 
-    let run = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(".")
-        .current_dir(&project)
-        .output()
-        .expect("ryn process starts");
+    let run = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(".")
+    .current_dir(&project)
+    .output()
+    .expect("ryn process starts");
     assert!(
         run.status.success(),
         "project run failed: {}",
@@ -178,11 +194,13 @@ fn project_manifest_errors_are_reported_before_source_compilation() {
     fs::create_dir(temporary.0.join("src")).expect("source directory is created");
     fs::write(temporary.0.join("src/main.ryn"), "fun main() {}").expect("source file is written");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("check")
-        .arg(&temporary.0)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("check")
+    .arg(&temporary.0)
+    .output()
+    .expect("ryn process starts");
     assert!(!result.status.success());
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(stderr.contains("invalid"), "{stderr}");
@@ -199,13 +217,15 @@ fn run_propagates_the_i32_main_exit_code_after_flushing_output() {
         "program"
     });
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(source)
-        .arg("--output")
-        .arg(output)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(source)
+    .arg("--output")
+    .arg(output)
+    .output()
+    .expect("ryn process starts");
 
     assert_eq!(result.status.code(), Some(7));
     assert_eq!(
@@ -231,11 +251,13 @@ fn new_refuses_to_overwrite_an_existing_project_directory() {
     let marker = project.join("keep.txt");
     fs::write(&marker, "keep me").expect("existing project file is written");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("new")
-        .arg(&project)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("new")
+    .arg(&project)
+    .output()
+    .expect("ryn process starts");
 
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("error[R0400]"));
@@ -254,11 +276,13 @@ fn project_commands_explain_when_the_entry_point_is_missing() {
     )
     .expect("valid manifest is written");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("check")
-        .arg(&temporary.0)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("check")
+    .arg(&temporary.0)
+    .output()
+    .expect("ryn process starts");
 
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("project entry point not found:"));
@@ -281,11 +305,13 @@ fn clean_removes_only_the_project_build_directory() {
     let custom_output = project.join("custom-output.exe");
     fs::write(&custom_output, "keep").expect("custom output is written");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("clean")
-        .arg(&project)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("clean")
+    .arg(&project)
+    .output()
+    .expect("ryn process starts");
 
     assert!(
         result.status.success(),
@@ -304,11 +330,13 @@ fn clean_removes_only_the_project_build_directory() {
 fn clean_without_build_artifacts_succeeds_without_changing_the_project() {
     let temporary = TestDirectory::new("project-clean-empty");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("clean")
-        .arg(&temporary.0)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("clean")
+    .arg(&temporary.0)
+    .output()
+    .expect("ryn process starts");
 
     assert!(result.status.success());
     assert!(String::from_utf8_lossy(&result.stdout).contains("no build artifacts"));
@@ -321,11 +349,13 @@ fn clean_refuses_to_delete_a_file_named_build() {
     let build_file = temporary.0.join("build");
     fs::write(&build_file, "keep").expect("file named build is written");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("clean")
-        .arg(&temporary.0)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("clean")
+    .arg(&temporary.0)
+    .output()
+    .expect("ryn process starts");
 
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("non-directory"));
@@ -349,11 +379,13 @@ fn clean_refuses_a_build_symlink_and_preserves_its_target() {
     fs::write(&marker, "keep").expect("outside marker is written");
     symlink(&outside, project.join("build")).expect("build symlink is created");
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("clean")
-        .arg(&project)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("clean")
+    .arg(&project)
+    .output()
+    .expect("ryn process starts");
 
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("symbolic link"));
@@ -386,11 +418,13 @@ fn clean_refuses_a_build_junction_and_preserves_its_target() {
         String::from_utf8_lossy(&created.stderr)
     );
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("clean")
-        .arg(&project)
-        .output()
-        .expect("ryn process starts");
+    let result = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("clean")
+    .arg(&project)
+    .output()
+    .expect("ryn process starts");
 
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("symbolic link"));

@@ -13,12 +13,14 @@ use std::{
 use ryn::{ast, ast_codec, comptime, generics, parser, patterns, sema};
 
 fn check_strict(path: &Path) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .env("RYN_SEMA_STRICT", "1")
-        .arg("check")
-        .arg(path)
-        .output()
-        .expect("ryn process starts");
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .env("RYN_SEMA_STRICT", "1")
+    .arg("check")
+    .arg(path)
+    .output()
+    .expect("ryn process starts");
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 

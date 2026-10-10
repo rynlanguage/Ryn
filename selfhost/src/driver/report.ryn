@@ -150,19 +150,39 @@ pub fun frontend_diagnostics(text: String) -> Vec<Diagnostic> {
 // A diagnostic of the form `diagnostic <code> <start> <end> <message> <help>`; an empty help is no help.
 pub fun lowered_diagnostic(text: String) -> Option<Diagnostic> {
     mut reader := Reader { text: text, at: 0 }
-    when reader.word() != "diagnostic" {
-        return Option::None
+    return reader.lowered_fields()
+}
+
+// Every diagnostic of a recovering analysis: one `diagnostic` entry after the other, in the order written.
+pub fun lowered_diagnostics(text: String) -> Vec<Diagnostic> {
+    mut reader := Reader { text: text, at: 0 }
+    mut found: Vec<Diagnostic> = Vec()
+    while true {
+        one := reader.lowered_fields()
+        when one.is_none() {
+            return found
+        }
+        found.push(one.unwrap())
     }
-    code := reader.word()
-    start := reader.number()
-    end := reader.number()
-    message := reader.string()
-    help := reader.string()
-    when code.is_empty() || start.is_none() || end.is_none() || message.is_none() || help.is_none() {
-        return Option::None
+    return found
+}
+
+extend Reader {
+    fun lowered_fields(mut self) -> Option<Diagnostic> {
+        when self.word() != "diagnostic" {
+            return Option::None
+        }
+        code := self.word()
+        start := self.number()
+        end := self.number()
+        message := self.string()
+        help := self.string()
+        when code.is_empty() || start.is_none() || end.is_none() || message.is_none() || help.is_none() {
+            return Option::None
+        }
+        help_text := help.unwrap()
+        return Option::Some(Diagnostic { code: code, message: message.unwrap(), start: start.unwrap(), end: end.unwrap(), has_help: !help_text.is_empty(), help: help_text })
     }
-    help_text := help.unwrap()
-    return Option::Some(Diagnostic { code: code, message: message.unwrap(), start: start.unwrap(), end: end.unwrap(), has_help: !help_text.is_empty(), help: help_text })
 }
 
 // A diagnostic with no place in a source, rendered as `error[CODE]: message`.

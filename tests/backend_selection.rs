@@ -26,15 +26,17 @@ fn suite_program(name: &str) -> PathBuf {
 fn build_and_run(source: &Path, backend: &str) -> (Output, Option<Output>) {
     let directory = temp_dir("backend");
     let executable = directory.join("program");
-    let build = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg("--backend")
-        .arg(backend)
-        .arg(source)
-        .arg("-o")
-        .arg(&executable)
-        .output()
-        .expect("ryn process starts");
+    let build = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("build")
+    .arg("--backend")
+    .arg(backend)
+    .arg(source)
+    .arg("-o")
+    .arg(&executable)
+    .output()
+    .expect("ryn process starts");
     let run = build.status.success().then(|| {
         Command::new(&executable)
             .output()
@@ -122,11 +124,13 @@ fn run_of_a_single_file_leaves_no_executable_beside_it() {
     let directory = temp_dir("run-scratch");
     let source = directory.join("program.ryn");
     fs::write(&source, "fun main() {\n    echo 7\n}\n").expect("source is written");
-    let run = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("run")
-        .arg(&source)
-        .output()
-        .expect("ryn process starts");
+    let run = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("run")
+    .arg(&source)
+    .output()
+    .expect("ryn process starts");
     let stderr = String::from_utf8_lossy(&run.stderr);
     assert!(run.status.success(), "{stderr}");
     assert_eq!(String::from_utf8_lossy(&run.stdout), "7\n");
@@ -154,13 +158,15 @@ fn native_build_rejects_what_check_rejects() {
     let source = suite_program("immutable_self_string_push_is_r0204.ryn");
     let directory = temp_dir("build-parity");
     let executable = directory.join("program");
-    let build = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg(&source)
-        .arg("-o")
-        .arg(&executable)
-        .output()
-        .expect("ryn process starts");
+    let build = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("build")
+    .arg(&source)
+    .arg("-o")
+    .arg(&executable)
+    .output()
+    .expect("ryn process starts");
     let stderr = String::from_utf8_lossy(&build.stderr);
     assert_eq!(build.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("error[R0204]"), "{stderr}");
@@ -174,13 +180,15 @@ fn native_build_rejects_what_check_rejects() {
 #[test]
 fn an_unknown_backend_is_rejected_with_its_diagnostic() {
     let source = suite_program("str_view_len_and_byte_at.ryn");
-    let build = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("build")
-        .arg("--backend")
-        .arg("llvm")
-        .arg(&source)
-        .output()
-        .expect("ryn process starts");
+    let build = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("build")
+    .arg("--backend")
+    .arg("llvm")
+    .arg(&source)
+    .output()
+    .expect("ryn process starts");
     let stderr = String::from_utf8_lossy(&build.stderr);
     assert_eq!(build.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("error[R0907]"), "{stderr}");

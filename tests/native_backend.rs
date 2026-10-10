@@ -24,12 +24,14 @@ fn repository(path: &str) -> PathBuf {
 fn ir_of(source: &Path, directory: &Path) -> PathBuf {
     let dump = directory.join("dump");
     fs::create_dir_all(&dump).expect("dump directory");
-    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
-        .arg("check")
-        .arg(source)
-        .env("RYN_DUMP_SEMA", &dump)
-        .output()
-        .expect("ryn check runs");
+    let output = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    )
+    .arg("check")
+    .arg(source)
+    .env("RYN_DUMP_SEMA", &dump)
+    .output()
+    .expect("ryn check runs");
     assert!(
         output.status.success(),
         "ryn check failed: {}",
@@ -49,13 +51,15 @@ fn object_of(ir: &Path) -> Result<Vec<u8>, String> {
     static DRIVER: OnceLock<PathBuf> = OnceLock::new();
     let driver = DRIVER.get_or_init(|| {
         let path = temp_dir("driver").join("native");
-        let build = Command::new(env!("CARGO_BIN_EXE_ryn"))
-            .arg("build")
-            .arg(repository("selfhost/src/native.ryn"))
-            .arg("-o")
-            .arg(&path)
-            .output()
-            .expect("native driver builds");
+        let build = Command::new(
+            std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+        )
+        .arg("build")
+        .arg(repository("selfhost/src/native.ryn"))
+        .arg("-o")
+        .arg(&path)
+        .output()
+        .expect("native driver builds");
         assert!(
             build.status.success(),
             "driver build failed: {}",

@@ -22,7 +22,9 @@ fn run_program(label: &str, source_text: &str, frontend: Option<&str>) -> std::p
     let directory = temp_dir(label);
     let source = directory.join("main.ryn");
     fs::write(&source, source_text).expect("Ryn source is written");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ryn"));
+    let mut command = Command::new(
+        std::env::var("RYN_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_ryn").to_string()),
+    );
     command.arg("run").arg(&source);
     if let Some(frontend) = frontend {
         command.arg("--frontend").arg(frontend);

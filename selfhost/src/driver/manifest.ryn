@@ -20,7 +20,7 @@ pub struct Manifest {
     pub error: String,
 }
 
-fun mf_indent(line: String) -> u64 {
+pub fun mf_indent(line: String) -> u64 {
     mut at: u64 = 0
     while at < line.len() && (line.byte_at(at) as u64) == 32 {
         at += 1
@@ -29,7 +29,7 @@ fun mf_indent(line: String) -> u64 {
 }
 
 // The line without a comment: `#` starts one outside quotes.
-fun mf_strip_comment(line: String) -> String {
+pub fun mf_strip_comment(line: String) -> String {
     mut quote: u64 = 0
     mut at: u64 = 0
     while at < line.len() {
@@ -62,7 +62,7 @@ pub fun scalar(text: String) -> String {
 }
 
 // The key of a `key: value` line and its value; nothing when the line has no `:`.
-fun mf_colon(text: String) -> Option<u64> {
+pub fun mf_colon(text: String) -> Option<u64> {
     mut quote: u64 = 0
     mut at: u64 = 0
     while at < text.len() {
@@ -82,7 +82,7 @@ fun mf_colon(text: String) -> Option<u64> {
 }
 
 // The `path` entry of a flow mapping such as `{ path: ../x }`, if any.
-fun mf_flow_path(value: String) -> Option<String> {
+pub fun mf_flow_path(value: String) -> Option<String> {
     trimmed := value.trim()
     when !trimmed.starts_with("{") || !trimmed.ends_with("}") {
         return Option::None
@@ -101,7 +101,7 @@ fun mf_flow_path(value: String) -> Option<String> {
 }
 
 // The lines of a text, without their line endings.
-fun mf_lines(text: String) -> Vec<String> {
+pub fun mf_lines(text: String) -> Vec<String> {
     mut lines: Vec<String> = Vec()
     mut start: u64 = 0
     mut at: u64 = 0
@@ -123,7 +123,7 @@ fun mf_lines(text: String) -> Vec<String> {
 }
 
 // The parts of a text between the bytes `separator`.
-fun mf_split(text: String, separator: u64) -> Vec<String> {
+pub fun mf_split(text: String, separator: u64) -> Vec<String> {
     mut parts: Vec<String> = Vec()
     mut start: u64 = 0
     mut at: u64 = 0

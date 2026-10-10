@@ -1,0 +1,1760 @@
+// Packages: dependency manifests, version requirements, the pods registry (through the system `curl` and `tar`), Git
+// dependencies (through the system `git`), `ryn.lock`, and `ryn login` / `ryn publish`. This is the Ryn port of the
+// registry and lockfile code that the Rust command used; the messages and the lockfile text are the same.
+
+use driver::manifest
+use driver::sha256
+use std::fs
+use std::env
+use std::process
+use std::time
+
+extern "C" fun fopen(path: *u8, mode: *u8) -> *u8;
+extern "C" fun fread(buffer: *u8, size: u64, count: u64, file: *u8) -> u64;
+extern "C" fun fclose(file: *u8) -> i32;
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(pointer: *u8);
+extern "C" fun chmod(path: *u8, mode: u32) -> i32;
+extern "C" fun readlink(path: *u8, buffer: *u8, size: u64) -> i64;
+
+fun default_registry() -> String {
+    return String("https://pods.ryn-lang.xyz")
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Small helpers
+
+// The file operations take owned `String` paths: the native backend cannot pass a temporary `String` as a `str`.
+fun f_is_file(path: String) -> bool {
+    return fs::is_file(path)
+}
+
+fun f_is_dir(path: String) -> bool {
+    return fs::is_dir(path)
+}
+
+fun f_exists(path: String) -> bool {
+    return fs::exists(path)
+}
+
+fun f_remove_file(path: String) -> bool {
+    return fs::remove_file(path)
+}
+
+fun f_remove_dir_all(path: String) -> bool {
+    return fs::remove_dir_all(path)
+}
+
+fun f_create_dir_all(path: String) -> bool {
+    return fs::create_dir_all(path)
+}
+
+fun f_copy_file(from: String, to: String) -> bool {
+    return fs::copy_file(from, to)
+}
+
+fun f_rename(from: String, to: String) -> bool {
+    return fs::rename(from, to)
+}
+
+fun f_read_dir(path: String) -> Vec<String> {
+    return fs::read_dir(path)
+}
+
+fun f_write(path: String, data: String) -> bool {
+    return fs::write(path, data)
+}
+
+fun f_read_result(path: String) -> Result<String, i32> {
+    return read_file_result(path)
+}
+
+
+fun c_text(text: String) -> *u8 {
+    buffer := malloc(text.len() + 1)
+    mut at: u64 = 0
+    while at < text.len() {
+        cell := ((buffer as u64) + at) as *u8
+        *cell = text.byte_at(at)
+        at += 1
+    }
+    end := ((buffer as u64) + text.len()) as *u8
+    *end = 0 as u8
+    return buffer
+}
+
+pub fun is_symlink(path: String) -> bool {
+    c_path := c_text(path)
+    buffer := malloc(8)
+    length := readlink(c_path, buffer, 8)
+    free(buffer)
+    free(c_path)
+    return length >= 0
+}
+
+// The bytes of a file, or nothing when it cannot be read.
+pub fun read_bytes(path: String) -> Option<Vec<u8>> {
+    c_path := c_text(path)
+    mode := c_text(String("rb"))
+    file := fopen(c_path, mode)
+    free(mode)
+    free(c_path)
+    when (file as u64) == 0 {
+        return Option::None
+    }
+    chunk: u64 = 65536
+    buffer := malloc(chunk)
+    mut bytes: Vec<u8> = Vec()
+    while true {
+        count := fread(buffer, 1, chunk, file)
+        when count == 0 {
+            break
+        }
+        mut at: u64 = 0
+        while at < count {
+            cell := ((buffer as u64) + at) as *u8
+            bytes.push(*cell)
+            at += 1
+        }
+    }
+    free(buffer)
+    closed := fclose(file)
+    return Option::Some(bytes)
+}
+
+fun hex_digit(value: u64) -> String {
+    digits := String("0123456789abcdef")
+    return digits.slice(value, value + 1)
+}
+
+fun hex16(value: u64) -> String {
+    mut out := String("")
+    mut shift: u32 = 60
+    while true {
+        out.append(hex_digit((value >> shift) & 15))
+        when shift == 0 {
+            break
+        }
+        shift -= 4
+    }
+    return out
+}
+
+fun is_hex(text: String) -> bool {
+    mut at: u64 = 0
+    while at < text.len() {
+        byte := text.byte_at(at) as u64
+        when !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102) || (byte >= 65 && byte <= 70)) {
+            return false
+        }
+        at += 1
+    }
+    return true
+}
+
+pub fun is_sha256(text: String) -> bool {
+    return text.len() == 64 && is_hex(text)
+}
+
+fun lower(text: String) -> String {
+    mut out := String("")
+    mut at: u64 = 0
+    while at < text.len() {
+        byte := text.byte_at(at) as u64
+        when byte >= 65 && byte <= 90 {
+            out.append(String("abcdefghijklmnopqrstuvwxyz").slice(byte - 65, byte - 64))
+        } else {
+            out.append(text.slice(at, at + 1))
+        }
+        at += 1
+    }
+    return out
+}
+
+fun trim_end_slash(text: String) -> String {
+    mut end := text.len()
+    while end > 0 && (text.byte_at(end - 1) as u64) == 47 {
+        end -= 1
+    }
+    return text.slice(0, end)
+}
+
+fun absolute(path: String) -> String {
+    when path.starts_with("/") {
+        return manifest::normalize(path)
+    }
+    return manifest::join_path(env::current_dir(), path)
+}
+
+fun join(base: String, part: str) -> String {
+    return manifest::join_path(base, String(part))
+}
+
+// A path in the temporary directory that is not used by another call: the label, the serial and the clock.
+fun temp_path(label: str, serial: u64) -> String {
+    mut name := String("ryn-")
+    name.append(label)
+    name.append("-")
+    name.append(hex16(serial))
+    name.append("-")
+    name.append(hex16((time::unix() * 1000000.0) as u64))
+    return join(env::temp_dir(), name)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Versions
+
+#[derive(Clone)]
+struct Version {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    ok: bool,
+    pre: bool,
+}
+
+// A decimal number part without leading zeros (`0` alone is fine), or nothing.
+fun number_part(text: String) -> Option<u64> {
+    when text.is_empty() || (text.len() > 1 && text.starts_with("0")) {
+        return Option::None
+    }
+    mut value: u64 = 0
+    mut at: u64 = 0
+    while at < text.len() {
+        byte := text.byte_at(at) as u64
+        when byte < 48 || byte > 57 || value > 1844674407370955160 {
+            return Option::None
+        }
+        value = value * 10 + (byte - 48)
+        at += 1
+    }
+    return Option::Some(value)
+}
+
+pub fun parse_version(raw: String) -> Version {
+    text := raw.trim()
+    mut core := text.clone()
+    mut pre := false
+    dash := text.find("-")
+    when dash.is_some() {
+        core = text.slice(0, dash.unwrap())
+        pre = text.len() > dash.unwrap() + 1
+    }
+    failed := Version { major: 0, minor: 0, patch: 0, ok: false, pre: false }
+    parts := manifest::mf_split(core, 46)
+    when parts.len() != 3 {
+        return failed
+    }
+    major := number_part(parts[0].clone())
+    minor := number_part(parts[1].clone())
+    patch := number_part(parts[2].clone())
+    when major.is_none() || minor.is_none() || patch.is_none() {
+        return failed
+    }
+    return Version { major: major.unwrap(), minor: minor.unwrap(), patch: patch.unwrap(), ok: true, pre: pre }
+}
+
+fun version_at_least(a: Version, b: Version) -> bool {
+    when a.major != b.major {
+        return a.major > b.major
+    }
+    when a.minor != b.minor {
+        return a.minor > b.minor
+    }
+    return a.patch >= b.patch
+}
+
+// A Cargo-style requirement: `1.2.3` and `^1.2.3` (compatible), `~1.2.3` (patch updates), `=1.2.3` (exact) or `*`;
+// pre-releases only match exactly.
+pub fun version_matches(requirement_raw: String, candidate: String) -> bool {
+    version := parse_version(candidate.clone())
+    when !version.ok {
+        return false
+    }
+    requirement := requirement_raw.trim()
+    when requirement.is_empty() || requirement == "*" {
+        return !version.pre
+    }
+    first := requirement.byte_at(0) as u64
+    mut op: u64 = 94
+    mut rest := requirement.clone()
+    when first == 94 || first == 126 || first == 61 {
+        op = first
+        rest = requirement.slice(1, requirement.len()).trim()
+    }
+    base := parse_version(rest.clone())
+    when !base.ok {
+        return false
+    }
+    when version.pre || base.pre {
+        return op != 126 && rest.trim() == candidate.trim()
+    }
+    when op == 61 {
+        return version.major == base.major && version.minor == base.minor && version.patch == base.patch
+    }
+    when op == 126 {
+        return version_at_least(version, base) && version.major == base.major && version.minor == base.minor
+    }
+    when !version_at_least(version, base) {
+        return false
+    }
+    when base.major > 0 {
+        return version.major == base.major
+    }
+    when base.minor > 0 {
+        return version.major == 0 && version.minor == base.minor
+    }
+    return version.major == 0 && version.minor == 0 && version.patch == base.patch
+}
+
+pub fun valid_requirement(raw: String) -> bool {
+    requirement := raw.trim()
+    when requirement.is_empty() || requirement == "*" {
+        return true
+    }
+    mut at: u64 = 0
+    while at < requirement.len() {
+        byte := requirement.byte_at(at) as u64
+        when byte == 94 || byte == 126 || byte == 61 {
+            at += 1
+        } else {
+            break
+        }
+    }
+    return parse_version(requirement.slice(at, requirement.len()).trim()).ok
+}
+
+pub fun valid_package_name(name: String) -> bool {
+    when name.is_empty() || name.len() > 64 {
+        return false
+    }
+    first := name.byte_at(0) as u64
+    when first < 97 || first > 122 {
+        return false
+    }
+    mut at: u64 = 0
+    while at < name.len() {
+        byte := name.byte_at(at) as u64
+        when !((byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 45 || byte == 95) {
+            return false
+        }
+        at += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The manifest: name, version and every dependency with its kind.
+
+// kind 0: a registry version requirement in `value`; 1: a Git URL in `value` with an optional branch; 2: a path.
+#[derive(Clone)]
+struct Dependency {
+    name: String,
+    kind: u32,
+    value: String,
+    branch: String,
+}
+
+#[derive(Clone)]
+struct Package {
+    name: String,
+    version: String,
+    dependencies: Vec<Dependency>,
+    error: String,
+}
+
+pub fun read_package(text: String) -> Package {
+    mut package := Package { name: String(""), version: String("0.1.0"), dependencies: Vec(), error: String("") }
+    mut in_dependencies := false
+    mut dependency_indent: u64 = 0
+    mut current_name := String("")
+    mut current_kind: u32 = 0
+    mut current_value := String("")
+    mut current_branch := String("")
+    mut current_open := false
+    for raw in manifest::mf_lines(text) {
+        line := manifest::mf_strip_comment(raw)
+        when line.trim().is_empty() {
+            continue
+        }
+        indent := manifest::mf_indent(line.clone())
+        content := line.trim()
+        colon := manifest::mf_colon(content.clone())
+        when indent == 0 {
+            when current_open {
+                package.dependencies.push(Dependency { name: current_name.clone(), kind: current_kind, value: current_value.clone(), branch: current_branch.clone() })
+                current_open = false
+            }
+            in_dependencies = false
+            when colon.is_some() {
+                key := manifest::scalar(content.slice(0, colon.unwrap()))
+                value := content.slice(colon.unwrap() + 1, content.len())
+                when key == "name" {
+                    package.name = manifest::scalar(value)
+                } else when key == "version" {
+                    package.version = manifest::scalar(value)
+                } else when key == "dependencies" {
+                    in_dependencies = true
+                    dependency_indent = 0
+                }
+            }
+        } else when in_dependencies && colon.is_some() {
+            key := manifest::scalar(content.slice(0, colon.unwrap()))
+            value := content.slice(colon.unwrap() + 1, content.len())
+            when dependency_indent == 0 || indent <= dependency_indent {
+                when current_open {
+                    package.dependencies.push(Dependency { name: current_name.clone(), kind: current_kind, value: current_value.clone(), branch: current_branch.clone() })
+                    current_open = false
+                }
+                dependency_indent = indent
+                current_name = key
+                current_kind = 0
+                current_value = String("")
+                current_branch = String("")
+                flow := manifest::mf_flow_path(value.clone())
+                scalar_value := manifest::scalar(value.clone())
+                when flow.is_some() {
+                    current_kind = 2
+                    current_value = flow.unwrap()
+                    current_open = true
+                } else when !scalar_value.is_empty() && !scalar_value.starts_with("{") {
+                    current_kind = 0
+                    current_value = scalar_value
+                    current_open = true
+                } else {
+                    // A nested mapping follows: `git`, `branch` or `path`.
+                    current_open = true
+                    current_kind = 3
+                }
+            } else when current_open {
+                when key == "path" {
+                    current_kind = 2
+                    current_value = manifest::scalar(value)
+                } else when key == "git" {
+                    current_kind = 1
+                    current_value = manifest::scalar(value)
+                } else when key == "branch" {
+                    current_branch = manifest::scalar(value)
+                }
+            }
+        }
+    }
+    when current_open {
+        package.dependencies.push(Dependency { name: current_name, kind: current_kind, value: current_value, branch: current_branch })
+    }
+    when package.name.is_empty() {
+        package.error = String("missing field `name`")
+    }
+    return package
+}
+
+fun load_package(directory: String) -> Package {
+    path := join(directory.clone(), "ryn.yaml")
+    mut package := Package { name: String(""), version: String("0.1.0"), dependencies: Vec(), error: String("") }
+    read := f_read_result(path.clone())
+    when read.is_err() {
+        package.error = String("cannot read manifest")
+        return package
+    }
+    return read_package(read.unwrap())
+}
+
+fun manifest_error(directory: String, package: Package) -> String {
+    mut message := String("error[R0410]: invalid ryn.yaml\n  --> ")
+    message.append(join(directory, "ryn.yaml"))
+    message.append("\n")
+    message.append(package.error.clone())
+    return message
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// HTTP through curl, and tar
+
+#[derive(Clone)]
+struct Response {
+    status: u64,
+    body: String,
+    error: String,
+}
+
+fun status_number(text: String) -> u64 {
+    mut value: u64 = 0
+    mut at: u64 = 0
+    trimmed := text.trim()
+    while at < trimmed.len() {
+        byte := trimmed.byte_at(at) as u64
+        when byte < 48 || byte > 57 {
+            return 0
+        }
+        value = value * 10 + (byte - 48)
+        at += 1
+    }
+    return value
+}
+
+// Runs curl; the response body is written to `body_path` (a file) and returned as text when `keep_text` is true.
+fun curl(method: str, url: String, headers: Vec<String>, upload: String, body_path: String) -> Response {
+    mut arguments: Vec<String> = Vec()
+    arguments.push(String("--silent"))
+    arguments.push(String("--show-error"))
+    arguments.push(String("--location"))
+    arguments.push(String("--proto"))
+    arguments.push(String("=https,http"))
+    arguments.push(String("--max-time"))
+    arguments.push(String("300"))
+    arguments.push(String("--request"))
+    arguments.push(String(method))
+    arguments.push(String("--output"))
+    arguments.push(body_path.clone())
+    arguments.push(String("--write-out"))
+    arguments.push(String("%{http_code}"))
+    mut header_file := String("")
+    when !headers.is_empty() {
+        header_file = temp_path("http-headers", 1)
+        mut text := String("")
+        for header in headers.clone() {
+            text.append(header)
+            text.append("\n")
+        }
+        when !f_write(header_file.clone(), text) {
+            return Response { status: 0, body: String(""), error: String("error[R0434]: cannot prepare request headers") }
+        }
+        arguments.push(String("--header"))
+        mut reference := String("@")
+        reference.append(header_file.clone())
+        arguments.push(reference)
+    }
+    when !upload.is_empty() {
+        arguments.push(String("--data-binary"))
+        mut reference := String("@")
+        reference.append(upload)
+        arguments.push(reference)
+    }
+    arguments.push(String("--"))
+    arguments.push(url.clone())
+    result := process::run_capture_args("curl", arguments)
+    when !header_file.is_empty() {
+        removed := f_remove_file(header_file)
+    }
+    when result.exit_code != 0 {
+        mut message := String("error[R0434]: cannot reach ")
+        message.append(url)
+        message.append(": ")
+        message.append(result.stderr.trim())
+        return Response { status: 0, body: String(""), error: message }
+    }
+    mut body := String("")
+    read := f_read_result(body_path.clone())
+    when read.is_ok() {
+        body = read.unwrap()
+    }
+    return Response { status: status_number(result.stdout.clone()), body: body, error: String("") }
+}
+
+// The string value of `"key": "value"` in a JSON text, or nothing.
+pub fun json_string(text: String, key: str) -> Option<String> {
+    mut needle := String("\"")
+    needle.append(key)
+    needle.append("\"")
+    found := text.find(needle.clone())
+    when found.is_none() {
+        return Option::None
+    }
+    mut at := found.unwrap() + needle.len()
+    while at < text.len() && (text.byte_at(at) as u64) != 58 {
+        at += 1
+    }
+    at += 1
+    while at < text.len() && ((text.byte_at(at) as u64) == 32 || (text.byte_at(at) as u64) == 9 || (text.byte_at(at) as u64) == 10) {
+        at += 1
+    }
+    when at >= text.len() || (text.byte_at(at) as u64) != 34 {
+        return Option::None
+    }
+    at += 1
+    mut out := String("")
+    while at < text.len() {
+        byte := text.byte_at(at) as u64
+        when byte == 34 {
+            return Option::Some(out)
+        }
+        when byte == 92 && at + 1 < text.len() {
+            next := text.byte_at(at + 1) as u64
+            when next == 110 {
+                out.append("\n")
+            } else when next == 116 {
+                out.append("\t")
+            } else {
+                out.append(text.slice(at + 1, at + 2))
+            }
+            at += 2
+        } else {
+            out.append(text.slice(at, at + 1))
+            at += 1
+        }
+    }
+    return Option::None
+}
+
+fun error_message(response: Response) -> String {
+    detail := json_string(response.body.clone(), "detail")
+    when detail.is_some() {
+        return detail.unwrap()
+    }
+    mut message := String("HTTP ")
+    message.append(response.status.to_string())
+    return message
+}
+
+fun encode(component: String) -> String {
+    mut out := String("")
+    mut at: u64 = 0
+    while at < component.len() {
+        byte := component.byte_at(at) as u64
+        when (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 45 || byte == 95 || byte == 46 || byte == 126 {
+            out.append(component.slice(at, at + 1))
+        } else {
+            out.append("%")
+            out.append(String("0123456789ABCDEF").slice(byte / 16, byte / 16 + 1))
+            out.append(String("0123456789ABCDEF").slice(byte % 16, byte % 16 + 1))
+        }
+        at += 1
+    }
+    return out
+}
+
+pub fun registry_url() -> String {
+    given := trim_end_slash(env::get("RYN_REGISTRY").trim())
+    when !given.is_empty() {
+        return given
+    }
+    return default_registry()
+}
+
+pub fun lock_source(registry: String) -> String {
+    mut text := String("registry:")
+    text.append(registry)
+    return text
+}
+
+#[derive(Clone)]
+struct Resolved {
+    version: String,
+    checksum: String,
+    error: String,
+}
+
+// Asks the registry for the newest non-yanked version matching `requirement`.
+pub fun resolve(registry: String, name: String, requirement: String) -> Resolved {
+    when !valid_requirement(requirement.clone()) {
+        mut message := String("error[R0435]: dependency `")
+        message.append(name)
+        message.append("` has an invalid version requirement `")
+        message.append(requirement)
+        message.append("`")
+        return Resolved { version: String(""), checksum: String(""), error: message }
+    }
+    mut url := registry.clone()
+    url.append("/api/v1/packages/")
+    url.append(encode(name.clone()))
+    url.append("/resolve?req=")
+    url.append(encode(requirement.trim()))
+    body_path := temp_path("http-body", 2)
+    response := curl("GET", url, Vec(), String(""), body_path.clone())
+    removed := f_remove_file(body_path)
+    when !response.error.is_empty() {
+        return Resolved { version: String(""), checksum: String(""), error: response.error.clone() }
+    }
+    when response.status != 200 {
+        mut message := String("error[R0435]: cannot resolve `")
+        message.append(name)
+        message.append("` ")
+        message.append(requirement)
+        message.append(" from ")
+        message.append(registry)
+        message.append(": ")
+        message.append(error_message(response))
+        return Resolved { version: String(""), checksum: String(""), error: message }
+    }
+    version := json_string(response.body.clone(), "version")
+    checksum := json_string(response.body.clone(), "checksum")
+    when version.is_none() || checksum.is_none() {
+        mut message := String("error[R0435]: unexpected registry response for `")
+        message.append(name)
+        message.append("`")
+        return Resolved { version: String(""), checksum: String(""), error: message }
+    }
+    when !version_matches(requirement.clone(), version.unwrap()) || !is_sha256(checksum.unwrap()) {
+        mut message := String("error[R0435]: registry returned an invalid version for `")
+        message.append(name)
+        message.append("` ")
+        message.append(requirement)
+        return Resolved { version: String(""), checksum: String(""), error: message }
+    }
+    return Resolved { version: version.unwrap(), checksum: lower(checksum.unwrap()), error: String("") }
+}
+
+fun sha256_file(path: String) -> Result<String, String> {
+    bytes := read_bytes(path.clone())
+    when bytes.is_none() {
+        mut message := String("error[R0436]: cannot read ")
+        message.append(path)
+        return Result::Err(message)
+    }
+    return Result::Ok(sha256::sha256_hex(bytes.unwrap()))
+}
+
+fun tar_program() -> String {
+    return String("tar")
+}
+
+fun package_root(cache: String, name: String) -> Result<String, String> {
+    when f_is_file(join(cache.clone(), "ryn.yaml")) {
+        return Result::Ok(cache)
+    }
+    nested := manifest::join_path(cache.clone(), name.clone())
+    when f_is_file(join(nested.clone(), "ryn.yaml")) {
+        return Result::Ok(nested)
+    }
+    mut message := String("error[R0436]: package `")
+    message.append(name)
+    message.append("` in ")
+    message.append(cache)
+    message.append(" has no ryn.yaml")
+    return Result::Err(message)
+}
+
+// Downloads, verifies and unpacks one package version into the project's registry cache, returning the package root.
+pub fun fetch(project: String, registry: String, name: String, version: String, checksum: String) -> Result<String, String> {
+    when !is_sha256(checksum.clone()) {
+        mut message := String("error[R0436]: ryn.lock has an invalid checksum for `")
+        message.append(name)
+        message.append("` ")
+        message.append(version)
+        return Result::Err(message)
+    }
+    when !parse_version(version.clone()).ok || !valid_package_name(name.clone()) {
+        mut message := String("error[R0436]: invalid locked package `")
+        message.append(name)
+        message.append("` ")
+        message.append(version)
+        return Result::Err(message)
+    }
+    mut entry := name.clone()
+    entry.append("-")
+    entry.append(version.clone())
+    cache := manifest::join_path(join(join(project, ".ryn"), "registry"), entry)
+    marker := join(cache.clone(), ".ryn-checksum")
+    marker_read := f_read_result(marker.clone())
+    when marker_read.is_ok() && marker_read.unwrap().trim() == checksum {
+        return package_root(cache, name)
+    }
+    when f_exists(cache.clone()) {
+        when !f_remove_dir_all(cache.clone()) {
+            mut message := String("error[R0436]: cannot replace ")
+            message.append(cache)
+            return Result::Err(message)
+        }
+    }
+    mut url := registry.clone()
+    url.append("/api/v1/packages/")
+    url.append(encode(name.clone()))
+    url.append("/")
+    url.append(encode(version.clone()))
+    url.append("/download")
+    archive := temp_path("package.tar.gz", 3)
+    response := curl("GET", url, Vec(), String(""), archive.clone())
+    when !response.error.is_empty() {
+        removed := f_remove_file(archive)
+        return Result::Err(response.error.clone())
+    }
+    when response.status != 200 {
+        removed := f_remove_file(archive)
+        mut message := String("error[R0436]: cannot download `")
+        message.append(name)
+        message.append("` ")
+        message.append(version)
+        message.append(": ")
+        message.append(error_message(response))
+        return Result::Err(message)
+    }
+    actual_result := sha256_file(archive.clone())
+    when actual_result.is_err() {
+        return Result::Err(actual_result.unwrap_err())
+    }
+    actual := actual_result.unwrap()
+    when actual != checksum {
+        removed := f_remove_file(archive)
+        mut message := String("error[R0436]: checksum mismatch for `")
+        message.append(name)
+        message.append("` ")
+        message.append(version)
+        message.append(": ryn.lock pins ")
+        message.append(checksum)
+        message.append(", the download is ")
+        message.append(actual)
+        return Result::Err(message)
+    }
+    mut unpack := cache.clone()
+    unpack.append(".unpack")
+    removed_old := f_remove_dir_all(unpack.clone())
+    when !f_create_dir_all(unpack.clone()) {
+        mut message := String("error[R0436]: cannot create ")
+        message.append(unpack)
+        return Result::Err(message)
+    }
+    mut arguments: Vec<String> = Vec()
+    arguments.push(String("-xzf"))
+    arguments.push(archive.clone())
+    arguments.push(String("-C"))
+    arguments.push(unpack.clone())
+    result := process::run_capture_args("tar", arguments)
+    removed_archive := f_remove_file(archive)
+    when result.exit_code != 0 {
+        removed_unpack := f_remove_dir_all(unpack.clone())
+        mut message := String("error[R0436]: cannot unpack `")
+        message.append(name)
+        message.append("` ")
+        message.append(version)
+        message.append(": ")
+        message.append(result.stderr.trim())
+        return Result::Err(message)
+    }
+    when !f_rename(unpack.clone(), cache.clone()) {
+        return Result::Err(String("error[R0436]: cannot move package into the cache"))
+    }
+    when !f_write(marker.clone(), checksum.clone()) {
+        mut message := String("error[R0436]: cannot write ")
+        message.append(marker)
+        return Result::Err(message)
+    }
+    return package_root(cache, name)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Credentials
+
+fun credentials_path() -> String {
+    mut base := env::get("XDG_CONFIG_HOME")
+    when base.is_empty() {
+        home := env::get("HOME")
+        when home.is_empty() {
+            base = env::temp_dir()
+        } else {
+            base = join(home, ".config")
+        }
+    }
+    return join(join(base, "ryn"), "credentials")
+}
+
+// Saves a registry token for `ryn publish`; the path of the credentials file.
+pub fun login(token_raw: String) -> Result<String, String> {
+    token := token_raw.trim()
+    mut bad := token.is_empty()
+    mut at: u64 = 0
+    while at < token.len() {
+        byte := token.byte_at(at) as u64
+        when byte <= 32 || byte == 127 {
+            bad = true
+        }
+        at += 1
+    }
+    when bad {
+        return Result::Err(String("error[R0437]: the token must be a single word, such as pods_xxxxxxxx"))
+    }
+    path := credentials_path()
+    parent := manifest::directory_of(path.clone())
+    when !f_create_dir_all(parent.clone()) {
+        mut message := String("error[R0437]: cannot create ")
+        message.append(parent)
+        return Result::Err(message)
+    }
+    mut text := token.clone()
+    text.append("\n")
+    when !f_write(path.clone(), text) {
+        mut message := String("error[R0437]: cannot write ")
+        message.append(path)
+        return Result::Err(message)
+    }
+    c_path := c_text(path.clone())
+    changed := chmod(c_path, 384 as u32)
+    free(c_path)
+    return Result::Ok(path)
+}
+
+fun token() -> Result<String, String> {
+    given := env::get("RYN_TOKEN").trim()
+    when !given.is_empty() {
+        return Result::Ok(given)
+    }
+    read := f_read_result(credentials_path())
+    when read.is_ok() && !read.unwrap().trim().is_empty() {
+        return Result::Ok(read.unwrap().trim())
+    }
+    return Result::Err(String("error[R0437]: no registry token; run `ryn login <token>` or set RYN_TOKEN"))
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Publishing
+
+fun starts_with_any_upper(name: String) -> bool {
+    upper := name.to_upper()
+    return upper.starts_with("README") || upper.starts_with("LICENSE") || upper.starts_with("LICENCE") || upper.starts_with("CHANGELOG") || upper.starts_with("COPYING")
+}
+
+fun copy_tree(from: String, to: String) -> Result<u64, String> {
+    when !f_create_dir_all(to.clone()) {
+        mut message := String("error[R0438]: cannot create ")
+        message.append(to)
+        return Result::Err(message)
+    }
+    mut total: u64 = 0
+    for name in f_read_dir(from.clone()) {
+        when name.starts_with(".") {
+            continue
+        }
+        source := manifest::join_path(from.clone(), name.clone())
+        when is_symlink(source.clone()) {
+            continue
+        }
+        target := manifest::join_path(to.clone(), name.clone())
+        when f_is_dir(source.clone()) {
+            copied := copy_tree(source, target)
+            when copied.is_err() {
+                return copied
+            }
+            total += copied.unwrap()
+        } else when f_is_file(source.clone()) {
+            when !f_copy_file(source.clone(), target) {
+                mut message := String("error[R0438]: cannot copy ")
+                message.append(source)
+                return Result::Err(message)
+            }
+            bytes := read_bytes(source)
+            when bytes.is_some() {
+                total += bytes.unwrap().len() as u64
+            }
+        }
+    }
+    return Result::Ok(total)
+}
+
+// Packs a project the way `ryn publish` uploads it: the archive path.
+fun pack(project: String, package: Package) -> Result<String, String> {
+    when !valid_package_name(package.name.clone()) {
+        mut message := String("error[R0438]: package name `")
+        message.append(package.name.clone())
+        message.append("` must start with a lowercase letter and use only a-z, 0-9, `-` and `_`")
+        return Result::Err(message)
+    }
+    when !parse_version(package.version.clone()).ok {
+        mut message := String("error[R0438]: version `")
+        message.append(package.version.clone())
+        message.append("` must be MAJOR.MINOR.PATCH")
+        return Result::Err(message)
+    }
+    for dependency in package.dependencies.clone() {
+        when dependency.kind == 0 && valid_requirement(dependency.value.clone()) {
+            continue
+        }
+        mut message := String("error[R0438]: dependency `")
+        message.append(dependency.name.clone())
+        when dependency.kind == 0 {
+            message.append("` has an invalid version requirement `")
+            message.append(dependency.value.clone())
+            message.append("`")
+        } else {
+            message.append("` uses a path or Git source; published packages may only depend on registry packages")
+        }
+        return Result::Err(message)
+    }
+    source_dir := join(project.clone(), "src")
+    when !f_is_dir(source_dir.clone()) {
+        return Result::Err(String("error[R0438]: a package needs its sources in src/"))
+    }
+    stage := temp_path("publish", 4)
+    root := manifest::join_path(stage.clone(), package.name.clone())
+    copied := copy_tree(source_dir, join(root.clone(), "src"))
+    when copied.is_err() {
+        return Result::Err(copied.unwrap_err())
+    }
+    when !f_copy_file(join(project.clone(), "ryn.yaml"), join(root.clone(), "ryn.yaml")) {
+        return Result::Err(String("error[R0438]: cannot copy ryn.yaml"))
+    }
+    for name in f_read_dir(project.clone()) {
+        entry := manifest::join_path(project.clone(), name.clone())
+        when f_is_file(entry.clone()) && starts_with_any_upper(name.clone()) {
+            kept := f_copy_file(entry, manifest::join_path(root.clone(), name))
+        }
+    }
+    mut archive_name := package.name.clone()
+    archive_name.append("-")
+    archive_name.append(package.version.clone())
+    archive_name.append(".tar.gz")
+    archive := manifest::join_path(stage.clone(), archive_name)
+    mut arguments: Vec<String> = Vec()
+    arguments.push(String("-czf"))
+    arguments.push(archive.clone())
+    arguments.push(String("-C"))
+    arguments.push(stage.clone())
+    arguments.push(package.name.clone())
+    result := process::run_capture_args("tar", arguments)
+    when result.exit_code != 0 {
+        mut message := String("error[R0438]: cannot create the package archive: ")
+        message.append(result.stderr.trim())
+        return Result::Err(message)
+    }
+    bytes := read_bytes(archive.clone())
+    when bytes.is_some() && bytes.unwrap().len() as u64 > 10485760 {
+        mut message := String("error[R0438]: the package archive is ")
+        message.append((bytes.unwrap().len() as u64 / 1024).to_string())
+        message.append(" KB; the registry accepts at most 10240 KB")
+        return Result::Err(message)
+    }
+    return Result::Ok(archive)
+}
+
+// Uploads a packed project. Returns the published package's page URL.
+pub fun publish(project: String) -> Result<String, String> {
+    secret := token()
+    when secret.is_err() {
+        return Result::Err(secret.unwrap_err())
+    }
+    package := load_package(project.clone())
+    when !package.error.is_empty() {
+        return Result::Err(manifest_error(project.clone(), package))
+    }
+    packed := pack(project.clone(), package.clone())
+    when packed.is_err() {
+        return Result::Err(packed.unwrap_err())
+    }
+    archive := packed.unwrap()
+    registry := registry_url()
+    mut headers: Vec<String> = Vec()
+    mut authorization := String("Authorization: Bearer ")
+    authorization.append(secret.unwrap())
+    headers.push(authorization)
+    headers.push(String("Content-Type: application/gzip"))
+    headers.push(String("X-Ryn-Version: 0.1.6"))
+    mut url := registry.clone()
+    url.append("/api/v1/packages/new")
+    body_path := temp_path("http-body", 5)
+    response := curl("PUT", url, headers, archive.clone(), body_path.clone())
+    removed_body := f_remove_file(body_path)
+    removed_stage := f_remove_dir_all(manifest::directory_of(archive))
+    when !response.error.is_empty() {
+        return Result::Err(response.error.clone())
+    }
+    when response.status != 200 {
+        mut message := String("error[R0439]: publishing ")
+        message.append(package.name.clone())
+        message.append(" ")
+        message.append(package.version.clone())
+        message.append(" failed: ")
+        message.append(error_message(response))
+        return Result::Err(message)
+    }
+    published := json_string(response.body.clone(), "url")
+    when published.is_some() {
+        return Result::Ok(published.unwrap())
+    }
+    name := json_string(response.body.clone(), "name")
+    version := json_string(response.body.clone(), "version")
+    when name.is_none() || version.is_none() {
+        return Result::Err(String("error[R0439]: unexpected registry response"))
+    }
+    mut page := registry.clone()
+    page.append("/packages/")
+    page.append(name.unwrap())
+    page.append("/")
+    page.append(version.unwrap())
+    return Result::Ok(page)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Git
+
+#[derive(Clone)]
+struct GitRoot {
+    directory: String,
+    commit: String,
+    error: String,
+}
+
+
+fun git(arguments: Vec<String>) -> process::ProcessResult {
+    return process::run_capture_args("git", arguments)
+}
+
+fun git_in(checkout: String, rest: Vec<String>) -> process::ProcessResult {
+    mut arguments: Vec<String> = Vec()
+    arguments.push(String("-C"))
+    arguments.push(checkout)
+    for item in rest {
+        arguments.push(item)
+    }
+    return git(arguments)
+}
+
+fun git_failure(message: str, detail: String) -> GitRoot {
+    mut text := String(message)
+    text.append(detail.trim())
+    return GitRoot { directory: String(""), commit: String(""), error: text }
+}
+
+fun valid_revision(revision: String) -> bool {
+    return (revision.len() == 40 || revision.len() == 64) && is_hex(revision)
+}
+
+fun validate_git_branch(branch: String) -> bool {
+    mut arguments: Vec<String> = Vec()
+    arguments.push(String("check-ref-format"))
+    arguments.push(String("--branch"))
+    arguments.push(branch)
+    return git(arguments).exit_code == 0
+}
+
+// Clones or updates the checkout of `url` in the project's Git cache and returns its directory and commit; a given
+// `revision` pins the commit.
+fun resolve_git(project: String, url: String, branch: String, revision: String) -> GitRoot {
+    when !revision.is_empty() && !valid_revision(revision.clone()) {
+        return GitRoot { directory: String(""), commit: String(""), error: String("error[R0430]: invalid pinned Git commit hash") }
+    }
+    scheme := url.find("://")
+    when scheme.is_some() {
+        rest := url.slice(scheme.unwrap() + 3, url.len())
+        slash := rest.find("/")
+        mut authority := rest.clone()
+        when slash.is_some() {
+            authority = rest.slice(0, slash.unwrap())
+        }
+        when authority.find("@").is_some() {
+            return GitRoot { directory: String(""), commit: String(""), error: String("error[R0430]: Git URLs must not embed credentials; use a Git credential helper") }
+        }
+    }
+    mut hash: u64 = 14695981039346656037
+    mut at: u64 = 0
+    while at < url.len() {
+        hash = (hash ^ (url.byte_at(at) as u64)) * 1099511628211
+        at += 1
+    }
+    cache := manifest::join_path(join(join(project, ".ryn"), "git"), hex16(hash))
+    when !f_is_dir(join(cache.clone(), ".git")) {
+        when f_exists(cache.clone()) {
+            when !f_remove_dir_all(cache.clone()) {
+                return git_failure("error[R0433]: cannot replace Git cache ", cache)
+            }
+        }
+        made := f_create_dir_all(manifest::directory_of(cache.clone()))
+        mut clone_arguments: Vec<String> = Vec()
+        clone_arguments.push(String("clone"))
+        clone_arguments.push(String("--depth"))
+        clone_arguments.push(String("1"))
+        when !branch.is_empty() {
+            clone_arguments.push(String("--branch"))
+            clone_arguments.push(branch.clone())
+        }
+        clone_arguments.push(String("--"))
+        clone_arguments.push(url.clone())
+        clone_arguments.push(cache.clone())
+        cloned := git(clone_arguments)
+        when cloned.exit_code != 0 {
+            mut message := String("error[R0433]: Git clone failed for `")
+            message.append(url.clone())
+            message.append("`: ")
+            message.append(cloned.stderr.trim())
+            return GitRoot { directory: String(""), commit: String(""), error: message }
+        }
+    }
+    when !revision.is_empty() {
+        mut checkout: Vec<String> = Vec()
+        checkout.push(String("checkout"))
+        checkout.push(String("--detach"))
+        checkout.push(revision.clone())
+        first := git_in(cache.clone(), checkout.clone())
+        when first.exit_code != 0 {
+            mut fetch: Vec<String> = Vec()
+            fetch.push(String("fetch"))
+            fetch.push(String("--depth"))
+            fetch.push(String("1"))
+            fetch.push(String("origin"))
+            fetch.push(revision.clone())
+            fetched := git_in(cache.clone(), fetch)
+            when fetched.exit_code != 0 {
+                mut message := String("error[R0433]: cannot fetch locked commit ")
+                message.append(revision.clone())
+                message.append(": ")
+                message.append(fetched.stderr.trim())
+                return GitRoot { directory: String(""), commit: String(""), error: message }
+            }
+            second := git_in(cache.clone(), checkout)
+            when second.exit_code != 0 {
+                mut message := String("error[R0433]: cannot checkout locked commit ")
+                message.append(revision.clone())
+                message.append(": ")
+                message.append(second.stderr.trim())
+                return GitRoot { directory: String(""), commit: String(""), error: message }
+            }
+        }
+    } else {
+        mut fetch: Vec<String> = Vec()
+        fetch.push(String("fetch"))
+        fetch.push(String("--depth"))
+        fetch.push(String("1"))
+        fetch.push(String("origin"))
+        when !branch.is_empty() {
+            fetch.push(branch.clone())
+        }
+        fetched := git_in(cache.clone(), fetch)
+        when fetched.exit_code != 0 {
+            mut message := String("error[R0433]: cannot fetch Git ref ")
+            message.append(branch.clone())
+            message.append(" from `")
+            message.append(url.clone())
+            message.append("`: ")
+            message.append(fetched.stderr.trim())
+            return GitRoot { directory: String(""), commit: String(""), error: message }
+        }
+        mut reset: Vec<String> = Vec()
+        reset.push(String("reset"))
+        reset.push(String("--hard"))
+        reset.push(String("FETCH_HEAD"))
+        when git_in(cache.clone(), reset).exit_code != 0 {
+            return GitRoot { directory: String(""), commit: String(""), error: String("error[R0433]: cannot update Git checkout") }
+        }
+    }
+    mut clean: Vec<String> = Vec()
+    clean.push(String("clean"))
+    clean.push(String("-fdx"))
+    when git_in(cache.clone(), clean).exit_code != 0 {
+        return GitRoot { directory: String(""), commit: String(""), error: String("error[R0433]: cannot clean managed Git cache") }
+    }
+    mut parse: Vec<String> = Vec()
+    parse.push(String("rev-parse"))
+    parse.push(String("HEAD"))
+    head := git_in(cache.clone(), parse)
+    when head.exit_code != 0 {
+        mut message := String("error[R0433]: cannot read Git revision for `")
+        message.append(url)
+        message.append("`")
+        return GitRoot { directory: String(""), commit: String(""), error: message }
+    }
+    return GitRoot { directory: cache, commit: head.stdout.trim(), error: String("") }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// ryn.lock
+
+#[derive(Clone)]
+struct Locked {
+    parent: String,
+    name: String,
+    version: String,
+    source: String,
+    branch: String,
+    revision: String,
+    checksum: String,
+}
+
+// Byte-wise order of two texts: -1, 0 or 1.
+fun compare_text(a: String, b: String) -> i32 {
+    mut at: u64 = 0
+    while at < a.len() && at < b.len() {
+        x := a.byte_at(at) as u64
+        y := b.byte_at(at) as u64
+        when x < y {
+            return -1
+        }
+        when x > y {
+            return 1
+        }
+        at += 1
+    }
+    when a.len() < b.len() {
+        return -1
+    }
+    when a.len() > b.len() {
+        return 1
+    }
+    return 0
+}
+
+// The order of the derived `Ord` of the Rust lock entry: field by field, a missing optional field first.
+fun locked_before(a: Locked, b: Locked) -> bool {
+    mut order := compare_text(a.parent.clone(), b.parent.clone())
+    when order == 0 {
+        order = compare_text(a.name.clone(), b.name.clone())
+    }
+    when order == 0 {
+        order = compare_text(a.version.clone(), b.version.clone())
+    }
+    when order == 0 {
+        order = compare_text(a.source.clone(), b.source.clone())
+    }
+    when order == 0 {
+        order = compare_text(a.branch.clone(), b.branch.clone())
+    }
+    when order == 0 {
+        order = compare_text(a.revision.clone(), b.revision.clone())
+    }
+    when order == 0 {
+        order = compare_text(a.checksum.clone(), b.checksum.clone())
+    }
+    return order < 0
+}
+
+fun sorted(entries: Vec<Locked>) -> Vec<Locked> {
+    mut items := entries
+    mut outer: u64 = 1
+    while outer < items.len() {
+        mut inner := outer
+        while inner > 0 {
+            current := items[inner]
+            previous := items[inner - 1]
+            when !locked_before(current.clone(), previous.clone()) {
+                break
+            }
+            items.set(inner, previous)
+            items.set(inner - 1, current)
+            inner -= 1
+        }
+        outer += 1
+    }
+    return items
+}
+
+fun digits_from(text: String, start: u64) -> u64 {
+    mut at := start
+    while at < text.len() {
+        byte := text.byte_at(at) as u64
+        when byte < 48 || byte > 57 {
+            break
+        }
+        at += 1
+    }
+    return at
+}
+
+// Whether a plain scalar would read back as a number: an integer, a decimal, or one with an exponent.
+fun number_like(text: String) -> bool {
+    mut at: u64 = 0
+    when at < text.len() && ((text.byte_at(at) as u64) == 43 || (text.byte_at(at) as u64) == 45) {
+        at += 1
+    }
+    first := at
+    at = digits_from(text.clone(), at)
+    mut digits := at - first
+    when at < text.len() && (text.byte_at(at) as u64) == 46 {
+        start := at + 1
+        at = digits_from(text.clone(), start)
+        digits += at - start
+    }
+    when digits == 0 {
+        return false
+    }
+    when at < text.len() && ((text.byte_at(at) as u64) == 101 || (text.byte_at(at) as u64) == 69) {
+        at += 1
+        when at < text.len() && ((text.byte_at(at) as u64) == 43 || (text.byte_at(at) as u64) == 45) {
+            at += 1
+        }
+        exponent := at
+        at = digits_from(text.clone(), at)
+        when at == exponent {
+            return false
+        }
+    }
+    return at == text.len()
+}
+
+// A YAML scalar the way the Rust writer wrote it: plain, single-quoted when it would read back as another type, and
+// double-quoted when it has characters a plain scalar cannot.
+fun yaml_text(value: String) -> String {
+    when value.is_empty() {
+        return String("''")
+    }
+    when value == "true" || value == "false" || value == "null" || value == "~" || value == "yes" || value == "no" || value == "on" || value == "off" || number_like(value.clone()) {
+        mut quoted := String("'")
+        quoted.append(value)
+        quoted.append("'")
+        return quoted
+    }
+    first := value.byte_at(0) as u64
+    mut special := first == 45 || first == 63 || first == 58 || first == 44 || first == 91 || first == 93 || first == 123 || first == 125 || first == 35 || first == 38 || first == 42 || first == 33 || first == 124 || first == 62 || first == 39 || first == 34 || first == 37 || first == 64 || first == 96 || first == 32
+    last := value.byte_at(value.len() - 1) as u64
+    when last == 32 || last == 58 {
+        special = true
+    }
+    when value.find(": ").is_some() || value.find(" #").is_some() {
+        special = true
+    }
+    when special {
+        mut quoted := String("\"")
+        mut at: u64 = 0
+        while at < value.len() {
+            byte := value.byte_at(at) as u64
+            when byte == 34 || byte == 92 {
+                quoted.append("\\")
+            }
+            quoted.append(value.slice(at, at + 1))
+            at += 1
+        }
+        quoted.append("\"")
+        return quoted
+    }
+    return value
+}
+
+fun lock_text(root: String, entries: Vec<Locked>) -> String {
+    mut text := String("lock_version: 1\nroot: ")
+    text.append(yaml_text(root))
+    text.append("\n")
+    when entries.is_empty() {
+        text.append("packages: []\n")
+        return text
+    }
+    text.append("packages:\n")
+    for entry in sorted(entries) {
+        text.append("- parent: ")
+        text.append(yaml_text(entry.parent.clone()))
+        text.append("\n  name: ")
+        text.append(yaml_text(entry.name.clone()))
+        text.append("\n  version: ")
+        text.append(yaml_text(entry.version.clone()))
+        text.append("\n  source: ")
+        text.append(yaml_text(entry.source.clone()))
+        text.append("\n")
+        when !entry.branch.is_empty() {
+            text.append("  branch: ")
+            text.append(yaml_text(entry.branch.clone()))
+            text.append("\n")
+        }
+        when !entry.revision.is_empty() {
+            text.append("  revision: ")
+            text.append(yaml_text(entry.revision.clone()))
+            text.append("\n")
+        }
+        when !entry.checksum.is_empty() {
+            text.append("  checksum: ")
+            text.append(yaml_text(entry.checksum.clone()))
+            text.append("\n")
+        }
+    }
+    return text
+}
+
+struct ParsedLock {
+    root: String,
+    entries: Vec<Locked>,
+    valid: bool,
+}
+
+fun parse_lock(text: String) -> ParsedLock {
+    mut lock := ParsedLock { root: String(""), entries: Vec(), valid: false }
+    mut seen_version := false
+    mut open := false
+    mut current := Locked { parent: String(""), name: String(""), version: String(""), source: String(""), branch: String(""), revision: String(""), checksum: String("") }
+    for raw in manifest::mf_lines(text) {
+        when raw.trim().is_empty() {
+            continue
+        }
+        mut content := raw.trim()
+        mut starts_entry := false
+        when content.starts_with("- ") {
+            starts_entry = true
+            content = content.slice(2, content.len()).trim()
+        }
+        colon := manifest::mf_colon(content.clone())
+        when colon.is_none() {
+            continue
+        }
+        key := manifest::scalar(content.slice(0, colon.unwrap()))
+        value := manifest::scalar(content.slice(colon.unwrap() + 1, content.len()))
+        when starts_entry {
+            when open {
+                lock.entries.push(current.clone())
+            }
+            open = true
+            current = Locked { parent: String(""), name: String(""), version: String(""), source: String(""), branch: String(""), revision: String(""), checksum: String("") }
+        }
+        when open {
+            when key == "parent" {
+                current.parent = value
+            } else when key == "name" {
+                current.name = value
+            } else when key == "version" {
+                current.version = value
+            } else when key == "source" {
+                current.source = value
+            } else when key == "branch" {
+                current.branch = value
+            } else when key == "revision" {
+                current.revision = value
+            } else when key == "checksum" {
+                current.checksum = value
+            }
+        } else when key == "lock_version" {
+            seen_version = value == "1"
+        } else when key == "root" {
+            lock.root = value
+        }
+    }
+    when open {
+        lock.entries.push(current)
+    }
+    lock.valid = seen_version
+    return lock
+}
+
+fun find_locked(entries: Vec<Locked>, parent: String, name: String) -> Option<Locked> {
+    for entry in entries {
+        when entry.parent == parent && entry.name == name {
+            return Option::Some(entry)
+        }
+    }
+    return Option::None
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The dependency graph of a project
+
+struct Resolver {
+    project: String,
+    registry: String,
+    have_lock: bool,
+    lock: Vec<Locked>,
+    refresh: bool,
+    packages: Vec<Locked>,
+    names: Vec<String>,
+    directories: Vec<String>,
+    visited: Vec<String>,
+    error: String,
+}
+
+fun lock_hint(project: String) -> String {
+    mut text := String("`ryn lock ")
+    text.append(project)
+    text.append("`")
+    return text
+}
+
+extend Resolver {
+    fun fail(mut self, message: String) -> bool {
+        self.error = message
+        return false
+    }
+
+    // Records the dependencies of the package at `directory`, and then theirs.
+    fun collect(mut self, directory: String, package: Package) -> bool {
+        for seen in self.visited.clone() {
+            when seen == directory {
+                return true
+            }
+        }
+        self.visited.push(directory.clone())
+        for dependency in package.dependencies.clone() {
+            mut root := String("")
+            mut source := String("")
+            mut branch := String("")
+            mut revision := String("")
+            mut checksum := String("")
+            when dependency.kind == 2 {
+                root = manifest::join_path(directory.clone(), dependency.value.clone())
+                when !f_is_dir(root.clone()) {
+                    mut message := String("error[R0430]: cannot resolve path dependency `")
+                    message.append(dependency.name.clone())
+                    message.append("` at ")
+                    message.append(root)
+                    message.append(": No such file or directory (os error 2)")
+                    return self.fail(message)
+                }
+                source = String("path:")
+                source.append(dependency.value.clone())
+            } else when dependency.kind == 1 {
+                branch = dependency.branch.clone()
+                when !branch.is_empty() && !validate_git_branch(branch.clone()) {
+                    mut message := String("error[R0430]: invalid Git branch name `")
+                    message.append(branch)
+                    message.append("`")
+                    return self.fail(message)
+                }
+                mut wanted := String("git:")
+                wanted.append(dependency.value.clone())
+                old := find_locked(self.lock.clone(), package.name.clone(), dependency.name.clone())
+                when !self.refresh && (old.is_none() || old.unwrap().source != wanted || old.unwrap().branch != branch) {
+                    mut message := String("error[R0431]: Git dependency `")
+                    message.append(dependency.name.clone())
+                    message.append("` in `")
+                    message.append(package.name.clone())
+                    message.append("` is missing from or differs from ryn.lock; run ")
+                    message.append(lock_hint(self.project.clone()))
+                    return self.fail(message)
+                }
+                mut pinned := String("")
+                when !self.refresh && old.is_some() {
+                    pinned = old.unwrap().revision
+                }
+                resolved := resolve_git(self.project.clone(), dependency.value.clone(), branch.clone(), pinned)
+                when !resolved.error.is_empty() {
+                    return self.fail(resolved.error.clone())
+                }
+                root = resolved.directory
+                source = wanted
+                revision = resolved.commit
+            } else {
+                source = lock_source(self.registry.clone())
+                old := find_locked(self.lock.clone(), package.name.clone(), dependency.name.clone())
+                mut version := String("")
+                mut sum := String("")
+                when !self.refresh && old.is_some() && old.unwrap().source == source && version_matches(dependency.value.clone(), old.unwrap().version) && !old.unwrap().checksum.is_empty() {
+                    version = old.unwrap().version
+                    sum = old.unwrap().checksum
+                } else when self.refresh {
+                    resolved := resolve(self.registry.clone(), dependency.name.clone(), dependency.value.clone())
+                    when !resolved.error.is_empty() {
+                        return self.fail(resolved.error.clone())
+                    }
+                    version = resolved.version
+                    sum = resolved.checksum
+                } else {
+                    mut message := String("error[R0431]: registry dependency `")
+                    message.append(dependency.name.clone())
+                    message.append("` ")
+                    message.append(dependency.value.clone())
+                    message.append(" in `")
+                    message.append(package.name.clone())
+                    message.append("` is missing from or differs from ryn.lock; run ")
+                    message.append(lock_hint(self.project.clone()))
+                    return self.fail(message)
+                }
+                fetched := fetch(self.project.clone(), self.registry.clone(), dependency.name.clone(), version, sum.clone())
+                when fetched.is_err() {
+                    return self.fail(fetched.unwrap_err())
+                }
+                root = fetched.unwrap()
+                checksum = sum
+            }
+            inner := load_package(root.clone())
+            when !inner.error.is_empty() {
+                return self.fail(manifest_error(root.clone(), inner))
+            }
+            when inner.name != dependency.name {
+                mut message := String("error[R0430]: dependency key `")
+                message.append(dependency.name.clone())
+                message.append("` resolves to package `")
+                message.append(inner.name.clone())
+                message.append("`")
+                return self.fail(message)
+            }
+            self.packages.push(Locked { parent: package.name.clone(), name: inner.name.clone(), version: inner.version.clone(), source: source, branch: branch, revision: revision, checksum: checksum })
+            mut known := false
+            for name in self.names.clone() {
+                when name == dependency.name {
+                    known = true
+                }
+            }
+            when !known {
+                self.names.push(dependency.name.clone())
+                self.directories.push(join(root.clone(), "src"))
+            }
+            when !self.collect(root.clone(), inner) {
+                return false
+            }
+        }
+        return true
+    }
+}
+
+fun new_resolver(project: String, lock: Vec<Locked>, have_lock: bool, refresh: bool) -> Resolver {
+    return Resolver { project: project, registry: registry_url(), have_lock: have_lock, lock: lock, refresh: refresh, packages: Vec(), names: Vec(), directories: Vec(), visited: Vec(), error: String("") }
+}
+
+struct Resolution {
+    // The name and the source directory of each dependency package, one after the other.
+    pairs: Vec<String>,
+    message: String,
+}
+
+fun lock_failure(message: String) -> Resolution {
+    return Resolution { pairs: Vec(), message: message }
+}
+
+// Whether the project's own manifest names a registry dependency.
+pub fun uses_registry(project: String) -> bool {
+    package := load_package(project)
+    for dependency in package.dependencies {
+        when dependency.kind == 0 {
+            return true
+        }
+    }
+    return false
+}
+
+// `ryn lock`: resolves every dependency, refreshing Git branches and registry versions, and writes `ryn.lock`.
+pub fun write_lock(project_given: String) -> Result<String, String> {
+    project := absolute(project_given)
+    package := load_package(project.clone())
+    when !package.error.is_empty() {
+        return Result::Err(manifest_error(project.clone(), package))
+    }
+    mut resolver := new_resolver(project.clone(), Vec(), false, true)
+    when !resolver.collect(project.clone(), package.clone()) {
+        return Result::Err(resolver.error.clone())
+    }
+    path := join(project.clone(), "ryn.lock")
+    when !f_write(path.clone(), lock_text(package.name.clone(), resolver.packages.clone())) {
+        mut message := String("error[R0430]: cannot write ")
+        message.append(path)
+        return Result::Err(message)
+    }
+    return Result::Ok(path)
+}
+
+// The source directories of the project's dependency packages, checked against `ryn.lock` when there is one: the name
+// and the directory of each, one after the other.
+pub fun dependency_directories(project_given: String) -> Result<Vec<String>, String> {
+    project := absolute(project_given)
+    package := load_package(project.clone())
+    when !package.error.is_empty() {
+        return Result::Err(manifest_error(project.clone(), package))
+    }
+    lock_path := join(project.clone(), "ryn.lock")
+    mut lock: Vec<Locked> = Vec()
+    mut have_lock := false
+    mut locked_text := String("")
+    when f_is_file(lock_path.clone()) {
+        read := f_read_result(lock_path.clone())
+        when read.is_err() {
+            mut message := String("error[R0430]: cannot read ")
+            message.append(lock_path)
+            return Result::Err(message)
+        }
+        parsed := parse_lock(read.unwrap())
+        when !parsed.valid {
+            mut message := String("error[R0430]: invalid ")
+            message.append(lock_path)
+            return Result::Err(message)
+        }
+        lock = parsed.entries.clone()
+        have_lock = true
+        locked_text = lock_text(parsed.root.clone(), parsed.entries.clone())
+    }
+    mut resolver := new_resolver(project.clone(), lock, have_lock, false)
+    when !resolver.collect(project.clone(), package.clone()) {
+        return Result::Err(resolver.error.clone())
+    }
+    when have_lock && locked_text != lock_text(package.name.clone(), resolver.packages.clone()) {
+        mut message := String("error[R0431]: ")
+        message.append(lock_path)
+        message.append(" does not match ryn.yaml or the resolved path dependencies; run ")
+        message.append(lock_hint(project))
+        return Result::Err(message)
+    }
+    mut pairs: Vec<String> = Vec()
+    mut at: u64 = 0
+    while at < resolver.names.len() {
+        pairs.push(resolver.names[at].clone())
+        pairs.push(resolver.directories[at].clone())
+        at += 1
+    }
+    return Result::Ok(pairs)
+}
