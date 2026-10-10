@@ -10,6 +10,7 @@ use middle::floatlib
 use middle::builtins
 use middle::methods
 
+#[derive(Clone)]
 pub struct Local {
     name: String,
     slot: u64,
@@ -44,6 +45,7 @@ pub struct ExplicitBorrow {
 }
 
 // A reference or raw pointer local and the local it points at, both as indices into `locals`.
+#[derive(Clone)]
 pub struct LocalOrigin {
     holder: u64,
     source: u64,
@@ -51,6 +53,7 @@ pub struct LocalOrigin {
 
 // A reference local that borrows another local: `holder` is the index of the reference in `locals`, and it is in
 // scope until that block ends. A mutable borrow makes any use of the borrowed local an error.
+#[derive(Clone)]
 pub struct ActiveBorrow {
     slot: u64,
     holder: u64,
@@ -58,6 +61,7 @@ pub struct ActiveBorrow {
 }
 
 // An owned local that a move has left, with the span of the move. The guard reports a later use of it.
+#[derive(Clone)]
 pub struct MovedValue {
     name: String,
     slot: u64,
@@ -105,6 +109,7 @@ pub struct EnumInfo {
 }
 
 // A `defer` body, with the locals that were visible where it was written.
+#[derive(Clone)]
 pub struct Deferred {
     body: Vec<u64>,
     visible: u64,
@@ -168,6 +173,11 @@ pub struct Lowering {
     alias_targets: Vec<u64>,
     // The statements that a statement needs before it runs, such as the temporaries that its method receivers borrow.
     setup: Vec<String>,
+    // Recovery, for `lower_recovering`: whether every independent error is collected, the diagnostics collected so far,
+    // and whether a failed `let` ends the block that holds it.
+    recovering: bool,
+    recovered: Vec<String>,
+    abandoned: bool,
 }
 
 // The IEEE bit pattern of a float literal's text, as the IR writes it.
@@ -779,7 +789,8 @@ fun repeat_copy_error(element: str, start: u64, end: u64) -> String {
 // `R0232` for a structure that contains itself by value. The structures are visited in order and each one's
 // by-value fields in order, depth first, as the bootstrap's layout pass does; the first field that reaches a
 // structure still in progress is reported. Structure `s`'s edges are `first[s]` .. `first[s] + count[s]`.
-fun struct_cycle_error(names: Vec<String>, first: Vec<u64>, count: Vec<u64>, targets: Vec<u64>, starts: Vec<u64>, ends: Vec<u64>) -> Option<String> {
+fun struct_cycle_errors(names: Vec<String>, first: Vec<u64>, count: Vec<u64>, targets: Vec<u64>, starts: Vec<u64>, ends: Vec<u64>) -> Vec<String> {
+    mut found: Vec<String> = Vec()
     mut states: Vec<u64> = Vec()
     mut slot: u64 = 0
     while slot < names.len() {
@@ -814,14 +825,14 @@ fun struct_cycle_error(names: Vec<String>, first: Vec<u64>, count: Vec<u64>, tar
                         mut message := String("structure `")
                         message.append(names[child].clone())
                         message.append("` contains itself by value")
-                        return Option::Some(diagnostic("R0232", starts[edge], ends[edge], message, String("break the recursive field chain; Ryn does not support indirect or recursive storage yet")))
+                        found.push(diagnostic("R0232", starts[edge], ends[edge], message, String("break the recursive field chain; Ryn does not support indirect or recursive storage yet")))
                     }
                 }
             }
         }
         start += 1
     }
-    return Option::None
+    return found
 }
 
 // `R0221` for a structure that declares no field, at the structure's span.
@@ -2418,11 +2429,12 @@ extend Lowering {
     fun inline(mut self, body: Vec<u64>) -> Result<Vec<String>, String> {
         start := self.statements.len()
         mut position: u64 = 0
-        while position < body.len() {
+        while position < body.len() && !self.abandoned {
             self.statement(body[position])?
             self.commit_moves()
             position += 1
         }
+        self.abandoned = false
         mut reversed: Vec<String> = Vec()
         while self.statements.len() > start {
             reversed.push(self.statements.pop().unwrap())
@@ -2570,7 +2582,8 @@ extend Lowering {
 
     // A field of a local that owns storage is moved out of its slot when used by value.
     // `R0225` for a field that the structure of a local value does not declare, at the field's name span.
-    // Tuples (their names start with `$`) and values that are not local structures are declined.
+    // Values that are not local structures are declined, and so are the built-in structures (their names start with `$`),
+    // except a tuple element `_N` that the tuple does not have, which the bootstrap reports as well.
     fun unknown_field(self, value: u64, name: String, name_span: ast::Span) -> Option<String> {
         place := self.place_of(value)
         when place.is_err() {
@@ -2581,7 +2594,7 @@ extend Lowering {
             return Option::None
         }
         definition := id.unwrap()
-        when self.structs[definition].name.starts_with("$") || self.field_index(definition, name.clone()).is_ok() {
+        when (self.structs[definition].name.starts_with("$") && !name.starts_with("_")) || self.field_index(definition, name.clone()).is_ok() {
             return Option::None
         }
         return Option::Some(self.unknown_struct_field(definition, name, name_span.start, name_span.end))
@@ -5626,11 +5639,12 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         }
         mut falls := true
         mut position: u64 = 0
-        while position < body.len() && falls {
+        while position < body.len() && falls && !self.abandoned {
             falls = !self.statement(body[position])?
             self.commit_moves()
             position += 1
         }
+        self.abandoned = false
         deferred := self.close_frame()?
         // A body that does not fall through leaves the deferred bodies unreachable, and the
         // guard drops statements after such a point.
@@ -5712,6 +5726,10 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
     // name (`R0202`) and before the body.
     fun for_statement(mut self, name: String, name_span: ast::Span, start: u64, end: u64, inclusive: bool, body: Vec<u64>) -> Result<bool, String> {
         when self.declared(name.clone()) {
+            when self.recovering {
+                self.recovered.push(range_loop_redeclared(name.clone(), name_span.start, name_span.end))
+                return self.for_after_redeclared(name, name_span, start, end, body)
+            }
             return Result::Err(range_loop_redeclared(name, name_span.start, name_span.end))
         }
         start_hint := self.operand_hint(end, true)?
@@ -5969,10 +5987,19 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         self.setup = Vec()
         start := self.statements.len()
         visible_before := self.visible
+        saved := self.checkpoint()
         lowered := self.statement_inner(index)
         when lowered.is_err() {
             self.setup = outer
             message := lowered.unwrap_err()
+            // In recovering mode a diagnostic ends this statement only: its state is put back, so that the statements after
+            // it are analyzed as if it had not been lowered. A failed `let` also ends its block, since the name is unknown.
+            when self.recovering && message.starts_with("diagnostic ") {
+                self.restore(saved)
+                self.recovered.push(message)
+                self.abandoned = self.is_let_statement(index)
+                return Result::Ok(self.is_return_statement(index))
+            }
             when message.contains(" @ ") || message.starts_with("diagnostic ") {
                 return Result::Err(message)
             }
@@ -6220,6 +6247,12 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
             return Result::Err(return_value_error(self.current_function.clone(), span.start, span.end))
         }
         returned := value.unwrap()
+        // `R0248`: where a call's reference result comes from is not tracked, so returning it is rejected whatever its
+        // arguments are. This is checked before the call is lowered, since the arguments need not be typed for it.
+        when self.return_ty.starts_with("Reference ") && self.returns_reference_call(returned) {
+            span_of := self.expr_span_of(returned)
+            return Result::Err(local_reference_error(span_of.start, span_of.end))
+        }
         lowered := self.moved_expression(returned, self.return_ty.clone())?
         // `R0248`: a reference result must come from a reference parameter, directly or through a slice parameter.
         when self.return_ty.starts_with("Reference ") && !self.reference_from_parameter(lowered.text.clone(), lowered.ty.clone()) {
@@ -6462,8 +6495,8 @@ extend Lowering {
     }
 }
 
-pub fun lower_program(program: ast::Program) -> Result<String, String> {
-    mut lowering := Lowering {
+fun new_lowering(program: ast::Program, recovering: bool) -> Lowering {
+    built := Lowering {
         program: program,
         signatures: Vec(),
         locals: Vec(),
@@ -6506,300 +6539,381 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         private_alias_targets: Vec(),
         alias_targets: Vec(),
         setup: Vec(),
+        recovering: recovering,
+        recovered: Vec(),
+        abandoned: false,
     }
-    // `R0453`: a shape declared twice in one module, or one that requires a method twice, as `validate_shape_declarations`.
-    declaration_failure := lowering.shape_declarations()
-    when declaration_failure.is_some() {
-        return Result::Err(declaration_failure.unwrap())
+    return built
+}
+
+pub fun lower_program(program: ast::Program) -> Result<String, String> {
+    mut lowering := new_lowering(program, false)
+    return lowering.lower()
+}
+
+// Lowers the program and reports every error that does not depend on another one: one `diagnostic` line each, in
+// source order. A construct the analysis does not handle declines the whole program, as `lower_program` does.
+pub fun lower_recovering(program: ast::Program) -> Result<String, String> {
+    mut lowering := new_lowering(program, true)
+    outcome := lowering.lower()
+    when outcome.is_ok() && lowering.recovered.len() == 0 {
+        return outcome
     }
-    // `R0450`: an `extend ... as Shape` block whose structure does not conform to the shape, checked before the defaults are added.
-    shape_failure := lowering.shape_conformance()
-    when shape_failure.is_some() {
-        return Result::Err(shape_failure.unwrap())
-    }
-    lowering.add_shape_defaults()
-    mut struct_position: u64 = 0
-    while struct_position < lowering.program.structs.len() {
-        definition := lowering.program.struct_defs[lowering.program.structs[struct_position]]
-        lowering.type_names.push(definition.name.clone())
-        lowering.type_words.push(struct_word(struct_position))
-        struct_position += 1
-    }
-    mut enum_position: u64 = 0
-    while enum_position < lowering.program.enums.len() {
-        definition := lowering.program.enum_defs[lowering.program.enums[enum_position]]
-        when !definition.type_parameters.is_empty() {
-            return Result::Err(unsupported("generic enum"))
+    when outcome.is_err() {
+        message := outcome.unwrap_err()
+        when !message.is_empty() && !message.starts_with("diagnostic ") {
+            return Result::Err(message)
         }
-        lowering.type_names.push(definition.name.clone())
-        lowering.type_words.push(join(words2(String("Enum"), num(enum_position))))
-        enum_position += 1
+        // An empty message ends the analysis after its diagnostics, which are already recorded.
+        when message.starts_with("diagnostic ") {
+            lowering.recovered.push(message)
+        }
     }
-    lowering.add_type_aliases()
-    mut alias_position: u64 = 0
-    while alias_position < lowering.program.type_aliases.len() {
-        alias := lowering.program.alias_defs[lowering.program.type_aliases[alias_position]]
-        // A generic alias is expanded where it is used; only plain aliases name a type.
-        when alias.type_parameters.is_empty() {
-            target := lowering.resolve(alias.ty)?
-            lowering.type_names.push(alias.name.clone())
-            lowering.type_words.push(target)
+    mut text := String("")
+    for item in sort_by_start(lowering.recovered.clone()) {
+        when text.len() > 0 {
+            text.append("\n")
         }
-        alias_position += 1
+        text.append(item)
     }
-    mut structs: Vec<StructInfo> = Vec()
-    // The by-value structure fields, grouped by their structure, for the cycle check after the loop.
-    mut struct_names: Vec<String> = Vec()
-    mut struct_first: Vec<u64> = Vec()
-    mut struct_edge_count: Vec<u64> = Vec()
-    mut edge_targets: Vec<u64> = Vec()
-    mut edge_starts: Vec<u64> = Vec()
-    mut edge_ends: Vec<u64> = Vec()
-    mut struct_index: u64 = 0
-    while struct_index < lowering.program.structs.len() {
-        definition := lowering.program.struct_defs[lowering.program.structs[struct_index]]
-        lowering.scope_path = declaration_namespace(definition.name.clone(), definition.module_path.clone())
-        // `derive` adds generated functions to the IR, which this subset does not write yet.
-        when !definition.type_parameters.is_empty() {
-            return Result::Err(unsupported("structure with generics"))
+    return Result::Err(text)
+}
+
+extend Lowering {
+    fun lower(mut self) -> Result<String, String> {
+        // `R0453`: a shape declared twice in one module, or one that requires a method twice, as `validate_shape_declarations`.
+        declaration_failure := self.shape_declarations()
+        when declaration_failure.is_some() {
+            return Result::Err(declaration_failure.unwrap())
         }
-        // `R0221`: a structure that declares no field, at the structure.
-        when definition.fields.is_empty() {
-            return Result::Err(empty_structure_error(definition.span.start, definition.span.end))
+        // `R0450`: an `extend ... as Shape` block whose structure does not conform to the shape, checked before the defaults are added.
+        shape_failure := self.shape_conformance()
+        when shape_failure.is_some() {
+            return Result::Err(shape_failure.unwrap())
         }
-        mut drop_name := String("")
-        when definition.drop_function.is_some() {
-            drop_name = definition.drop_function.unwrap()
+        // The declarations named twice, as the bootstrap's first pass finds them. Recovering mode reports all of them and
+        // stops before the other declarations.
+        duplicates := self.duplicate_declarations()
+        when duplicates.len() > 0 {
+            when !self.recovering {
+                return Result::Err(duplicates[0].clone())
+            }
+            for found in duplicates {
+                self.recovered.push(found)
+            }
+            return Result::Err(String(""))
         }
-        // `R0255`: a destructor must name a function of the program (a method is not one). In a module the bootstrap
-        // resolves the name through the module, which is not modelled, so a name that is not found there is declined.
-        when !drop_name.is_empty() {
-            mut named := false
-            for function_index in lowering.program.functions.clone() {
-                function_of := lowering.program.function_defs[function_index]
-                when function_of.name == drop_name && !(function_of.parameters.len() > 0 && lowering.program.parameters[function_of.parameters[0]].name == "self") {
-                    named = true
+        self.add_shape_defaults()
+        mut struct_position: u64 = 0
+        while struct_position < self.program.structs.len() {
+            definition := self.program.struct_defs[self.program.structs[struct_position]]
+            self.type_names.push(definition.name.clone())
+            self.type_words.push(struct_word(struct_position))
+            struct_position += 1
+        }
+        mut enum_position: u64 = 0
+        while enum_position < self.program.enums.len() {
+            definition := self.program.enum_defs[self.program.enums[enum_position]]
+            when !definition.type_parameters.is_empty() {
+                return Result::Err(unsupported("generic enum"))
+            }
+            self.type_names.push(definition.name.clone())
+            self.type_words.push(join(words2(String("Enum"), num(enum_position))))
+            enum_position += 1
+        }
+        self.add_type_aliases()
+        mut alias_position: u64 = 0
+        while alias_position < self.program.type_aliases.len() {
+            alias := self.program.alias_defs[self.program.type_aliases[alias_position]]
+            // A generic alias is expanded where it is used; only plain aliases name a type.
+            when alias.type_parameters.is_empty() {
+                target := self.resolve(alias.ty)?
+                self.type_names.push(alias.name.clone())
+                self.type_words.push(target)
+            }
+            alias_position += 1
+        }
+        mut structs: Vec<StructInfo> = Vec()
+        // The by-value structure fields, grouped by their structure, for the cycle check after the loop.
+        mut struct_names: Vec<String> = Vec()
+        mut struct_first: Vec<u64> = Vec()
+        mut struct_edge_count: Vec<u64> = Vec()
+        mut edge_targets: Vec<u64> = Vec()
+        mut edge_starts: Vec<u64> = Vec()
+        mut edge_ends: Vec<u64> = Vec()
+        mut struct_index: u64 = 0
+        while struct_index < self.program.structs.len() {
+            definition := self.program.struct_defs[self.program.structs[struct_index]]
+            self.scope_path = declaration_namespace(definition.name.clone(), definition.module_path.clone())
+            // `derive` adds generated functions to the IR, which this subset does not write yet.
+            when !definition.type_parameters.is_empty() {
+                return Result::Err(unsupported("structure with generics"))
+            }
+            // `R0221`: a structure that declares no field, at the structure.
+            when definition.fields.is_empty() {
+                self.report(empty_structure_error(definition.span.start, definition.span.end))?
+            }
+            mut drop_name := String("")
+            when definition.drop_function.is_some() {
+                drop_name = definition.drop_function.unwrap()
+            }
+            // `R0255`: a destructor must name a function of the program (a method is not one). In a module the bootstrap
+            // resolves the name through the module, which is not modelled, so a name that is not found there is declined.
+            when !drop_name.is_empty() {
+                mut named := false
+                for function_index in self.program.functions.clone() {
+                    function_of := self.program.function_defs[function_index]
+                    when function_of.name == drop_name && !(function_of.parameters.len() > 0 && self.program.parameters[function_of.parameters[0]].name == "self") {
+                        named = true
+                    }
+                }
+                when !named {
+                    when !definition.module_path.is_empty() {
+                        return Result::Err(unsupported("destructor of a structure in a module"))
+                    }
+                    mut message := String("destructor function `")
+                    message.append(drop_name.clone())
+                    message.append("` was not found")
+                    self.report(diagnostic("R0255", definition.span.start, definition.span.end, message, String("")))?
                 }
             }
-            when !named {
-                when !definition.module_path.is_empty() {
-                    return Result::Err(unsupported("destructor of a structure in a module"))
+            mut repr: u64 = 0
+            when definition.repr_c {
+                repr = 1
+            }
+            mut clone_flag: u64 = 0
+            mut hash_flag: u64 = 0
+            for derive in definition.derives {
+                when derive == "Clone" {
+                    clone_flag = 1
                 }
-                mut message := String("destructor function `")
-                message.append(drop_name.clone())
-                message.append("` was not found")
-                return Result::Err(diagnostic("R0255", definition.span.start, definition.span.end, message, String("")))
+                when derive == "Hash" {
+                    hash_flag = 1
+                }
+            }
+            mut field_names: Vec<String> = Vec()
+            mut field_types: Vec<String> = Vec()
+            mut field_public: Vec<u64> = Vec()
+            mut field_position: u64 = 0
+            first_edge := edge_targets.len()
+            while field_position < definition.fields.len() {
+                field := self.program.struct_fields[definition.fields[field_position]]
+                // `R0222`: a field name that an earlier field of the structure already has, at the field's span.
+                mut earlier: u64 = 0
+                mut repeated := false
+                while earlier < field_names.len() {
+                    when field_names[earlier] == field.name {
+                        repeated = true
+                    }
+                    earlier += 1
+                }
+                when repeated {
+                    self.report(duplicate_field_error(field.name.clone(), field.span.start, field.span.end))?
+                }
+                field_names.push(field.name.clone())
+                resolved_type := self.resolve(field.ty)
+                when resolved_type.is_err() {
+                    self.report(resolved_type.unwrap_err())?
+                    field_position += 1
+                    continue
+                }
+                resolved := resolved_type.unwrap()
+                when struct_id_of(resolved.clone()).is_some() {
+                    edge_targets.push(struct_id_of(resolved.clone()).unwrap())
+                    edge_starts.push(field.span.start)
+                    edge_ends.push(field.span.end)
+                }
+                field_types.push(resolved)
+                mut public: u64 = 0
+                when field.public {
+                    public = 1
+                }
+                field_public.push(public)
+                field_position += 1
+            }
+            struct_names.push(definition.name.clone())
+            struct_first.push(first_edge)
+            struct_edge_count.push(edge_targets.len() - first_edge)
+            // `R0255`: a custom destructor needs a non-`repr(C)` structure whose first field is a raw pointer and whose fields
+            // are all scalars, raw pointers or `String`.
+            when !drop_name.is_empty() {
+                mut allowed := field_types.len() > 0 && field_types[0].starts_with("RawPointer ") && repr == 0
+                for field_type in field_types.clone() {
+                    when !destructor_field_type(field_type) {
+                        allowed = false
+                    }
+                }
+                when !allowed {
+                    self.report(destructor_layout_error(definition.span.start, definition.span.end))?
+                }
+            }
+            structs.push(StructInfo { name: definition.name, field_names: field_names, field_types: field_types, field_public: field_public, repr_c: repr, derives_clone: clone_flag, derives_hash: hash_flag, drop_name: drop_name, module_path: definition.module_path.clone(), public: definition.public })
+            struct_index += 1
+        }
+        for cycle in struct_cycle_errors(struct_names, struct_first, struct_edge_count, edge_targets, edge_starts, edge_ends) {
+            self.report(cycle)?
+        }
+        when self.recovering && self.recovered.len() > 0 {
+            return Result::Err(String(""))
+        }
+        mut enums: Vec<EnumInfo> = Vec()
+        mut enum_index: u64 = 0
+        while enum_index < self.program.enums.len() {
+            definition := self.program.enum_defs[self.program.enums[enum_index]]
+            self.scope_path = declaration_namespace(definition.name.clone(), definition.module_path.clone())
+            mut variant_names: Vec<String> = Vec()
+            mut variant_counts: Vec<u64> = Vec()
+            mut field_types: Vec<String> = Vec()
+            mut variant_position: u64 = 0
+            while variant_position < definition.variants.len() {
+                variant := self.program.variant_defs[definition.variants[variant_position]]
+                variant_names.push(variant.name.clone())
+                variant_counts.push(variant.fields.len())
+                mut field_position: u64 = 0
+                while field_position < variant.fields.len() {
+                    field_types.push(self.resolve(variant.fields[field_position])?)
+                    field_position += 1
+                }
+                variant_position += 1
+            }
+            enums.push(EnumInfo { name: definition.name, variant_names: variant_names, variant_counts: variant_counts, field_types: field_types })
+            enum_index += 1
+        }
+        enums = with_builtin_enums(enums)
+        count := self.program.functions.len()
+        self.structs = structs
+        when self.recovering {
+            for found in self.signature_errors() {
+                self.recovered.push(found)
+            }
+            when self.recovered.len() > 0 {
+                return Result::Err(String(""))
             }
         }
-        mut repr: u64 = 0
-        when definition.repr_c {
-            repr = 1
-        }
-        mut clone_flag: u64 = 0
-        mut hash_flag: u64 = 0
-        for derive in definition.derives {
-            when derive == "Clone" {
-                clone_flag = 1
+        mut signatures: Vec<Signature> = Vec()
+        mut main_index: u64 = count
+        mut position: u64 = 0
+        while position < count {
+            definition := self.program.function_defs[self.program.functions[position]]
+            // The bootstrap's signature key: the name, with `#method` for a function whose first parameter is `self`.
+            mut key := definition.name.clone()
+            when definition.parameters.len() > 0 && self.program.parameters[definition.parameters[0]].name == "self" && !definition.name.starts_with("String::") {
+                key.append("#method")
             }
-            when derive == "Hash" {
-                hash_flag = 1
-            }
-        }
-        mut field_names: Vec<String> = Vec()
-        mut field_types: Vec<String> = Vec()
-        mut field_public: Vec<u64> = Vec()
-        mut field_position: u64 = 0
-        first_edge := edge_targets.len()
-        while field_position < definition.fields.len() {
-            field := lowering.program.struct_fields[definition.fields[field_position]]
-            // `R0222`: a field name that an earlier field of the structure already has, at the field's span.
+            // `R0201` for a function whose key an earlier function already has, before its signature is read.
             mut earlier: u64 = 0
-            while earlier < field_names.len() {
-                when field_names[earlier] == field.name {
-                    return Result::Err(duplicate_field_error(field.name.clone(), field.span.start, field.span.end))
+            while earlier < signatures.len() {
+                when signatures[earlier].name == key {
+                    return Result::Err(duplicate_function_error(definition.name, definition.span.start, definition.span.end))
                 }
                 earlier += 1
             }
-            field_names.push(field.name.clone())
-            resolved := lowering.resolve(field.ty)?
-            when struct_id_of(resolved.clone()).is_some() {
-                edge_targets.push(struct_id_of(resolved.clone()).unwrap())
-                edge_starts.push(field.span.start)
-                edge_ends.push(field.span.end)
-            }
-            field_types.push(resolved)
-            mut public: u64 = 0
-            when field.public {
-                public = 1
-            }
-            field_public.push(public)
-            field_position += 1
-        }
-        struct_names.push(definition.name.clone())
-        struct_first.push(first_edge)
-        struct_edge_count.push(edge_targets.len() - first_edge)
-        // `R0255`: a custom destructor needs a non-`repr(C)` structure whose first field is a raw pointer and whose fields
-        // are all scalars, raw pointers or `String`.
-        when !drop_name.is_empty() {
-            mut allowed := field_types.len() > 0 && field_types[0].starts_with("RawPointer ") && repr == 0
-            for field_type in field_types.clone() {
-                when !destructor_field_type(field_type) {
-                    allowed = false
-                }
-            }
-            when !allowed {
-                return Result::Err(destructor_layout_error(definition.span.start, definition.span.end))
-            }
-        }
-        structs.push(StructInfo { name: definition.name, field_names: field_names, field_types: field_types, field_public: field_public, repr_c: repr, derives_clone: clone_flag, derives_hash: hash_flag, drop_name: drop_name, module_path: definition.module_path.clone(), public: definition.public })
-        struct_index += 1
-    }
-    cycle := struct_cycle_error(struct_names, struct_first, struct_edge_count, edge_targets, edge_starts, edge_ends)
-    when cycle.is_some() {
-        return Result::Err(cycle.unwrap())
-    }
-    mut enums: Vec<EnumInfo> = Vec()
-    mut enum_index: u64 = 0
-    while enum_index < lowering.program.enums.len() {
-        definition := lowering.program.enum_defs[lowering.program.enums[enum_index]]
-        lowering.scope_path = declaration_namespace(definition.name.clone(), definition.module_path.clone())
-        mut variant_names: Vec<String> = Vec()
-        mut variant_counts: Vec<u64> = Vec()
-        mut field_types: Vec<String> = Vec()
-        mut variant_position: u64 = 0
-        while variant_position < definition.variants.len() {
-            variant := lowering.program.variant_defs[definition.variants[variant_position]]
-            variant_names.push(variant.name.clone())
-            variant_counts.push(variant.fields.len())
-            mut field_position: u64 = 0
-            while field_position < variant.fields.len() {
-                field_types.push(lowering.resolve(variant.fields[field_position])?)
-                field_position += 1
-            }
-            variant_position += 1
-        }
-        enums.push(EnumInfo { name: definition.name, variant_names: variant_names, variant_counts: variant_counts, field_types: field_types })
-        enum_index += 1
-    }
-    enums = with_builtin_enums(enums)
-    count := lowering.program.functions.len()
-    lowering.structs = structs
-    mut signatures: Vec<Signature> = Vec()
-    mut main_index: u64 = count
-    mut position: u64 = 0
-    while position < count {
-        definition := lowering.program.function_defs[lowering.program.functions[position]]
-        // The bootstrap's signature key: the name, with `#method` for a function whose first parameter is `self`.
-        mut key := definition.name.clone()
-        when definition.parameters.len() > 0 && lowering.program.parameters[definition.parameters[0]].name == "self" && !definition.name.starts_with("String::") {
-            key.append("#method")
-        }
-        // `R0201` for a function whose key an earlier function already has, before its signature is read.
-        mut earlier: u64 = 0
-        while earlier < signatures.len() {
-            when signatures[earlier].name == key {
-                return Result::Err(duplicate_function_error(definition.name, definition.span.start, definition.span.end))
-            }
-            earlier += 1
-        }
 
-        // A signature names types as its function's namespace does, as the body does.
-        lowering.scope_path = declaration_namespace(definition.name.clone(), definition.module_path.clone())
-        mut params: Vec<String> = Vec()
-        mut parameter_index: u64 = 0
-        while parameter_index < definition.parameters.len() {
-            parameter := lowering.program.parameters[definition.parameters[parameter_index]]
-            params.push(lowering.resolve(parameter.ty)?)
-            parameter_index += 1
-        }
-        mut ret := String("")
-        when definition.return_type.is_some() {
-            ret = lowering.resolve(definition.return_type.unwrap())?
-        }
-        // `R0247`: an `extern "C"` signature with a value the C ABI does not pass, and an `extern "C"` `main`.
-        when definition.extern_c {
-            for word in params.clone() {
-                when lowering.c_parameter_status(word) == 1 {
+            // A signature names types as its function's namespace does, as the body does.
+            self.scope_path = declaration_namespace(definition.name.clone(), definition.module_path.clone())
+            mut params: Vec<String> = Vec()
+            mut parameter_index: u64 = 0
+            while parameter_index < definition.parameters.len() {
+                parameter := self.program.parameters[definition.parameters[parameter_index]]
+                params.push(self.resolve(parameter.ty)?)
+                parameter_index += 1
+            }
+            mut ret := String("")
+            when definition.return_type.is_some() {
+                ret = self.resolve(definition.return_type.unwrap())?
+            }
+            // `R0247`: an `extern "C"` signature with a value the C ABI does not pass, and an `extern "C"` `main`.
+            when definition.extern_c {
+                for word in params.clone() {
+                    when self.c_parameter_status(word) == 1 {
+                        return Result::Err(c_abi_error(definition.span.start, definition.span.end))
+                    }
+                }
+                when !ret.is_empty() && self.c_return_status(ret.clone()) == 1 {
                     return Result::Err(c_abi_error(definition.span.start, definition.span.end))
                 }
-            }
-            when !ret.is_empty() && lowering.c_return_status(ret.clone()) == 1 {
-                return Result::Err(c_abi_error(definition.span.start, definition.span.end))
+                when definition.name == "main" {
+                    return Result::Err(extern_main_error(definition.span.start, definition.span.end))
+                }
             }
             when definition.name == "main" {
-                return Result::Err(extern_main_error(definition.span.start, definition.span.end))
+                // `R0208`: `main` takes no parameters and returns no value or `i32`.
+                when !params.is_empty() || (!ret.is_empty() && ret != "I32") {
+                    return Result::Err(main_signature_error(definition.span.start, definition.span.end))
+                }
+                main_index = position
             }
+            returned := self.returned_parameter(definition.body.clone(), definition.return_value, definition.parameters.clone(), ret.clone())
+            signatures.push(Signature { name: key, params: params, ret: ret, public: definition.public, module: definition.module_path.clone(), return_param: returned })
+            position += 1
         }
-        when definition.name == "main" {
-            // `R0208`: `main` takes no parameters and returns no value or `i32`.
-            when !params.is_empty() || (!ret.is_empty() && ret != "I32") {
-                return Result::Err(main_signature_error(definition.span.start, definition.span.end))
+        when main_index == count {
+            return Result::Err(unsupported("no main function"))
+        }
+        self.scope_path = String("")
+        self.call_scope = String("")
+        self.module = String("")
+        // `#[derive(Clone)]` adds a `clone` method per structure after the program's own functions.
+        mut clone_structs: Vec<u64> = Vec()
+        mut derive_index: u64 = 0
+        while derive_index < self.structs.len() {
+            mut clone_key := self.structs[derive_index].name.clone()
+            clone_key.append("::clone#method")
+            mut present := false
+            for known in signatures.clone() {
+                when known.name == clone_key {
+                    present = true
+                }
             }
-            main_index = position
-        }
-        returned := lowering.returned_parameter(definition.body.clone(), definition.return_value, definition.parameters.clone(), ret.clone())
-        signatures.push(Signature { name: key, params: params, ret: ret, public: definition.public, module: definition.module_path.clone(), return_param: returned })
-        position += 1
-    }
-    when main_index == count {
-        return Result::Err(unsupported("no main function"))
-    }
-    lowering.scope_path = String("")
-    lowering.call_scope = String("")
-    lowering.module = String("")
-    // `#[derive(Clone)]` adds a `clone` method per structure after the program's own functions.
-    mut clone_structs: Vec<u64> = Vec()
-    mut derive_index: u64 = 0
-    while derive_index < lowering.structs.len() {
-        mut clone_key := lowering.structs[derive_index].name.clone()
-        clone_key.append("::clone#method")
-        mut present := false
-        for known in signatures.clone() {
-            when known.name == clone_key {
-                present = true
+            when self.structs[derive_index].derives_clone == 1 && !present {
+                mut self_type := String("Reference ")
+                self_type.append(struct_word(derive_index))
+                self_type.append(" 0")
+                mut clone_params: Vec<String> = Vec()
+                clone_params.push(self_type)
+                signatures.push(Signature { name: clone_key, params: clone_params, ret: struct_word(derive_index), public: true, module: self.structs[derive_index].module_path.clone(), return_param: Option::None })
+                clone_structs.push(derive_index)
             }
+            derive_index += 1
         }
-        when lowering.structs[derive_index].derives_clone == 1 && !present {
-            mut self_type := String("Reference ")
-            self_type.append(struct_word(derive_index))
-            self_type.append(" 0")
-            mut clone_params: Vec<String> = Vec()
-            clone_params.push(self_type)
-            signatures.push(Signature { name: clone_key, params: clone_params, ret: struct_word(derive_index), public: true, module: lowering.structs[derive_index].module_path.clone(), return_param: Option::None })
-            clone_structs.push(derive_index)
-        }
-        derive_index += 1
-    }
-    lowering.signatures = signatures
-    lowering.enums = enums
-    lowering.add_aliases()
-    mut functions: Vec<String> = Vec()
-    mut id: u64 = 0
-    while id < count {
-        // The bounds of a function are checked before its body, as the bootstrap's `prepare_function` does.
-        bound_failure := lowering.bound_conformance(id)
-        when bound_failure.is_some() {
-            return Result::Err(bound_failure.unwrap())
-        }
-        lowered_function := lowering.function(id)
-        when lowered_function.is_err() {
-            message := lowered_function.unwrap_err()
-            when message.contains(" @ ") || message.starts_with("diagnostic ") {
-                return Result::Err(message)
+        self.signatures = signatures
+        self.enums = enums
+        self.add_aliases()
+        mut functions: Vec<String> = Vec()
+        mut id: u64 = 0
+        while id < count {
+            // The bounds of a function are checked before its body, as the bootstrap's `prepare_function` does.
+            bound_failure := self.bound_conformance(id)
+            when bound_failure.is_some() {
+                self.report(bound_failure.unwrap())?
+                id += 1
+                continue
             }
-            mut located := message
-            located.append(" @ ")
-            located.append(lowering.current_function.clone())
-            located.append(" 0")
-            return Result::Err(located)
+            lowered_function := self.function(id)
+            when lowered_function.is_err() {
+                message := lowered_function.unwrap_err()
+                when message.contains(" @ ") || message.starts_with("diagnostic ") {
+                    self.report(message)?
+                    id += 1
+                    continue
+                }
+                mut located := message
+                located.append(" @ ")
+                located.append(self.current_function.clone())
+                located.append(" 0")
+                return Result::Err(located)
+            }
+            functions.push(lowered_function.unwrap())
+            id += 1
         }
-        functions.push(lowered_function.unwrap())
-        id += 1
+        for struct_id in clone_structs {
+            functions.push(self.clone_function(struct_id))
+        }
+        when self.recovering && self.recovered.len() > 0 {
+            return Result::Err(String(""))
+        }
+        return Result::Ok(assemble(main_index, self.struct_records()?, functions, self.user_enum_records()))
     }
-    for struct_id in clone_structs {
-        functions.push(lowering.clone_function(struct_id))
-    }
-    return Result::Ok(assemble(main_index, lowering.struct_records()?, functions, lowering.user_enum_records()))
 }
 
 extend Lowering {
@@ -7051,6 +7165,11 @@ extend Lowering {
         self.continue_moves = Vec()
         self.borrows = Vec()
         self.origins = Vec()
+        self.defers = Vec()
+        self.defer_depth = 0
+        self.borrow_chain = false
+        self.setup = Vec()
+        self.abandoned = false
         self.open_frame()
         definition := self.program.function_defs[self.program.functions[id]]
         self.scope_path = declaration_namespace(definition.name.clone(), definition.module_path.clone())
@@ -7090,10 +7209,15 @@ extend Lowering {
         }
         mut falls_through := true
         mut position: u64 = 0
-        while position < definition.body.len() && falls_through {
+        while position < definition.body.len() && falls_through && !self.abandoned {
             falls_through = !self.statement(definition.body[position])?
             self.commit_moves()
             position += 1
+        }
+        // A failed `let` at the top level of the body ends the analysis of the function; its diagnostics are recorded.
+        when self.abandoned {
+            self.abandoned = false
+            return Result::Ok(String(""))
         }
         // The function's own defers run after its body, and after the result is computed.
         mut deferred := self.close_frame()?
@@ -9818,4 +9942,352 @@ fun method_conformance_text(structure: String, method: String, detail: String) -
     message.append("` ")
     message.append(detail)
     return message
+}
+
+// The start offset that a `diagnostic` line gives: `diagnostic CODE START END LINE:message help`.
+fun diagnostic_start(text: String) -> u64 {
+    mut at: u64 = 11
+    while at < text.len() && text.byte_at(at) != (32 as u8) {
+        at += 1
+    }
+    at += 1
+    mut start: u64 = 0
+    while at < text.len() && text.byte_at(at) != (32 as u8) {
+        start = start * 10 + ((text.byte_at(at) as u64) - 48)
+        at += 1
+    }
+    return start
+}
+
+// The diagnostics in source order. Diagnostics that start at the same offset keep the order they were found in.
+fun sort_by_start(diagnostics: Vec<String>) -> Vec<String> {
+    mut used: Vec<u64> = Vec()
+    for item in diagnostics.clone() {
+        used.push(0)
+    }
+    mut sorted: Vec<String> = Vec()
+    mut placed: u64 = 0
+    while placed < diagnostics.len() {
+        mut best: u64 = diagnostics.len()
+        mut best_start: u64 = 0
+        mut at: u64 = 0
+        while at < diagnostics.len() {
+            when used[at] == 0 {
+                start := diagnostic_start(diagnostics[at].clone())
+                when best == diagnostics.len() || start < best_start {
+                    best = at
+                    best_start = start
+                }
+            }
+            at += 1
+        }
+        used.set(best, 1)
+        sorted.push(diagnostics[best].clone())
+        placed += 1
+    }
+    return sorted
+}
+
+// The analysis state that a statement can change. In recovering mode a statement that fails puts it back, so that the
+// statements after it are analyzed as if the failed one had not been lowered.
+pub struct Checkpoint {
+    locals: Vec<Local>,
+    local_types: Vec<String>,
+    addressed_types: Vec<String>,
+    c_addressed: Vec<u64>,
+    c_loop_written: Vec<u64>,
+    statements: Vec<String>,
+    loop_depth: u64,
+    visible: u64,
+    loop_floors: Vec<u64>,
+    owners: Vec<String>,
+    defers: Vec<Deferred>,
+    defer_depth: u64,
+    frame_marks: Vec<u64>,
+    loop_frames: Vec<u64>,
+    scope_floors: Vec<u64>,
+    borrow_chain: bool,
+    returned_refs: Vec<String>,
+    moved_names: Vec<MovedValue>,
+    pending_moves: Vec<MovedValue>,
+    break_moves: Vec<MovedValue>,
+    continue_moves: Vec<MovedValue>,
+    borrows: Vec<ActiveBorrow>,
+    origins: Vec<LocalOrigin>,
+    param_slots: Vec<u64>,
+}
+
+extend Lowering {
+    // The state a statement may change, copied before it runs. Outside recovering mode nothing is copied.
+    fun checkpoint(self) -> Checkpoint {
+        when !self.recovering {
+            return Checkpoint { locals: Vec(), local_types: Vec(), addressed_types: Vec(), c_addressed: Vec(), c_loop_written: Vec(), statements: Vec(), loop_depth: 0, visible: 0, loop_floors: Vec(), owners: Vec(), defers: Vec(), defer_depth: 0, frame_marks: Vec(), loop_frames: Vec(), scope_floors: Vec(), borrow_chain: false, returned_refs: Vec(), moved_names: Vec(), pending_moves: Vec(), break_moves: Vec(), continue_moves: Vec(), borrows: Vec(), origins: Vec(), param_slots: Vec() }
+        }
+        return Checkpoint { locals: self.locals.clone(), local_types: self.local_types.clone(), addressed_types: self.addressed_types.clone(), c_addressed: self.c_addressed.clone(), c_loop_written: self.c_loop_written.clone(), statements: self.statements.clone(), loop_depth: self.loop_depth, visible: self.visible, loop_floors: self.loop_floors.clone(), owners: self.owners.clone(), defers: self.defers.clone(), defer_depth: self.defer_depth, frame_marks: self.frame_marks.clone(), loop_frames: self.loop_frames.clone(), scope_floors: self.scope_floors.clone(), borrow_chain: self.borrow_chain, returned_refs: self.returned_refs.clone(), moved_names: self.moved_names.clone(), pending_moves: self.pending_moves.clone(), break_moves: self.break_moves.clone(), continue_moves: self.continue_moves.clone(), borrows: self.borrows.clone(), origins: self.origins.clone(), param_slots: self.param_slots.clone() }
+    }
+
+    fun restore(mut self, saved: Checkpoint) {
+        self.locals = saved.locals
+        self.local_types = saved.local_types
+        self.addressed_types = saved.addressed_types
+        self.c_addressed = saved.c_addressed
+        self.c_loop_written = saved.c_loop_written
+        self.statements = saved.statements
+        self.loop_depth = saved.loop_depth
+        self.visible = saved.visible
+        self.loop_floors = saved.loop_floors
+        self.owners = saved.owners
+        self.defers = saved.defers
+        self.defer_depth = saved.defer_depth
+        self.frame_marks = saved.frame_marks
+        self.loop_frames = saved.loop_frames
+        self.scope_floors = saved.scope_floors
+        self.borrow_chain = saved.borrow_chain
+        self.returned_refs = saved.returned_refs
+        self.moved_names = saved.moved_names
+        self.pending_moves = saved.pending_moves
+        self.break_moves = saved.break_moves
+        self.continue_moves = saved.continue_moves
+        self.borrows = saved.borrows
+        self.origins = saved.origins
+        self.param_slots = saved.param_slots
+    }
+}
+
+// The declaration errors of the bootstrap's first pass: a name declared twice, and a name that a structure and an enum
+// share. A function declared twice is found here only in recovering mode; the signature loop finds the first otherwise.
+fun listed(names: Vec<String>, name: String) -> bool {
+    for known in names {
+        when known == name {
+            return true
+        }
+    }
+    return false
+}
+
+fun duplicate_structure_error(name: String, start: u64, end: u64) -> String {
+    mut message := String("duplicate structure `")
+    message.append(name)
+    message.append("`")
+    return diagnostic("R0220", start, end, message, String("give each structure a unique name"))
+}
+
+fun duplicate_enum_error(name: String, start: u64, end: u64) -> String {
+    mut message := String("duplicate enum `")
+    message.append(name)
+    message.append("`")
+    return diagnostic("R0238", start, end, message, String("give each enum a unique name"))
+}
+
+fun enum_named_as_structure_error(name: String, start: u64, end: u64) -> String {
+    mut message := String("enum `")
+    message.append(name)
+    message.append("` has the same name as a structure")
+    return diagnostic("R0238", start, end, message, String("give each type a unique name"))
+}
+
+fun structure_named_as_enum_error(name: String, start: u64, end: u64) -> String {
+    mut message := String("structure `")
+    message.append(name)
+    message.append("` has the same name as an enum")
+    return diagnostic("R0238", start, end, message, String("give each type a unique name"))
+}
+
+// Whether a statement is a `let`, and whether it is a `return`: the two kinds of statement that end a block or a function
+// when they fail in recovering mode.
+extend Lowering {
+    fun is_let_statement(self, index: u64) -> bool {
+        choose self.program.stmts[index] {
+            ast::Stmt::LetS(name, mutable, annotation, value, span) => true,
+            _ => false,
+        }
+    }
+
+    fun is_return_statement(self, index: u64) -> bool {
+        choose self.program.stmts[index] {
+            ast::Stmt::ReturnS(value, span) => true,
+            _ => false,
+        }
+    }
+
+    // Reports a diagnostic. Outside recovering mode it stops the analysis, so the caller propagates it with `?`. In
+    // recovering mode it is recorded and the caller goes on with the next item. A construct the analysis does not handle
+    // is never recorded: it stops the analysis in both modes.
+    fun report(mut self, message: String) -> Result<bool, String> {
+        when !self.recovering || !message.starts_with("diagnostic ") {
+            return Result::Err(message)
+        }
+        self.recovered.push(message)
+        return Result::Ok(true)
+    }
+
+    // The declarations named twice, in the bootstrap's order: structures, enums, an enum or structure that shares a name
+    // with the other kind, and in recovering mode the functions.
+    fun duplicate_declarations(self) -> Vec<String> {
+        mut found: Vec<String> = Vec()
+        mut structure_names: Vec<String> = Vec()
+        for index in self.program.structs.clone() {
+            definition := self.program.struct_defs[index]
+            when listed(structure_names.clone(), definition.name.clone()) {
+                found.push(duplicate_structure_error(definition.name.clone(), definition.span.start, definition.span.end))
+            } else {
+                structure_names.push(definition.name.clone())
+            }
+        }
+        mut enum_names: Vec<String> = Vec()
+        for index in self.program.enums.clone() {
+            definition := self.program.enum_defs[index]
+            when listed(enum_names.clone(), definition.name.clone()) {
+                found.push(duplicate_enum_error(definition.name.clone(), definition.span.start, definition.span.end))
+            } else when listed(structure_names.clone(), definition.name.clone()) {
+                found.push(enum_named_as_structure_error(definition.name.clone(), definition.span.start, definition.span.end))
+            } else {
+                enum_names.push(definition.name.clone())
+            }
+        }
+        for index in self.program.structs.clone() {
+            definition := self.program.struct_defs[index]
+            when listed(enum_names.clone(), definition.name.clone()) {
+                found.push(structure_named_as_enum_error(definition.name.clone(), definition.span.start, definition.span.end))
+            }
+        }
+        when self.recovering {
+            mut keys: Vec<String> = Vec()
+            for index in self.program.functions.clone() {
+                definition := self.program.function_defs[index]
+                // The bootstrap's signature key, as the signature loop builds it.
+                mut key := definition.name.clone()
+                when definition.parameters.len() > 0 && self.program.parameters[definition.parameters[0]].name == "self" && !definition.name.starts_with("String::") {
+                    key.append("#method")
+                }
+                when listed(keys.clone(), key.clone()) {
+                    found.push(duplicate_function_error(definition.name.clone(), definition.span.start, definition.span.end))
+                } else {
+                    keys.push(key)
+                }
+            }
+        }
+        return found
+    }
+
+    // The signature errors of the bootstrap's signature pass: a parameter or return type that does not resolve, and a
+    // `main` that takes parameters or returns something other than `i32`.
+    fun signature_errors(mut self) -> Vec<String> {
+        mut found: Vec<String> = Vec()
+        for index in self.program.functions.clone() {
+            definition := self.program.function_defs[index]
+            self.scope_path = declaration_namespace(definition.name.clone(), definition.module_path.clone())
+            for parameter_index in definition.parameters.clone() {
+                parameter := self.program.parameters[parameter_index]
+                resolved := self.resolve(parameter.ty)
+                when resolved.is_err() {
+                    found.push(resolved.unwrap_err())
+                }
+            }
+            mut ret := String("")
+            when definition.return_type.is_some() {
+                resolved := self.resolve(definition.return_type.unwrap())
+                when resolved.is_err() {
+                    found.push(resolved.unwrap_err())
+                } else {
+                    ret = resolved.unwrap()
+                }
+            }
+            when definition.name == "main" && (definition.parameters.len() > 0 || (!ret.is_empty() && ret != "I32")) {
+                found.push(main_signature_error(definition.span.start, definition.span.end))
+            }
+        }
+        self.scope_path = String("")
+        return found
+    }
+
+    // A `for` whose name is declared already, in recovering mode. As the bootstrap's recovery does, the bounds are checked
+    // and the body is analyzed with the loop variable of the bounds' type, whenever the bounds give one.
+    fun for_after_redeclared(mut self, name: String, name_span: ast::Span, start: u64, end: u64, body: Vec<u64>) -> Result<bool, String> {
+        start_result := self.expression(start, String(""))
+        when start_result.is_err() {
+            self.report(start_result.unwrap_err())?
+            return self.for_after_invalid_start(name, name_span, end, body)
+        }
+        start_ty := start_result.unwrap().ty
+        when !is_integer_word(start_ty.clone()) {
+            found := range_bound_error(start_ty.clone(), name_span.start, name_span.end)
+            when found.is_some() {
+                self.report(found.unwrap())?
+            }
+            return self.for_after_invalid_start(name, name_span, end, body)
+        }
+        end_result := self.expression(end, start_ty.clone())
+        when end_result.is_err() {
+            self.report(end_result.unwrap_err())?
+        } else {
+            end_ty := end_result.unwrap().ty
+            when end_ty != start_ty {
+                found := range_mismatch_error(start_ty.clone(), end_ty, name_span.start, name_span.end)
+                when found.is_some() {
+                    self.report(found.unwrap())?
+                }
+            }
+        }
+        return self.for_body_recovering(name, start_ty, body)
+    }
+
+    // The end of a `for` whose start bound was refused: an integer end gives the loop variable's type.
+    fun for_after_invalid_start(mut self, name: String, name_span: ast::Span, end: u64, body: Vec<u64>) -> Result<bool, String> {
+        end_result := self.expression(end, String(""))
+        when end_result.is_err() {
+            self.report(end_result.unwrap_err())?
+            return Result::Ok(false)
+        }
+        end_ty := end_result.unwrap().ty
+        when is_integer_word(end_ty.clone()) {
+            return self.for_body_recovering(name, end_ty, body)
+        }
+        found := range_bound_error(end_ty, name_span.start, name_span.end)
+        when found.is_some() {
+            self.report(found.unwrap())?
+        }
+        return Result::Ok(false)
+    }
+
+    // The body of a `for` in recovering mode, lowered as the body of a loop that runs.
+    fun for_body_recovering(mut self, name: String, ty: String, body: Vec<u64>) -> Result<bool, String> {
+        variable_slot := self.allocate(ty.clone())?
+        visible_before := self.visible
+        self.declare(Local { name: name, slot: variable_slot, ty: ty, mutable: false })
+        self.loop_depth += 1
+        self.loop_floors.push(visible_before)
+        self.loop_frames.push(self.frame_marks.len())
+        self.commit_moves()
+        outer_breaks := self.break_moves.clone()
+        outer_continues := self.continue_moves.clone()
+        self.break_moves = Vec()
+        self.continue_moves = Vec()
+        body_result := self.block(body)
+        self.break_moves = outer_breaks
+        self.continue_moves = outer_continues
+        self.loop_frames.pop()
+        self.loop_floors.pop()
+        self.loop_depth -= 1
+        self.visible = visible_before
+        when body_result.is_err() {
+            return Result::Err(body_result.unwrap_err())
+        }
+        return Result::Ok(false)
+    }
+}
+
+extend Lowering {
+    // Whether an expression is a call of a function that declares a reference result.
+    fun returns_reference_call(self, index: u64) -> bool {
+        choose self.program.exprs[index] {
+            ast::ExprTree::CallE(name, type_arguments, arguments, span) => self.callee_returns_reference(name),
+            _ => false,
+        }
+    }
+
+    fun callee_returns_reference(self, name: String) -> bool {
+        result := self.call_result_type(name)
+        return result.is_ok() && result.unwrap().starts_with("Reference ")
+    }
 }

@@ -226,11 +226,11 @@ impl Frontend {
 
     /// Runs semantic analysis.
     ///
-    /// With the self-hosted frontend, the Ryn semantic analysis lowers the program to typed IR
-    /// and the bootstrap analyzer checks the same program: invalid programs get the bootstrap's
-    /// exact diagnostics, and an IR that differs from the bootstrap's is reported as an internal
-    /// error instead of being compiled. A program the Ryn analysis does not handle is analyzed by
-    /// the bootstrap alone. `RYN_SEMA=rust` skips the Ryn analysis.
+    /// With the self-hosted frontend, the Ryn semantic analysis alone lowers the program to typed
+    /// IR and reports its diagnostics. A program it does not handle is an error: there is no
+    /// fallback to the bootstrap analysis. `RYN_SEMA=both` also runs the bootstrap analysis and
+    /// reports an IR or a diagnostic that differs from it as an internal error (`R0904`), and
+    /// `RYN_SEMA=rust` runs the bootstrap analysis alone.
     pub fn analyze(
         &self,
         mut program: Program,
@@ -309,35 +309,45 @@ impl Frontend {
             }
         }
         desugared.map_err(|diagnostic| vec![diagnostic])?;
-        // `RYN_SEMA=ryn-only` takes the Ryn analysis alone: its IR is the result and its diagnostics are the errors. The
-        // bootstrap analysis is not run, so a program it would reject is accepted or rejected by the Ryn analysis alone.
+        // The Ryn analysis alone is the default: its IR is the result and its diagnostics are the errors. The bootstrap
+        // analysis is not run, so a program it would reject is accepted or rejected by the Ryn analysis alone.
         if let Self::SelfHosted(executable) = self
-            && env::var("RYN_SEMA").is_ok_and(|choice| choice == "ryn-only")
+            && !env::var("RYN_SEMA").is_ok_and(|choice| choice == "rust" || choice == "both")
         {
             let encoded = ast_codec::encode_program(&program);
-            let text = run_self_hosted_mode(executable, &encoded, Some("--sema"))
+            // In recovering mode the analysis writes every independent diagnostic, one line each.
+            let mode = if recovering {
+                "--sema-recover"
+            } else {
+                "--sema"
+            };
+            let text = run_self_hosted_mode(executable, &encoded, Some(mode))
                 .map_err(|error| vec![error])?;
             // As on the default path, `RYN_DUMP_SEMA` receives what the Ryn analysis produced.
             if let Some(directory) = env::var_os("RYN_DUMP_SEMA") {
                 let _ = std::fs::write(std::path::PathBuf::from(directory).join("ryn.ir"), &text);
             }
             if text.starts_with("diagnostic ") {
-                let ryn = parse_ryn_diagnostic(&text).ok_or_else(|| {
-                    vec![frontend_failure(format!(
-                        "the self-hosted semantic analysis wrote a diagnostic that cannot be read: {text}"
-                    ))]
-                })?;
-                // The diagnostic's code is a static string in the bootstrap types; a leaked copy is made once per error.
-                let code: &'static str = Box::leak(ryn.code.into_boxed_str());
-                return Err(vec![Diagnostic {
-                    code,
-                    message: ryn.message,
-                    span: Span {
-                        start: ryn.start,
-                        end: ryn.end,
-                    },
-                    help: (!ryn.help.is_empty()).then_some(ryn.help),
-                }]);
+                let mut diagnostics = Vec::new();
+                for line in text.lines().filter(|line| line.starts_with("diagnostic ")) {
+                    let ryn = parse_ryn_diagnostic(line).ok_or_else(|| {
+                        vec![frontend_failure(format!(
+                            "the self-hosted semantic analysis wrote a diagnostic that cannot be read: {line}"
+                        ))]
+                    })?;
+                    // The diagnostic's code is a static string in the bootstrap types; a leaked copy is made once per error.
+                    let code: &'static str = Box::leak(ryn.code.into_boxed_str());
+                    diagnostics.push(Diagnostic {
+                        code,
+                        message: ryn.message,
+                        span: Span {
+                            start: ryn.start,
+                            end: ryn.end,
+                        },
+                        help: (!ryn.help.is_empty()).then_some(ryn.help),
+                    });
+                }
+                return Err(diagnostics);
             }
             return ir_codec::decode_ir(&text).map_err(|message| {
                 vec![frontend_failure(format!(

@@ -46,7 +46,7 @@ env -i PATH=/usr/bin:/bin HOME="$HOME" ./tools/bootstrap-native.sh "$PWD/bootstr
 ```
 
 On the machine where this seed was made, stage2 and stage3 were byte-identical and equal to
-the seed itself: 8,994,816 bytes, sha256 `bba0d86b…`. The seed reproduces itself, so it
+the seed itself: 9,109,504 bytes, sha256 `f0e02a3d…`. The seed reproduces itself, so it
 is a fixed point of the current sources. To replace it, build a new stage2 with the
 current seed, check that stage2 and stage3 are byte-identical, then copy stage2 to
 `bootstrap/rync-seed` and update the digest in the same change.

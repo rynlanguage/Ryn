@@ -170,12 +170,12 @@ EXACT	tests/programs/fail/operator_type_mismatch.ryn	R0206	arithmetic operands m
 DECLINE	tests/programs/fail/optional_field_on_struct.ryn	R0234	`choose` requires an enum value
 EXACT	tests/programs/fail/pipe_bad_target.ryn	R0265	the right side of `|>` must be a function name or a function call
 EXACT	tests/programs/fail/range_mixed_types.ryn	R0205	range end has type `i64` but the start has type `i32`
-DECLINE	tests/programs/fail/return_aliased_local_reference.ryn	R0248	a reference to a local value cannot escape its stack frame
+EXACT	tests/programs/fail/return_aliased_local_reference.ryn	R0248	a reference to a local value cannot escape its stack frame
 EXACT	tests/programs/fail/return_local_reference.ryn	R0248	a reference to a local value cannot escape its stack frame
 DECLINE	tests/programs/fail/shape_bound_unknown_shape.ryn	R0452	unknown shape `Missing` in the bound on `B`
 EXACT	tests/programs/fail/struct_destructuring_unknown_field.ryn	R0225	structure `Point` has no field `z`
 EXACT	tests/programs/fail/struct_destructuring_wrong_type.ryn	R0205	declared type `structure` does not match initializer type `structure`
-DECLINE	tests/programs/fail/tuple_destructuring_arity.ryn	R0225	structure `$RynTuple#inferred0` has no field `_2`
+EXACT	tests/programs/fail/tuple_destructuring_arity.ryn	R0225	structure `$RynTuple#inferred0` has no field `_2`
 EXACT	tests/programs/fail/unknown_variable.ryn	R0203	unknown variable `missing`
 EXACT	tests/programs/fail/w5_argument_count.ryn	R0211	function `add` expects 2 arguments but got 1
 EXACT	tests/programs/fail/w5_argument_type.ryn	R0212	argument to `double` has type `str` but `i32` is required

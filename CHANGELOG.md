@@ -19,8 +19,7 @@ archive and no commit for 0.1.6 yet. Items marked "not verified" were not run in
   the native compiler. Before this, `build` accepted programs that `check` rejects: a mutating
   `String` method on an immutable `self` was compiled and mutated the value. Such programs are now
   rejected with the same diagnostic as `check`, and no executable is written.
-- `ryn bootstrap --native` rebuilds the native compiler from its own sources and requires stage 2 and
-  stage 3 to be byte-identical. The last run in this work gave a fixpoint of 8,953,856 bytes.
+- `ryn bootstrap --native` rebuilds the native compiler from its own sources and requires stage 2 and stage 3 to be byte-identical. The last run in this work gave a fixpoint of 9,109,504 bytes (sha256 `f0e02a3d…`), the same bytes as the cargo-free bootstrap from the committed seed.
 - `ryn run` of a single file without `-o` builds the program into a scratch directory that is removed
   afterwards. Before, every run left an executable beside the source.
 
@@ -29,26 +28,15 @@ archive and no commit for 0.1.6 yet. Items marked "not verified" were not run in
 - The Ryn analysis (`ryn-frontend --sema`) reports `R0204` for a mutating `String` method on a shared
   reference, and `R0234` for `Map.clone` of values with a custom destructor, with the same text as the
   Rust analysis.
-- `RYN_SEMA=ryn-only` runs the Ryn analysis alone for the IR and the diagnostics, skipping the Rust
-  bootstrap analysis (the Rust constant evaluation and pattern desugaring still run). It is opt-in;
-  the default path is unchanged.
-- `tools/ryn-diagnostic-coverage.sh` compares the Ryn analysis with the Rust one on every invalid
-  program of the corpus. `tests/fixtures/ryn_sema_coverage.tsv` records the outcomes, and
-  `tests/ryn_sema_ratchet.rs` fails on any change, so a rule that starts or stops matching has to be
-  recorded. The Ryn checks run in the compiler's order: constant checks (`--comptime`), then the
-  analysis (`--sema`). Current outcomes over 195 programs: 141 exact, 35 declined by the Ryn analysis,
-  14 with a different code, 1 with different text, 4 accepted. Four of the accepted programs are
-  module-level checks (`R0420`, `R0421`), which a single-file measurement cannot see; the module
-  tests pass under `ryn-only`.
+- The Ryn analysis alone is the default for `ryn check`, `ryn build` and `ryn run`; the bootstrap (Rust) analysis is not run on that path. A program the Ryn analysis does not handle is an error, not a reason to fall back to the Rust analysis. `RYN_SEMA=both` runs both analyses and reports a difference as `R0904`; `RYN_SEMA=rust` runs the Rust analysis alone.
+- `tools/ryn-diagnostic-coverage.sh` compares the Ryn analysis with the Rust one on every invalid program of the corpus. `tests/fixtures/ryn_sema_coverage.tsv` records the outcomes, and `tests/ryn_sema_ratchet.rs` fails on any change, so a rule that starts or stops matching has to be recorded. The Ryn checks run in the compiler's order: constant checks (`--comptime`), then the analysis (`--sema`). Current outcomes over 195 programs: 143 exact, 33 declined by the Ryn analysis, 14 with a different code, 1 with different text, 4 accepted. Four of the accepted programs are module-level checks (`R0420`, `R0421`), which a single-file measurement cannot see; the module tests pass under the Ryn analysis alone.
 - The Ryn analysis also reports the bootstrap's messages for: an unknown function (`R0210`) and an
   unknown variable (`R0203`) with a did-you-mean hint, an unknown field in an assignment (`R0225`),
   an integer literal outside its type's range (`R0206`), and a `Vec` of a set (`R0234`), whether
   written as a type or built with `Vec<Set<..>>()`.
-- With `RYN_SEMA=ryn-only`, the full test suite has 6 failing tests. Five need several independent
-  diagnostics reported together (the Rust analysis recovers after an error and the Ryn analysis stops
-  at the first). One needs `R0248` for a reference returned from a call, a flow rule. These are the
-  remaining rules to port before the Rust analysis can be removed from the default path. Collecting
-  several diagnostics needs a design decision, which is still open.
+- Several independent diagnostics are reported together, as the bootstrap reports them. Declarations are checked in its three groups (names declared twice; structure declarations and their cycles; signatures), and a group with errors ends the analysis; each function is then analyzed on its own. Inside a function a failed statement is recorded, and the statements after it are analyzed as if it had not been lowered. A failed `let` also ends its block, so later uses of its name are not reported again. A `for` whose name is declared already still checks its bounds and body. The mode is `ryn-frontend --sema-recover`, which writes one `diagnostic` line per error in source order; `--sema` still stops at the first. Tests: `tests/ryn_sema_recovery.rs` runs five such programs under both analyses, and `tests/diagnostics.rs` covers the multi-error cases.
+- New rules in the Ryn analysis: `R0220` for a structure declared twice, and `R0238` for an enum declared twice or named like a structure (before, only the bootstrap reported them); `R0248` for a reference returned from a call, which is rejected whatever its arguments are, as in the bootstrap; `R0225` for an unknown tuple element such as `_2` in a destructuring.
+- With the Ryn analysis alone, the full test suite passes: 405 tests in the default `cargo test` run and 405 in the `RYN_SEMA=ryn-only` run.
 
 ### Language and runtime fixes
 
@@ -123,16 +111,8 @@ archive and no commit for 0.1.6 yet. Items marked "not verified" were not run in
 - `ryn_native_live_allocations` and `ryn_native_live_bytes` count only freestanding native programs;
   programs that use file, process, thread or socket operations are linked against libc and are
   declined for these counters.
-- The default `ryn check`, `ryn build` and `ryn run` still run the Rust analysis next to the
-  self-hosted analysis, for the `R0904` consistency check and for diagnostics the self-hosted
-  analysis does not yet produce. The native compiler does not depend on Rust at run time, and the
-  standard path works with an empty `PATH`, but the path still contains Rust code. Removing it needs
-  the self-hosted analysis to produce the messages the Rust analysis produces. For example, the Rust
-  analysis has 50 `R0234` diagnostic sites and the self-hosted analysis has 16; the Map diagnostics
-  for destructor values exist only in Rust.
-- Two fixed points: the Rust-seeded `ryn bootstrap --native` gave a stage 2 of 8,953,856 bytes, and
-  the committed seed gives 8,994,816 bytes. Both reproduce themselves, but why the sources have two
-  fixed points was not investigated.
+- The Rust analysis is no longer run on the default path, but the Rust code is still used: by `RYN_SEMA=rust` and `RYN_SEMA=both`, by the Cranelift backend (`--backend cranelift`), by the constant evaluation and pattern desugaring that run before the Ryn analysis, by the CLI, and by the library's unit tests. Removing the Rust frontend and the Cranelift backend needs those uses moved first, so nothing was removed in this work, and the cargo dependencies are still needed.
+- A struct literal whose fields are written out of declaration order is refused by the native compiler (`R0905`, a structure value out of field order) when it is a `return` value, a call argument or another value that is not a `let` initializer. Cranelift runs these programs. The native code generator takes fields in declaration order and the lowering keeps the written order, so a fix needs temporaries that keep the evaluation order. A `let` initializer with the same fields compiles. Example: `fun make() -> P { return P { y: 2, x: 1 } }`.
 - Windows float records were not re-run in this work; the shims are now compiled for all x86_64
   targets.
 - Native declines: `Map.get`, `Map.values` and `Map.clone` of destructor values are rejected by the
@@ -143,12 +123,10 @@ archive and no commit for 0.1.6 yet. Items marked "not verified" were not run in
 Run in this work. The work is committed locally on `release/v0.1.6-native-first`; nothing is pushed,
 tagged or published.
 
-- `cargo test` (full suite, all test targets) exits 0.
-- `ryn bootstrap --native`: stage 2 and stage 3 byte-identical (8,953,856 bytes, from the Rust-built
-  compiler).
-- Cargo-free bootstrap: `tools/bootstrap-native.sh` with the committed `bootstrap/rync-seed` and
-  `PATH=/usr/bin:/bin` completes; stage 2 and stage 3 are byte-identical and equal to the seed
-  (8,994,816 bytes).
+- `cargo test` (all test targets) exits 0 with the default analysis (405 tests) and with `RYN_SEMA=ryn-only` (405 tests).
+- `tests/fixtures/ryn_sema_coverage.tsv` regenerated with `tools/ryn-diagnostic-coverage.sh`: two rows changed from DECLINE to EXACT (R0248 for a reference returned from a call; R0225 for a tuple element), and the ratchet test passes.
+- `ryn bootstrap --native`: stage 2 and stage 3 byte-identical (9,109,504 bytes, sha256 `f0e02a3d…`).
+- Cargo-free bootstrap: `tools/bootstrap-native.sh` with the committed `bootstrap/rync-seed` and `PATH=/usr/bin:/bin` completes; stage 2 and stage 3 are byte-identical and equal to the seed (9,109,504 bytes). The seed was rebuilt from the current sources, and the archive's own bootstrap reproduces it.
 - Examples: all 97 entries of `examples/` (87 files and 10 project directories) build with the native
   default and with `--backend cranelift`. The two runs agree on stdout, stderr and exit status for
   every entry. `network_smoke` and `realtime_input` time out with stdin closed on both backends, so
