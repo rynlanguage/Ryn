@@ -26,7 +26,7 @@ use std::{
     thread,
 };
 
-const EXPECTED_TOTAL: usize = 631;
+const EXPECTED_TOTAL: usize = 636;
 
 #[derive(Debug)]
 struct Case {

@@ -1,29 +1,25 @@
 # Native Ryn compiler (`rync`)
 
-`rync` is the Ryn-written compiler: its lexer, parser, generic specialization,
-lowering, ownership, machine-code generation, ELF linker and runtime run without
-Rust, a system linker or libc. Its current executable target is Linux x86_64.
-The standard `ryn` command builds, checks and runs programs with this native
-compiler by default. `ryn build --backend cranelift` selects the Rust/Cranelift
-backend instead, which remains available for comparison. `ryn build` and
-`ryn run` run the same analysis as `ryn check` before the native compiler, so
-both reject the same programs.
+`rync` is the Ryn-written compiler: its lexer, parser, generic specialization, lowering, analysis, ownership checks,
+machine-code generation, ELF and PE linkers and runtime run without Rust, a system linker or libc. It targets Linux
+x86-64 and (cross-compiled, see below) Windows x86-64. The `ryn` command (also written in Ryn, `selfhost/src/ryn.ryn`)
+starts `rync` for `check`, `build` and `run`; the two programs and the standard library are installed in one directory,
+and `ryn` finds `rync` and `stdlib/std/src` next to itself. `build` and `run` run the same analysis as `check`, so they
+reject the same programs.
 
-The `rync-<version>-linux-x86_64.tar.gz` release archive contains `rync`, its Ryn
-sources, the standard-library sources and the native bootstrap script.
-From the extracted directory:
+The `ryn-<version>-linux-x86_64.tar.gz` archive contains `ryn`, `rync`, the Ryn sources, the standard-library sources
+and the bootstrap script. From the extracted directory:
 
 ```sh
-./rync --stdlib "$PWD/stdlib/std/src" /absolute/path/to/main.ryn > program
-chmod +x program
-./program
+./ryn run hello.ryn
+./rync --stdlib "$PWD/stdlib/std/src" /absolute/path/to/main.ryn > program    # the compiler alone
 ```
 
-The compiler writes executable bytes to stdout and diagnostics to stderr.
-Status 0 means successful compilation, 1 means a frontend error, 2 means invalid
-command arguments, and 3 means a feature the native pipeline cannot handle.
-Module paths resolve relative to the entry file's directory; standard modules
-resolve under `--stdlib`.
+`rync` writes executable bytes to stdout (or to `-o <path>`) and diagnostics to stderr. Status 0 means successful
+compilation, 1 means a frontend error, 2 means invalid command arguments, and 3 means a feature the native pipeline
+cannot handle. Module paths resolve relative to the entry file's directory; standard modules resolve under `--stdlib`.
+An output that is a link to a source file replaces the link and never writes through it, because the executable is
+written to a temporary file beside the output and renamed over it.
 
 ## Rebuild the compiler using itself
 
@@ -45,11 +41,11 @@ rustc (the release archive contains the same file as `rync`):
 env -i PATH=/usr/bin:/bin HOME="$HOME" ./tools/bootstrap-native.sh "$PWD/bootstrap/rync-seed" /var/tmp/ryn-bootstrap
 ```
 
-On the machine where this seed was made, stage2 and stage3 were byte-identical and equal to
-the seed itself: 9,084,928 bytes, sha256 `d10afe33…`. The seed reproduces itself, so it
-is a fixed point of the current sources. To replace it, build a new stage2 with the
-current seed, check that stage2 and stage3 are byte-identical, then copy stage2 to
-`bootstrap/rync-seed` and update the digest in the same change.
+The seed is a fixed point of the sources it is committed with: stage2 and stage3 are byte-identical and equal to the
+seed. To replace it, run the script with the current seed, check that stage2 and stage3 are byte-identical, then copy
+stage2 to `bootstrap/rync-seed` and update the digest in the same change. A compiler change that the old seed cannot
+compile (it uses a feature the seed lacks) is built in two steps: the old seed compiles sources that avoid the feature,
+and the compiler it makes compiles the full sources.
 
 ## Windows x86-64 target
 
@@ -121,7 +117,7 @@ run time, so running them depends on that library being present.
 
 ## Benchmarks (0.1.6 working tree)
 
-Four small programs, compiled and run with `ryn` 0.1.5 (Cranelift, its only backend) and with the 0.1.6 working tree
+These numbers were measured before the Rust implementation and the Cranelift backend were removed, and are a record of that run, not something the current tree can reproduce. Four small programs, compiled and run with `ryn` 0.1.5 (Cranelift, its only backend) and with the 0.1.6 working tree
 (native by default, and `--backend cranelift`). Each run time is the median of five runs after one warm-up run; the
 compile times are single measurements. The three configurations printed identical output for every program. The
 programs and the comparison script are kept outside the repository (in the local scratch area of this work), so the

@@ -16,106 +16,68 @@ compiler, and what a change has to satisfy before it is merged.
 
 ## Environment
 
-You need a stable Rust toolchain (edition 2024).
-
-On Linux x86-64, building Ryn programs needs nothing else: the default native backend emits the
-executable itself, without `cc`, `ld` or libc. On Windows the Cranelift backend links through the
-compiler's own PE linker (`src/pe_linker.rs`), again without `link.exe` or an SDK. On other targets
-the Cranelift backend uses the system C compiler driver (`cc` or `CC`), and realtime keyboard input
-uses evdev on Linux and virtual-key state on Windows.
+You need a Linux x86-64 machine, `python3` (for the test runners), `tar`, and `sha256sum`. The compiler is built by the
+compiler: the committed seed `bootstrap/rync-seed` compiles the sources, and the result must compile itself to the same
+bytes. No Rust toolchain, C compiler, linker or C library is used.
 
 ```sh
 git clone https://github.com/rynlanguage/Ryn.git
 cd Ryn
-cargo build --release
-./target/release/ryn --help
+tools/bootstrap-native.sh "$PWD/bootstrap/rync-seed" /tmp/ryn-bootstrap      # stage 2 must equal stage 3
 ```
 
-`rustup component add clippy rustfmt` is required for the local checks below.
+`docker`/`podman` with the `ryn-wine` image (Wine on Debian) is only needed to run Windows programs; the Windows target
+is cross-compiled on Linux.
 
 ## Repository layout
 
 | Path | Contents |
 | --- | --- |
-| `src/` | The Rust compiler: CLI, lexer/parser bootstrap, semantic analysis, Ryn Guard, Cranelift backend, PE/ELF linking, runtime |
-| `selfhost/src/frontend` | Ryn-written lexer, parser, generic specializer |
-| `selfhost/src/middle` | Ryn-written lowering to typed IR, compile-time evaluation, patterns |
-| `selfhost/src/back` | Ryn-written native code generator, runtime, ELF writer |
-| `selfhost/src/driver` | Ryn-written manifest and diagnostic driver |
+| `selfhost/src/ryn.ryn` | The `ryn` command (new, check, build, run, clean, lock, login, publish) |
 | `selfhost/src/rync.ryn` | The native compiler entry point |
-| `stdlib/std/src` | The standard library |
+| `selfhost/src/frontend` | Lexer, parser, generic specializer |
+| `selfhost/src/middle` | Lowering to typed IR, analysis and diagnostics, compile-time evaluation, patterns |
+| `selfhost/src/back` | Code generator, runtime, ELF and PE writers, the Windows runtime |
+| `selfhost/src/driver` | Manifest, packages and registry, SHA-256, diagnostic rendering |
+| `stdlib/std/src` | The standard library (`native.ryn` is the Linux runtime, `native_windows.ryn` the Windows differences) |
+| `bootstrap/` | The committed seed compiler and its checksum |
 | `tests/suite` | The language suite; each `.ryn` file (or project directory) is one test |
-| `examples/` | Runnable programs; every entry is built in CI |
-| `tools/` | Bootstrap, native suite and diagnostic-coverage scripts |
+| `tests/programs`, `tests/fixtures`, `tests/native` | Programs and recorded diagnostics used by the tests |
+| `examples/` | Runnable programs |
+| `tools/` | Bootstrap, distribution, suite listing and the Python test runners (`tools/tests`) |
 | `docs/` | Language reference, memory model, self-hosting plan, validation reports |
 
 ## Building and testing
 
 ```sh
-cargo check --workspace
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo doc --workspace --no-deps
-
-cargo test --workspace                                   # everything
-cargo test --release --workspace -- --test-threads=4     # suite against optimized code
-cargo test --release --test suite                        # the 628-program language suite
-RUST_MIN_STACK=16777216 cargo test                       # deep compiler tests need a 16 MiB thread stack
+tools/bootstrap-native.sh "$PWD/bootstrap/rync-seed" /tmp/ryn-bootstrap          # the compiler: rync-stage2
+python3 tools/test-native-sources.py /tmp/ryn-bootstrap/rync-stage2 $(python3 tools/list-suite.py)   # the language suite
+python3 tools/make-dist.py /tmp/ryn-bootstrap/rync-stage2 "$(cat VERSION)" /tmp/ryn-dist             # the archives
+python3 tools/run-tests.py /tmp/ryn-dist/.../ryn                                  # ryn command and runtime tests
 ```
 
-`RUST_MIN_STACK` matters: several compiler tests recurse deeply and overflow the default 8 MiB test
-thread stack. CI sets it for every job.
+`tools/test-native-sources.py` reads each program's header (`// test: run` with `// out:`, `// err:`, `// exit:`, or
+`// test: fail` with `// code:`, `// msg:`). Set `RYN_TEST_TARGET=windows` to cross-compile the programs and run them under
+Wine (`RYN_TEST_WINE=local` uses a local `wine`; the default is the `ryn-wine` container).
 
-### Native compiler
+### Changing the compiler
 
-```sh
-./target/release/ryn bootstrap --native    # rebuild rync from its own sources; stages 2 and 3 must match
-tools/bootstrap-native.sh <seed> <out-dir>  # Cargo-free bootstrap from bootstrap/rync-seed
-python3 tools/test-native-sources.py <rync> tests/suite/...  # compile suite programs with rync only
-```
-
-The native compiler must reproduce itself: stage 2 and stage 3 byte-identical. `bootstrap/rync-seed`
-is the committed, Cargo-free seed; replace it only through the procedure in
-`docs/native-compiler.md`.
+The seed can only compile sources it supports. When a change needs a feature the seed lacks (or changes the code the
+compiler generates for itself), the new compiler is built in two steps: the old seed compiles the new sources without
+using the feature, then that compiler compiles the full sources. The result of `tools/bootstrap-native.sh` must have
+stage 2 equal stage 3; copy that stage 2 to `bootstrap/rync-seed` and update `bootstrap/rync-seed.sha256` in the same
+change. The Rust implementation that used to bootstrap the first seed is in the git history before its removal.
 
 ### Diagnostics work
 
-`tools/ryn-diagnostic-coverage.sh` compares the Ryn analysis with the Rust analysis on every invalid
-program of the corpus and writes `tests/fixtures/ryn_sema_coverage.tsv`;
-`tests/ryn_sema_ratchet.rs` fails when an outcome changes, so every agreement change is deliberate.
-
-### Benchmarks
-
-```sh
-cargo bench --bench compiler_pipeline
-```
-
-Benchmarks report medians on the machine that ran them; they are not performance guarantees.
+`tests/fixtures/ryn_sema_coverage.tsv` records, for each invalid program of the corpus, the code and message that the
+original (Rust) analyzer produced; `tools/tests/test_diagnostic_corpus.py` requires `rync check` to give the same.
 
 ## Code style
 
-- Rust: `cargo fmt` defaults, propagate errors with `?` instead of `unwrap()`/`expect()` on paths
-  reachable from user input, and no `unsafe` without a comment explaining the invariant.
 - Ryn (`selfhost/`, `stdlib/`): follow the surrounding files. Public items carry a `//` comment that
   explains what they guarantee, not what they do line by line.
-- Diagnostics: keep the `Rxxxx` code stable, write the message in the compiler's voice, and add a
-  `help` line when the fix is not obvious. A new rule needs tests for both the accepted and the
-  rejected program.
-- Comments explain why. Delete commented-out code.
-
-## Adding language features
-
-A new syntax or semantic feature needs, in order:
-
-1. A decision recorded in the issue (what it means, what it rejects, what it costs).
-2. Implementation in the Rust bootstrap path and, where applicable, the Ryn front end, keeping both
-   consistent — `tests/self_hosted_parity.rs` compares their trees.
-3. Tests: at least one positive and one negative program in `tests/suite/<category>/`, plus an
-   example in `examples/` when the feature is user-visible.
-4. Documentation: `docs/language-0.2.md` for semantics, `README.md` for a one-line mention,
-   `CHANGELOG.md` for the entry.
-
-Use the [Language Proposal](.github/ISSUE_TEMPLATE/language_proposal.md) issue template for step 1.
+- Python (`tools/`): standard library only.
 
 ## Reporting bugs
 
@@ -128,8 +90,7 @@ instead of a public issue.
 
 - One logical change per PR. Keep the diff reviewable; say in the description what the change costs.
 - Fill in the [pull request template](.github/PULL_REQUEST_TEMPLATE.md).
-- The PR must pass CI: formatting, Clippy with `-D warnings`, `cargo doc`, both test jobs, and the
-  native bootstrap job on Linux.
+- The PR must pass CI: the bootstrap fixpoint, the language suite, the command-line tests and the Windows jobs.
 - Describe behavior changes in `CHANGELOG.md` under the unreleased section.
 - PRs are merged with a merge commit; keep the branch history readable.
 

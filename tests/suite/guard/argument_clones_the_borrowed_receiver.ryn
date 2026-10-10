@@ -1,0 +1,8 @@
+// test: run
+// out: aa
+// A clone of the receiver can be passed as an argument of its own method call.
+fun main() {
+    mut text := String("a")
+    text.append(text.clone())
+    echo text
+}

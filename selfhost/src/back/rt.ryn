@@ -30,6 +30,9 @@ pub struct Labels {
     pub errno_location: u64,
     pub putchar: u64,
     pub chmod: u64,
+    pub rename: u64,
+    pub unlink: u64,
+    pub getpid: u64,
     pub sigreturn: u64,
     pub live_allocations: u64,
     pub live_bytes: u64,
@@ -512,6 +515,34 @@ pub fun emit(asm: &mut x64::Asm, labels: &Labels, error_numbers: Vec<u64>, error
     asm.bind(chmod_failed)
     asm.mov_ri(x64::Reg::RAX, 0)
     asm.alu_ri(5, x64::Reg::RAX, 1)
+    asm.ret()
+
+    // rename(rdi = from, rsi = to) -> 0, or -1; unlink(rdi = path) -> 0, or -1; getpid() -> the process identifier
+    asm.bind(labels.rename)
+    asm.mov_ri(x64::Reg::RAX, 82)
+    asm.syscall()
+    rename_failed := asm.new_label()
+    asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
+    asm.jcc(x64::Cc::LESS, rename_failed)
+    asm.mov_ri(x64::Reg::RAX, 0)
+    asm.ret()
+    asm.bind(rename_failed)
+    asm.mov_ri(x64::Reg::RAX, 18446744073709551615)
+    asm.ret()
+    asm.bind(labels.unlink)
+    asm.mov_ri(x64::Reg::RAX, 87)
+    asm.syscall()
+    unlink_failed := asm.new_label()
+    asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
+    asm.jcc(x64::Cc::LESS, unlink_failed)
+    asm.mov_ri(x64::Reg::RAX, 0)
+    asm.ret()
+    asm.bind(unlink_failed)
+    asm.mov_ri(x64::Reg::RAX, 18446744073709551615)
+    asm.ret()
+    asm.bind(labels.getpid)
+    asm.mov_ri(x64::Reg::RAX, 39)
+    asm.syscall()
     asm.ret()
 
     // strerror(rdi = errno) -> the text

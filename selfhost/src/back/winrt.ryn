@@ -29,6 +29,7 @@ pub fun api_names() -> Vec<String> {
     names.push(String("kernel32!SetConsoleOutputCP"))
     names.push(String("kernel32!SetThreadStackGuarantee"))
     names.push(String("kernel32!GetLastError"))
+    names.push(String("kernel32!GetCurrentProcessId"))
     names.push(String("kernel32!GetFileAttributesExW"))
     names.push(String("kernel32!SetCurrentDirectoryW"))
     names.push(String("kernel32!GetCurrentDirectoryW"))
@@ -178,6 +179,7 @@ pub fun emit_syscall(asm: &mut x64::Asm, rt: &WinRt) {
     chdir_case := asm.new_label()
     getcwd_case := asm.new_label()
     stat_case := asm.new_label()
+    getpid_case := asm.new_label()
 
     asm.alu_ri(7, x64::Reg::RBX, 1)
     asm.jcc(x64::Cc::EQUAL, write_case)
@@ -219,6 +221,8 @@ pub fun emit_syscall(asm: &mut x64::Asm, rt: &WinRt) {
     asm.jcc(x64::Cc::EQUAL, stat_case)
     asm.alu_ri(7, x64::Reg::RBX, 6)
     asm.jcc(x64::Cc::EQUAL, stat_case)
+    asm.alu_ri(7, x64::Reg::RBX, 39)
+    asm.jcc(x64::Cc::EQUAL, getpid_case)
     // A system call this runtime does not emulate: ENOSYS.
     asm.mov_ri(x64::Reg::RAX, negative(38))
     asm.jmp(done)
@@ -626,6 +630,12 @@ pub fun emit_syscall(asm: &mut x64::Asm, rt: &WinRt) {
     asm.jmp(done)
     asm.bind(stat_failed)
     asm.mov_ri(x64::Reg::RAX, negative(2))
+    asm.jmp(done)
+
+    // getpid()
+    asm.bind(getpid_case)
+    call_api(asm, rt, String("kernel32!GetCurrentProcessId"))
+    asm.zext_rr(x64::Reg::RAX, x64::Reg::RAX, 4)
     asm.jmp(done)
 
     // sigaltstack: the thread's stack guarantee takes its place.

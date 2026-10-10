@@ -34,7 +34,7 @@ What happened instead: full stdout/stderr and the exit code.
 - OS and architecture:
 - `ryn --version`:
 - Backend (`native` on Linux x86-64, otherwise `cranelift`), if you passed `--backend`:
-- How you built the compiler (release archive, `cargo build --release`, or a commit):
+- How you built the compiler (release archive, `tools/bootstrap-native.sh`, or a commit):
 
 **Additional context**
 Diagnostic codes, related issues, or anything that narrows the defect down. If the program passes on

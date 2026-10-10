@@ -1007,8 +1007,11 @@ pub fun __rt_system_remove_env(key_given: str) -> bool {
 }
 
 pub fun __rt_system_current_dir() -> String {
-    buffer := getcwd(0 as *u8, 0)
-    when (buffer as u64) == 0 {
+    // The buffer is given (4097 bytes): a call with no buffer would have the C library allocate one.
+    buffer := malloc(4097)
+    given := getcwd(buffer, 4097)
+    when (given as u64) == 0 {
+        free(buffer)
         return String("")
     }
     text := from_c(buffer)

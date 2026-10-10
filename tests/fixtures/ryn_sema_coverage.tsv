@@ -115,7 +115,7 @@ WRONG_CODE	tests/suite/modules/r2_j6_private_nested_module_fn_rejected/src/main.
 WRONG_CODE	tests/suite/modules/r2_j6_private_nested_module_method_rejected/src/main.ryn	R0425	method `secret` is private to `Rect`'s module
 WRONG_CODE	tests/suite/modules/w9_circular_three_modules/src/main.ryn	R0427	circular module dependency: ring::one -> ring::two -> ring::three -> ring::one
 EXACT	tests/suite/modules/w9_missing_item_rejected/src/main.ryn	R0210	unknown function `util::absent`
-ACCEPT	tests/suite/modules/w9_missing_path_dependency/src/main.ryn	R0420	module `ghost::x` not found (looked for /home/v3nn7/Ryn-Lang/Ryn/tests/suite/modules/w9_missing_path_dependency/src/ghost/x.ryn and /home/v3nn7/Ryn-Lang/Ryn/tests/suite/modules/w9_missing_path_dependency/src/ghost/x/mod.ryn)
+EXACT	tests/suite/modules/w9_missing_path_dependency/src/main.ryn	R0425	cannot resolve path dependency `ghost` of package `w9-missing-path-dependency` at /home/v3nn7/Ryn-Lang/Ryn/tests/suite/modules/w9_missing_path_dependency/vendor/ghost: No such file or directory (os error 2)
 WRONG_CODE	tests/suite/modules/w9_private_field_read_after_literal_rejected/src/main.ryn	R0426	field `y` of `P` is private
 EXACT	tests/suite/modules/w9_private_struct_rejected/src/main.ryn	R0227	unknown structure `hid::Secret`
 EXACT	tests/suite/output/print_malformed_format_rejected.ryn	R0014	malformed format string in `print`

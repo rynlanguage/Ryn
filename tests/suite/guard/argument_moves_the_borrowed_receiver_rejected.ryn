@@ -1,0 +1,11 @@
+// test: fail
+// code: R0242
+// msg: cannot move a value while an earlier operand borrows it
+// The receiver of a method is borrowed for the whole call, so an argument cannot move it.
+fun consume(text: String) -> String {
+    return text
+}
+fun main() {
+    mut text := String("a")
+    text.append(consume(text))
+}

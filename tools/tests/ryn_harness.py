@@ -56,15 +56,11 @@ def run_ryn(*args: object, cwd: Path | str | None = None, env: dict | None = Non
 
 
 def expected_version() -> str:
-    """The version the binary must report: RYN_EXPECTED_VERSION, else the repo's Cargo.toml."""
+    """The version the binary must report: RYN_EXPECTED_VERSION, else the `VERSION` file of the repository."""
     override = os.environ.get("RYN_EXPECTED_VERSION")
     if override:
         return override
-    text = (REPO_ROOT / "Cargo.toml").read_text(encoding="utf-8")
-    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
-    if not match:
-        raise RuntimeError("could not find the package version; set RYN_EXPECTED_VERSION")
-    return match.group(1)
+    return (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip()
 
 
 def unique_suffix() -> str:

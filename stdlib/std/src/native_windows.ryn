@@ -548,3 +548,34 @@ pub fun __rt_filesystem_path_canonical(path_given: str) -> String {
     }
     return text
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Dynamic libraries
+
+extern "C" fun LoadLibraryA(path: *u8) -> *u8;
+extern "C" fun GetProcAddress(library: *u8, name: *u8) -> *u8;
+extern "C" fun FreeLibrary(library: *u8) -> i32;
+
+pub fun __rt_system_load_library(path_given: str) -> *u8 {
+    name := c_text_of(String(path_given))
+    library := LoadLibraryA(name)
+    free(name)
+    return library
+}
+
+pub fun __rt_system_load_symbol(library: *u8, name_given: str) -> *u8 {
+    when (library as u64) == 0 {
+        return 0 as *u8
+    }
+    text := c_text_of(String(name_given))
+    symbol := GetProcAddress(library, text)
+    free(text)
+    return symbol
+}
+
+pub fun __rt_system_unload_library(library: *u8) -> bool {
+    when (library as u64) == 0 {
+        return false
+    }
+    return FreeLibrary(library) != 0
+}

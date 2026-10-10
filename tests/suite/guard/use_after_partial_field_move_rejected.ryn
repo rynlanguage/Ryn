@@ -1,0 +1,13 @@
+// test: fail
+// code: R0240
+// msg: use of a moved value
+// Moving one owned field out of a structure leaves the structure unusable as a whole.
+struct Pair {
+    first: String
+    second: String
+}
+fun main() {
+    pair := Pair { first: String("a"), second: String("b") }
+    first := pair.first
+    echo pair
+}

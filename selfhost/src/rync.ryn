@@ -37,6 +37,7 @@ use std::env
 use std::system
 
 extern "C" fun putchar(value: i32) -> i32;
+extern "C" fun getpid() -> i32;
 extern "C" fun malloc(size: u64) -> *u8;
 extern "C" fun free(pointer: *u8);
 extern "C" fun fopen(path: *u8, mode: *u8) -> *u8;
@@ -678,8 +679,25 @@ fun rync_c_string(text: String) -> *u8 {
     return buffer
 }
 
-// Writes the executable to `path` with mode 0755.
+// Writes the executable to `path` with mode 0755. The bytes go to a file of their own beside it that then replaces `path`,
+// so an output that is a link to a source file replaces the link and never the source.
 fun rync_write_executable(path: String, bytes: Vec<u8>) -> bool {
+    mut temporary := path.clone()
+    temporary.append(".ryn-")
+    temporary.append(String(getpid() as u64))
+    temporary.append(".tmp")
+    when !rync_write_file(temporary.clone(), bytes) {
+        removed := fs::remove_file(temporary)
+        return false
+    }
+    moved := fs::rename(temporary.clone(), path)
+    when !moved {
+        removed := fs::remove_file(temporary)
+    }
+    return moved
+}
+
+fun rync_write_file(path: String, bytes: Vec<u8>) -> bool {
     c_path := rync_c_string(path)
     mode := rync_c_string(String("wb"))
     file := fopen(c_path, mode)

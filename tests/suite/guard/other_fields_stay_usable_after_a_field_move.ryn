@@ -1,0 +1,14 @@
+// test: run
+// out: a
+// out: b
+// After one owned field is moved out of a structure, the other fields can still be used.
+struct Pair {
+    first: String
+    second: String
+}
+fun main() {
+    pair := Pair { first: String("a"), second: String("b") }
+    first := pair.first
+    echo first
+    echo pair.second
+}

@@ -2704,6 +2704,13 @@ extend Lowering {
         when !expected.is_empty() && expected != place.ty {
             return Result::Err(unsupported("owned field where another type is expected"))
         }
+        // The local that holds the field has a moved part from the end of this statement on: its other fields can still be
+        // used, but the value as a whole cannot (`R0240`).
+        holder := self.local_holding_slot(place.slot)
+        when holder.is_some() {
+            part := self.expr_span_of(value)
+            self.pending_moves.push(MovedValue { name: self.locals[holder.unwrap()].name.clone(), slot: place.slot, start: part.start, end: part.end })
+        }
         return Result::Ok(Lowered { text: join(words3(String("Move"), num(place.slot), place.ty.clone())), ty: place.ty })
     }
 
@@ -2750,6 +2757,14 @@ extend Lowering {
         return Result::Ok(Lowered { text: join(words3(String("Move"), num(slot), ty.clone())), ty: ty })
     }
 
+    fun has_moved_part_named(self, name: String) -> bool {
+        found := self.find(name)
+        when found.is_err() {
+            return false
+        }
+        return self.has_moved_part(found.unwrap())
+    }
+
     // Whether the local that `name` now refers to has been moved: in an earlier statement, or earlier in this one.
     fun is_moved(self, name: String) -> bool {
         found := self.find(name.clone())
@@ -2770,6 +2785,37 @@ extend Lowering {
             return false
         }
         return self.is_moved_local(source.unwrap())
+    }
+
+    // The innermost local whose slots include `slot`, if any.
+    fun local_holding_slot(self, slot: u64) -> Option<u64> {
+        mut index: u64 = self.locals.len()
+        while index > 0 {
+            index -= 1
+            first := self.locals[index].slot
+            when first <= slot && slot < first + self.slot_count(self.locals[index].ty.clone()) {
+                return Option::Some(index)
+            }
+        }
+        return Option::None
+    }
+
+    // Whether any part of the local at `index` has been moved: a move of one of its fields makes the whole value unusable.
+    fun has_moved_part(self, index: u64) -> bool {
+        name := self.locals[index].name.clone()
+        first := self.locals[index].slot
+        last := first + self.slot_count(self.locals[index].ty.clone())
+        for item in self.moved_names.clone() {
+            when item.name == name && item.slot >= first && item.slot < last {
+                return true
+            }
+        }
+        for item in self.pending_moves.clone() {
+            when item.name == name && item.slot >= first && item.slot < last {
+                return true
+            }
+        }
+        return false
     }
 
     // Whether the local at `index` has been moved, matched by its name and slot.
@@ -3308,6 +3354,24 @@ extend Lowering {
             index += 1
         }
         self.pending_moves = kept
+    }
+
+    // The moves of the slots from `first` for `count` cells of the local `name`, which hold a new value now.
+    fun forget_moved_part(mut self, name: String, first: u64, count: u64) {
+        mut kept: Vec<MovedValue> = Vec()
+        for item in self.moved_names.clone() {
+            when !(item.name == name && item.slot >= first && item.slot < first + count) {
+                kept.push(item)
+            }
+        }
+        self.moved_names = kept
+        mut pending: Vec<MovedValue> = Vec()
+        for item in self.pending_moves.clone() {
+            when !(item.name == name && item.slot >= first && item.slot < first + count) {
+                pending.push(item)
+            }
+        }
+        self.pending_moves = pending
     }
 
     // A declaration or an assignment makes the name hold a new value, so an earlier move no longer applies.
@@ -4170,6 +4234,8 @@ extend Lowering {
             when lowered.ty != place.ty {
                 return Result::Err(unsupported("field assignment type"))
             }
+            // Storing a new value in a field that was moved out makes that field available again.
+            self.forget_moved_part(object.clone(), place.slot, self.slot_count(place.ty.clone()))
             self.statements.push(join(words4(String("FieldAssign"), num(place.slot), place.ty.clone(), lowered.text)))
             return Result::Ok(false)
         }
@@ -4474,7 +4540,7 @@ extend Lowering {
         when self.borrowed_name(name.clone(), true) {
             return Result::Err(borrowed_use_error(span.start, span.end))
         }
-        when self.is_moved(name.clone()) {
+        when self.is_moved(name.clone()) || self.has_moved_part_named(name.clone()) {
             return Result::Err(moved_value_error(span.start, span.end))
         }
         when self.raw_target_moved(name.clone()) {
@@ -5748,8 +5814,17 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
             when other.is_some() {
                 found := range_bound_error(other.unwrap(), name_span.start, name_span.end)
                 when found.is_some() {
+                    // The end and the body are still analyzed when every independent error is wanted.
+                    when self.recovering {
+                        self.report(found.unwrap())?
+                        return self.for_after_invalid_start(name, name_span, end, body)
+                    }
                     return Result::Err(found.unwrap())
                 }
+            }
+            when self.recovering && refusal.starts_with("diagnostic ") {
+                self.report(refusal)?
+                return self.for_after_invalid_start(name, name_span, end, body)
             }
             return Result::Err(refusal)
         }
@@ -5757,6 +5832,10 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         when !is_integer_word(start_value.ty.clone()) {
             found := range_bound_error(start_value.ty.clone(), name_span.start, name_span.end)
             when found.is_some() {
+                when self.recovering {
+                    self.report(found.unwrap())?
+                    return self.for_after_invalid_start(name, name_span, end, body)
+                }
                 return Result::Err(found.unwrap())
             }
             return Result::Err(unsupported("range over this type"))
@@ -7710,7 +7789,35 @@ extend Lowering {
 
     // `receiver.name(arguments)`: the call target with its argument count and arguments, and the
     // result type ("" for none).
+    // A method call on a local: an argument that moves that same local is `R0242`, since the receiver is borrowed for the whole
+    // call.
     fun method_target(mut self, receiver: u64, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: ast::Span) -> Result<Lowered, String> {
+        before := self.pending_moves.len()
+        lowered := self.method_target_unchecked(receiver, name, type_arguments, arguments, span)?
+        receiver_name := self.receiver_local_name(receiver)
+        when receiver_name.is_some() {
+            mut position: u64 = before
+            all := self.pending_moves.clone()
+            wanted := receiver_name.unwrap()
+            while position < all.len() {
+                moved := all[position]
+                when moved.name == wanted {
+                    return Result::Err(diagnostic("R0242", moved.start, moved.end, String("cannot move a value while an earlier operand borrows it"), String("complete the borrowing operation first, or pass an explicit `.clone()`")))
+                }
+                position += 1
+            }
+        }
+        return Result::Ok(lowered)
+    }
+
+    fun receiver_local_name(self, index: u64) -> Option<String> {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::NameRef(name, span) => Option::Some(name),
+            _ => Option::None,
+        }
+    }
+
+    fun method_target_unchecked(mut self, receiver: u64, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: ast::Span) -> Result<Lowered, String> {
         recv := self.receiver(receiver)?
         ty := recv.ty.clone()
         when ty == "OwnedString" && (name == "append" || name == "push" || name == "clear") && self.immutable_local_receiver(receiver) {
@@ -10240,6 +10347,10 @@ extend Lowering {
 
     // The end of a `for` whose start bound was refused: an integer end gives the loop variable's type.
     fun for_after_invalid_start(mut self, name: String, name_span: ast::Span, end: u64, body: Vec<u64>) -> Result<bool, String> {
+        // A bare integer literal has no type of its own: the loop variable is an `i32`, as it is where the start is valid.
+        when self.literal_value(end).is_some() {
+            return self.for_body_recovering(name, String("I32"), body)
+        }
         end_result := self.expression(end, String(""))
         when end_result.is_err() {
             self.report(end_result.unwrap_err())?

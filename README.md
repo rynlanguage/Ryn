@@ -16,13 +16,15 @@ compiler rebuilds itself from its own sources.
 Version 0.1.6 is under development on `release/v0.1.6-native-first`; the latest published release is
 [0.1.5](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.5).
 
-- On Linux x86-64, `ryn check`, `ryn build` and `ryn run` use the self-hosted native compiler
-  (`rync`) by default — no rustc, C compiler, linker or C library is invoked. `--backend cranelift`
-  selects the Rust/Cranelift backend, which also serves other targets.
-- The native compiler reproduces itself: `ryn bootstrap --native` builds stage 2 and stage 3 and
-  requires them to be byte-identical.
-- The Rust analysis still runs next to the self-hosted analysis on the default path, for the R0904
-  consistency check and for diagnostics the self-hosted analysis does not yet produce.
+- The whole toolchain is written in Ryn: the `ryn` command, the native compiler `rync` (lexer, parser,
+  analysis, code generator, ELF and PE writers) and the runtime. There is no Rust code in the tree and no Cargo
+  build. The compiler is built from the committed seed (`bootstrap/rync-seed`) by `tools/bootstrap-native.sh`, which
+  requires stage 2 and stage 3 to be byte-identical.
+- Linux x86-64 is the primary target. Windows x86-64 programs and the Windows `ryn.exe`/`rync.exe` are cross-compiled
+  by the same compiler; they have been run under Wine only, not on Windows itself, and threads, sockets and
+  keyboard input are not available there yet (see `docs/native-compiler.md`).
+- The Rust implementation and the Cranelift backend were removed in 0.1.6. They remain in the git history up to
+  the commit before their removal.
 - Ryn is experimental. It is not a general-purpose production language yet.
 
 ## Example
@@ -67,11 +69,11 @@ patterns, collections, file and process APIs, FFI, and the self-hosted compiler 
 ## Install
 
 Download a release archive from [GitHub Releases](https://github.com/rynlanguage/Ryn/releases)
-(Linux x86-64 and Windows x86-64, with SHA-256 checksums), or build from source:
+(Linux x86-64 and Windows x86-64, with SHA-256 checksums), or build from source with the committed seed:
 
 ```sh
-cargo build --release
-./target/release/ryn --version
+tools/bootstrap-native.sh "$PWD/bootstrap/rync-seed" /tmp/ryn-bootstrap       # rync, stage 2 == stage 3
+python3 tools/make-dist.py /tmp/ryn-bootstrap/rync-stage2 "$(cat VERSION)" /tmp/ryn-dist
 ```
 
 The release installers verify the archive checksum and install for the current user:
@@ -84,8 +86,8 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 bash ./install.sh
 ```
 
-The Linux `rync-<version>-linux-x86_64.tar.gz` archive contains the self-hosted compiler, its Ryn
-sources, the standard library and the native bootstrap script.
+The Linux `ryn-<version>-linux-x86_64.tar.gz` archive contains `ryn`, the compiler `rync`, the standard library,
+the compiler's Ryn sources and the bootstrap script; `ryn` finds `rync` and `stdlib` next to itself.
 
 ## Quick start
 
@@ -154,11 +156,9 @@ compiler.
 ## Testing
 
 ```sh
-cargo test --workspace                              # unit, integration and end-to-end tests
-cargo test --release --test suite                   # the 631-program language suite
-RUST_MIN_STACK=16777216 cargo test                  # deep compiler tests need a larger thread stack
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all -- --check
+python3 tools/test-native-sources.py <rync> $(python3 tools/list-suite.py)   # the 636-program language suite
+python3 tools/run-tests.py <ryn>                                           # command-line, diagnostics and runtime tests
+RYN_TEST_TARGET=windows python3 tools/test-native-sources.py <rync> $(python3 tools/list-suite.py)   # under Wine
 ```
 
 ## Contributing

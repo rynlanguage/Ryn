@@ -1,0 +1,24 @@
+// test: run
+// out: 0
+// out: true
+// out: xy
+// out: 0
+// `clear` empties a String in place and the String keeps working afterwards; clearing and dropping strings in a loop
+// leaves the native runtime's live allocation count unchanged.
+extern "C" fun ryn_native_live_allocations() -> u64;
+fun main() {
+    mut text := String("abc")
+    text.clear()
+    echo text.len()
+    echo text.is_empty()
+    text.append("xy")
+    echo text
+    before := ryn_native_live_allocations()
+    mut round: u64 = 0
+    while round < 100 {
+        mut scratch := String("hello")
+        scratch.clear()
+        round += 1
+    }
+    echo ryn_native_live_allocations() - before
+}

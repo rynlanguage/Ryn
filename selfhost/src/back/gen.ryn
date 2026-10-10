@@ -43,7 +43,7 @@ fun rt_provides(name: String) -> bool {
     when ffi_helpers::is_helper(name.clone()) {
         return true
     }
-    return name == "ryn_native_live_allocations" || name == "ryn_native_live_bytes" || name == "malloc" || name == "free" || name == "realloc" || name == "calloc" || name == "memcpy" || name == "memmove" || name == "strlen" || name == "fopen" || name == "fseek" || name == "ftell" || name == "fread" || name == "fwrite" || name == "fclose" || name == "strerror" || name == "__errno_location" || name == "putchar" || name == "chmod"
+    return name == "ryn_native_live_allocations" || name == "ryn_native_live_bytes" || name == "malloc" || name == "free" || name == "realloc" || name == "calloc" || name == "memcpy" || name == "memmove" || name == "strlen" || name == "fopen" || name == "fseek" || name == "ftell" || name == "fread" || name == "fwrite" || name == "fclose" || name == "strerror" || name == "__errno_location" || name == "putchar" || name == "chmod" || name == "rename" || name == "unlink" || name == "getpid"
 }
 
 // The 64-bit pattern of an integer literal's text (a leading `-` negates it).
@@ -406,7 +406,7 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool, windows: bool) -> 
         span_end: 0,
         failed_start: 0,
         failed_end: 0,
-        rt: rt::Labels { malloc: 0, free: 0, realloc: 0, calloc: 0, memcpy: 0, memmove: 0, strlen: 0, fopen: 0, fseek: 0, ftell: 0, fread: 0, fwrite: 0, fclose: 0, strerror: 0, errno_location: 0, putchar: 0, chmod: 0, sigreturn: 0, live_allocations: 0, live_bytes: 0, state: 0 },
+        rt: rt::Labels { malloc: 0, free: 0, realloc: 0, calloc: 0, memcpy: 0, memmove: 0, strlen: 0, fopen: 0, fseek: 0, ftell: 0, fread: 0, fwrite: 0, fclose: 0, strerror: 0, errno_location: 0, putchar: 0, chmod: 0, rename: 0, unlink: 0, getpid: 0, sigreturn: 0, live_allocations: 0, live_bytes: 0, state: 0 },
         enum_clone_ids: Vec(),
         enum_clone_labels: Vec(),
         glue_kinds: Vec(),
@@ -472,6 +472,9 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool, windows: bool) -> 
     gen.rt.errno_location = asm.new_label()
     gen.rt.putchar = asm.new_label()
     gen.rt.chmod = asm.new_label()
+    gen.rt.rename = asm.new_label()
+    gen.rt.unlink = asm.new_label()
+    gen.rt.getpid = asm.new_label()
     gen.rt.sigreturn = asm.new_label()
     gen.literal(String("\n"))
     gen.literal(String("true"))
@@ -5126,6 +5129,15 @@ extend Gen {
         when op == "Push" && arguments.len() == 2 {
             return self.string_push(asm, arguments[0], arguments[1])
         }
+        // `clear` keeps the buffer and sets the length to zero.
+        when op == "Clear" && arguments.len() == 1 {
+            when !self.expr(asm, arguments[0]) {
+                return false
+            }
+            asm.mov_ri(x64::Reg::RCX, 0)
+            asm.store(8, x64::Reg::RCX, x64::Reg::RAX, 8)
+            return true
+        }
         when op == "AppendString" && arguments.len() == 2 {
             return self.string_append(asm, arguments[0], arguments[1], true)
         }
@@ -8609,6 +8621,9 @@ extend Gen {
         when name == "__errno_location" { return Option::Some(self.rt.errno_location) }
         when name == "putchar" { return Option::Some(self.rt.putchar) }
         when name == "chmod" { return Option::Some(self.rt.chmod) }
+        when name == "rename" { return Option::Some(self.rt.rename) }
+        when name == "unlink" { return Option::Some(self.rt.unlink) }
+        when name == "getpid" { return Option::Some(self.rt.getpid) }
         return Option::None
     }
 
@@ -9249,22 +9264,35 @@ extend Gen {
     // of shadow space, and the pushed cells are dropped after the call. Nothing is passed by value that is larger than a
     // register, and no function pointer is passed, since the callee would call it with the System V convention.
     fun windows_import_call(mut self, asm: &mut x64::Asm, name: String, types: Vec<u64>) -> bool {
+        // Windows has no symbolic-link query by this name: the call answers -1, as for a path that is not a link.
+        when name == "readlink" {
+            asm.alu_ri(0, x64::Reg::RSP, (8 * types.len()) as i64)
+            asm.mov_ri(x64::Reg::RAX, 18446744073709551615)
+            return true
+        }
+        when windows_unavailable(name.clone()) {
+            mut reason := String("the C library function `")
+            reason.append(name)
+            reason.append("` is not available in a Windows program yet")
+            self.failed = true
+            when self.reason.is_empty() {
+                self.reason = reason
+            }
+            return false
+        }
+        imported := self.foreign_symbol(windows_import_name(name))
+        return self.windows_call_core(asm, imported, false, types)
+    }
+
+    // The call itself: `indirect` takes the target from the cell below the arguments (a function pointer), otherwise it is
+    // the symbol `imported`.
+    fun windows_call_core(mut self, asm: &mut x64::Asm, imported: u64, indirect: bool, types: Vec<u64>) -> bool {
         count := types.len()
         for ty in types.clone() {
             when self.c_classes(ty).len() > 0 || self.cells_of(ty) != 1 {
                 return self.fail("a record argument of a foreign call in a Windows program")
             }
-            when self.is_function_pointer(ty) {
-                return self.fail("a function pointer argument of a foreign call in a Windows program")
-            }
         }
-        // Windows has no symbolic-link query by this name: the call answers -1, as for a path that is not a link.
-        when name == "readlink" {
-            asm.alu_ri(0, x64::Reg::RSP, (8 * count) as i64)
-            asm.mov_ri(x64::Reg::RAX, 18446744073709551615)
-            return true
-        }
-        imported := self.foreign_symbol(windows_import_name(name))
         mut extra: u64 = 0
         when count > 4 {
             extra = count - 4
@@ -9272,6 +9300,9 @@ extend Gen {
         frame := (32 + 8 * extra + 15) / 16 * 16
         asm.push(x64::Reg::RBP)
         asm.mov_rr(x64::Reg::RBP, x64::Reg::RSP)
+        when indirect {
+            asm.load(8, false, x64::Reg::R11, x64::Reg::RBP, (8 + 8 * count) as i64)
+        }
         asm.alu_ri(4, x64::Reg::RSP, (0 as i64) - 16)
         asm.alu_ri(5, x64::Reg::RSP, frame as i64)
         mut index: u64 = 4
@@ -9291,11 +9322,19 @@ extend Gen {
             }
             index += 1
         }
-        asm.call_symbol(imported)
+        when indirect {
+            asm.call_reg(x64::Reg::R11)
+        } else {
+            asm.call_symbol(imported)
+        }
         asm.mov_rr(x64::Reg::RSP, x64::Reg::RBP)
         asm.pop(x64::Reg::RBP)
-        when count > 0 {
-            asm.alu_ri(0, x64::Reg::RSP, (8 * count) as i64)
+        mut cells := count
+        when indirect {
+            cells += 1
+        }
+        when cells > 0 {
+            asm.alu_ri(0, x64::Reg::RSP, (8 * cells) as i64)
         }
         return true
     }
@@ -10154,6 +10193,16 @@ extend Gen {
             asm.bind(self.thunk_labels[at])
             asm.push(x64::Reg::RBP)
             asm.mov_rr(x64::Reg::RBP, x64::Reg::RSP)
+            when self.windows {
+                // Windows callers keep rbx, rdi, rsi and r12 to r15; the generated code uses them freely.
+                asm.push(x64::Reg::RBX)
+                asm.push(x64::Reg::RDI)
+                asm.push(x64::Reg::RSI)
+                asm.push(12)
+                asm.push(13)
+                asm.push(14)
+                asm.push(15)
+            }
             mut integers: u64 = 0
             mut floats: u64 = 0
             mut pair: u64 = 0
@@ -10162,7 +10211,20 @@ extend Gen {
                 when self.cells_of(ty) != 1 {
                     return self.fail("a function pointer to a function with a parameter of this type")
                 }
-                when self.is_sse(ty) {
+                when self.windows {
+                    // By position: the first four in rcx, rdx, r8, r9 or xmm0 to xmm3, the rest above the shadow space.
+                    when pair < 4 {
+                        when self.is_sse(ty) {
+                            asm.movq_from_xmm(self.word(ty) == "F64", x64::Reg::RAX, pair)
+                            asm.push(x64::Reg::RAX)
+                        } else {
+                            asm.push(windows_argument_register(pair))
+                        }
+                    } else {
+                        asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (48 + 8 * (pair - 4)) as i64)
+                        asm.push(x64::Reg::RAX)
+                    }
+                } else when self.is_sse(ty) {
                     when floats >= 8 {
                         return self.fail("a function pointer to a function with this many float parameters")
                     }
@@ -10189,9 +10251,22 @@ extend Gen {
                     asm.movq_to_xmm(self.word(definition.return_type.unwrap()) == "F64", 0, x64::Reg::RAX)
                 }
             }
-            asm.mov_rr(x64::Reg::RSP, x64::Reg::RBP)
-            asm.pop(x64::Reg::RBP)
-            asm.ret()
+            when self.windows {
+                asm.lea(x64::Reg::RSP, x64::Reg::RBP, (0 as i64) - 56)
+                asm.pop(15)
+                asm.pop(14)
+                asm.pop(13)
+                asm.pop(12)
+                asm.pop(x64::Reg::RSI)
+                asm.pop(x64::Reg::RDI)
+                asm.pop(x64::Reg::RBX)
+                asm.pop(x64::Reg::RBP)
+                asm.ret()
+            } else {
+                asm.mov_rr(x64::Reg::RSP, x64::Reg::RBP)
+                asm.pop(x64::Reg::RBP)
+                asm.ret()
+            }
             at += 1
         }
         return true
@@ -10398,6 +10473,12 @@ extend Gen {
             }
             asm.push(x64::Reg::RAX)
             position += 1
+        }
+        when self.windows {
+            when !self.windows_call_core(asm, 0, true, parameters) {
+                return false
+            }
+            return self.finish_c_call(asm, self.pointer_result(id))
         }
         when !self.load_c_arguments(asm, parameters) {
             return false
@@ -12035,6 +12116,11 @@ extend Gen {
     }
 }
 
+// POSIX functions that have no counterpart in the Windows runtime yet: processes by `fork`, pipes, `poll`, threads and sockets.
+fun windows_unavailable(name: String) -> bool {
+    return name == "pipe" || name == "fork" || name == "execvp" || name == "waitpid" || name == "fcntl" || name == "dup2" || name == "kill" || name == "poll" || name == "pthread_create" || name == "pthread_join" || name == "pthread_detach" || name == "opendir" || name == "readdir" || name == "closedir" || name == "socket" || name == "bind" || name == "listen" || name == "accept" || name == "connect" || name == "setsockopt" || name == "send" || name == "recv" || name == "getaddrinfo" || name == "freeaddrinfo" || name == "inet_pton" || name == "inet_ntop" || name == "htons" || name == "sigaction" || name == "sigaltstack"
+}
+
 // The register of the argument at `index` in the Windows convention.
 fun windows_argument_register(index: u64) -> u64 {
     when index == 0 {
@@ -12104,6 +12190,8 @@ fun windows_import_name(name: String) -> String {
         text.append("llabs")
     } else when name == "time" {
         text.append("_time64")
+    } else when name == "setenv" {
+        text.append("_putenv_s")
     } else when name == "getcwd" || name == "chdir" || name == "rmdir" || name == "unlink" || name == "getpid" || name == "strdup" || name == "isatty" || name == "dup" || name == "dup2" || name == "fileno" {
         text.append("_")
         text.append(name)

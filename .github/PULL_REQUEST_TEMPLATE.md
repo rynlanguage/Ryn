@@ -16,10 +16,9 @@ Fixes #
 
 **Tests**
 
-- [ ] `cargo fmt --all -- --check`
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
-- [ ] `cargo test --workspace` (with `RUST_MIN_STACK=16777216` for deep compiler tests)
-- [ ] `cargo test --release --test suite`
+- [ ] `tools/bootstrap-native.sh` reaches a fixpoint (stage 2 equals stage 3)
+- [ ] `python3 tools/test-native-sources.py <rync> $(python3 tools/list-suite.py)`
+- [ ] `python3 tools/run-tests.py <ryn>`
 - [ ] New or updated tests in `tests/suite/` or the relevant integration test, covering both the
       accepted and the rejected program
 - [ ] Backends verified: [ ] native [ ] cranelift — or the change is backend-independent
