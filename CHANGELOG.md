@@ -19,7 +19,7 @@ archive and no commit for 0.1.6 yet. Items marked "not verified" were not run in
   the native compiler. Before this, `build` accepted programs that `check` rejects: a mutating
   `String` method on an immutable `self` was compiled and mutated the value. Such programs are now
   rejected with the same diagnostic as `check`, and no executable is written.
-- `ryn bootstrap --native` rebuilds the native compiler from its own sources and requires stage 2 and stage 3 to be byte-identical. The last run in this work gave a fixpoint of 9,109,504 bytes (sha256 `f0e02a3d…`), the same bytes as the cargo-free bootstrap from the committed seed.
+- `ryn bootstrap --native` rebuilds the native compiler from its own sources and requires stage 2 and stage 3 to be byte-identical. The last run in this work gave a fixpoint of 9,084,928 bytes (sha256 `d10afe33…`), the same bytes as the cargo-free bootstrap from the committed seed.
 - `ryn run` of a single file without `-o` builds the program into a scratch directory that is removed
   afterwards. Before, every run left an executable beside the source.
 
@@ -67,6 +67,13 @@ archive and no commit for 0.1.6 yet. Items marked "not verified" were not run in
 - The live-allocation counter `ryn_native_live_allocations` is declined with `R0905` in a program
   that links the C library. Its counter covers only the freestanding allocator, so the symbol used to
   be left unresolved at run time.
+- A struct literal whose fields are written out of declaration order now compiles natively when it is a
+  `return` value, a call argument or another value that is not a `let` initializer. Before, the native
+  compiler refused it with `R0905` (a structure value out of field order). The fields are evaluated in the
+  order they are written into temporaries and then passed in declaration order, so the evaluation order
+  is the same as on Cranelift. Three suite tests cover it: one that records the evaluation order, one with
+  an owned field (`String`) that checks the printed values, and one that builds such a literal as a
+  return value and as a call argument 1000 times and checks that the live-allocation count is unchanged.
 
 ### Build and tooling
 
@@ -112,7 +119,6 @@ archive and no commit for 0.1.6 yet. Items marked "not verified" were not run in
   programs that use file, process, thread or socket operations are linked against libc and are
   declined for these counters.
 - The Rust analysis is no longer run on the default path, but the Rust code is still used: by `RYN_SEMA=rust` and `RYN_SEMA=both`, by the Cranelift backend (`--backend cranelift`), by the constant evaluation and pattern desugaring that run before the Ryn analysis, by the CLI, and by the library's unit tests. Removing the Rust frontend and the Cranelift backend needs those uses moved first, so nothing was removed in this work, and the cargo dependencies are still needed.
-- A struct literal whose fields are written out of declaration order is refused by the native compiler (`R0905`, a structure value out of field order) when it is a `return` value, a call argument or another value that is not a `let` initializer. Cranelift runs these programs. The native code generator takes fields in declaration order and the lowering keeps the written order, so a fix needs temporaries that keep the evaluation order. A `let` initializer with the same fields compiles. Example: `fun make() -> P { return P { y: 2, x: 1 } }`.
 - Windows float records were not re-run in this work; the shims are now compiled for all x86_64
   targets.
 - Native declines: `Map.get`, `Map.values` and `Map.clone` of destructor values are rejected by the
@@ -120,21 +126,25 @@ archive and no commit for 0.1.6 yet. Items marked "not verified" were not run in
 
 ### Verification in this work
 
-Run in this work. The work is committed locally on `release/v0.1.6-native-first`; nothing is pushed,
-tagged or published.
+Run in this work, on `release/v0.1.6-native-first`. Nothing is pushed, tagged or published.
 
-- `cargo test` (all test targets) exits 0 with the default analysis (405 tests) and with `RYN_SEMA=ryn-only` (405 tests).
+- `cargo test` (all test targets) exits 0 with the default analysis (405 tests, 41 targets) and, in an earlier run before the code generator change, with `RYN_SEMA=ryn-only` (405 tests); the Ryn analysis alone is the default, so the two runs are the same configuration. `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` pass.
+- The three new suite tests for out-of-order struct literals fail with the previous seed (`R0905`) and pass with the new one: the evaluation order printed is `4 3 3 4 2 1 1`, the owning-field test prints `two 2 one 1`, and the loop test ends with 0 live allocations.
+- Old seed against new seed: all 97 entries of `examples/` compile to byte-identical executables with both. Of the 631 `tests/suite` entries, 628 give the same result with both (identical executable bytes, or the same rejection status and message); the other three are the new out-of-order tests, which the old seed refuses with `R0905`. So the change does not alter the code generated for programs the previous seed accepted. This includes `realtime_input`, whose differing output in the example sweep therefore comes from the keyboard, which the program reads from `/dev/input/event*`.
 - `tests/fixtures/ryn_sema_coverage.tsv` regenerated with `tools/ryn-diagnostic-coverage.sh`: two rows changed from DECLINE to EXACT (R0248 for a reference returned from a call; R0225 for a tuple element), and the ratchet test passes.
-- `ryn bootstrap --native`: stage 2 and stage 3 byte-identical (9,109,504 bytes, sha256 `f0e02a3d…`).
-- Cargo-free bootstrap: `tools/bootstrap-native.sh` with the committed `bootstrap/rync-seed` and `PATH=/usr/bin:/bin` completes; stage 2 and stage 3 are byte-identical and equal to the seed (9,109,504 bytes). The seed was rebuilt from the current sources, and the archive's own bootstrap reproduces it.
+- `ryn bootstrap --native`: stage 2 and stage 3 byte-identical (9,084,928 bytes, sha256 `d10afe33…`).
+- Cargo-free bootstrap: `tools/bootstrap-native.sh` with the committed `bootstrap/rync-seed` and `PATH=/usr/bin:/bin` completes; stage 2 and stage 3 are byte-identical and equal to the seed (9,084,928 bytes). The seed was rebuilt from the current sources, and the archive's own bootstrap reproduces it. The previous seed (`f0e02a3d…`) cannot compile the current sources, because they contain struct literals written out of declaration order, which it refuses with `R0905`; the new seed was therefore built with `ryn bootstrap --native`, which starts from the bootstrap compiler, and not from the old seed.
 - Examples: all 97 entries of `examples/` (87 files and 10 project directories) build with the native
   default and with `--backend cranelift`. The two runs agree on stdout, stderr and exit status for
-  every entry. `network_smoke` and `realtime_input` time out with stdin closed on both backends, so
-  for those two the agreement shows only that both behave the same, not that the output is correct.
+  96 entries. `realtime_input` reads the real keyboard, so its output depends on the keys pressed
+  while it runs (one run printed `First key: D`, the other `First key: L`); it cannot be compared
+  without a controlled input device, and this run does not show whether the backends agree on it. For
+  `network_smoke`, an earlier run timed out on both backends, so that run showed only that both behave
+  the same, not that the output is correct.
 - Distribution without cargo: the release archive built from the seed was extracted into an empty
-  directory. Its `rync`, run with `PATH=/usr/bin:/bin`, compiled and ran all 628 entries of
-  `tests/suite` through `tools/test-native-sources.py` (471 that must run, 157 that must be
-  rejected); all 628 pass. Its build of `examples/vec.ryn` prints the same output as `ryn run`. The
+  directory. Its `rync`, run with `PATH=/usr/bin:/bin`, compiled and ran all 631 entries of
+  `tests/suite` through `tools/test-native-sources.py` (474 that must run, 157 that must be
+  rejected); all 631 pass. Its build of `examples/vec.ryn` prints the same output as `ryn run`. The
   archive's own `tools/bootstrap-native.sh`, run from the extracted directory with the same `PATH`,
   gives stage 2 and stage 3 byte-identical to the seed. The sweep used the repository's copy of the
   standard library, which is byte-identical to the archive's.

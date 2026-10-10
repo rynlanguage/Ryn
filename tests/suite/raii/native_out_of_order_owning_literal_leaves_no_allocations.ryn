@@ -1,0 +1,28 @@
+// test: run
+// out: 5000
+// out: 0
+// A structure with an owning field, written out of declaration order as a return value and as a call argument, is
+// released once per round: the native runtime's live count is unchanged after 1000 rounds.
+extern "C" fun ryn_native_live_allocations() -> u64;
+struct Label {
+    name: String
+    count: i32
+}
+fun label(text: str, count: i32) -> Label {
+    return Label { count: count, name: String(text) }
+}
+fun weight(value: Label) -> u64 {
+    return value.name.len() + value.count as u64
+}
+fun main() {
+    before := ryn_native_live_allocations()
+    mut round: u64 = 0
+    mut total: u64 = 0
+    while round < 1000 {
+        total += weight(label("ab", 1))
+        total += weight(Label { count: 1, name: String("c") })
+        round += 1
+    }
+    echo total
+    echo ryn_native_live_allocations() - before
+}

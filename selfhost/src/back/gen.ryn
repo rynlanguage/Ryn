@@ -9229,11 +9229,26 @@ extend Gen {
         when fields.len() != self.program.structs[id].fields.len() {
             return self.fail("a structure value with missing fields")
         }
+        mut in_order := true
         mut position: u64 = 0
         while position < fields.len() {
             when fields[position] != position {
-                return self.fail("a structure value out of field order")
+                in_order = false
             }
+            position += 1
+        }
+        // Fields written out of declaration order are evaluated in the order they are written, into scratch cells, and the
+        // cells are then pushed in declaration order.
+        when !in_order {
+            count := self.program.structs[id].slot_count
+            saved := self.scratch(count)
+            when !self.store_fields(asm, saved, id, id, fields.clone(), values.clone()) {
+                return false
+            }
+            return self.push_local_cells(asm, saved, count)
+        }
+        position = 0
+        while position < fields.len() {
             field_ty := self.program.structs[id].fields[position].ty
             when !self.push_value(asm, values[position], field_ty) {
                 return false

@@ -46,7 +46,7 @@ env -i PATH=/usr/bin:/bin HOME="$HOME" ./tools/bootstrap-native.sh "$PWD/bootstr
 ```
 
 On the machine where this seed was made, stage2 and stage3 were byte-identical and equal to
-the seed itself: 9,109,504 bytes, sha256 `f0e02a3d…`. The seed reproduces itself, so it
+the seed itself: 9,084,928 bytes, sha256 `d10afe33…`. The seed reproduces itself, so it
 is a fixed point of the current sources. To replace it, build a new stage2 with the
 current seed, check that stage2 and stage3 are byte-identical, then copy stage2 to
 `bootstrap/rync-seed` and update the digest in the same change.
@@ -89,9 +89,9 @@ A successful bootstrap does not by itself show parity with the language corpus, 
 corpus is run through the compiler as well. `tools/test-native-sources.py` compiles each
 entry of `tests/suite` directly with `rync`, without the Rust frontend or Rust-generated
 IR, and checks the executable's stdout, stderr and status, or the rejection's status and
-diagnostic. The suite has 628 entries: 471 that must run and 157 that must be rejected.
+diagnostic. The suite has 631 entries: 474 that must run and 157 that must be rejected.
 41 of the entries are project directories rather than single files. With the shipped `rync` and
-`PATH=/usr/bin:/bin`, all 628 entries pass.
+`PATH=/usr/bin:/bin`, all 631 entries pass.
 
 Programs that declare C functions are linked against the system's shared C library at
 run time, so running them depends on that library being present.

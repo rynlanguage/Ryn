@@ -6496,7 +6496,7 @@ extend Lowering {
 }
 
 fun new_lowering(program: ast::Program, recovering: bool) -> Lowering {
-    built := Lowering {
+    return Lowering {
         program: program,
         signatures: Vec(),
         locals: Vec(),
@@ -6543,7 +6543,6 @@ fun new_lowering(program: ast::Program, recovering: bool) -> Lowering {
         recovered: Vec(),
         abandoned: false,
     }
-    return built
 }
 
 pub fun lower_program(program: ast::Program) -> Result<String, String> {

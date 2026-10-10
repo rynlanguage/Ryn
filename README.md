@@ -155,7 +155,7 @@ compiler.
 
 ```sh
 cargo test --workspace                              # unit, integration and end-to-end tests
-cargo test --release --test suite                   # the 628-program language suite
+cargo test --release --test suite                   # the 631-program language suite
 RUST_MIN_STACK=16777216 cargo test                  # deep compiler tests need a larger thread stack
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check

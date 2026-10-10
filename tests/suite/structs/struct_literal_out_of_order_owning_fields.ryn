@@ -1,0 +1,27 @@
+// test: run
+// out: two
+// out: 2
+// out: one
+// out: 1
+// A structure with an owning field, written out of declaration order as a return value and as a call argument, owns the
+// field's String once: the string is released with the structure and not twice.
+struct Label {
+    name: String
+    count: i32
+}
+
+fun label(text: str, count: i32) -> Label {
+    return Label { count: count, name: String(text) }
+}
+
+fun describe(item: Label) {
+    echo(item.name)
+    echo(item.count)
+}
+
+fun main() {
+    describe(Label { count: 2, name: String("two") })
+    item := label("one", 1)
+    echo(item.name)
+    echo(item.count)
+}
