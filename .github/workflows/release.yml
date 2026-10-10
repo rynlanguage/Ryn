@@ -46,6 +46,9 @@ jobs:
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
       - name: Build Linux binary
         run: cargo build --release --locked
 
@@ -58,16 +61,16 @@ jobs:
           grep -Fxq 'argument count: 1' <<< "$output"
           grep -Fxq 'first argument: linux smoke' <<< "$output"
 
-      - name: Bootstrap native compiler under 1 GiB
+      - name: Bootstrap the native compiler from the committed seed
         shell: bash
         run: |
-          mkdir -p native-bootstrap/dump
-          ./target/release/ryn build selfhost/src/native.ryn -o native-bootstrap/native
-          RYN_DUMP_SEMA="$PWD/native-bootstrap/dump" ./target/release/ryn check selfhost/src/rync.ryn
-          native-bootstrap/native native-bootstrap/dump/ryn.ir exe > native-bootstrap/seed
-          chmod +x native-bootstrap/seed
-          tools/bootstrap-native.sh "$PWD/native-bootstrap/seed" "$PWD/native-bootstrap/fixpoint"
-          python3 tools/test-native-sources.py "$PWD/native-bootstrap/fixpoint/rync-stage2" tests/native/freestanding_float_rounding.ryn tests/native/freestanding_math.ryn tests/native/nested_result_ownership.ryn
+          # The committed seed starts a bootstrap that needs no Cargo, rustc, system linker or
+          # C library. The script requires stage 2 and stage 3 to be byte-identical.
+          tools/bootstrap-native.sh "$PWD/bootstrap/rync-seed" "$PWD/native-bootstrap/fixpoint"
+          python3 tools/test-native-sources.py "$PWD/native-bootstrap/fixpoint/rync-stage2" \
+            tests/native/freestanding_float_rounding.ryn \
+            tests/native/freestanding_math.ryn \
+            tests/native/nested_result_ownership.ryn
 
       - name: Package and upload Linux binary
         shell: bash
@@ -78,13 +81,17 @@ jobs:
           version="${TAG#v}"
           stage="ryn-${version}-linux-x86_64"
           mkdir "$stage"
-          cp target/release/ryn README.md "$stage/"
+          cp target/release/ryn README.md install.sh "$stage/"
           tar -czf "${stage}.tar.gz" "$stage"
           sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
           gh release upload "$TAG" "${stage}.tar.gz" "${stage}.tar.gz.sha256" --repo "$GITHUB_REPOSITORY" --clobber
           native_stage="rync-${version}-linux-x86_64"
-          mkdir -p "$native_stage/tools" "$native_stage/docs" "$native_stage/selfhost" "$native_stage/stdlib/std"
+          mkdir -p "$native_stage/tools" "$native_stage/docs" "$native_stage/selfhost" "$native_stage/stdlib/std" "$native_stage/bootstrap"
+          # Ship the fixpoint: it is built from exactly the sources in this archive, and it
+          # reproduces itself, so it also serves as the archive's bootstrap seed.
           cp native-bootstrap/fixpoint/rync-stage2 "$native_stage/rync"
+          cp native-bootstrap/fixpoint/rync-stage2 "$native_stage/bootstrap/rync-seed"
+          sha256sum native-bootstrap/fixpoint/rync-stage2 | awk '{print $1}' > "$native_stage/bootstrap/rync-seed.sha256"
           cp docs/native-compiler.md "$native_stage/README.md"
           cp tools/bootstrap-native.sh "$native_stage/tools/"
           cp -R selfhost/src "$native_stage/selfhost/"
@@ -123,6 +130,9 @@ jobs:
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
 
       - name: Build Windows binary
         run: cargo build --release --locked

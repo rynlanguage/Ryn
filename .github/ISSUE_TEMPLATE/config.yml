@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question about using Ryn
+    url: https://github.com/rynlanguage/Ryn/blob/main/SUPPORT.md
+    about: Read the support guide first, then open an issue if the compiler is at fault.
+  - name: Security vulnerability
+    url: https://github.com/rynlanguage/Ryn/blob/main/SECURITY.md
+    about: Report security bugs privately; never in a public issue.
+  - name: Contribution guide
+    url: https://github.com/rynlanguage/Ryn/blob/main/CONTRIBUTING.md
+    about: Environment setup, code style, tests and pull request rules.

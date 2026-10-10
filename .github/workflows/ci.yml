@@ -3,9 +3,14 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   validate:
@@ -29,33 +34,41 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Check workspace
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
 
       - name: Build documentation
         run: cargo doc --workspace --no-deps
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run release tests
-        run: cargo test --release --workspace -- --test-threads=4
+        run: cargo test --release --workspace --locked -- --test-threads=4
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   native:
     name: Native compiler on Linux
     runs-on: ubuntu-latest
+    env:
+      RUST_MIN_STACK: 16777216
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
 
       - name: Build the release compiler
         run: cargo build --release --locked
@@ -64,4 +77,4 @@ jobs:
         run: ./target/release/ryn bootstrap --native
 
       - name: Run the native suite, runtime leak and backend tests
-        run: cargo test --release --test suite --test native_hello --test native_runtime_leaks --test backend_selection
+        run: cargo test --release --locked --test suite --test native_hello --test native_runtime_leaks --test backend_selection
