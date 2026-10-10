@@ -7,14 +7,13 @@
 **Reliable. Fast. Native.**
 
 Ryn is a statically typed systems language that compiles to native machine code. There is no garbage
-collector: ownership is checked at compile time by Ryn Guard and released deterministically. The
-compiler's lexer, parser, lowering and native code generator are written in Ryn, and the native
-compiler rebuilds itself from its own sources.
+collector: ownership is checked at compile time by Ryn Guard and released deterministically. The whole
+toolchain is written in Ryn: the `ryn` command, the compiler and the runtime. The compiler rebuilds itself from its
+own sources, and the tree contains no Rust.
 
 ## Status
 
-Version 0.1.6 is under development on `release/v0.1.6-native-first`; the latest published release is
-[0.1.5](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.5).
+The latest release is [0.1.6](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.6) ("Native First").
 
 - The whole toolchain is written in Ryn: the `ryn` command, the native compiler `rync` (lexer, parser,
   analysis, code generator, ELF and PE writers) and the runtime. There is no Rust code in the tree and no Cargo
@@ -23,8 +22,8 @@ Version 0.1.6 is under development on `release/v0.1.6-native-first`; the latest 
 - Linux x86-64 is the primary target. Windows x86-64 programs and the Windows `ryn.exe`/`rync.exe` are cross-compiled
   by the same compiler; they have been run under Wine only, not on Windows itself, and threads, sockets and
   keyboard input are not available there yet (see `docs/native-compiler.md`).
-- The Rust implementation and the Cranelift backend were removed in 0.1.6. They remain in the git history up to
-  the commit before their removal.
+- The Rust implementation and the Cranelift backend were removed in 0.1.6. They remain in the git history before
+  commit `950e152`.
 - Ryn is experimental. It is not a general-purpose production language yet.
 
 ## Example
@@ -99,13 +98,16 @@ ryn build .                # compile to build/debug/<name>
 ryn run .                  # compile and run
 ryn run app.ryn -- arg     # pass arguments after --
 ryn clean .                # remove build artifacts
+ryn lock .                 # resolve dependencies and write ryn.lock
+ryn login <token>          # save a pods registry token
+ryn publish .              # check, pack and upload the package
 ```
 
 A single file works too: `ryn check main.ryn`, `ryn build main.ryn -o main`, `ryn run main.ryn`.
 `main` returning `i32` becomes the process exit code.
 
-Useful options: `--backend native|cranelift`, `--frontend ryn|rust` (Cranelift pipeline),
-`--release`, `-o/--output <path>`.
+Useful options: `--release` (outputs go to `build/release`), `-o/--output <path>`. On Windows the program is
+`ryn.exe` and the executables get `.exe`; Windows support is experimental (see Status).
 
 ## Language
 

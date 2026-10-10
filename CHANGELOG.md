@@ -4,12 +4,11 @@ All notable changes to Ryn are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses a `0.x` version
 sequence: minor releases may change language details while the compiler is pre-1.0.
 
-## [Unreleased]
+## [0.1.6] — 2026-10-11
 
-This section lists what was built and checked in the working tree on `release/v0.1.6-native-first`. Nothing here is a
-published release: there is no tag and no release archive for 0.1.6 yet, and nothing is pushed. The sections below the
-first one were written while the Rust implementation still existed; where they mention `--backend cranelift`,
-`RYN_SEMA`, `ryn bootstrap`, `cargo test` or the Rust analysis, those things were removed at the end of this work.
+"Native First". The `ryn` command, the native compiler and the runtime are written in Ryn, and the Rust implementation and
+the Cranelift backend are removed. There is also an experimental Windows target. Items marked "not verified" were not run.
+
 
 ### The Rust implementation is gone
 
@@ -51,48 +50,26 @@ first one were written while the Rust implementation still existed; where they m
   passed to or returned from C by value. The CI workflow has a job that runs `ryn.exe` on a real Windows runner; it has
   not been run.
 
-### Native compiler is the default
+### Diagnostics and ownership
 
-- `ryn build`, `ryn run` and `ryn check` use the Ryn-written native compiler (`rync`) by default on
-  Linux x86-64. `--backend cranelift` selects the Rust/Cranelift backend, which remains available for
-  comparison and for other targets.
-- `ryn build` and `ryn run` with the native backend now run the same analysis as `ryn check` before
-  the native compiler. Before this, `build` accepted programs that `check` rejects: a mutating
-  `String` method on an immutable `self` was compiled and mutated the value. Such programs are now
-  rejected with the same diagnostic as `check`, and no executable is written.
-- `ryn bootstrap --native` rebuilds the native compiler from its own sources and requires stage 2 and stage 3 to be byte-identical. The last run in this work gave a fixpoint of 9,084,928 bytes (sha256 `d10afe33…`), the same bytes as the cargo-free bootstrap from the committed seed.
-- `ryn run` of a single file without `-o` builds the program into a scratch directory that is removed
-  afterwards. Before, every run left an executable beside the source.
+- `ryn build` and `ryn run` run the same analysis as `ryn check` before code generation; before, `build` accepted
+  programs that `check` rejected (a mutating `String` method on an immutable `self` was compiled and mutated the value).
+- The Ryn analysis reports the original messages for, among others: unknown function (`R0210`) and unknown variable
+  (`R0203`) with a did-you-mean hint, unknown field in an assignment (`R0225`), integer literal out of range
+  (`R0206`), `Vec` of a set (`R0234`), `R0204`, `R0220`, `R0238`, `R0248`, and the `R0240`/`R0241`/`R0242` ownership
+  rules (moving a field makes the whole value unusable; an argument that moves the receiver of a method call is `R0242`).
+- Several independent errors are reported together (declarations in three groups, then each function and each
+  statement); after an invalid `for` range start the end and the body are still analyzed.
+- `tests/fixtures/ryn_sema_coverage.tsv` records the code and message the original analyzer gave for 195 invalid
+  programs; `tools/tests/test_diagnostic_corpus.py` requires `rync check` to give the same (all match).
 
-### Diagnostics: the Ryn analysis takes over rules
-
-- The Ryn analysis (`ryn-frontend --sema`) reports `R0204` for a mutating `String` method on a shared
-  reference, and `R0234` for `Map.clone` of values with a custom destructor, with the same text as the
-  Rust analysis.
-- The Ryn analysis alone is the default for `ryn check`, `ryn build` and `ryn run`; the bootstrap (Rust) analysis is not run on that path. A program the Ryn analysis does not handle is an error, not a reason to fall back to the Rust analysis. `RYN_SEMA=both` runs both analyses and reports a difference as `R0904`; `RYN_SEMA=rust` runs the Rust analysis alone.
-- `tools/ryn-diagnostic-coverage.sh` compares the Ryn analysis with the Rust one on every invalid program of the corpus. `tests/fixtures/ryn_sema_coverage.tsv` records the outcomes, and `tests/ryn_sema_ratchet.rs` fails on any change, so a rule that starts or stops matching has to be recorded. The Ryn checks run in the compiler's order: constant checks (`--comptime`), then the analysis (`--sema`). Current outcomes over 195 programs: 143 exact, 33 declined by the Ryn analysis, 14 with a different code, 1 with different text, 4 accepted. Four of the accepted programs are module-level checks (`R0420`, `R0421`), which a single-file measurement cannot see; the module tests pass under the Ryn analysis alone.
-- The Ryn analysis also reports the bootstrap's messages for: an unknown function (`R0210`) and an
-  unknown variable (`R0203`) with a did-you-mean hint, an unknown field in an assignment (`R0225`),
-  an integer literal outside its type's range (`R0206`), and a `Vec` of a set (`R0234`), whether
-  written as a type or built with `Vec<Set<..>>()`.
-- Several independent diagnostics are reported together, as the bootstrap reports them. Declarations are checked in its three groups (names declared twice; structure declarations and their cycles; signatures), and a group with errors ends the analysis; each function is then analyzed on its own. Inside a function a failed statement is recorded, and the statements after it are analyzed as if it had not been lowered. A failed `let` also ends its block, so later uses of its name are not reported again. A `for` whose name is declared already still checks its bounds and body. The mode is `ryn-frontend --sema-recover`, which writes one `diagnostic` line per error in source order; `--sema` still stops at the first. Tests: `tests/ryn_sema_recovery.rs` runs five such programs under both analyses, and `tests/diagnostics.rs` covers the multi-error cases.
-- New rules in the Ryn analysis: `R0220` for a structure declared twice, and `R0238` for an enum declared twice or named like a structure (before, only the bootstrap reported them); `R0248` for a reference returned from a call, which is rejected whatever its arguments are, as in the bootstrap; `R0225` for an unknown tuple element such as `_2` in a destructuring.
-- With the Ryn analysis alone, the full test suite passes: 405 tests in the default `cargo test` run and 405 in the `RYN_SEMA=ryn-only` run.
-
-### Windows target (experimental)
-
-- `rync --target windows` writes a PE32+ executable; `ryn.exe` and `rync.exe` are built that way and run under Wine
-  (`ryn new`, `check`, `build`, `run` with the program's exit status). See `docs/native-compiler.md`. Verified under Wine
-  only, not on Windows; threads, sockets, dynamic libraries, keyboard input and C callbacks are not available there yet.
 
 ### Language and runtime fixes
 
 - `extend String` methods with `mut self` changed the caller's value unreliably. A statement-level
   `String` method on a `&mut String` receiver passed the reference instead of the String handle, so
   `push` and `append` corrupted memory. This affected both backends and predates 0.1.6; it is fixed in
-  the Rust and Ryn frontends and in the native backend.
-- Cranelift now drops a discarded value that holds a destructor in a field, and frees owned fields of
-  a discarded structure. Before, a bare call or a bare `take` of such a value was never dropped.
+  the native compiler (the Rust frontends it was also fixed in were removed later in this release).
 - Native programs support, among others: file handles and `read_file_result`, `String::repeat`, Linux
   keyboard input, slices of structures, enum and array payloads, `echo` of structures and enums,
   structure equality, `repr(C)` updates through methods and raw pointers, structure keys in maps,
@@ -101,11 +78,6 @@ first one were written while the Rust implementation still existed; where they m
   destructor sits in a field.
 - Maps and vectors whose values have destructors still reject `get`, `values` and `clone` with
   `R0234` in both frontends.
-- The Ryn analysis and the Rust bootstrap analysis agree on programs that use `std::process`. A vector
-  passed to a borrowing system builtin (`__process_capture`) is lowered as a clone in both, because
-  the native runtime function consumes the vector it is given. Before, the consistency check reported
-  `R0904` for these programs under `ryn check` and under every Cranelift build; the native path did
-  not run the check, so the difference was not visible there.
 - Float records: the runtime shims for `f32` and `f64` records (`ryn_ffi_float_pair_sum`,
   `ryn_ffi_make_float_pair`, `ryn_ffi_double_value`) are now built for every x86_64 target, and the
   native backend implements the same three functions in assembly. Before, they existed only on
@@ -122,54 +94,44 @@ first one were written while the Rust implementation still existed; where they m
   an owned field (`String`) that checks the printed values, and one that builds such a literal as a
   return value and as a call argument 1000 times and checks that the live-allocation count is unchanged.
 
-### Build and tooling
+### Build, tooling and distribution
 
-- The crate version is 0.1.6 (`Cargo.toml`, `Cargo.lock`).
-- `bootstrap/rync-seed` (digest in `bootstrap/rync-seed.sha256`) is the native compiler that
-  `tools/bootstrap-native.sh` starts from, so the bootstrap needs no Cargo or rustc. The seed
-  reproduces itself from the sources. The release archive ships it as `rync`. How to replace it is in
-  `docs/native-compiler.md`.
-- `build.rs` lists the Ryn sources of the native compiler and the standard library in
-  `native_sources.rs`, so the compiler can write them out and build `rync`, and it compiles the
-  runtime shim object for the build target.
-- `install.sh` reads the release archive listing in full before searching it, so a `pipefail` shell no
-  longer reports a killed `tar` instead of the match. It also checks that extracting the executable
-  succeeded.
-- `tools/test-native-sources.py` compiles suite programs directly with `rync`, without the Rust
-  frontend, with a 1 GiB address-space limit per process.
-- `.github/workflows/ci.yml` has a new Linux job `native`: it builds the release compiler, runs
-  `ryn bootstrap --native`, and runs the native suite, runtime leak tests and backend comparison
-  tests. This job was not executed here.
+- `tools/bootstrap-native.sh <seed> <dir>` builds the compiler from the committed seed; `bootstrap/rync-seed` (digest in
+  `bootstrap/rync-seed.sha256`) is a fixed point of the committed sources. `tools/make-dist.py` builds the Linux archive
+  and the cross-compiled Windows archive. `tools/list-suite.py` lists the suite entries, `tools/test-native-sources.py`
+  runs them (`RYN_TEST_TARGET=windows` for Windows under Wine), and `tools/run-tests.py` runs the Python tests.
+- `VERSION` holds the version. `install.sh` and `install.ps1` install the whole archive directory, since `ryn` finds
+  `rync` and `stdlib` next to itself. `install.sh` reads the archive listing in full before searching it, so a
+  `pipefail` shell no longer reports a killed `tar` instead of the match.
+- `.github/workflows/ci.yml` bootstraps to a fixpoint, runs the suite and the Python tests, runs the Windows target under
+  Wine, and runs `ryn.exe` on a Windows runner; `release.yml` builds both archives. Not executed before the tag.
+- `ryn run` of a single file without `-o` builds the program into a scratch directory that is removed afterwards.
 
-### Known differences and limits in 0.1.6
 
-- The Windows CI job fails on 7 suite programs, unchanged from `main` at v0.1.5:
-  `ffi/sixteen_byte_float_record_to_and_from_c.ryn`, `ffi/sixteen_byte_integer_record_from_c.ryn`
-  and `ffi/w10_ffi_libm_pow_floor_and_div_records.ryn` are rejected with `R0247`, because
-  `#[repr(C)]` records of 9 to 16 bytes are accepted on non-Windows targets only
-  (`c_abi_packed_record_layout` in `src/sema.rs`); `ffi/complex_float_record_to_and_from_c.ryn`,
-  `ffi/libc_integer_functions.ryn` and `ffi/w4_libc_abs_labs_nested.ryn` compile but produce wrong
-  values (`labs(-9000000000)` prints `410065408`, the 32-bit truncated magnitude); and
-  `raii/r2_lead_stack_overflow_reports_error.ryn` terminates with access violation `0xC0000005`
-  instead of the documented status 1.
-- `realpath(path, NULL)` returns `NULL` in native binaries, with `errno` 22, while the same call
-  succeeds under the Cranelift backend. The standard library passes a 4096-byte buffer instead. Ruled
-  out in this work: the NULL argument itself (`strtol` with a NULL end pointer, `getcwd(NULL, 0)`,
-  and `realpath` with the NULL passed through a function parameter all behave correctly natively),
-  `malloc` and `sysconf` and `pathconf` values, and absolute versus relative paths. The cause is not
-  found. What would settle it: tracing the glibc calls made inside `realpath` in a native binary,
-  which needs a tracer that this machine does not have.
-- Thread ids are pthread ids on Linux.
-- Keyboard input state (`key_down`, `key_pressed`, `key_released`) is not thread-safe.
-- TCP and UDP `read` do not replace invalid UTF-8 with replacement characters.
-- `ryn_native_live_allocations` and `ryn_native_live_bytes` count only freestanding native programs;
-  programs that use file, process, thread or socket operations are linked against libc and are
-  declined for these counters.
-- The Rust analysis is no longer run on the default path, but the Rust code is still used: by `RYN_SEMA=rust` and `RYN_SEMA=both`, by the Cranelift backend (`--backend cranelift`), by the constant evaluation and pattern desugaring that run before the Ryn analysis, by the CLI, and by the library's unit tests. Removing the Rust frontend and the Cranelift backend needs those uses moved first, so nothing was removed in this work, and the cargo dependencies are still needed.
-- Windows float records were not re-run in this work; the shims are now compiled for all x86_64
-  targets.
-- Native declines: `Map.get`, `Map.values` and `Map.clone` of destructor values are rejected by the
-  frontends, so programs that reach the native backend never use them.
+### Known differences and limits
+
+- **Windows was run under Wine only, never on Windows itself.** Threads, sockets, `pipe`/`fork`, keyboard input and
+  records passed to or returned from C by value are not available there and are declined when compiling. A thread-safe
+  allocator would be needed first for threads.
+- The GitHub workflows (CI and release) were rewritten for the Cargo-free build and had not been run when 0.1.6 was
+  tagged.
+- Linux x86-64 is the only supported native host; macOS is not supported.
+- The exact spans, help texts and suggestions of the removed Rust analyzer are no longer pinned by tests; codes and
+  messages are.
+- An output that is a link to a source file is replaced by the executable (the source is not touched); the removed Rust
+  CLI refused such an output.
+- `realpath(path, NULL)` returns `NULL` in native binaries, with `errno` 22. The standard library passes a 4096-byte
+  buffer instead. The cause is not found; ruled out: the NULL argument itself, `malloc`/`sysconf`/`pathconf` values, and
+  absolute versus relative paths.
+- Thread ids are pthread ids on Linux. Keyboard input state (`key_down`, `key_pressed`, `key_released`) is not
+  thread-safe. TCP and UDP `read` do not replace invalid UTF-8 with replacement characters.
+- `ryn_native_live_allocations` and `ryn_native_live_bytes` count only freestanding native programs; programs that use
+  file, process, thread or socket operations are linked against libc and are declined for these counters.
+- Native declines: `Map.get`, `Map.values` and `Map.clone` of destructor values are rejected by the frontends, so
+  programs that reach the native backend never use them.
+- The two files `tests/native/ownership_30m.ryn` and `tests/native/ownership_paths.ryn` have no `// test:` header and
+  are not run by the suite runner.
+
 
 ### Verification after the Rust removal
 
@@ -185,7 +147,7 @@ Run from a clean `git clone` of the commit that removed Rust, with `PATH=/usr/bi
   against the extracted Linux `ryn`: 241 tests pass, 6 skipped. The extracted Windows archive runs `ryn.exe run` under Wine.
 - Not verified: the GitHub workflows (not executed), Windows itself (only Wine), macOS (not supported).
 
-### Verification before the Rust removal
+### Earlier verification (before the Rust removal)
 
 Run in this work, on `release/v0.1.6-native-first`. Nothing is pushed, tagged or published.
 
