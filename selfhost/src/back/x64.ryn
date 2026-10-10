@@ -57,10 +57,13 @@ pub struct Asm {
     pub reloc_symbols: Vec<u64>,
     pub reloc_kinds: Vec<u64>,
     pub reloc_addends: Vec<i64>,
+    // For a Windows image: every `syscall` becomes a call of the emulation routine at this label.
+    pub windows: bool,
+    pub syscall_label: u64,
 }
 
 pub fun new_asm() -> Asm {
-    return Asm { code: Vec(), label_offsets: Vec(), fixup_positions: Vec(), fixup_labels: Vec(), reloc_offsets: Vec(), reloc_symbols: Vec(), reloc_kinds: Vec(), reloc_addends: Vec() }
+    return Asm { code: Vec(), label_offsets: Vec(), fixup_positions: Vec(), fixup_labels: Vec(), reloc_offsets: Vec(), reloc_symbols: Vec(), reloc_kinds: Vec(), reloc_addends: Vec(), windows: false, syscall_label: 0 }
 }
 
 // Marks a label as not bound yet.
@@ -429,6 +432,10 @@ extend Asm {
     }
 
     pub fun syscall(mut self) {
+        when self.windows {
+            self.call_label(self.syscall_label)
+            return
+        }
         self.b(15)
         self.b(5)
     }

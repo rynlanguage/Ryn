@@ -733,7 +733,7 @@ fun rync_fail(message: String, code: i32) -> i32 {
 }
 
 fun rync_usage() -> String {
-    return String("usage: rync [build|check] [-o <path>] [--stdlib <directory>] [--package <name>=<directory>] <entry.ryn|project-dir>\n       rync --version")
+    return String("usage: rync [build|check] [-o <path>] [--target <linux|windows>] [--stdlib <directory>] [--package <name>=<directory>] <entry.ryn|project-dir>\n       rync --version")
 }
 
 fun main() -> i32 {
@@ -745,6 +745,7 @@ fun main() -> i32 {
     mut package_roots: Vec<String> = Vec()
     mut position: u32 = 0
     mut seen_command := false
+    mut windows := false
     while position < arg_count() {
         word := String(arg(position))
         when word == "--version" || word == "-V" {
@@ -760,6 +761,14 @@ fun main() -> i32 {
             checking = word == "check"
             seen_command = true
             position += 1
+        } else when word == "--target" && position + 1 < arg_count() {
+            target := String(arg(position + 1))
+            when target == "windows" || target == "x86_64-windows" {
+                windows = true
+            } else when target != "linux" && target != "x86_64-linux" {
+                return rync_fail(rync_usage(), 2)
+            }
+            position += 2
         } else when word == "--stdlib" && position + 1 < arg_count() {
             std_root = String(arg(position + 1))
             position += 2
@@ -857,7 +866,7 @@ fun main() -> i32 {
         }
         return 0
     }
-    linked := gen::generate_executable_text(compiled.ir_text)
+    linked := gen::generate_for_target(compiled.ir_text, windows)
     when linked.is_err() {
         failure := compilation.stage_failure(linked.unwrap_err())
         return rync_fail(failure.text, failure.status)

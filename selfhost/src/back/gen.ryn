@@ -13,6 +13,8 @@
 
 use back::x64
 use back::elf
+use back::pe
+use back::winrt
 use back::math
 use back::floats
 use back::float_runtime_ir
@@ -191,6 +193,14 @@ pub struct Gen {
     // The enums whose values are copied by a routine of their own, and its labels.
     // Whether the object runs without the C library (its own `_start` and the routines of `back/rt.ryn`), and their labels.
     freestanding: bool,
+    // Whether the image is for Windows: the system requests of the freestanding runtime go through `back/winrt`.
+    windows: bool,
+    win_syscall: u64,
+    win_init: u64,
+    win_veh: u64,
+    win_state: u64,
+    win_names: Vec<String>,
+    win_symbols: Vec<u64>,
     // Whether the program's own foreign functions come from the system's shared C library: a freestanding program that
     // declares a C function the runtime does not provide is linked dynamically, and every foreign call it makes itself goes
     // to the library, so that memory and handles it gets from C are given back to C.
@@ -262,7 +272,7 @@ fun false_literal() -> u64 {
 
 // Generates the object of a program, or the reason it is not handled.
 pub fun generate(program: ir::IrProgram) -> Result<Vec<u8>, String> {
-    return build(program, false, false)
+    return build(program, false, false, false)
 }
 
 // The program as an executable. A program that needs nothing from the C library becomes a static executable with the
@@ -270,7 +280,7 @@ pub fun generate(program: ir::IrProgram) -> Result<Vec<u8>, String> {
 // again against the C library: its runtime calls go to libc, its `_start` hands `main` to `__libc_start_main`, and the
 // executable is linked dynamically with `libc.so.6` and `libm.so.6` (`elf::link_executable`).
 pub fun generate_executable(program: ir::IrProgram) -> Result<Vec<u8>, String> {
-    first := build(program, true, false)
+    first := build(program, true, false, false)
     when first.is_err() {
         reason := first.unwrap_err()
         when reason == needs_libc_marker() {
@@ -283,19 +293,27 @@ pub fun generate_executable(program: ir::IrProgram) -> Result<Vec<u8>, String> {
 
 // `generate_executable` from the encoded typed IR, which is read again for the build against the C library.
 pub fun generate_executable_text(text: String) -> Result<Vec<u8>, String> {
+    return generate_for_target(text, false)
+}
+
+// An executable for Windows (`windows`) or Linux: a Windows program that needs the C library is declined.
+pub fun generate_for_target(text: String, windows: bool) -> Result<Vec<u8>, String> {
     program := ir::decode_ir(text.clone())
     when program.is_err() {
         return Result::Err(String("the typed IR does not decode"))
     }
-    first := build(program.unwrap(), true, false)
+    first := build(program.unwrap(), true, false, windows)
     when first.is_err() {
         reason := first.unwrap_err()
         when reason == needs_libc_marker() {
+            when windows {
+                return Result::Err(String("the C library is not available in a Windows program yet"))
+            }
             again := ir::decode_ir(text)
             when again.is_err() {
                 return Result::Err(String("the typed IR does not decode"))
             }
-            return build(again.unwrap(), true, true)
+            return build(again.unwrap(), true, true, false)
         }
         return Result::Err(reason)
     }
@@ -309,10 +327,10 @@ fun needs_libc_marker() -> String {
 
 // An object linked against libc, including its floating-point formatting and parsing routines.
 pub fun generate_libc(program: ir::IrProgram) -> Result<Vec<u8>, String> {
-    return build(program, false, true)
+    return build(program, false, true, false)
 }
 
-fun build(input: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>, String> {
+fun build(input: ir::IrProgram, executable: bool, libc: bool, windows: bool) -> Result<Vec<u8>, String> {
     runtime_base := input.functions.len()
     program := ir::append_ir(input, float_runtime_ir::source_ir())?
     mut asm := x64::new_asm()
@@ -373,6 +391,13 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>,
         shadow_images: Vec(),
         shadow_ids: Vec(),
         freestanding: false,
+        windows: false,
+        win_syscall: 0,
+        win_init: 0,
+        win_veh: 0,
+        win_state: 0,
+        win_names: Vec(),
+        win_symbols: Vec(),
         dynamic_imports: false,
         wants_libc: false,
         helper_names: Vec(),
@@ -487,6 +512,22 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>,
         position += 1
     }
     gen.needed.set(gen.program.main_index, true)
+    when windows {
+        gen.windows = true
+        asm.windows = true
+        asm.syscall_label = asm.new_label()
+        mut symbols: Vec<u64> = Vec()
+        for name in winrt::api_names() {
+            symbols.push(gen.foreign_symbol(name))
+        }
+        state := gen.symbol(String("ryn_win_state"), elf::Where::BSS, 16 + rt::state_size() + 8, 16, false)
+        gen.win_syscall = asm.syscall_label
+        gen.win_init = asm.new_label()
+        gen.win_veh = asm.new_label()
+        gen.win_state = state
+        gen.win_names = winrt::api_names()
+        gen.win_symbols = symbols
+    }
     gen.entry(&mut asm)
     start_size := asm.code.len()
     gen.runtime(&mut asm)
@@ -532,6 +573,9 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>,
             return Result::Err(gen.failure())
         }
     }
+    when gen.windows {
+        gen.emit_windows(&mut asm)
+    }
     when gen.textops_used % 2 == 1 {
         textops::emit_trim(&mut asm, gen.trim_label)
     }
@@ -570,6 +614,9 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>,
     when executable {
         when gen.wants_libc && !libc {
             return Result::Err(needs_libc_marker())
+        }
+        when gen.windows {
+            return pe::link_executable(gen.object(&mut asm, start_size))
         }
         return elf::link_executable(gen.object(&mut asm, start_size))
     }
@@ -766,7 +813,16 @@ extend Gen {
             asm.call_symbol(self.foreign_symbol(String("__libc_start_main")))
             asm.trap()
         }
-        when self.freestanding {
+        when self.windows {
+            // Windows enters with the return address on the stack: the command line is read by the start-up routine.
+            asm.alu_ri(4, x64::Reg::RSP, (0 as i64) - 16)
+            asm.call_label(self.win_init)
+            asm.alu_ri(4, x64::Reg::RSP, (0 as i64) - 16)
+            asm.call_label(entry_body)
+            asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
+            asm.mov_ri(x64::Reg::RAX, 231)
+            asm.syscall()
+        } else when self.freestanding {
             asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 0)
             asm.lea(x64::Reg::RSI, x64::Reg::RSP, 8)
             asm.alu_ri(4, x64::Reg::RSP, (0 as i64) - 16)
@@ -2347,6 +2403,22 @@ extend Gen {
     }
 
     // The routines of the freestanding runtime, with the text `strerror` gives for the common errors.
+    // The zero-filled bytes only a Windows image has: the exception handler's state.
+    fun windows_state_size(self) -> u64 {
+        when self.windows {
+            return 16
+        }
+        return 0
+    }
+
+    // The Windows routines under the freestanding runtime: the system call emulation, the start-up and the exception handler.
+    fun emit_windows(mut self, asm: &mut x64::Asm) {
+        win := winrt::WinRt { syscall_label: self.win_syscall, init_label: self.win_init, veh_label: self.win_veh, state_symbol: self.win_state, api_names: self.win_names.clone(), api_symbols: self.win_symbols.clone() }
+        winrt::emit_syscall(asm, &win)
+        winrt::emit_init(asm, &win)
+        winrt::emit_veh(asm, &win)
+    }
+
     fun emit_freestanding(mut self, asm: &mut x64::Asm) {
         mut numbers: Vec<u64> = Vec()
         mut texts: Vec<u64> = Vec()
@@ -9120,11 +9192,54 @@ extend Gen {
             }
             position += 1
         }
-        when !self.load_c_arguments(asm, types) {
+        // A Windows program reaches the operating system through the emulated system calls (`write`, `read`, `open`,
+        // `close`) or the scalar functions of the C runtime library (`ucrtbase.dll`), called with the Windows convention.
+        windows_call := self.windows && self.freestanding && !rt_provides(name.clone()) && !ffi_helpers::is_helper(name.clone())
+        system_number := windows_system_number(name.clone())
+        when windows_call && system_number == 0 {
+            when !self.load_windows_arguments(asm, types) {
+                return false
+            }
+        } else when !self.load_c_arguments(asm, types) {
             return false
         }
         self.sync_shadows(asm, false)
-        when self.freestanding && !rt_provides(name.clone()) {
+        when windows_call {
+            when system_number != 0 {
+                // The emulated call answers with a negative error number; a C function answers -1.
+                asm.mov_ri(x64::Reg::RAX, system_number - 1000)
+                asm.syscall()
+                nonnegative := asm.new_label()
+                asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
+                asm.jcc(x64::Cc::GREATER_EQUAL, nonnegative)
+                asm.unary(3, x64::Reg::RAX)
+                asm.lea_symbol(x64::Reg::RCX, self.rt.state)
+                asm.store(4, x64::Reg::RAX, x64::Reg::RCX, 16)
+                asm.mov_ri(x64::Reg::RAX, 18446744073709551615)
+                asm.bind(nonnegative)
+                // `getcwd` answers its buffer, or a null pointer on failure; the call answered a length, or -1.
+                when name == "getcwd" {
+                    failed_cwd := asm.new_label()
+                    cwd_done := asm.new_label()
+                    asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
+                    asm.jcc(x64::Cc::LESS, failed_cwd)
+                    asm.mov_rr(x64::Reg::RAX, x64::Reg::RDI)
+                    asm.jmp(cwd_done)
+                    asm.bind(failed_cwd)
+                    asm.mov_ri(x64::Reg::RAX, 0)
+                    asm.bind(cwd_done)
+                }
+            } else {
+                imported := self.foreign_symbol(windows_import_name(name))
+                asm.push(x64::Reg::RBP)
+                asm.mov_rr(x64::Reg::RBP, x64::Reg::RSP)
+                asm.alu_ri(4, x64::Reg::RSP, (0 as i64) - 16)
+                asm.alu_ri(5, x64::Reg::RSP, 32)
+                asm.call_symbol(imported)
+                asm.mov_rr(x64::Reg::RSP, x64::Reg::RBP)
+                asm.pop(x64::Reg::RBP)
+            }
+        } else when self.freestanding && !rt_provides(name.clone()) {
             // A freestanding program cannot make this call: it is built again against the C library.
             self.wants_libc = true
             asm.trap()
@@ -9132,6 +9247,41 @@ extend Gen {
             self.aligned_call(asm, name)
         }
         return self.finish_c_call(asm, result)
+    }
+
+    // The arguments of a call of a Windows function: the first four go to rcx, rdx, r8 and r9 by position (a float to the
+    // xmm register of its position), and nothing is passed by value that is larger than a register, passed on the stack, or
+    // called back (a function pointer would be called with the System V convention).
+    fun load_windows_arguments(mut self, asm: &mut x64::Asm, types: Vec<u64>) -> bool {
+        when types.len() > 4 {
+            return self.fail("a foreign call with more than four arguments in a Windows program")
+        }
+        for ty in types.clone() {
+            when self.c_classes(ty).len() > 0 || self.cells_of(ty) != 1 {
+                return self.fail("a record argument of a foreign call in a Windows program")
+            }
+            when self.is_function_pointer(ty) {
+                return self.fail("a function pointer argument of a foreign call in a Windows program")
+            }
+        }
+        mut index: u64 = types.len()
+        while index > 0 {
+            index -= 1
+            when self.is_sse(types[index]) {
+                asm.pop(x64::Reg::RAX)
+                asm.movq_to_xmm(self.word(types[index]) == "F64", index, x64::Reg::RAX)
+            } else {
+                asm.pop(windows_argument_register(index))
+            }
+        }
+        return true
+    }
+
+    fun is_function_pointer(self, ty: u64) -> bool {
+        return choose self.program.types[ty] {
+            ir::IrTy::FunctionPointerTo(parameters, result, external) => true,
+            _ => false,
+        }
     }
 
     // After a foreign call: the result is taken, and the `repr(C)` locals whose address was given out are read back from
@@ -10157,6 +10307,9 @@ extend Gen {
         }
         ty := result.unwrap()
         classes := self.c_classes(ty)
+        when classes.len() > 0 && self.windows {
+            return self.fail("a record result of a foreign call in a Windows program")
+        }
         when classes.len() > 0 {
             cells := self.cells_of(ty)
             asm.alu_ri(5, x64::Reg::RSP, (8 * cells + 16) as i64)
@@ -11845,7 +11998,7 @@ extend Gen {
         return elf::ObjectInput {
             text: asm.code.clone(),
             rodata: self.rodata.clone(),
-            bss_size: 16 + rt::state_size() + 8,
+            bss_size: 16 + rt::state_size() + 8 + self.windows_state_size(),
             symbol_names: names,
             symbol_sections: sections,
             symbol_values: values,
@@ -11857,6 +12010,78 @@ extend Gen {
             reloc_addends: asm.reloc_addends.clone(),
         }
     }
+}
+
+// The register of the argument at `index` in the Windows convention.
+fun windows_argument_register(index: u64) -> u64 {
+    when index == 0 {
+        return x64::Reg::RCX
+    }
+    when index == 1 {
+        return x64::Reg::RDX
+    }
+    when index == 2 {
+        return x64::Reg::R8
+    }
+    return x64::Reg::R9
+}
+
+// The C functions that a Windows program makes through the emulated system calls: 1000 plus the call number, or 0.
+fun windows_system_number(name: String) -> u64 {
+    when name == "write" {
+        return 1001
+    }
+    when name == "read" {
+        return 1000
+    }
+    when name == "open" {
+        return 1002
+    }
+    when name == "close" {
+        return 1003
+    }
+    when name == "mkdir" {
+        return 1083
+    }
+    when name == "rmdir" {
+        return 1084
+    }
+    when name == "unlink" {
+        return 1087
+    }
+    when name == "rename" {
+        return 1082
+    }
+    when name == "chdir" {
+        return 1080
+    }
+    when name == "getcwd" {
+        return 1079
+    }
+    when name == "stat" {
+        return 1004
+    }
+    when name == "lstat" {
+        return 1006
+    }
+    return 0
+}
+
+// The import that a C function is called through in a Windows program.
+fun windows_import_name(name: String) -> String {
+    mut text := String("ucrtbase!")
+    // `long` has 32 bits on Windows, so a 64-bit `labs` is `llabs`; some functions have an underscore there.
+    when name == "labs" {
+        text.append("llabs")
+    } else when name == "time" {
+        text.append("_time64")
+    } else when name == "getcwd" || name == "chdir" || name == "rmdir" || name == "unlink" || name == "getpid" || name == "strdup" || name == "isatty" || name == "dup" || name == "dup2" || name == "fileno" {
+        text.append("_")
+        text.append(name)
+    } else {
+        text.append(name)
+    }
+    return text
 }
 
 // The least value of a signed type, as the 64-bit pattern of its sign-extended value.

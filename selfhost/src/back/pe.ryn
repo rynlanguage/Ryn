@@ -1,0 +1,361 @@
+// The Windows linker: turns one object (the code, the read-only data, the zero-filled data, and the relocations) into a
+// PE32+ executable for x86-64. The image is loaded at 0x140000000 and never moved, so a relocation of the code is resolved
+// to a final distance and the image carries no base relocations. A symbol the object does not define is an import, named
+// `library!function`; each import gets a stub in the code (`jmp [slot]`) that goes through its slot of the import address
+// table, and the table is filled by the Windows loader.
+
+use back::elf
+
+struct Image {
+    bytes: Vec<u8>,
+}
+
+extend Image {
+    fun b(mut self, value: u64) {
+        self.bytes.push((value & 255) as u8)
+    }
+
+    fun w16(mut self, value: u64) {
+        self.b(value)
+        self.b(value >> (8 as u32))
+    }
+
+    fun w32(mut self, value: u64) {
+        self.w16(value)
+        self.w16(value >> (16 as u32))
+    }
+
+    fun w64(mut self, value: u64) {
+        self.w32(value)
+        self.w32(value >> (32 as u32))
+    }
+
+    fun text(mut self, value: String) {
+        mut at: u64 = 0
+        while at < value.len() {
+            self.b(value.byte_at(at) as u64)
+            at += 1
+        }
+    }
+
+    fun pad_to(mut self, size: u64) {
+        while (self.bytes.len() as u64) < size {
+            self.b(0)
+        }
+    }
+
+    fun append(mut self, more: Vec<u8>) {
+        mut at: u64 = 0
+        while at < more.len() {
+            self.bytes.push(more[at])
+            at += 1
+        }
+    }
+}
+
+fun round_up(value: u64, alignment: u64) -> u64 {
+    return (value + alignment - 1) / alignment * alignment
+}
+
+// The library part of `library!function`, and the function part.
+fun library_of(name: String) -> String {
+    at := name.find("!")
+    when at.is_none() {
+        return String("")
+    }
+    return name.slice(0, at.unwrap())
+}
+
+fun function_of(name: String) -> String {
+    at := name.find("!")
+    when at.is_none() {
+        return name
+    }
+    return name.slice(at.unwrap() + 1, name.len())
+}
+
+
+// A section header: the name, the size in memory and its address, the size in the file and its position, the flags.
+fun section_header(image: &mut Image, name: String, virtual_size: u64, rva: u64, raw_size: u64, raw_at: u64, flags: u64) {
+    image.text(name.clone())
+    mut at: u64 = name.len()
+    while at < 8 {
+        image.b(0)
+        at += 1
+    }
+    image.w32(virtual_size)
+    image.w32(rva)
+    image.w32(raw_size)
+    image.w32(raw_at)
+    image.w32(0)
+    image.w32(0)
+    image.w16(0)
+    image.w16(0)
+    image.w32(flags)
+}
+
+// Links one object into a PE32+ console executable entered at symbol 0.
+pub fun link_executable(input: elf::ObjectInput) -> Result<Vec<u8>, String> {
+    // The imports: every undefined symbol the code refers to, once, with its library.
+    mut imports: Vec<String> = Vec()
+    mut libraries: Vec<String> = Vec()
+    mut index: u64 = 0
+    while index < input.reloc_offsets.len() {
+        symbol := input.reloc_symbols[index]
+        when input.symbol_sections[symbol] == elf::Where::UNDEFINED {
+            name := input.symbol_names[symbol].clone()
+            when library_of(name.clone()).is_empty() {
+                mut message := String("undefined symbol: ")
+                message.append(name)
+                return Result::Err(message)
+            }
+            mut known := false
+            for imported in imports.clone() {
+                when imported == name {
+                    known = true
+                }
+            }
+            when !known {
+                imports.push(name.clone())
+                library := library_of(name)
+                mut have := false
+                for existing in libraries.clone() {
+                    when existing == library {
+                        have = true
+                    }
+                }
+                when !have {
+                    libraries.push(library)
+                }
+            }
+        }
+        index += 1
+    }
+    // Which library and which position in its table each import has.
+    mut import_library: Vec<u64> = Vec()
+    mut import_position: Vec<u64> = Vec()
+    mut counts: Vec<u64> = Vec()
+    for library in libraries.clone() {
+        counts.push(0)
+    }
+    for imported in imports.clone() {
+        library := library_of(imported)
+        mut which: u64 = 0
+        while libraries[which] != library {
+            which += 1
+        }
+        import_library.push(which)
+        import_position.push(counts[which])
+        counts.set(which, counts[which] + 1)
+    }
+
+    image_base: u64 = 5368709120
+    section_alignment: u64 = 4096
+    file_alignment: u64 = 512
+    headers_size: u64 = 512
+    text_rva: u64 = 4096
+    stubs_at := round_up(input.text.len(), 16)
+    text_virtual := stubs_at + 8 * imports.len()
+    text_raw := round_up(text_virtual, file_alignment)
+    rdata_rva := round_up(text_rva + text_virtual, section_alignment)
+    tables_at := round_up(input.rodata.len(), 16)
+    mut cursor := tables_at + (libraries.len() + 1) * 20
+    mut lookup_at: Vec<u64> = Vec()
+    mut address_at: Vec<u64> = Vec()
+    mut which: u64 = 0
+    while which < libraries.len() {
+        lookup_at.push(cursor)
+        cursor += (counts[which] + 1) * 8
+        address_at.push(cursor)
+        cursor += (counts[which] + 1) * 8
+        which += 1
+    }
+    mut name_at: Vec<u64> = Vec()
+    for imported in imports.clone() {
+        name_at.push(cursor)
+        cursor += 2 + function_of(imported).len() + 1
+        cursor = round_up(cursor, 2)
+    }
+    mut library_name_at: Vec<u64> = Vec()
+    for library in libraries.clone() {
+        library_name_at.push(cursor)
+        cursor += library.len() + 5
+    }
+    rdata_virtual := cursor
+    rdata_raw := round_up(rdata_virtual, file_alignment)
+    data_rva := round_up(rdata_rva + rdata_virtual, section_alignment)
+    mut data_virtual := input.bss_size
+    when data_virtual < 16 {
+        data_virtual = 16
+    }
+    image_size := round_up(data_rva + data_virtual, section_alignment)
+    text_at := headers_size
+    rdata_at := text_at + text_raw
+
+    // The code: relocations resolved to final distances, and the stubs of the imports.
+    mut code := input.text.clone()
+    index = 0
+    while index < input.reloc_offsets.len() {
+        symbol := input.reloc_symbols[index]
+        section := input.symbol_sections[symbol]
+        mut target: u64 = 0
+        when section == elf::Where::TEXT {
+            target = image_base + text_rva + input.symbol_values[symbol]
+        } else when section == elf::Where::RODATA {
+            target = image_base + rdata_rva + input.symbol_values[symbol]
+        } else when section == elf::Where::BSS {
+            target = image_base + data_rva + input.symbol_values[symbol]
+        } else {
+            name := input.symbol_names[symbol].clone()
+            mut found: u64 = 0
+            while imports[found] != name {
+                found += 1
+            }
+            target = image_base + text_rva + stubs_at + 8 * found
+        }
+        place := image_base + text_rva + input.reloc_offsets[index]
+        value := (target + (input.reloc_addends[index] as u64) - place) & 4294967295
+        at := input.reloc_offsets[index]
+        mut byte: u64 = 0
+        while byte < 4 {
+            code.set(at + byte, ((value >> ((byte * 8) as u32)) & 255) as u8)
+            byte += 1
+        }
+        index += 1
+    }
+    while (code.len() as u64) < stubs_at {
+        code.push(204 as u8)
+    }
+    mut found: u64 = 0
+    while found < imports.len() {
+        slot := rdata_rva + address_at[import_library[found]] + 8 * import_position[found]
+        stub := text_rva + stubs_at + 8 * found
+        distance := (slot - (stub + 6)) & 4294967295
+        code.push(255 as u8)
+        code.push(37 as u8)
+        mut byte: u64 = 0
+        while byte < 4 {
+            code.push(((distance >> ((byte * 8) as u32)) & 255) as u8)
+            byte += 1
+        }
+        code.push(204 as u8)
+        code.push(204 as u8)
+        found += 1
+    }
+
+    mut image := Image { bytes: Vec() }
+    // The DOS header: `MZ`, and the offset of the PE header at 0x3c.
+    image.text(String("MZ"))
+    image.pad_to(60)
+    image.w32(64)
+    // The PE signature, the COFF header: x86-64, three sections, an executable that can address more than 2 GiB and has no
+    // base relocations.
+    image.text(String("PE"))
+    image.w16(0)
+    image.w16(34404)
+    image.w16(3)
+    image.w32(0)
+    image.w32(0)
+    image.w32(0)
+    image.w16(240)
+    image.w16(35)
+    // The optional header.
+    image.w16(523)
+    image.b(14)
+    image.b(0)
+    image.w32(text_raw)
+    image.w32(rdata_raw)
+    image.w32(data_virtual)
+    image.w32(text_rva + input.symbol_values[0])
+    image.w32(text_rva)
+    image.w64(image_base)
+    image.w32(section_alignment)
+    image.w32(file_alignment)
+    image.w16(6)
+    image.w16(0)
+    image.w16(0)
+    image.w16(0)
+    image.w16(6)
+    image.w16(0)
+    image.w32(0)
+    image.w32(image_size)
+    image.w32(headers_size)
+    image.w32(0)
+    image.w16(3)
+    image.w16(256)
+    image.w64(16777216)
+    image.w64(16777216)
+    image.w64(1048576)
+    image.w64(4096)
+    image.w32(0)
+    image.w32(16)
+    // The data directories: only the import table, the second, is given; the loader reads the address tables from it.
+    mut directory: u64 = 0
+    while directory < 16 {
+        when directory == 1 {
+            image.w32(rdata_rva + tables_at)
+            image.w32((libraries.len() + 1) * 20)
+        } else {
+            image.w32(0)
+            image.w32(0)
+        }
+        directory += 1
+    }
+    section_header(&mut image, String(".text"), text_virtual, text_rva, text_raw, text_at, 1610612768)
+    section_header(&mut image, String(".rdata"), rdata_virtual, rdata_rva, rdata_raw, rdata_at, 1073741888)
+    section_header(&mut image, String(".data"), data_virtual, data_rva, 0, 0, 3221225600)
+    image.pad_to(text_at)
+    image.append(code)
+    image.pad_to(text_at + text_raw)
+    image.append(input.rodata.clone())
+    image.pad_to(text_at + text_raw + tables_at)
+    // The import descriptors, then each library's lookup and address tables (the same entries until the loader fills the
+    // second), the names of the functions, and the names of the libraries.
+    mut library_index: u64 = 0
+    while library_index < libraries.len() {
+        image.w32(rdata_rva + lookup_at[library_index])
+        image.w32(0)
+        image.w32(0)
+        image.w32(rdata_rva + library_name_at[library_index])
+        image.w32(rdata_rva + address_at[library_index])
+        library_index += 1
+    }
+    image.w32(0)
+    image.w32(0)
+    image.w32(0)
+    image.w32(0)
+    image.w32(0)
+    library_index = 0
+    while library_index < libraries.len() {
+        mut table: u64 = 0
+        while table < 2 {
+            mut member: u64 = 0
+            while member < imports.len() {
+                when import_library[member] == library_index {
+                    image.w64(rdata_rva + name_at[member])
+                }
+                member += 1
+            }
+            image.w64(0)
+            table += 1
+        }
+        library_index += 1
+    }
+    mut member: u64 = 0
+    while member < imports.len() {
+        image.w16(0)
+        image.text(function_of(imports[member].clone()))
+        image.b(0)
+        when (image.bytes.len() as u64) % 2 == 1 {
+            image.b(0)
+        }
+        member += 1
+    }
+    for library in libraries.clone() {
+        image.text(library)
+        image.text(String(".dll"))
+        image.b(0)
+    }
+    image.pad_to(rdata_at + rdata_raw)
+    return Result::Ok(image.bytes)
+}

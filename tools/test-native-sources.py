@@ -19,7 +19,12 @@ import subprocess
 import sys
 import tempfile
 
+import os
+
 ROOT = Path(__file__).resolve().parents[1]
+# RYN_TEST_TARGET=windows compiles every program for Windows and runs it under Wine in the container `ryn-wine`
+# (`podman run`), so the result is the behaviour under Wine, not on Windows itself.
+WINDOWS = os.environ.get("RYN_TEST_TARGET") == "windows"
 COMPILER = str(Path(sys.argv[1]).resolve())
 STDLIB = str(ROOT / "stdlib/std/src")
 
@@ -63,8 +68,9 @@ def run(path):
     if case["kind"] not in ("run", "fail"):
         return "skip", path, "no `// test:` header"
     with tempfile.TemporaryDirectory(prefix="ryn-native-source-") as directory:
-        executable = Path(directory) / "program"
-        build = subprocess.run([COMPILER, "build", "--stdlib", STDLIB, "-o", str(executable), str(target)],
+        executable = Path(directory) / ("program.exe" if WINDOWS else "program")
+        build_command = [COMPILER, "build"] + (["--target", "windows"] if WINDOWS else []) + ["--stdlib", STDLIB, "-o", str(executable), str(target)]
+        build = subprocess.run(build_command,
                                cwd=ROOT, capture_output=True, preexec_fn=limit, timeout=300)
         stderr = build.stderr.decode(errors="replace")
         if case["kind"] == "fail":
@@ -78,9 +84,18 @@ def run(path):
                 if text not in stderr:
                     return "wrongmsg", path, f"lacks `{text}`: {stderr.strip()[:300]}"
             return "pass", path, ""
+        if build.returncode == 3 and WINDOWS and "in a Windows program" in stderr:
+            return "declined", path, stderr.strip().splitlines()[0][:200] if stderr.strip() else "needs the C library"
         if build.returncode:
             return "compilefail", path, stderr.strip()[:600]
-        result = subprocess.run([str(executable)], cwd=ROOT, capture_output=True, preexec_fn=limit, timeout=60)
+        if WINDOWS:
+            run_command = ["podman", "run", "--rm", "--network=none", "-v", f"{directory}:/w:Z", "-v", f"{ROOT}:/repo:ro,Z", "-w", "/repo", "ryn-wine", "wine", "/w/program.exe"]
+            result = subprocess.run(run_command, cwd=ROOT, capture_output=True, timeout=120)
+            if not result.stdout and result.returncode == 0 and case["out"]:
+                # Wine sometimes starts without output when many containers start at once: one more try.
+                result = subprocess.run(run_command, cwd=ROOT, capture_output=True, timeout=120)
+        else:
+            result = subprocess.run([str(executable)], cwd=ROOT, capture_output=True, preexec_fn=limit, timeout=60)
         expected = "".join(line + "\n" for line in case["out"])
         if result.returncode != case["exit"] or result.stdout.decode(errors="replace") != expected:
             return "mismatch", path, repr((result.returncode, result.stdout[:160], result.stderr[:160]))
@@ -94,9 +109,12 @@ def run(path):
 # Popen preexec_fn must not run in a threaded parent. Use worker processes.
 from concurrent.futures import ProcessPoolExecutor
 if __name__ == '__main__':
-    with ProcessPoolExecutor(max_workers=8) as pool:
+    with ProcessPoolExecutor(max_workers=int(os.environ.get('RYN_TEST_JOBS', '8'))) as pool:
         results = list(pool.map(run, sys.argv[2:]))
     for status, path, detail in results:
         print(status, path, detail, flush=True)
     print(f"{sum(status == 'pass' for status, _, _ in results)}/{len(results)} passed", flush=True)
-    sys.exit(any(status not in ("pass", "skip") for status, _, _ in results))
+    declined = sum(status == "declined" for status, _, _ in results)
+    if declined:
+        print(f"{declined} declined (not a failure of the program, but not run)", flush=True)
+    sys.exit(any(status not in ("pass", "skip", "declined") for status, _, _ in results))
