@@ -1,0 +1,266 @@
+// ryn: the command-line tool. It creates and cleans projects and runs `check`, `build` and `run` by starting the sibling
+// compiler `rync` (installed next to it) with the project layout the commands define.
+//
+//     ryn new <path>
+//     ryn check <file.ryn|project-dir>
+//     ryn build <file.ryn|project-dir> [--release] [-o|--output <path>]
+//     ryn run <file.ryn|project-dir> [--release] [-o|--output <path>] [-- <program-args...>]
+//     ryn clean <project-dir>
+//
+// The standard library is found at `<directory of ryn>/stdlib/std/src`, or at `RYN_STDLIB`. Status 0 means success, 1 an
+// error (diagnostics go to standard error), and `run` returns the program's own status.
+
+use driver::manifest
+use std::fs
+use std::env
+use std::time
+
+fun ryn_usage() -> String {
+    return String("usage:\n  ryn new <path>\n  ryn check <file.ryn|project-dir>\n  ryn build <file.ryn|project-dir> [--release] [-o|--output <path>]\n  ryn run <file.ryn|project-dir> [--release] [-o|--output <path>] [-- <program-args...>]\n  ryn clean <project-dir>")
+}
+
+fun ryn_help() -> String {
+    mut text := String("Ryn — Reliable. Fast. Native.\n\n")
+    text.append(ryn_usage())
+    text.append("\n\nCommands:\n  new <path>        Create a project with a native Hello World example\n  check <source>    Check a .ryn file or project directory\n  build <source>    Compile a .ryn file or project directory\n  run <source>      Compile and run a .ryn file or project directory\n  clean <project>   Remove the project's build directory\n\nA project directory uses src/main.ryn as its entry point.\nProject outputs go under build/debug or build/release; build/cache is reserved for compiler caches.\nAn i32 result from main becomes the process exit code for run.\nPass program arguments to run after --.\nclean removes only the direct build directory and refuses symbolic links.\n\nOptions:\n  --release            Use the project's release output directory\n  -o, --output <path>  Set the executable path for build or run\n  -h, --help           Show this help\n  -V, --version        Show compiler version\n")
+    return text
+}
+
+fun ryn_fail(message: String) -> i32 {
+    eprint("{}", message)
+    return 1
+}
+
+fun ryn_ends_with(text: String, suffix: str) -> bool {
+    return text.ends_with(suffix)
+}
+
+// The last component of a path, ignoring trailing slashes.
+fun ryn_base_name(path: String) -> String {
+    mut end := path.len()
+    while end > 1 && (path.byte_at(end - 1) as u64) == 47 {
+        end -= 1
+    }
+    mut start := end
+    while start > 0 && (path.byte_at(start - 1) as u64) != 47 {
+        start -= 1
+    }
+    return path.slice(start, end)
+}
+
+fun ryn_new(path: String) -> i32 {
+    when fs::exists(path.clone()) {
+        mut message := String("error[R0400]: project path already exists: ")
+        message.append(path)
+        return ryn_fail(message)
+    }
+    name := ryn_base_name(path.clone())
+    when name.is_empty() {
+        return ryn_fail(ryn_usage())
+    }
+    mut directories: Vec<String> = Vec()
+    directories.push(String("src"))
+    directories.push(String("build/cache"))
+    directories.push(String("build/debug"))
+    directories.push(String("build/release"))
+    for directory in directories {
+        full := manifest::join_path(path.clone(), directory)
+        when !fs::create_dir_all(full.clone()) {
+            mut message := String("error[R0401]: cannot create ")
+            message.append(full)
+            return ryn_fail(message)
+        }
+    }
+    when !fs::write(manifest::join_path(path.clone(), String("src/main.ryn")), "fun main() {\n    echo \"Hello, Ryn!\"\n}\n") {
+        return ryn_fail(String("error[R0401]: cannot write project entry point"))
+    }
+    mut yaml := String("name: ")
+    yaml.append(name)
+    yaml.append("\nversion: 0.1.0\nowner: guest\n\ndependencies:\n\nbuild:\n  optimize: speed\n")
+    when !fs::write(manifest::join_path(path.clone(), String("ryn.yaml")), yaml) {
+        return ryn_fail(String("error[R0401]: cannot write project manifest"))
+    }
+    echo "created {path}"
+    return 0
+}
+
+fun ryn_clean(path: String) -> i32 {
+    when !fs::is_dir(path.clone()) {
+        mut message := String("error[R0402]: project path is not a directory: ")
+        message.append(path)
+        return ryn_fail(message)
+    }
+    build := manifest::join_path(path.clone(), String("build"))
+    when !fs::exists(build.clone()) {
+        echo "no build artifacts in {path}"
+        return 0
+    }
+    when !fs::is_dir(build.clone()) {
+        mut message := String("error[R0402]: refusing to clean a non-directory or symbolic link at ")
+        message.append(build)
+        return ryn_fail(message)
+    }
+    when !fs::remove_dir_all(build.clone()) {
+        mut message := String("error[R0402]: cannot remove build directory ")
+        message.append(build)
+        return ryn_fail(message)
+    }
+    echo "cleaned {build}"
+    return 0
+}
+
+// The directory the tool is installed in.
+fun ryn_home() -> String {
+    return manifest::directory_of(env::executable_path())
+}
+
+fun ryn_stdlib() -> String {
+    given := env::get("RYN_STDLIB")
+    when !given.is_empty() {
+        return given
+    }
+    return manifest::join_path(ryn_home(), String("stdlib/std/src"))
+}
+
+fun ryn_default_output(input: String, project: bool, release: bool) -> String {
+    when project {
+        mut name := ryn_base_name(input.clone())
+        when name == "." || name == ".." || name.is_empty() {
+            name = ryn_base_name(env::current_dir())
+        }
+        profile := when release { String("release") } else { String("debug") }
+        mut relative := String("build/")
+        relative.append(profile)
+        relative.append("/")
+        relative.append(name)
+        return manifest::join_path(input, relative)
+    }
+    when input.ends_with(".ryn") {
+        return input.slice(0, input.len() - 4)
+    }
+    mut out := input
+    out.append(".out")
+    return out
+}
+
+fun ryn_compiler(command: str, input: String, output: String) -> i32 {
+    compiler := manifest::join_path(ryn_home(), String("rync"))
+    when !fs::exists(compiler.clone()) {
+        mut message := String("error[R0301]: the compiler is not installed at ")
+        message.append(compiler)
+        return ryn_fail(message)
+    }
+    mut arguments: Vec<String> = Vec()
+    arguments.push(String(command))
+    arguments.push(String("--stdlib"))
+    arguments.push(ryn_stdlib())
+    when !output.is_empty() {
+        arguments.push(String("-o"))
+        arguments.push(output)
+    }
+    arguments.push(input)
+    return run_process_args(compiler, arguments)
+}
+
+fun main() -> i32 {
+    when arg_count() == 0 {
+        return ryn_fail(ryn_usage())
+    }
+    command := String(arg(0))
+    when command == "-h" || command == "--help" || command == "help" {
+        text := ryn_help()
+        echo "{text}"
+        return 0
+    }
+    when command == "-V" || command == "--version" || command == "version" {
+        echo "ryn 0.1.6"
+        return 0
+    }
+    when command == "new" || command == "clean" {
+        when arg_count() != 2 {
+            return ryn_fail(ryn_usage())
+        }
+        path := String(arg(1))
+        when command == "new" {
+            return ryn_new(path)
+        }
+        return ryn_clean(path)
+    }
+    when command != "check" && command != "build" && command != "run" {
+        return ryn_fail(ryn_usage())
+    }
+    mut input := String("")
+    mut output := String("")
+    mut release := false
+    mut program_args: Vec<String> = Vec()
+    mut position: u32 = 1
+    while position < arg_count() {
+        word := String(arg(position))
+        when word == "--" && command == "run" {
+            position += 1
+            while position < arg_count() {
+                program_args.push(String(arg(position)))
+                position += 1
+            }
+        } else when (word == "-o" || word == "--output") && command != "check" && position + 1 < arg_count() && output.is_empty() {
+            output = String(arg(position + 1))
+            position += 2
+        } else when word == "--release" && command != "check" && !release {
+            release = true
+            position += 1
+        } else when input.is_empty() && !word.starts_with("-") {
+            input = word
+            position += 1
+        } else {
+            return ryn_fail(ryn_usage())
+        }
+    }
+    when input.is_empty() {
+        return ryn_fail(ryn_usage())
+    }
+    project := fs::is_dir(input.clone())
+    when command == "check" {
+        status := ryn_compiler("check", input.clone(), String(""))
+        when status == 0 {
+            echo "{input}: ok"
+        }
+        return status
+    }
+    mut scratch := String("")
+    when command == "run" && output.is_empty() && !project {
+        scratch = env::temp_dir()
+        scratch.append("/ryn-run-")
+        scratch.append(time::unix().to_string())
+        when !fs::create_dir_all(scratch.clone()) {
+            return ryn_fail(String("error[R0401]: cannot create a scratch directory"))
+        }
+        output = manifest::join_path(scratch.clone(), ryn_base_name(ryn_default_output(input.clone(), false, release)))
+    }
+    when output.is_empty() {
+        output = ryn_default_output(input.clone(), project, release)
+    }
+    parent := manifest::directory_of(output.clone())
+    when !parent.is_empty() {
+        made := fs::create_dir_all(parent)
+    }
+    status := ryn_compiler("build", input, output.clone())
+    when status != 0 {
+        when !scratch.is_empty() {
+            removed := fs::remove_dir_all(scratch)
+        }
+        return status
+    }
+    when command == "build" {
+        echo "built {output}"
+        return 0
+    }
+    mut absolute := output
+    when !absolute.starts_with("/") {
+        absolute = manifest::join_path(env::current_dir(), absolute)
+    }
+    code := run_process_args(absolute, program_args)
+    when !scratch.is_empty() {
+        removed := fs::remove_dir_all(scratch)
+    }
+    return code
+}
