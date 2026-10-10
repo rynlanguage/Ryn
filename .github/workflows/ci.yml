@@ -23,7 +23,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Verify the seed checksum
-        run: cd bootstrap && sha256sum --check rync-seed.sha256
+        run: sha256sum --check bootstrap/rync-seed.sha256
 
       - name: Bootstrap the compiler to a byte-identical fixpoint
         run: env -i PATH=/usr/bin:/bin HOME="$HOME" tools/bootstrap-native.sh "$PWD/bootstrap/rync-seed" "$RUNNER_TEMP/fixpoint"

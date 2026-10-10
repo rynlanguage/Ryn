@@ -6,9 +6,50 @@ sequence: minor releases may change language details while the compiler is pre-1
 
 ## [Unreleased]
 
-This section lists what was built and checked in the working tree on
-`release/v0.1.6-native-first`. Nothing here is a published release: there is no tag, no release
-archive and no commit for 0.1.6 yet. Items marked "not verified" were not run in this work.
+This section lists what was built and checked in the working tree on `release/v0.1.6-native-first`. Nothing here is a
+published release: there is no tag and no release archive for 0.1.6 yet, and nothing is pushed. The sections below the
+first one were written while the Rust implementation still existed; where they mention `--backend cranelift`,
+`RYN_SEMA`, `ryn bootstrap`, `cargo test` or the Rust analysis, those things were removed at the end of this work.
+
+### The Rust implementation is gone
+
+- The tree has no Rust. The `ryn` command (`selfhost/src/ryn.ryn`), the native compiler `rync`, the runtime and the
+  Windows target are written in Ryn. `src/`, `Cargo.toml`, `Cargo.lock`, `build.rs`, `benches/` and the 34 Rust test
+  files were deleted. Everything stays in the git history; the commit before the removal is the last that builds with
+  Cargo (the local branch `rust-reference-0.1.6` points at it).
+- Removed with the Rust code: the Cranelift backend (`--backend`), `--frontend`, `RYN_SEMA`, `RYN_LINKER`,
+  `RYN_DUMP_SEMA`, `ryn ast`, `ryn bootstrap`, the `ryn-frontend` comparison tests, and `tools/ryn-diagnostic-coverage.sh`.
+  Programs, projects, diagnostics and manifests that worked with the native backend work the same.
+- The compiler is built by itself from the committed seed: `tools/bootstrap-native.sh` (stage 2 must equal stage 3,
+  and the seed equals both). `tools/make-dist.py` builds the Linux and the Windows archives with that compiler.
+  Compiler changes that the seed cannot compile are built in two steps (see `CONTRIBUTING.md`).
+- `ryn` now also does `lock`, `login` and `publish` (registry, Git and path dependencies, SHA-256, `ryn.lock` text
+  identical to what the Rust command wrote); they use the system `curl`, `tar` and `git`.
+- `rync` reports every independent error, rejects invalid UTF-8 sources and a project manifest without `name`, and
+  writes the executable through a temporary file renamed over the output, so an output that is a link to a source file
+  never overwrites the source (the old Rust CLI refused such an output; now the link is replaced).
+- Ownership: moving a field out of a local makes the whole value unusable (`R0240`) while the other fields stay
+  usable; a store into the field makes it available again. An argument that moves the receiver of the method call is
+  `R0242`. These were rules of the Rust guard that the Ryn analysis did not have; the Python tests that ported the Rust
+  tests found them.
+- Recovery: after an invalid `for` range start, the end and the body are still analyzed. `String::clear` works natively.
+- Tests: the Rust tests were ported to Python (`tools/tests`, run by `tools/run-tests.py`; 241 tests, 6 skipped because they are Windows-only or need a Windows host), and
+  `tools/tests/REMOVED_RUST_TESTS.md` lists, for each Rust test file, what it checked and why it was not ported (it used
+  the Rust implementation as an oracle or called its library API). The diagnostics of the corpus are checked against the
+  code and message the Rust analyzer produced (`test_diagnostic_corpus.py`, 195 rows). Not kept: the exact spans, help
+  texts and suggestions of the Rust analyzer, and the AST/IR round-trip tests of the Rust codecs.
+
+### Windows target (experimental)
+
+- `rync --target windows` writes a PE32+ executable; a `rync` that runs on Windows targets Windows by default.
+  `ryn.exe` and `rync.exe` are built that way (`tools/make-dist.py` cross-compiles them on Linux). See
+  `docs/native-compiler.md`.
+- Under Wine 10 (not on Windows itself): `ryn.exe new/check/build/run` work and pass the program's exit status; the
+  Windows `rync.exe` compiles and runs 618 of 631 suite entries; 629 of 636 entries pass when compiled for Windows by the
+  Linux compiler and run under Wine.
+- Not available on Windows yet, and declined when compiling: threads, sockets, `pipe`/`fork`, keyboard input, records
+  passed to or returned from C by value. The CI workflow has a job that runs `ryn.exe` on a real Windows runner; it has
+  not been run.
 
 ### Native compiler is the default
 
@@ -130,7 +171,21 @@ archive and no commit for 0.1.6 yet. Items marked "not verified" were not run in
 - Native declines: `Map.get`, `Map.values` and `Map.clone` of destructor values are rejected by the
   frontends, so programs that reach the native backend never use them.
 
-### Verification in this work
+### Verification after the Rust removal
+
+Run from a clean `git clone` of the commit that removed Rust, with `PATH=/usr/bin:/bin` (no `cargo`, `rustc`, `cc` or
+`ld` on it):
+
+- `sha256sum --check bootstrap/rync-seed.sha256`: ok.
+- `tools/bootstrap-native.sh bootstrap/rync-seed <dir>`: stage 2 and stage 3 byte-identical, and equal to the committed
+  seed (sha256 `1fe730f4...`).
+- The suite plus `tests/native` through that compiler: 639 of 641 pass; the other two (`tests/native/ownership_*.ryn`)
+  have no `// test:` header and are skipped by design.
+- `tools/make-dist.py` builds `ryn-0.1.6-linux-x86_64.tar.gz` and `ryn-0.1.6-windows-x86_64.zip`; `tools/run-tests.py`
+  against the extracted Linux `ryn`: 241 tests pass, 6 skipped. The extracted Windows archive runs `ryn.exe run` under Wine.
+- Not verified: the GitHub workflows (not executed), Windows itself (only Wine), macOS (not supported).
+
+### Verification before the Rust removal
 
 Run in this work, on `release/v0.1.6-native-first`. Nothing is pushed, tagged or published.
 
