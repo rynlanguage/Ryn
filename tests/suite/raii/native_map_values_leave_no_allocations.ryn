@@ -1,0 +1,22 @@
+// test: run
+// out: 1000
+// out: 0
+// `values()` of a map of scalars frees its temporary node array: no live allocation remains.
+extern "C" fun ryn_native_live_allocations() -> u64;
+fun round(seed: i64) -> i64 {
+    mut table := Map<i32, i64>()
+    table.insert(1, seed)
+    mut all := table.values()
+    return all.len() as i64
+}
+fun main() {
+    before := ryn_native_live_allocations()
+    mut i: i64 = 0
+    mut total: i64 = 0
+    while i < 1000 {
+        total += round(i)
+        i += 1
+    }
+    echo total
+    echo ryn_native_live_allocations() - before
+}

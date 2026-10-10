@@ -1,0 +1,36 @@
+// test: run
+// out: 501500
+// out: 0
+// A thousand rounds of insert, replace, get, remove and clear of a map of structures leave no live allocation.
+extern "C" fun ryn_native_live_allocations() -> u64;
+struct Mixed {
+    small: u8
+    wide: i64
+    flag: bool
+    count: i32
+}
+fun round(seed: i64) -> i64 {
+    mut table := Map<i32, Mixed>()
+    table.insert(1, Mixed { small: 1, wide: seed, flag: true, count: 10 })
+    table.insert(2, Mixed { small: 2, wide: seed + 1, flag: false, count: 20 })
+    table.insert(2, Mixed { small: 3, wide: seed + 2, flag: true, count: 30 })
+    mut sum: i64 = 0
+    when table.get(2).is_some() {
+        sum = table.get(2).unwrap().wide
+    }
+    table.remove(1)
+    table.insert(3, Mixed { small: 4, wide: 4, flag: false, count: 4 })
+    table.clear()
+    return sum
+}
+fun main() {
+    before := ryn_native_live_allocations()
+    mut i: i64 = 0
+    mut total: i64 = 0
+    while i < 1000 {
+        total += round(i)
+        i += 1
+    }
+    echo total
+    echo ryn_native_live_allocations() - before
+}

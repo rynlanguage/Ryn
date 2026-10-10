@@ -122,6 +122,10 @@ pub struct Lowering {
     locals: Vec<Local>,
     local_types: Vec<String>,
     addressed_types: Vec<String>,
+    // The `repr(C)` locals whose address is given out in this function, and those written inside a loop before it: such a
+    // write comes after the copy that the pointer reaches is made, and the copy would not see it.
+    c_addressed: Vec<u64>,
+    c_loop_written: Vec<u64>,
     next_slot: u64,
     statements: Vec<String>,
     return_ty: String,
@@ -137,7 +141,6 @@ pub struct Lowering {
     frame_marks: Vec<u64>,
     loop_frames: Vec<u64>,
     scope_floors: Vec<u64>,
-    chained: bool,
     borrow_chain: bool,
     returned_refs: Vec<String>,
     // Owned locals that a top-level statement of the function has moved, so that a later use is `R0240`; and
@@ -497,6 +500,18 @@ fun scalar_type_name(ty: String) -> Option<String> {
     return Option::None
 }
 
+// The type a mismatch message names: a scalar by its name, and a structure or an enum as `structure` or `enum`, the
+// words the bootstrap prints for `Type::Struct` and `Type::Enum`.
+fun mismatch_type_name(ty: String) -> Option<String> {
+    when struct_id_of(ty.clone()).is_some() {
+        return Option::Some(String("structure"))
+    }
+    when enum_id_of(ty.clone()).is_some() {
+        return Option::Some(String("enum"))
+    }
+    return scalar_type_name(ty)
+}
+
 // `R0206` with the operand types spelled as the bootstrap does: `<prefix> found `<left>` and `<right>``.
 fun operator_error(prefix: str, left: String, right: String, help: str, span: ast::Span) -> Option<String> {
     mut message := String(prefix)
@@ -599,6 +614,31 @@ fun unknown_module_item_error(module: String, item: String, start: u64, end: u64
 // `R0234` for a `choose` (or a `??`, which is one) over a value that is not an enum, at the expression's span.
 fun choose_enum_error(start: u64, end: u64) -> String {
     return diagnostic("R0234", start, end, String("`choose` requires an enum value"), String("match one of this enum's variants over a value of enum type"))
+}
+
+// Whether a type of `names` is declared as `name` in a namespace or module (`math::integer::Name`). A name found
+// that way is resolved by the namespace's scope, which this lowering does not yet follow, so it is not reported unknown.
+fun declared_in_a_namespace(names: Vec<String>, name: String) -> bool {
+    mut at: u64 = 0
+    while at < names.len() {
+        declared := names[at].clone()
+        when declared == name {
+            return true
+        }
+        when declared.len() > name.len() + 2 && declared.slice(declared.len() - name.len(), declared.len()) == name && declared.slice(declared.len() - name.len() - 2, declared.len() - name.len()) == "::" {
+            return true
+        }
+        at += 1
+    }
+    return false
+}
+
+// `R0230` for a type name that no structure, enum or alias declares, at the name's span.
+fun unknown_type_error(name: String, start: u64, end: u64) -> String {
+    mut message := String("unknown type `")
+    message.append(name)
+    message.append("`")
+    return diagnostic("R0230", start, end, message, String("use a built-in type or declare this structure or enum"))
 }
 
 // `R0235` for a `choose` that leaves out variants and has no `_` arm, at the `choose`'s span. `missing` lists
@@ -1038,6 +1078,161 @@ fun unknown_function_error(name: String, start: u64, end: u64) -> String {
     message.append(name.clone())
     message.append("`")
     return diagnostic("R0210", start, end, message, bare_variant_hint(name))
+}
+
+// The largest value an integer literal of type `ty` may have.
+fun integer_maximum(ty: String) -> u64 {
+    when ty == "I8" {
+        return 127
+    }
+    when ty == "I16" {
+        return 32767
+    }
+    when ty == "I32" {
+        return 2147483647
+    }
+    when ty == "U8" {
+        return 255
+    }
+    when ty == "U16" {
+        return 65535
+    }
+    when ty == "U32" {
+        return 4294967295
+    }
+    when ty == "U64" {
+        return 18446744073709551615
+    }
+    return 9223372036854775807
+}
+
+// The name the bootstrap gives an integer type in a range diagnostic.
+fun integer_type_name(ty: String) -> String {
+    when ty == "I8" {
+        return String("i8")
+    }
+    when ty == "I16" {
+        return String("i16")
+    }
+    when ty == "I32" {
+        return String("i32")
+    }
+    when ty == "U8" {
+        return String("u8")
+    }
+    when ty == "U16" {
+        return String("u16")
+    }
+    when ty == "U32" {
+        return String("u32")
+    }
+    when ty == "U64" {
+        return String("u64")
+    }
+    return String("i64")
+}
+
+// The smallest value of an integer type, as the range diagnostic writes it.
+fun integer_minimum_text(ty: String) -> String {
+    when ty == "I8" {
+        return String("-128")
+    }
+    when ty == "I16" {
+        return String("-32768")
+    }
+    when ty == "I32" {
+        return String("-2147483648")
+    }
+    when ty == "I64" {
+        return String("-9223372036854775808")
+    }
+    return String("0")
+}
+
+// `R0206` for an integer literal above the largest value of its type, at the literal, with the range as the help.
+fun integer_range_error(ty: String, start: u64, end: u64) -> String {
+    mut message := String("integer literal is outside the `")
+    message.append(integer_type_name(ty.clone()))
+    message.append("` range")
+    mut help := String("use a value from `")
+    help.append(integer_minimum_text(ty.clone()))
+    help.append("` to `")
+    help.append(num(integer_maximum(ty.clone())))
+    help.append("`, or choose a wider integer type")
+    return diagnostic("R0206", start, end, message, help)
+}
+
+// The name the bootstrap's messages give a type word: a scalar, `str`, `String`, or a set of one of them. None for others.
+fun rust_type_name(word: String) -> Option<String> {
+    when word.starts_with("Set ") && word.ends_with(" Bool") {
+        inner := rust_type_name(word.slice(4, word.len() - 5))
+        when inner.is_none() {
+            return Option::None
+        }
+        mut name := String("Set<")
+        name.append(inner.unwrap())
+        name.append(">")
+        return Option::Some(name)
+    }
+    when word == "I8" {
+        return Option::Some(String("i8"))
+    }
+    when word == "I16" {
+        return Option::Some(String("i16"))
+    }
+    when word == "I32" {
+        return Option::Some(String("i32"))
+    }
+    when word == "I64" {
+        return Option::Some(String("i64"))
+    }
+    when word == "U8" {
+        return Option::Some(String("u8"))
+    }
+    when word == "U16" {
+        return Option::Some(String("u16"))
+    }
+    when word == "U32" {
+        return Option::Some(String("u32"))
+    }
+    when word == "U64" {
+        return Option::Some(String("u64"))
+    }
+    when word == "F32" {
+        return Option::Some(String("f32"))
+    }
+    when word == "F64" {
+        return Option::Some(String("f64"))
+    }
+    when word == "Bool" {
+        return Option::Some(String("bool"))
+    }
+    when word == "Char" {
+        return Option::Some(String("char"))
+    }
+    when word == "OwnedString" {
+        return Option::Some(String("String"))
+    }
+    when word == "Str" {
+        return Option::Some(String("str"))
+    }
+    return Option::None
+}
+
+// `R0234` for a vector whose element type the bootstrap does not support, at the type, with its supported element types.
+fun vec_of_set_error(name: String, start: u64, end: u64) -> String {
+    mut message := String("`Vec<")
+    message.append(name)
+    message.append(">` is not supported yet")
+    return diagnostic("R0234", start, end, message, String("supported element types are integers, floats, `bool`, `char`, `String`, maps, structures, and enums for now"))
+}
+
+// The built-in calls that `call` lowers by name: a name that is none of these and is no function of the program is unknown.
+fun is_builtin_call_name(name: String) -> bool {
+    when name == "String" || name == "arg" || name == "arg_count" || name == "try_read_file" || name == "read_file_result" {
+        return true
+    }
+    return builtins::builtin_named(name).is_some()
 }
 
 // `R0204` for a method that takes `mut self` called on a receiver whose root binding is not `mut`.
@@ -1846,7 +2041,7 @@ extend Lowering {
     }
 
     // Allocates the slots a value of `ty` takes, as `sema` does: `str` takes a pointer and a
-    // length, and each scalar takes one. Each allocation adds one addressed entry.
+    // length, and each scalar takes one. Each slot adds one addressed entry, so a `str` or a slice adds two.
     fun allocate(mut self, ty: String) -> Result<u64, String> {
         when struct_id_of(ty.clone()).is_some() {
             id := struct_id_of(ty).unwrap()
@@ -1942,6 +2137,7 @@ extend Lowering {
             self.owners.push(String(""))
             self.local_types.push(String("I64"))
             self.owners.push(String(""))
+            self.addressed_types.push(String(""))
             self.next_slot += 2
             return Result::Ok(slot)
         }
@@ -1956,6 +2152,7 @@ extend Lowering {
             self.owners.push(String(""))
             self.local_types.push(String("I64"))
             self.owners.push(String(""))
+            self.addressed_types.push(String(""))
             self.next_slot += 2
             return Result::Ok(slot)
         }
@@ -2043,6 +2240,21 @@ extend Lowering {
     fun name_place(self, name: String) -> Result<Place, String> {
         index := self.find(name)?
         return Result::Ok(Place { slot: self.locals[index].slot, ty: self.locals[index].ty.clone(), mutable: self.locals[index].mutable })
+    }
+
+    // The place of the field `name` of `place` as `field_step` gives it; a field that the structure does not declare is
+    // `R0225` at the field's name, with the closest field name as a hint.
+    fun field_step_at(self, place: Place, name: String, start: u64, end: u64) -> Result<Place, String> {
+        mut ty := place.ty.clone()
+        inner := reference_inner(ty.clone())
+        when inner.is_some() {
+            ty = inner.unwrap()
+        }
+        id := struct_id_of(ty.clone())
+        when id.is_some() && self.field_index(id.unwrap(), name.clone()).is_err() {
+            return Result::Err(self.unknown_struct_field(id.unwrap(), name, start, end))
+        }
+        return self.field_step(place, name)
     }
 
     fun field_step(self, base: Place, name: String) -> Result<Place, String> {
@@ -2302,14 +2514,14 @@ extend Lowering {
         choose self.program.exprs[index] {
             ast::ExprTree::NameRef(name, span) => self.moved_name(index, name, expected),
             ast::ExprTree::FieldE(value, name, name_span, span) => self.moved_field_checked(value, name, name_span, span, expected),
-            ast::ExprTree::DerefE(pointer, span) => self.moved_dereference(pointer),
+            ast::ExprTree::DerefE(pointer, span) => self.moved_dereference(pointer, span),
             _ => self.expression(index, expected),
         }
     }
 
     // A value read through a reference is copied, never moved out of it: an owned pointee is `R0240`, at the pointer.
-    fun moved_dereference(mut self, pointer: u64) -> Result<Lowered, String> {
-        lowered := self.dereference(pointer)?
+    fun moved_dereference(mut self, pointer: u64, span: ast::Span) -> Result<Lowered, String> {
+        lowered := self.dereference(pointer, span)?
         when self.owns(lowered.ty.clone()) {
             pointer_span := self.expr_span_of(pointer)
             return Result::Err(moved_out_of_reference_error(pointer_span.start, pointer_span.end))
@@ -3251,6 +3463,24 @@ extend Lowering {
         return closest_name(name, candidates)
     }
 
+    // The closest function name for an unknown call: the functions of the program, and the built-in `arg` and `arg_count`
+    // unless the program declares a function of that name, as the bootstrap's candidates are.
+    fun unknown_function_suggestion(self, name: String) -> String {
+        mut candidates: Vec<String> = Vec()
+        mut position: u64 = 0
+        while position < self.signatures.len() {
+            candidates.push(self.signatures[position].name.clone())
+            position += 1
+        }
+        when self.signature_index(String("arg")).is_err() {
+            candidates.push(String("arg"))
+        }
+        when self.signature_index(String("arg_count")).is_err() {
+            candidates.push(String("arg_count"))
+        }
+        return closest_name(name, candidates)
+    }
+
     // Whether `name` is a function of this program that is not public and lives in another module than the caller.
     fun private_function_call(self, name: String) -> bool {
         found := self.signature_index(name.clone())
@@ -3461,8 +3691,9 @@ extend Lowering {
         self.discard_pending(scrutinee_pending)
         id := enum_id_of(scrutinee.ty.clone()).unwrap_or(0)
         when enum_id_of(scrutinee.ty.clone()).is_none() {
-            // A tuple or structure pattern is a shape probe, which the bootstrap checks first (`R0235`).
-            when scalar_type_name(scrutinee.ty.clone()).is_some() && !self.has_shape_probe(arms.clone()) {
+            // A tuple or structure pattern is a shape probe, which the bootstrap checks first (`R0235`). Any other value
+            // that is not an enum, such as a structure with `?.`, is `R0234` there too.
+            when !self.has_shape_probe(arms.clone()) {
                 return Result::Err(choose_enum_error(span.start, span.end))
             }
             return Result::Err(unsupported("choose on a value that is not an enum"))
@@ -3682,7 +3913,8 @@ extend Lowering {
         when found.is_err() {
             return false
         }
-        return self.locals[found.unwrap()].ty.starts_with("Reference ")
+        // A raw pointer's fields are read and written through its address, as a reference's are.
+        return self.locals[found.unwrap()].ty.starts_with("Reference ") || self.locals[found.unwrap()].ty.starts_with("RawPointer ")
     }
 
     // A field of a structure reached through a reference local: `ReferenceField pointer ...`, and
@@ -3821,15 +4053,21 @@ extend Lowering {
     fun reference_field_assign(mut self, object: String, names: Vec<String>, spans: Vec<u64>, op: Option<String>, value: u64, span: ast::Span) -> Result<bool, String> {
         index := self.find(object.clone())?
         local := self.locals[index]
-        id := struct_id_of(reference_inner(local.ty.clone()).unwrap())
+        // A reference and a raw pointer are both stores through an address: the pointer's pointee is the structure.
+        pointee := self.pointee_of(local.ty.clone())?
+        id := struct_id_of(pointee.clone())
         when id.is_none() || names.len() != 1 {
             return Result::Err(unsupported("assignment through this reference"))
         }
         field := self.field_index(id.unwrap(), names[0].clone())?
         // `R0426`: a field of a structure from another module is assigned through a reference only when it is `pub`.
-        private := self.private_field_of(reference_inner(local.ty.clone()).unwrap(), names[0].clone(), spans[0], spans[1])
+        private := self.private_field_of(pointee.clone(), names[0].clone(), spans[0], spans[1])
         when private.is_some() {
             return Result::Err(private.unwrap())
+        }
+        // `R0255`: the resource handle, the first field of a structure with a destructor, is not overwritten through a borrow.
+        when reference_inner(local.ty.clone()).is_some() && field == 0 && !self.structs[id.unwrap()].drop_name.is_empty() {
+            return Result::Err(diagnostic("R0255", span.start, span.end, String("cannot overwrite the resource handle through a borrowed value"), String("")))
         }
         field_ty := self.structs[id.unwrap()].field_types[field].clone()
         object_end := span.start + object.len()
@@ -3878,8 +4116,12 @@ extend Lowering {
     // `place.field = value`, or `place.field op= value` with the target's span.
     fun field_assign(mut self, object: String, names: Vec<String>, spans: Vec<u64>, op: Option<String>, value: u64, span: ast::Span) -> Result<bool, String> {
         mut place := self.name_place(object.clone())?
-        when reference_inner(place.ty.clone()).is_some() {
+        when reference_inner(place.ty.clone()).is_some() || place.ty.starts_with("RawPointer ") {
             return self.reference_field_assign(object, names, spans, op, value, span)
+        }
+        // A write after the address is given out is kept in the pointer's copy by the back end; one in a loop before it is not.
+        when self.is_c_record(place.ty.clone()) && self.loop_depth > 0 {
+            self.c_loop_written.push(place.slot)
         }
         when !place.mutable {
             // A raw pointer's fields are checked by `R0224` or the reference path, not here.
@@ -3892,8 +4134,10 @@ extend Lowering {
         mut target_len := object.len()
         mut position: u64 = 0
         while position < names.len() {
+            // The field's name follows its dot, which follows the text written so far.
+            name_start := span.start + target_len + 1
             target_len += 1 + names[position].len()
-            place = self.field_step(place, names[position].clone())?
+            place = self.field_step_at(place, names[position].clone(), name_start, name_start + names[position].len())?
             position += 1
         }
         // `R0251`/`R0252`: a reference or raw pointer stored into a field may not point at a local of a deeper block
@@ -3989,6 +4233,16 @@ extend Lowering {
     }
 
     fun signature_index(self, name: String) -> Result<u64, String> {
+        // The native runtime module (`std::native`) calls its own functions first: a program may declare a C function of
+        // the same name with another signature.
+        when self.module == "std::native" {
+            mut local := String("std::native::")
+            local.append(name.clone())
+            own := self.signature_exact(local)
+            when own.is_ok() {
+                return own
+            }
+        }
         found := self.signature_exact(name.clone())
         when found.is_ok() {
             return found
@@ -4061,7 +4315,7 @@ extend Lowering {
 
     fun expression(mut self, index: u64, expected: String) -> Result<Lowered, String> {
         choose self.program.exprs[index] {
-            ast::ExprTree::IntLit(value, span) => self.integer(value, expected),
+            ast::ExprTree::IntLit(value, span) => self.integer(value, expected, span),
             ast::ExprTree::FloatLit(bits, span) => self.float_literal(bits, expected),
             ast::ExprTree::CharLit(value, span) => self.character_literal(value, expected),
             ast::ExprTree::BitNotE(value, span) => self.bit_not(value, span, expected),
@@ -4079,13 +4333,13 @@ extend Lowering {
             ast::ExprTree::StructLit(name, fields, span) => self.struct_literal(name, fields, span, expected),
             ast::ExprTree::CallE(name, type_arguments, arguments, span) => self.call_at(name, type_arguments, arguments, span, expected),
             ast::ExprTree::MethodCallE(receiver, name, type_arguments, arguments, span) => self.method_expression(receiver, name, type_arguments, arguments, span, expected),
-            ast::ExprTree::VecNewE(element, span) => self.vec_new(element, expected),
-            ast::ExprTree::MapNewE(key, value, span) => self.map_new(key, value),
+            ast::ExprTree::VecNewE(element, span) => self.vec_new(element, expected, span),
+            ast::ExprTree::MapNewE(key, value, span) => self.map_new(key, value, span),
             ast::ExprTree::SetNewE(element, span) => self.set_new(element),
             ast::ExprTree::IndexE(value, position, span) => self.index_expression(value, position, expected, span),
             ast::ExprTree::LayoutE(ty, alignment, span) => self.layout_of(ty, alignment),
             ast::ExprTree::AddressOfE(mutable, raw, value, span) => self.address_of(mutable, raw, value, span),
-            ast::ExprTree::DerefE(pointer, span) => self.dereference(pointer),
+            ast::ExprTree::DerefE(pointer, span) => self.dereference(pointer, span),
             ast::ExprTree::TupleE(elements, span) => self.tuple_literal(elements, expected),
             ast::ExprTree::RangeE(start, end, inclusive, span) => self.range_literal(start, end, inclusive, expected),
             ast::ExprTree::ArrayE(elements, span) => self.array_literal(elements, expected),
@@ -4138,13 +4392,13 @@ extend Lowering {
 
     // A literal takes the expected integer type. In any other context it is `I64`, as the bootstrap
     // types it, and the caller then reports the mismatch; a value beyond `I64` is declined.
-    fun integer(self, value: u64, expected: String) -> Result<Lowered, String> {
+    fun integer(self, value: u64, expected: String, span: ast::Span) -> Result<Lowered, String> {
         mut ty := expected.clone()
         when !is_integer_word(ty.clone()) {
-            when value > 9223372036854775807 {
-                return Result::Err(unsupported("integer type"))
-            }
             ty = String("I64")
+        }
+        when value > integer_maximum(ty.clone()) {
+            return Result::Err(integer_range_error(ty.clone(), span.start, span.end))
         }
         text := join(words3(String("Integer"), num(value), ty.clone()))
         return Result::Ok(Lowered { text: text, ty: ty })
@@ -4611,7 +4865,7 @@ extend Lowering {
             equality := op == "Eq" || op == "Ne"
             mut valid := lhs.ty == rhs.ty
             when equality {
-                valid = valid && (is_numeric_word(lhs.ty.clone()) || lhs.ty == "Str" || lhs.ty == "OwnedString" || lhs.ty == "Char" || lhs.ty == "Bool" || lhs.ty.starts_with("RawPointer ") || lhs.ty.starts_with("FunctionPointer "))
+                valid = valid && (is_numeric_word(lhs.ty.clone()) || lhs.ty == "Str" || lhs.ty == "OwnedString" || lhs.ty == "Char" || lhs.ty == "Bool" || lhs.ty.starts_with("RawPointer ") || lhs.ty.starts_with("FunctionPointer ") || struct_id_of(lhs.ty.clone()).is_some())
             } else {
                 valid = valid && (is_numeric_word(lhs.ty.clone()) || lhs.ty == "Char")
             }
@@ -4712,8 +4966,8 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
 
 // `R0205` for an initializer whose type is not the declared type, at the initializer's span.
     fun declared_mismatch(self, value: u64, declared: String, actual: String) -> Option<String> {
-        declared_name := scalar_type_name(declared)
-        actual_name := scalar_type_name(actual)
+        declared_name := mismatch_type_name(declared)
+        actual_name := mismatch_type_name(actual)
         when declared_name.is_none() || actual_name.is_none() {
             return Option::None
         }
@@ -4875,7 +5129,19 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
             } else when path.ty != "Str" {
                 return Result::Err(unsupported("file path type"))
             }
-            return Result::Ok(Lowered { text: join(words4(target, num(id), String("1"), text)), ty: join(words2(String("Enum"), num(id))) })
+            ret := join(words2(String("Enum"), num(id)))
+            // The native runtime module reads the file in Ryn, so the call is an ordinary call of that function.
+            mut runtime_params: Vec<String> = Vec()
+            runtime_params.push(String("Str"))
+            runtime := self.runtime_function(join(words2(String("Filesystem"), target.clone())), runtime_params, ret.clone())
+            when runtime.is_some() {
+                mut call: Vec<String> = Vec()
+                call.push(join(words2(String("Function"), num(runtime.unwrap()))))
+                call.push(String("1"))
+                call.push(text.clone())
+                return Result::Ok(Lowered { text: join(call), ty: ret })
+            }
+            return Result::Ok(Lowered { text: join(words4(target, num(id), String("1"), text)), ty: ret })
         }
         entry := builtins::builtin_named(name)
         when entry.is_none() {
@@ -4897,8 +5163,12 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
                 context = String("")
             }
             mut value := Lowered { text: String(""), ty: String("") }
+            // A vector that a builtin borrows is passed as a clone: the native runtime function takes the vector it is given.
+            // The argument list of `RunProcessArgs` is consumed by the call, as sema moves it, so it is checked before the borrowing rule.
             when builtin.target == "System RunProcessArgs" && position == 1 {
                 value = self.moved_expression(arguments[position], context)?
+            } else when borrows && expected.starts_with("Vec ") {
+                value = self.borrowed_vector(arguments[position])?
             } else {
                 value = self.expression(arguments[position], context)?
             }
@@ -4911,7 +5181,55 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
             }
             position += 1
         }
+        // A builtin the native runtime module implements in Ryn is a call of that function.
+        runtime := self.runtime_function(builtin.target.clone(), builtin.params.clone(), builtin.ret.clone())
+        when runtime.is_some() {
+            tokens.set(0, join(words2(String("Function"), num(runtime.unwrap()))))
+        }
         return Result::Ok(Lowered { text: join(tokens), ty: builtin.ret.clone() })
+    }
+
+    // The clone of a `Vec` value that a builtin borrows (the caller keeps the vector, and the clone is the callee's).
+    fun borrowed_vector(mut self, index: u64) -> Result<Lowered, String> {
+        span := self.expr_span_of(index)
+        return self.method_expression(index, String("clone"), Vec<u64>(), Vec<u64>(), span, String(""))
+    }
+
+    // The function of the native runtime module (`std::native::__rt_<target in snake case>`) that implements the builtin
+    // `target`, when the program has it with the builtin's parameter and result types. Only `rync` loads that module.
+    fun runtime_function(self, target: String, params: Vec<String>, ret: String) -> Option<u64> {
+        mut name := String("std::native::__rt_")
+        mut at: u64 = 0
+        while at < target.len() {
+            byte := target.byte_at(at) as u64
+            when byte == 32 {
+                name.push('_')
+            } else when byte >= 65 && byte <= 90 {
+                when at > 0 && (target.byte_at(at - 1) as u64) != 32 {
+                    name.push('_')
+                }
+                name.push(char_from_u32((byte + 32) as u32))
+            } else {
+                name.push(char_from_u32(byte as u32))
+            }
+            at += 1
+        }
+        found := self.signature_exact(name)
+        when found.is_err() {
+            return Option::None
+        }
+        id := found.unwrap()
+        when self.signatures[id].ret != ret || self.signatures[id].params.len() != params.len() {
+            return Option::None
+        }
+        mut position: u64 = 0
+        while position < params.len() {
+            when self.signatures[id].params[position] != params[position] {
+                return Option::None
+            }
+            position += 1
+        }
+        return Option::Some(id)
     }
 
     fun builtin_call(mut self, name: String, arguments: Vec<u64>, expected: String) -> Result<Lowered, String> {
@@ -5013,6 +5331,10 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         }
         when self.signature_index(name.clone()).is_err() && !bare_variant_hint(name.clone()).is_empty() {
             return Result::Err(unknown_function_error(name.clone(), span.start, span.end))
+        }
+        // `R0210`: a name that is neither a function of the program nor a built-in, with the closest function name as a hint.
+        when self.signature_index(name.clone()).is_err() && bare_variant_hint(name.clone()).is_empty() && !is_builtin_call_name(name.clone()) && last_index_of(name.clone(), String("::")).is_none() {
+            return Result::Err(unknown_module_function_error(name.clone(), self.unknown_function_suggestion(name.clone()), span.start, span.end))
         }
         when type_arguments.is_empty() {
             mismatch := self.arity_mismatch(name.clone(), arguments.len(), span)
@@ -5227,6 +5549,10 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
             cut := last_index_of(name.clone(), String("::"))
             when cut.is_some() {
                 return self.enum_construct(name.slice(0, cut.unwrap()), name.slice(cut.unwrap() + 2, name.len()), arguments, expected, span, located, false)
+            }
+            // `R0210`: a name that is neither a function of the program nor a built-in, with the closest function name as a hint.
+            when bare_variant_hint(name.clone()).is_empty() && !is_builtin_call_name(name.clone()) {
+                return Result::Err(unknown_module_function_error(name.clone(), self.unknown_function_suggestion(name.clone()), span.start, span.end))
             }
             return self.builtin_call(name, arguments, expected)
         }
@@ -5777,7 +6103,7 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
     }
 
     fun assign_statement(mut self, name: String, value: u64, span: ast::Span) -> Result<bool, String> {
-        index := self.find(name.clone())?
+        index := self.assigned_local(name.clone(), span)?
         when !self.locals[index].mutable {
             return Result::Err(immutable_binding(name, span.start, span.end, "if this binding must be mutable"))
         }
@@ -5818,8 +6144,19 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
     }
 
     // `x op= value` is lowered as `x = x op value`; the name's span is the first `len(x)` bytes.
+    // The local that an assignment writes: a name that is no local is `R0203` at the name, with the closest visible name
+    // as a hint, as the bootstrap reports it.
+    fun assigned_local(self, name: String, span: ast::Span) -> Result<u64, String> {
+        found := self.find(name.clone())
+        when found.is_ok() {
+            return found
+        }
+        name_span := ast::Span { start: span.start, end: span.start + name.len() }
+        return Result::Err(self.unknown_variable(name, name_span))
+    }
+
     fun compound_statement(mut self, name: String, op: String, value: u64, span: ast::Span) -> Result<bool, String> {
-        index := self.find(name.clone())?
+        index := self.assigned_local(name.clone(), span)?
         when !self.locals[index].mutable {
             end := span.start + name.len()
             return Result::Err(immutable_binding(name.clone(), span.start, end, "if this binding must be mutable"))
@@ -5963,7 +6300,7 @@ extend Lowering {
             ast::TypeTree::Simple(word) => type_word(word),
             ast::TypeTree::NamedTy(name, span) => self.named_resolve(name, span.start, span.end),
             ast::TypeTree::ParamTy(name, span) => Result::Err(unsupported("type param")),
-            ast::TypeTree::VecTy(element, span) => self.collection(String("Vec "), element),
+            ast::TypeTree::VecTy(element, span) => self.vec_type(element, span),
             ast::TypeTree::MapTy(key, value, span) => self.pair(String("Map "), key, value),
             ast::TypeTree::SetTy(element, span) => self.pair_set(element),
             ast::TypeTree::ArrayTy(element, length, span) => self.array_type(element, length),
@@ -6015,10 +6352,17 @@ extend Lowering {
         return named_type_word(self.type_names.clone(), self.type_words.clone(), name)
     }
 
-    // A named type. The placeholder of a generic structure that no instance matches is `R0262`, at the name's span.
+    // A named type. The placeholder of a generic structure that no instance matches is `R0262`, at the name's span. A
+    // name that declares no type is `R0230`, unless it is a path (`a::B`) or a generated `$` name, which keep their own.
     fun named_resolve(self, name: String, start: u64, end: u64) -> Result<String, String> {
         found := self.named_word(name.clone())
-        when found.is_ok() || !name.starts_with("$RynStructParam#") {
+        when found.is_ok() {
+            return found
+        }
+        when !name.starts_with("$") && !name.contains("::") && !declared_in_a_namespace(self.type_names.clone(), name.clone()) {
+            return Result::Err(unknown_type_error(name, start, end))
+        }
+        when !name.starts_with("$RynStructParam#") {
             return found
         }
         return Result::Err(diagnostic("R0262", start, end, String("a generic structure has no instance for the inferred type arguments"), String("name the instance once in the program, for example `value: Box<i32> = make(1)` or `Box::<i32> { ... }`")))
@@ -6040,6 +6384,21 @@ extend Lowering {
     fun collection(self, prefix: String, element: u64) -> Result<String, String> {
         inner := self.resolve(element)?
         mut word := prefix
+        word.append(inner)
+        return Result::Ok(word)
+    }
+
+    // The word of `Vec<element>`. A set as the element is `R0234` at the type, as the bootstrap rejects it.
+    fun vec_type(self, element: u64, span: ast::Span) -> Result<String, String> {
+        inner := self.resolve(element)?
+        when inner.starts_with("Set ") && inner.ends_with(" Bool") {
+            name := rust_type_name(inner.clone())
+            when name.is_none() {
+                return Result::Err(unsupported("set element of a vector"))
+            }
+            return Result::Err(vec_of_set_error(name.unwrap(), span.start, span.end))
+        }
+        mut word := String("Vec ")
         word.append(inner)
         return Result::Ok(word)
     }
@@ -6066,6 +6425,43 @@ extend Lowering {
 
 // Lowers the program's functions, in source order, and returns the complete IR text, or
 // `unsupported: ...` when the program is outside the subset.
+extend Lowering {
+    fun shape_declarations(self) -> Option<String> {
+        mut seen_names: Vec<String> = Vec()
+        for shape_index in self.program.shapes.clone() {
+            contract := self.program.shape_defs[shape_index]
+            mut key := contract.module_path.clone()
+            key.append("::")
+            key.append(contract.name.clone())
+            for earlier in seen_names.clone() {
+                when earlier == key {
+                    mut message := String("shape `")
+                    message.append(contract.name.clone())
+                    message.append("` is declared more than once")
+                    return Option::Some(diagnostic("R0453", contract.span.start, contract.span.end, message, String("")))
+                }
+            }
+            seen_names.push(key)
+            mut methods: Vec<String> = Vec()
+            for method_index in contract.methods.clone() {
+                method := self.program.shape_methods[method_index]
+                for earlier in methods.clone() {
+                    when earlier == method.name {
+                        mut message := String("shape `")
+                        message.append(contract.name.clone())
+                        message.append("` requires method `")
+                        message.append(method.name.clone())
+                        message.append("` more than once")
+                        return Option::Some(diagnostic("R0453", contract.span.start, contract.span.end, message, String("")))
+                    }
+                }
+                methods.push(method.name.clone())
+            }
+        }
+        return Option::None
+    }
+}
+
 pub fun lower_program(program: ast::Program) -> Result<String, String> {
     mut lowering := Lowering {
         program: program,
@@ -6073,6 +6469,8 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         locals: Vec(),
         local_types: Vec(),
         addressed_types: Vec(),
+        c_addressed: Vec(),
+        c_loop_written: Vec(),
         next_slot: 0,
         statements: Vec(),
         return_ty: String(""),
@@ -6086,7 +6484,6 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         frame_marks: Vec(),
         loop_frames: Vec(),
         scope_floors: Vec(),
-        chained: false,
         borrow_chain: false,
         returned_refs: Vec(),
         moved_names: Vec(),
@@ -6109,6 +6506,11 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
         private_alias_targets: Vec(),
         alias_targets: Vec(),
         setup: Vec(),
+    }
+    // `R0453`: a shape declared twice in one module, or one that requires a method twice, as `validate_shape_declarations`.
+    declaration_failure := lowering.shape_declarations()
+    when declaration_failure.is_some() {
+        return Result::Err(declaration_failure.unwrap())
     }
     // `R0450`: an `extend ... as Shape` block whose structure does not conform to the shape, checked before the defaults are added.
     shape_failure := lowering.shape_conformance()
@@ -6301,6 +6703,8 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
             earlier += 1
         }
 
+        // A signature names types as its function's namespace does, as the body does.
+        lowering.scope_path = declaration_namespace(definition.name.clone(), definition.module_path.clone())
         mut params: Vec<String> = Vec()
         mut parameter_index: u64 = 0
         while parameter_index < definition.parameters.len() {
@@ -6604,11 +7008,30 @@ extend Lowering {
         return join(tokens)
     }
 
+    // Whether a local of this type is a `repr(C)` structure, which a pointer reaches through a copy in C's layout.
+    fun is_c_record(self, ty: String) -> bool {
+        when struct_id_of(ty.clone()).is_none() {
+            return false
+        }
+        return self.structs[struct_id_of(ty).unwrap()].repr_c == 1
+    }
+
+    fun slot_listed(list: Vec<u64>, slot: u64) -> bool {
+        for item in list {
+            when item == slot {
+                return true
+            }
+        }
+        return false
+    }
+
     // Lowers one function body. Its locals, slots, and statements start empty.
     fun function(mut self, id: u64) -> Result<String, String> {
         self.locals = Vec()
         self.local_types = Vec()
         self.addressed_types = Vec()
+        self.c_addressed = Vec()
+        self.c_loop_written = Vec()
         self.next_slot = 0
         self.statements = Vec()
         self.return_ty = self.signatures[id].ret.clone()
@@ -7163,6 +7586,17 @@ extend Lowering {
         when ty == "OwnedString" && (name == "append" || name == "push" || name == "clear") && self.immutable_local_receiver(receiver) {
             return Result::Err(mutable_string_error(name.clone(), span.start, span.end))
         }
+        // A mutating String method through a shared reference, such as the `self` of an `extend String` method without `mut`.
+        when reference_inner(ty.clone()).is_some() && reference_inner(ty.clone()).unwrap() == "OwnedString" && !reference_is_mutable(ty.clone()) && (name == "append" || name == "push" || name == "clear") {
+            return Result::Err(mutable_string_error(name.clone(), span.start, span.end))
+        }
+        // `R0234` for a map of values with a custom destructor, which a clone would duplicate: the map is moved, not copied.
+        when ty.starts_with("Map ") && name == "clone" && arguments.is_empty() {
+            parts := map_parts(ty.clone()).unwrap()
+            when self.has_destructor(parts[1].clone()) {
+                return Result::Err(diagnostic("R0234", span.start, span.end, String("Map.clone cannot duplicate move-only custom-destructor values"), String("")))
+            }
+        }
         when name == "to_string" && arguments.is_empty() {
             when ty == "OwnedString" {
                 return Result::Ok(Lowered { text: join(words4(String("String"), String("Clone"), String("1"), recv.text)), ty: String("OwnedString") })
@@ -7174,12 +7608,13 @@ extend Lowering {
             }
         }
         when reference_inner(ty.clone()).is_some() && reference_inner(ty.clone()).unwrap() == "OwnedString" {
-            // A statement passes the reference itself; an expression reads through it.
-            mut viewed := Lowered { text: join(words3(String("Dereference"), recv.text.clone(), String("OwnedString"))), ty: String("OwnedString") }
-            when self.chained {
-                viewed = Lowered { text: recv.text.clone(), ty: String("OwnedString") }
-            }
+            // The runtime takes the String handle, so a statement and an expression both read it through the reference.
+            viewed := Lowered { text: join(words3(String("Dereference"), recv.text.clone(), String("OwnedString"))), ty: String("OwnedString") }
             return self.string_method(viewed, name, type_arguments, arguments)
+        }
+        // `len()` and `byte_at(index)` of a `str` view.
+        when ty == "Str" && (name == "len" || name == "byte_at") {
+            return self.str_method(recv, name, arguments, span)
         }
         when ty.starts_with("Slice ") && name == "len" && arguments.is_empty() {
             return Result::Ok(Lowered { text: join(words3(String("SliceLen"), String("1"), recv.text)), ty: String("U64") })
@@ -7324,7 +7759,27 @@ extend Lowering {
         when try_prefix {
             lowered.push(join(words3(String("Integer"), num(tag), String("U32"))))
         } else {
-            lowered = self.method_arguments(params, arguments, 0, true)?
+            lowered = self.method_arguments(params.clone(), arguments, 0, true)?
+        }
+        // A String operation that the native runtime module implements is a call of that function, with the receiver borrowed
+        // as `str` and then the arguments, which must have the parameter types of the operation's table row.
+        when !try_prefix && recv.ty == "OwnedString" {
+            mut runtime_params: Vec<String> = Vec()
+            runtime_params.push(String("Str"))
+            for param in params.clone() {
+                runtime_params.push(param)
+            }
+            runtime := self.runtime_function(join(words2(String("String"), operation.clone())), runtime_params, ret.clone())
+            when runtime.is_some() {
+                mut call: Vec<String> = Vec()
+                call.push(join(words2(String("Function"), num(runtime.unwrap()))))
+                call.push(num(lowered.len() + 1))
+                call.push(join(words2(String("StringAsStr"), recv.text.clone())))
+                for text in lowered.clone() {
+                    call.push(text)
+                }
+                return Result::Ok(Lowered { text: join(call), ty: ret.clone() })
+            }
         }
         mut tokens: Vec<String> = Vec()
         tokens.push(String("String"))
@@ -7335,6 +7790,35 @@ extend Lowering {
             tokens.push(text)
         }
         return Result::Ok(Lowered { text: join(tokens), ty: ret })
+    }
+
+    // `str.len()` (its length in bytes) and `str.byte_at(index)` (one byte, checked against the length).
+    fun str_method(mut self, recv: Lowered, name: String, arguments: Vec<u64>, span: ast::Span) -> Result<Lowered, String> {
+        mut expected: u64 = 1
+        when name == "len" {
+            expected = 0
+        }
+        when arguments.len() != expected {
+            mut message := String("method `")
+            message.append(name.clone())
+            message.append("` expects ")
+            message.append(String(expected))
+            when expected == 1 {
+                message.append(" argument but got ")
+            } else {
+                message.append(" arguments but got ")
+            }
+            message.append(String(arguments.len()))
+            return Result::Err(diagnostic("R0211", span.start, span.end, message, String("")))
+        }
+        when name == "len" {
+            return Result::Ok(Lowered { text: join(words4(String("String"), String("StrLen"), String("1"), recv.text)), ty: String("U64") })
+        }
+        index := self.expression(arguments[0], String("U64"))?
+        when index.ty != "U64" {
+            return Result::Err(unsupported("str byte index type"))
+        }
+        return Result::Ok(Lowered { text: join(words5(String("String"), String("StrByteAt"), String("2"), recv.text, index.text)), ty: String("U8") })
     }
 
     // A method added to `String` by an `extend String` block. The receiver local is lent to it.
@@ -7401,7 +7885,6 @@ extend Lowering {
             root = self.method_receiver_of(root)
         }
         mut items: Vec<String> = Vec()
-        self.chained = true
         mut position: u64 = chain.len()
         while position > 0 {
             position -= 1
@@ -7413,7 +7896,6 @@ extend Lowering {
             items.push(join(words2(String("CallStatement"), lowered.text)))
         }
         last := self.method_target(root, name, Vec(), arguments, span)?
-        self.chained = false
         items.push(join(words2(String("CallStatement"), last.text)))
         when items.len() == 1 {
             self.statements.push(items[0].clone())
@@ -7712,14 +8194,50 @@ extend Lowering {
         return Result::Ok(Lowered { text: join(tokens), ty: ret })
     }
 
-    fun map_new(self, key: u64, value: u64) -> Result<Lowered, String> {
+    fun map_new(self, key: u64, value: u64, span: ast::Span) -> Result<Lowered, String> {
         key_ty := self.annotation(key)?
         value_ty := self.annotation(value)?
+        // `R0244`: a key hashes and compares as its words, so it is a String, an integer, a bool, a char, or a structure that
+        // derives `Hash` with only such fields (and nested structures of the same kind).
+        when !self.map_key_hashable(key_ty.clone()) {
+            return Result::Err(diagnostic("R0244", span.start, span.end, String("Map key type `structure` does not implement Hash and Eq"), String("Map keys currently support integer types, bool, char, String, and `#[derive(Hash)]` structs with scalar fields")))
+        }
         mut map := String("Map ")
         map.append(key_ty.clone())
         map.append(" ")
         map.append(value_ty.clone())
         return Result::Ok(Lowered { text: join(words5(String("Call"), String("Map"), String("New"), key_ty, join(words3(value_ty, String("0"), map.clone())))), ty: map })
+    }
+
+    // Whether a map key of this type is supported, as `sema` decides it.
+    fun map_key_hashable(self, ty: String) -> bool {
+        when ty == "OwnedString" || ty == "Bool" || ty == "Char" || is_integer_word(ty.clone()) {
+            return true
+        }
+        return self.key_structure_hashable(ty)
+    }
+
+    // A structure key: one that derives `Hash`, whose fields are scalars of the kinds a key hashes, or such structures.
+    fun key_structure_hashable(self, ty: String) -> bool {
+        when struct_id_of(ty.clone()).is_none() {
+            return false
+        }
+        id := struct_id_of(ty).unwrap()
+        when self.structs[id].derives_hash != 1 {
+            return false
+        }
+        for field_ty in self.structs[id].field_types.clone() {
+            when struct_id_of(field_ty.clone()).is_some() {
+                when !self.key_structure_hashable(field_ty) {
+                    return false
+                }
+            } else {
+                when !(is_integer_word(field_ty.clone()) || field_ty == "Bool" || field_ty == "Char") {
+                    return false
+                }
+            }
+        }
+        return true
     }
 
     fun set_new(self, element: u64) -> Result<Lowered, String> {
@@ -7731,8 +8249,16 @@ extend Lowering {
     }
 
     // `Vec<T>()`: an empty vector of the element type.
-    fun vec_new(self, element: u64, expected: String) -> Result<Lowered, String> {
+    fun vec_new(self, element: u64, expected: String, span: ast::Span) -> Result<Lowered, String> {
         word := self.annotation(element)?
+        // A set as the element is `R0234` at the constructor, as the bootstrap rejects it.
+        when word.starts_with("Set ") && word.ends_with(" Bool") {
+            name := rust_type_name(word.clone())
+            when name.is_none() {
+                return Result::Err(unsupported("set element of a vector"))
+            }
+            return Result::Err(vec_of_set_error(name.unwrap(), span.start, span.end))
+        }
         mut vec := String("Vec ")
         vec.append(word.clone())
         when !expected.is_empty() && expected != vec {
@@ -7909,6 +8435,17 @@ extend Lowering {
         }
         last := self.expression(end, first.ty.clone())?
         when last.ty != first.ty {
+            // `R0205` as the bootstrap reports a range whose end is another integer type, over the whole range.
+            when scalar_type_name(last.ty.clone()).is_some() && scalar_type_name(first.ty.clone()).is_some() {
+                start_span := self.expr_span_of(start)
+                end_span := self.expr_span_of(end)
+                mut message := String("range end has type `")
+                message.append(scalar_type_name(last.ty.clone()).unwrap())
+                message.append("` but the start has type `")
+                message.append(scalar_type_name(first.ty.clone()).unwrap())
+                message.append("`")
+                return Result::Err(diagnostic("R0205", start_span.start, end_span.end, message, String("")))
+            }
             return Result::Err(unsupported("range bounds of mixed types"))
         }
         id := self.range_struct_for(first.ty.clone())
@@ -8007,6 +8544,12 @@ extend Lowering {
     fun address_of_local(mut self, name: String, mutable: bool, raw: bool, span: ast::Span, name_span: ast::Span) -> Result<Lowered, String> {
         found := self.find(name.clone())?
         local := self.locals[found]
+        when self.is_c_record(local.ty.clone()) {
+            when slot_listed(self.c_loop_written.clone(), local.slot) {
+                return Result::Err(unsupported("a repr(C) local written in a loop before its address is taken"))
+            }
+            self.c_addressed.push(local.slot)
+        }
         // `R0206`: a mutable reference (not a raw pointer) needs a binding declared `mut`.
         when mutable && !raw && !local.mutable {
             return Result::Err(diagnostic("R0206", name_span.start, name_span.end, String("cannot create a mutable reference to an immutable binding"), String("declare the value with `mut` before borrowing it mutably")))
@@ -8077,6 +8620,10 @@ extend Lowering {
             base_ty = inner.unwrap()
             through = true
         }
+        when base.ty.starts_with("RawPointer ") {
+            base_ty = base.ty.slice(11, base.ty.len())
+            through = true
+        }
         id := struct_id_of(base_ty)
         when id.is_none() {
             return Result::Err(unsupported("field of a value that is not a structure"))
@@ -8105,10 +8652,38 @@ extend Lowering {
         return Result::Ok(Lowered { text: join(tokens), ty: field_ty })
     }
 
-    fun dereference(mut self, pointer: u64) -> Result<Lowered, String> {
+    fun dereference(mut self, pointer: u64, span: ast::Span) -> Result<Lowered, String> {
         value := self.field_tree(pointer)?
         pointee := self.pointee_of(value.ty.clone())?
+        // `R0206`: a structure that cannot be copied (it has a destructor, or a field that owns memory) is not read through a reference.
+        when struct_id_of(pointee.clone()).is_some() && !self.record_is_copy(pointee.clone()) {
+            return Result::Err(diagnostic("R0206", span.start, span.end, String("dereferencing `structure` is not supported yet"), String("")))
+        }
         return Result::Ok(Lowered { text: join(words3(String("Dereference"), value.text, pointee.clone())), ty: pointee })
+    }
+
+    // Whether a value read through a reference is a copy: a structure with no destructor and only copy fields, an array of
+    // copies, or a scalar, text-free one; an owner, a text, a view or a reference is not.
+    fun record_is_copy(self, ty: String) -> bool {
+        when struct_id_of(ty.clone()).is_some() {
+            id := struct_id_of(ty).unwrap()
+            when !self.structs[id].drop_name.is_empty() {
+                return false
+            }
+            for field_ty in self.structs[id].field_types.clone() {
+                when !self.record_is_copy(field_ty) {
+                    return false
+                }
+            }
+            return true
+        }
+        when array_parts(ty.clone()).is_some() {
+            return self.record_is_copy(array_parts(ty).unwrap()[0].clone())
+        }
+        when ty == "OwnedString" || ty == "Str" || ty.starts_with("Vec ") || ty.starts_with("Map ") || ty.starts_with("Set ") || ty.starts_with("Enum ") || ty.starts_with("Slice ") || ty.starts_with("Reference ") {
+            return false
+        }
+        return true
     }
 
     fun dereference_assign(mut self, pointer: u64, value: u64, span: ast::Span) -> Result<bool, String> {

@@ -1,0 +1,19 @@
+// test: run
+// out: ééé
+// out: 0
+// out: 0
+// out: 1
+// out: 5
+// out: true
+// out: true
+// exit: 0
+// `repeat` of a String, and the error codes of `read_file_result` for a missing file and a directory on native code.
+fun main() {
+    echo String("é").repeat(3)
+    echo String("").repeat(4).len()
+    echo String("ab").repeat(0).len()
+    echo read_file_result("tests/suite/output/no-such-native-file.txt").unwrap_err()
+    echo read_file_result("tests/suite/output").unwrap_err()
+    echo try_read_file("tests/suite/output/no-such-native-file.txt").is_none()
+    echo try_read_file("tests/suite/output").is_none()
+}

@@ -12,3 +12,6 @@
 /selfhost/**/build/
 /selfhost/.ryn/
 /selfhost/**/.ryn/
+
+# Build outputs of test projects, written next to their sources.
+build/

@@ -293,10 +293,32 @@ pub fun write_object(input: ObjectInput) -> Vec<u8> {
 
 // ---- the linker ------------------------------------------------------------------------------------------------------
 
-// Links one object that needs nothing from outside into a static executable: three segments (the headers and the code, the
-// read-only data, and the zero-filled data), loaded at 0x400000 and following pages, entered at symbol 0. A relocation is
-// resolved to the address of its symbol; a symbol that is not defined is an error.
+// Links one object into an executable entered at symbol 0. An object that needs nothing from outside becomes a static
+// executable: three segments (the headers and the code, the read-only data, and the zero-filled data), loaded at 0x400000
+// and following pages. An object that calls functions it does not define becomes a dynamically linked executable whose
+// functions come from the system's C library (`link_dynamic`). A relocation is resolved to the address of its symbol.
 pub fun link_executable(input: ObjectInput) -> Result<Vec<u8>, String> {
+    mut imports: Vec<String> = Vec()
+    mut index: u64 = 0
+    while index < input.reloc_offsets.len() {
+        symbol := input.reloc_symbols[index]
+        when input.symbol_sections[symbol] == Where::UNDEFINED {
+            name := input.symbol_names[symbol].clone()
+            mut known := false
+            for imported in imports.clone() {
+                when imported == name {
+                    known = true
+                }
+            }
+            when !known {
+                imports.push(name)
+            }
+        }
+        index += 1
+    }
+    when !imports.is_empty() {
+        return link_dynamic(input, imports)
+    }
     page: u64 = 4096
     base: u64 = 4194304
     text_at: u64 = page
@@ -306,7 +328,7 @@ pub fun link_executable(input: ObjectInput) -> Result<Vec<u8>, String> {
     bss_at := (rodata_end + page - 1) / page * page
     mut code := input.text.clone()
     // Resolve each relocation against the final addresses.
-    mut index: u64 = 0
+    index = 0
     while index < input.reloc_offsets.len() {
         symbol := input.reloc_symbols[index]
         section := input.symbol_sections[symbol]
@@ -333,27 +355,7 @@ pub fun link_executable(input: ObjectInput) -> Result<Vec<u8>, String> {
         index += 1
     }
     mut out := Out { bytes: Vec() }
-    // The ELF header.
-    out.b(127)
-    out.text(String("ELF"))
-    out.b(2)
-    out.b(1)
-    out.b(1)
-    out.b(0)
-    out.w64(0)
-    out.w16(2)
-    out.w16(62)
-    out.w32(1)
-    out.w64(base + text_at + input.symbol_values[0])
-    out.w64(64)
-    out.w64(0)
-    out.w32(0)
-    out.w16(64)
-    out.w16(56)
-    out.w16(3)
-    out.w16(64)
-    out.w16(0)
-    out.w16(0)
+    elf_header(&mut out, base + text_at + input.symbol_values[0], 3)
     // Program headers: type, flags, offset, virtual address, physical address, file size, memory size, alignment.
     program_header(&mut out, 5, 0, base, text_end, text_end, page)
     program_header(&mut out, 4, rodata_at, base + rodata_at, input.rodata.len(), input.rodata.len(), page)
@@ -364,6 +366,219 @@ pub fun link_executable(input: ObjectInput) -> Result<Vec<u8>, String> {
     out.append(input.rodata.clone())
     out.align(page)
     return Result::Ok(out.bytes)
+}
+
+// The ELF header of an x86-64 executable with `headers` program headers after it.
+fun elf_header(out: &mut Out, entry: u64, headers: u64) {
+    out.b(127)
+    out.text(String("ELF"))
+    out.b(2)
+    out.b(1)
+    out.b(1)
+    out.b(0)
+    out.w64(0)
+    out.w16(2)
+    out.w16(62)
+    out.w32(1)
+    out.w64(entry)
+    out.w64(64)
+    out.w64(0)
+    out.w32(0)
+    out.w16(64)
+    out.w16(56)
+    out.w16(headers)
+    out.w16(64)
+    out.w16(0)
+    out.w16(0)
+}
+
+fun typed_header(out: &mut Out, kind: u64, flags: u64, offset: u64, address: u64, file_size: u64, memory_size: u64, alignment: u64) {
+    out.w32(kind)
+    out.w32(flags)
+    out.w64(offset)
+    out.w64(address)
+    out.w64(address)
+    out.w64(file_size)
+    out.w64(memory_size)
+    out.w64(alignment)
+}
+
+fun round_up(value: u64, alignment: u64) -> u64 {
+    return (value + alignment - 1) / alignment * alignment
+}
+
+// A dynamically linked executable: the program's own code and runtime, with the functions in `imports` taken from
+// `libc.so.6` and `libm.so.6` when the program starts. The system's dynamic loader (`/lib64/ld-linux-x86-64.so.2`) loads
+// the libraries, fills one global offset table entry per function (`R_X86_64_GLOB_DAT`, bound at start), and enters the
+// program at its own `_start`. A call to an imported function goes through a stub, `jmp [entry]`, after the code.
+//
+// Layout (file offsets equal addresses minus 0x400000): the ELF header, eight program headers, the interpreter path, the
+// hash table, the dynamic symbols and their names, and the relocations; the code and stubs from the next page; the
+// read-only data; the dynamic section and the offset table; then the zero-filled data.
+fun link_dynamic(input: ObjectInput, imports: Vec<String>) -> Result<Vec<u8>, String> {
+    page: u64 = 4096
+    base: u64 = 4194304
+    header_count: u64 = 8
+    interpreter := String("/lib64/ld-linux-x86-64.so.2")
+    count := imports.len()
+    symbols := count + 1
+    // The names: the libraries first, then the functions.
+    mut names: Vec<u8> = Vec()
+    names.push(0 as u8)
+    libc_name := names.len()
+    names = intern(names, String("libc.so.6"))
+    libm_name := names.len()
+    names = intern(names, String("libm.so.6"))
+    mut name_offsets: Vec<u64> = Vec()
+    for imported in imports.clone() {
+        name_offsets.push(names.len())
+        names = intern(names, imported)
+    }
+    interp_at: u64 = 64 + header_count * 56
+    hash_at := round_up(interp_at + interpreter.len() + 1, 8)
+    dynsym_at := round_up(hash_at + 4 * (2 + 1 + symbols), 8)
+    dynstr_at := dynsym_at + 24 * symbols
+    rela_at := round_up(dynstr_at + names.len(), 8)
+    meta_end := rela_at + 24 * count
+    text_at := round_up(meta_end, page)
+    stubs_at := text_at + round_up(input.text.len(), 16)
+    text_end := stubs_at + 8 * count
+    rodata_at := round_up(text_end, page)
+    rodata_end := rodata_at + input.rodata.len()
+    data_at := round_up(rodata_end, page)
+    dynamic_entries: u64 = 14
+    got_at := data_at + 16 * dynamic_entries
+    data_end := got_at + 8 * count
+    bss_at := round_up(data_end, page)
+    mut code := input.text.clone()
+    mut index: u64 = 0
+    while index < input.reloc_offsets.len() {
+        symbol := input.reloc_symbols[index]
+        section := input.symbol_sections[symbol]
+        mut target: u64 = 0
+        when section == Where::TEXT {
+            target = base + text_at + input.symbol_values[symbol]
+        } else when section == Where::RODATA {
+            target = base + rodata_at + input.symbol_values[symbol]
+        } else when section == Where::BSS {
+            target = base + bss_at + input.symbol_values[symbol]
+        } else {
+            name := input.symbol_names[symbol].clone()
+            mut slot: u64 = 0
+            mut at: u64 = 0
+            while at < count {
+                when imports[at] == name {
+                    slot = at
+                }
+                at += 1
+            }
+            target = base + stubs_at + 8 * slot
+        }
+        place := base + text_at + input.reloc_offsets[index]
+        value := (target + (input.reloc_addends[index] as u64) - place) & 4294967295
+        at := input.reloc_offsets[index]
+        mut byte: u64 = 0
+        while byte < 4 {
+            code.set(at + byte, ((value >> ((byte * 8) as u32)) & 255) as u8)
+            byte += 1
+        }
+        index += 1
+    }
+    mut out := Out { bytes: Vec() }
+    elf_header(&mut out, base + text_at + input.symbol_values[0], header_count)
+    typed_header(&mut out, 6, 4, 64, base + 64, header_count * 56, header_count * 56, 8)
+    typed_header(&mut out, 3, 4, interp_at, base + interp_at, interpreter.len() + 1, interpreter.len() + 1, 1)
+    typed_header(&mut out, 1, 5, 0, base, text_end, text_end, page)
+    typed_header(&mut out, 1, 4, rodata_at, base + rodata_at, input.rodata.len(), input.rodata.len(), page)
+    typed_header(&mut out, 1, 6, data_at, base + data_at, data_end - data_at, data_end - data_at, page)
+    typed_header(&mut out, 1, 6, bss_at, base + bss_at, 0, input.bss_size, page)
+    typed_header(&mut out, 2, 6, data_at, base + data_at, 16 * dynamic_entries, 16 * dynamic_entries, 8)
+    typed_header(&mut out, 1685382481, 6, 0, 0, 0, 0, 16)
+    out.text(interpreter)
+    out.b(0)
+    out.align(8)
+    // The hash table: one bucket that holds no symbol, since the program exports nothing.
+    out.w32(1)
+    out.w32(symbols)
+    out.w32(0)
+    mut chain: u64 = 0
+    while chain < symbols {
+        out.w32(0)
+        chain += 1
+    }
+    out.align(8)
+    // The dynamic symbols: the null symbol, then one undefined global function per import.
+    mut zero_field: u64 = 0
+    while zero_field < 3 {
+        out.w64(0)
+        zero_field += 1
+    }
+    for offset in name_offsets.clone() {
+        out.w32(offset)
+        out.b(18)
+        out.b(0)
+        out.w16(0)
+        out.w64(0)
+        out.w64(0)
+    }
+    out.append(names.clone())
+    out.align(8)
+    // The relocations: each offset table entry takes the address of its function.
+    mut entry: u64 = 0
+    while entry < count {
+        out.w64(base + got_at + 8 * entry)
+        out.w64(((entry + 1) << (32 as u32)) | 6)
+        out.w64(0)
+        entry += 1
+    }
+    out.align(page)
+    out.append(code)
+    // The stubs: `jmp [rip + entry]`, padded to eight bytes.
+    while out.bytes.len() < stubs_at {
+        out.b(204)
+    }
+    entry = 0
+    while entry < count {
+        stub := base + stubs_at + 8 * entry
+        displacement := (base + got_at + 8 * entry - (stub + 6)) & 4294967295
+        out.b(255)
+        out.b(37)
+        out.w32(displacement)
+        out.b(204)
+        out.b(204)
+        entry += 1
+    }
+    out.align(page)
+    out.append(input.rodata.clone())
+    out.align(page)
+    // The dynamic section: tag and value pairs.
+    dynamic_pair(&mut out, 1, libc_name)
+    dynamic_pair(&mut out, 1, libm_name)
+    dynamic_pair(&mut out, 4, base + hash_at)
+    dynamic_pair(&mut out, 5, base + dynstr_at)
+    dynamic_pair(&mut out, 6, base + dynsym_at)
+    dynamic_pair(&mut out, 10, names.len())
+    dynamic_pair(&mut out, 11, 24)
+    dynamic_pair(&mut out, 7, base + rela_at)
+    dynamic_pair(&mut out, 8, 24 * count)
+    dynamic_pair(&mut out, 9, 24)
+    dynamic_pair(&mut out, 30, 8)
+    dynamic_pair(&mut out, 1879048187, 1)
+    dynamic_pair(&mut out, 21, 0)
+    dynamic_pair(&mut out, 0, 0)
+    // The offset table, which the loader fills.
+    entry = 0
+    while entry < count {
+        out.w64(0)
+        entry += 1
+    }
+    out.align(page)
+    return Result::Ok(out.bytes)
+}
+
+fun dynamic_pair(out: &mut Out, tag: u64, value: u64) {
+    out.w64(tag)
+    out.w64(value)
 }
 
 fun program_header(out: &mut Out, flags: u64, offset: u64, address: u64, file_size: u64, memory_size: u64, alignment: u64) {

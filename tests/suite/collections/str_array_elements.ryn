@@ -1,0 +1,21 @@
+// test: run
+// out: views
+// out: fixed
+// out: changed
+// out: fixed
+// out: 1
+// A `str` element is two cells: it is printed, copied, overwritten and passed as an array parameter.
+fun show(words: [str; 2]) -> i32 {
+    echo words[0]
+    return 1
+}
+fun main() {
+    words: [str; 2] = ["fixed", "views"]
+    echo words[1]
+    first := words[0]
+    echo first
+    mut rep: [str; 2] = ["ryn"; 2]
+    rep[1] = "changed"
+    echo rep[1]
+    echo show(words)
+}

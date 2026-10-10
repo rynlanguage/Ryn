@@ -1,0 +1,60 @@
+// test: run
+// out: 0
+// exit: 0
+// Vectors and maps of destructor values, and of structures with a destructor in a field, free every element they drop:
+// two hundred rounds of set, take, iteration, replacement, removal and clear leave no live allocation.
+extern "C" fun ryn_native_live_allocations() -> u64;
+
+#[drop(release)]
+struct Resource {
+    handle: *i32,
+    tag: i32,
+}
+
+fun release(resource: Resource) {
+    when resource.tag < 0 {
+        echo resource.tag
+    }
+}
+
+struct Bundle {
+    resource: Resource,
+    label: String,
+}
+
+struct Envelope {
+    bundle: Bundle,
+    note: String,
+}
+
+fun main() {
+    before := ryn_native_live_allocations()
+    mut a: i32 = 1
+    mut round: u64 = 0
+    while round < 200 {
+        mut items := Vec<Resource>()
+        items.push(Resource { handle: &raw mut a, tag: 1 })
+        items.push(Resource { handle: &raw mut a, tag: 2 })
+        items.set(0, Resource { handle: &raw mut a, tag: 3 })
+        items.take(0)
+        mut kept := Vec<Resource>()
+        kept.push(Resource { handle: &raw mut a, tag: 4 })
+        for item in items {
+            when item.tag < 0 {
+                echo item.tag
+            }
+        }
+        mut values := Map<i32, Resource>()
+        values.insert(1, Resource { handle: &raw mut a, tag: 5 })
+        values.insert(1, Resource { handle: &raw mut a, tag: 6 })
+        values.insert(2, Resource { handle: &raw mut a, tag: 7 })
+        values.remove(2)
+        values.clear()
+        mut nested := Vec<Envelope>()
+        nested.push(Envelope { bundle: Bundle { resource: Resource { handle: &raw mut a, tag: 8 }, label: String("l") }, note: String("n") })
+        nested.set(0, Envelope { bundle: Bundle { resource: Resource { handle: &raw mut a, tag: 9 }, label: String("m") }, note: String("o") })
+        nested.take(0)
+        round += 1
+    }
+    echo ryn_native_live_allocations() - before
+}

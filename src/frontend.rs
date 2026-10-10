@@ -309,6 +309,42 @@ impl Frontend {
             }
         }
         desugared.map_err(|diagnostic| vec![diagnostic])?;
+        // `RYN_SEMA=ryn-only` takes the Ryn analysis alone: its IR is the result and its diagnostics are the errors. The
+        // bootstrap analysis is not run, so a program it would reject is accepted or rejected by the Ryn analysis alone.
+        if let Self::SelfHosted(executable) = self
+            && env::var("RYN_SEMA").is_ok_and(|choice| choice == "ryn-only")
+        {
+            let encoded = ast_codec::encode_program(&program);
+            let text = run_self_hosted_mode(executable, &encoded, Some("--sema"))
+                .map_err(|error| vec![error])?;
+            // As on the default path, `RYN_DUMP_SEMA` receives what the Ryn analysis produced.
+            if let Some(directory) = env::var_os("RYN_DUMP_SEMA") {
+                let _ = std::fs::write(std::path::PathBuf::from(directory).join("ryn.ir"), &text);
+            }
+            if text.starts_with("diagnostic ") {
+                let ryn = parse_ryn_diagnostic(&text).ok_or_else(|| {
+                    vec![frontend_failure(format!(
+                        "the self-hosted semantic analysis wrote a diagnostic that cannot be read: {text}"
+                    ))]
+                })?;
+                // The diagnostic's code is a static string in the bootstrap types; a leaked copy is made once per error.
+                let code: &'static str = Box::leak(ryn.code.into_boxed_str());
+                return Err(vec![Diagnostic {
+                    code,
+                    message: ryn.message,
+                    span: Span {
+                        start: ryn.start,
+                        end: ryn.end,
+                    },
+                    help: (!ryn.help.is_empty()).then_some(ryn.help),
+                }]);
+            }
+            return ir_codec::decode_ir(&text).map_err(|message| {
+                vec![frontend_failure(format!(
+                    "the self-hosted semantic analysis wrote IR that cannot be read: {message}"
+                ))]
+            });
+        }
         let bootstrap = |program: Program| {
             if recovering {
                 sema::analyze_recovering(program)

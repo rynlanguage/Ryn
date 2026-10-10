@@ -1,0 +1,42 @@
+// test: run
+// out: 9
+// out: 123456
+// out: 2.5
+// out: 9
+// out: 123456
+// out: 2.5
+// out: 10
+// out: 123456
+// out: 2.5
+// out: 10
+// out: 123456
+// out: 2.5
+// out: 123456
+// out: 123456
+// exit: 0
+// Writes through a raw pointer and direct writes to the record it points at are seen by both, and copies of records agree.
+
+#[repr(C)]
+struct Record { pub small: u8, pub wide: u64, pub value: f32 }
+fun set(pointer: *Record) { pointer.small = 9 pointer.wide = 123456 pointer.value = 2.5 }
+fun main() {
+    mut a := Record { small: 1, wide: 2, value: 3.0 }
+    p := &raw mut a
+    set(p)
+    echo p.small echo p.wide echo p.value
+    echo a.small echo a.wide echo a.value
+    a.small = 10
+    echo p.small echo p.wide echo p.value
+    mut b := Record { small: 0, wide: 0, value: 0.0 }
+    q := &raw mut b
+    *q = *p
+    echo q.small echo q.wide echo q.value
+    address := p as u64
+    roundtrip := address as *Record
+    echo roundtrip.wide
+    mut slot := 0 as *Record
+    out := &raw mut slot
+    *out = p
+    restored := *out
+    echo restored.wide
+}

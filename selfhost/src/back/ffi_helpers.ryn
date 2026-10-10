@@ -1,0 +1,94 @@
+// The C functions the bootstrap compiler's runtime defines for testing the C calling convention of `repr(C)` records
+// (`ryn_ffi_*` in `src/runtime_shim.rs`), written as machine code for the native runtime. A program that declares them
+// gets the same behaviour from either compiler. Records of up to eight bytes travel in one integer register (System V).
+
+use back::x64
+
+pub fun is_helper(name: String) -> bool {
+    return name == "ryn_ffi_record_i32" || name == "ryn_ffi_make_record_i32" || name == "ryn_ffi_pair_i32" || name == "ryn_ffi_make_pair_i32" || name == "ryn_ffi_pair_i16" || name == "ryn_ffi_make_pair_i16" || name == "ryn_ffi_byte_pair" || name == "ryn_ffi_make_byte_pair" || name == "ryn_ffi_mixed_pair" || name == "ryn_ffi_make_mixed_pair" || name == "ryn_ffi_float_pair_sum" || name == "ryn_ffi_make_float_pair" || name == "ryn_ffi_double_value"
+}
+
+// rax <- rax >> `count` (logical), through rcx.
+fun shift_right(asm: &mut x64::Asm, register: u64, count: u64) {
+    asm.mov_ri(x64::Reg::RCX, count)
+    asm.shift_cl(5, register)
+}
+
+fun shift_left(asm: &mut x64::Asm, register: u64, count: u64) {
+    asm.mov_ri(x64::Reg::RCX, count)
+    asm.shift_cl(4, register)
+}
+
+// Writes the routine `name` at `label`.
+pub fun emit_helper(asm: &mut x64::Asm, label: u64, name: String) {
+    asm.bind(label)
+    when name == "ryn_ffi_record_i32" {
+        // record.value + 1
+        asm.mov_rr(x64::Reg::RAX, x64::Reg::RDI)
+        asm.alu_ri(0, x64::Reg::RAX, 1)
+    } else when name == "ryn_ffi_make_record_i32" {
+        asm.zext_rr(x64::Reg::RAX, x64::Reg::RDI, 4)
+    } else when name == "ryn_ffi_pair_i32" {
+        // first + second, from the low and high halves.
+        asm.mov_rr(x64::Reg::RAX, x64::Reg::RDI)
+        asm.mov_rr(x64::Reg::RDX, x64::Reg::RDI)
+        shift_right(asm, x64::Reg::RDX, 32)
+        asm.alu_rr(1, x64::Reg::RAX, x64::Reg::RDX)
+    } else when name == "ryn_ffi_make_pair_i32" {
+        asm.zext_rr(x64::Reg::RAX, x64::Reg::RDI, 4)
+        asm.mov_rr(x64::Reg::RDX, x64::Reg::RSI)
+        shift_left(asm, x64::Reg::RDX, 32)
+        asm.alu_rr(9, x64::Reg::RAX, x64::Reg::RDX)
+    } else when name == "ryn_ffi_pair_i16" {
+        asm.mov_rr(x64::Reg::RAX, x64::Reg::RDI)
+        asm.mov_rr(x64::Reg::RDX, x64::Reg::RDI)
+        shift_right(asm, x64::Reg::RDX, 16)
+        asm.alu_rr(1, x64::Reg::RAX, x64::Reg::RDX)
+    } else when name == "ryn_ffi_make_pair_i16" {
+        asm.zext_rr(x64::Reg::RAX, x64::Reg::RDI, 2)
+        asm.zext_rr(x64::Reg::RDX, x64::Reg::RSI, 2)
+        shift_left(asm, x64::Reg::RDX, 16)
+        asm.alu_rr(9, x64::Reg::RAX, x64::Reg::RDX)
+    } else when name == "ryn_ffi_byte_pair" {
+        asm.mov_rr(x64::Reg::RAX, x64::Reg::RDI)
+        asm.mov_rr(x64::Reg::RDX, x64::Reg::RDI)
+        shift_right(asm, x64::Reg::RDX, 8)
+        asm.alu_rr(1, x64::Reg::RAX, x64::Reg::RDX)
+    } else when name == "ryn_ffi_make_byte_pair" {
+        asm.zext_rr(x64::Reg::RAX, x64::Reg::RDI, 1)
+        asm.zext_rr(x64::Reg::RDX, x64::Reg::RSI, 1)
+        shift_left(asm, x64::Reg::RDX, 8)
+        asm.alu_rr(9, x64::Reg::RAX, x64::Reg::RDX)
+    } else when name == "ryn_ffi_mixed_pair" {
+        // first (byte 0) widened to u16, plus second (bytes 2 and 3).
+        asm.zext_rr(x64::Reg::RAX, x64::Reg::RDI, 1)
+        asm.mov_rr(x64::Reg::RDX, x64::Reg::RDI)
+        shift_right(asm, x64::Reg::RDX, 16)
+        asm.zext_rr(x64::Reg::RDX, x64::Reg::RDX, 2)
+        asm.alu_rr(1, x64::Reg::RAX, x64::Reg::RDX)
+    } else when name == "ryn_ffi_float_pair_sum" {
+        // The record is two f32 in xmm0, the first in its low 32 bits and the second in its high 32 bits: the second is
+        // moved to xmm1, and the sum is added to the first, in xmm0.
+        asm.movq_from_xmm(true, x64::Reg::RAX, 0)
+        asm.mov_rr(x64::Reg::RDX, x64::Reg::RAX)
+        shift_right(asm, x64::Reg::RDX, 32)
+        asm.movq_to_xmm(false, 1, x64::Reg::RDX)
+        asm.sse_op(4, 88, 0, 1)
+    } else when name == "ryn_ffi_make_float_pair" {
+        // first (xmm0) in the low 32 bits, second (xmm1) in the high 32 bits, returned in xmm0.
+        asm.movq_from_xmm(false, x64::Reg::RAX, 0)
+        asm.movq_from_xmm(false, x64::Reg::RDX, 1)
+        shift_left(asm, x64::Reg::RDX, 32)
+        asm.alu_rr(9, x64::Reg::RAX, x64::Reg::RDX)
+        asm.movq_to_xmm(true, 0, x64::Reg::RAX)
+    } else when name == "ryn_ffi_double_value" {
+        // One f64 in xmm0 is both the argument and the result: nothing moves.
+    } else {
+        // ryn_ffi_make_mixed_pair: first at byte 0, second at bytes 2 and 3.
+        asm.zext_rr(x64::Reg::RAX, x64::Reg::RDI, 1)
+        asm.zext_rr(x64::Reg::RDX, x64::Reg::RSI, 2)
+        shift_left(asm, x64::Reg::RDX, 16)
+        asm.alu_rr(9, x64::Reg::RAX, x64::Reg::RDX)
+    }
+    asm.ret()
+}

@@ -3,9 +3,13 @@
 `rync` is the Ryn-written compiler: its lexer, parser, generic specialization,
 lowering, ownership, machine-code generation, ELF linker and runtime run without
 Rust, a system linker or libc. Its current executable target is Linux x86_64.
-The standard `ryn` command remains the Rust/Cranelift compiler and CLI.
+The standard `ryn` command builds, checks and runs programs with this native
+compiler by default. `ryn build --backend cranelift` selects the Rust/Cranelift
+backend instead, which remains available for comparison. `ryn build` and
+`ryn run` run the same analysis as `ryn check` before the native compiler, so
+both reject the same programs.
 
-The `rync-0.1.5-linux-x86_64.tar.gz` release archive contains `rync`, its Ryn
+The `rync-<version>-linux-x86_64.tar.gz` release archive contains `rync`, its Ryn
 sources, the standard-library sources and the native bootstrap script.
 From the extracted directory:
 
@@ -77,3 +81,21 @@ the existing typed-IR pipeline, including all 17 formerly declined float cases.
 `tools/test-native-sources.py` tests executable output and status directly through
 `rync`, without using Rust-generated IR. Tests are retained for unsupported
 features.
+
+## Benchmarks (0.1.6 working tree)
+
+Four small programs, compiled and run with `ryn` 0.1.5 (Cranelift, its only backend) and with the 0.1.6 working tree
+(native by default, and `--backend cranelift`). Each run time is the median of five runs after one warm-up run; the
+compile times are single measurements. The three configurations printed identical output for every program. The
+programs and the comparison script are kept outside the repository (in the local scratch area of this work), so the
+numbers are a record of this run, not a reproducible repository benchmark. They are measurements on one machine, not a claim about other workloads.
+
+| program | 0.1.5 compile / run | 0.1.6 native compile / run | 0.1.6 Cranelift compile / run |
+|---|---|---|---|
+| `loop_sum` (300 M integer iterations) | 0.45 s / 2.24 s | 0.85 s / 2.28 s | 0.44 s / 2.27 s |
+| `vec_work` (5 M pushes, then a sum) | 0.41 s / 0.134 s | 0.70 s / 0.117 s | 0.46 s / 0.167 s |
+| `map_work` (400 k inserts, 400 k lookups) | 0.52 s / 1.86 s | 0.77 s / 0.46 s | 0.43 s / 1.75 s |
+| `string_work` (2 M `push` calls) | 0.44 s / 0.019 s | 0.76 s / 0.031 s | 0.45 s / 0.018 s |
+
+The native backend is faster on the map workload and slower on the string workload, and its compile step takes about
+0.8 s against about 0.45 s for the Cranelift path. These numbers are the only benchmark results recorded for 0.1.6.

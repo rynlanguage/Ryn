@@ -1,0 +1,42 @@
+// test: run
+// out: 2
+// out: 10
+// out: true
+// out: 1
+// out: 11
+// out: true
+// out: 2
+// out: 1
+// out: 30
+// out: 3
+// out: 20
+// out: 9
+// exit: 0
+// A map of structs with a destructor takes its values in a box: a replaced value is dropped when it is replaced, a removed
+// value when it is removed, and `clear` drops the rest in the order of their hashes.
+#[drop(release)]
+struct Resource {
+    handle: *i32,
+    tag: i32,
+}
+
+fun release(resource: Resource) {
+    echo *resource.handle
+    echo resource.tag
+}
+
+fun main() {
+    mut a: i32 = 1
+    mut b: i32 = 2
+    mut c: i32 = 3
+    mut values := Map<i32, Resource>()
+    values.insert(3, Resource { handle: &raw mut a, tag: 30 })
+    values.insert(1, Resource { handle: &raw mut b, tag: 10 })
+    values.insert(2, Resource { handle: &raw mut c, tag: 20 })
+    values.insert(1, Resource { handle: &raw mut a, tag: 11 })
+    echo values.contains_key(1)
+    echo values.remove(1)
+    echo values.len()
+    values.clear()
+    echo 9
+}

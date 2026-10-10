@@ -46,3 +46,22 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+  native:
+    name: Native compiler on Linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the release compiler
+        run: cargo build --release --locked
+
+      - name: Bootstrap the native compiler to a byte-identical fixpoint
+        run: ./target/release/ryn bootstrap --native
+
+      - name: Run the native suite, runtime leak and backend tests
+        run: cargo test --release --test suite --test native_hello --test native_runtime_leaks --test backend_selection

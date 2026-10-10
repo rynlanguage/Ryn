@@ -1,0 +1,195 @@
+EXACT	tests/suite/collections/immutable_self_string_push_is_r0204.ryn	R0204	method `push` requires a mutable String
+EXACT	tests/suite/collections/map_clone_of_destructor_values_is_r0234.ryn	R0234	Map.clone cannot duplicate move-only custom-destructor values
+EXACT	tests/suite/collections/map_key_without_hash_is_r0244.ryn	R0244	Map key type `structure` does not implement Hash and Eq
+EXACT	tests/suite/collections/range_end_type_mismatch_is_r0205.ryn	R0205	range end has type `i64` but the start has type `i32`
+EXACT	tests/suite/collections/w4_for_loop_moves_vec_rejected.ryn	R0240	use of a moved value
+EXACT	tests/suite/comptime/array_length_constant_must_be_declared_first.ryn	R0012	expected a non-negative integer array length
+EXACT	tests/suite/comptime/array_length_needs_a_literal_constant.ryn	R0012	expected a non-negative integer array length
+EXACT	tests/suite/comptime/constant_cycle_rejected.ryn	R0462	constant `A` depends on itself
+EXACT	tests/suite/comptime/constant_division_by_zero_rejected.ryn	R0464	division by zero during compile-time evaluation
+EXACT	tests/suite/comptime/constant_overflow_rejected.ryn	R0464	256 does not fit in `u8` during compile-time evaluation
+EXACT	tests/suite/comptime/constant_type_mismatch_rejected.ryn	R0464	expected `i32` but found a bool
+WRONG_TEXT	tests/suite/comptime/i1_when_branch_name_not_visible_after.ryn	R0203	unknown variable `y`
+WRONG_CODE	tests/suite/comptime/i1_when_non_bool_constant_rejected.ryn	R0207	`when` condition must have type `bool`
+EXACT	tests/suite/comptime/i1_when_taken_static_assert_fails.ryn	R0460	static assertion failed: debug only
+EXACT	tests/suite/comptime/r2_lead_assign_to_constant_rejected.ryn	R0467	cannot assign to the constant `K`
+EXACT	tests/suite/comptime/r2_lead_compound_assign_to_constant_rejected.ryn	R0467	cannot assign to the constant `LIMIT`
+WRONG_CODE	tests/suite/comptime/runaway_loop_hits_step_limit.ryn	R0463	compile-time evaluation exceeded the limit of 2000000 steps
+WRONG_CODE	tests/suite/comptime/runaway_recursion_hits_depth_limit.ryn	R0463	compile-time recursion in `down` is deeper than 200 calls
+EXACT	tests/suite/comptime/runtime_function_is_not_constant_rejected.ryn	R0461	this statement cannot be evaluated at compile time
+EXACT	tests/suite/comptime/static_assert_failure_rejected.ryn	R0460	static assertion failed: size must be nine
+EXACT	tests/suite/comptime/static_assert_needs_constant_rejected.ryn	R0461	`x` cannot be evaluated at compile time
+EXACT	tests/suite/comptime/static_assert_without_message_rejected.ryn	R0460	static assertion failed
+EXACT	tests/suite/comptime/unknown_name_in_constant_rejected.ryn	R0461	`missing` cannot be evaluated at compile time
+ACCEPT	tests/suite/comptime/vec_cannot_be_a_constant.ryn	R0464	a Vec cannot be a compile-time constant; build it at run time
+WRONG_CODE	tests/suite/comptime/vec_index_out_of_range_rejected.ryn	R0464	Vec index is out of range during compile-time evaluation
+EXACT	tests/suite/comptime/w1_const_shift_overflow_rejected.ryn	R0464	1099511627776 does not fit in `i32` during compile-time evaluation
+EXACT	tests/suite/comptime/w1_const_u32_negative_rejected.ryn	R0464	-1 does not fit in `u32` during compile-time evaluation
+DECLINE	tests/suite/contracts/combined_bounds_one_missing_rejected.ryn	R0450	`A` does not satisfy shape `Named`: missing method `name`
+EXACT	tests/suite/contracts/duplicate_shape_method_rejected.ryn	R0453	shape `Show` requires method `show` more than once
+EXACT	tests/suite/contracts/explicit_conformance_missing_method_rejected.ryn	R0450	`Crate` does not satisfy shape `Sized`: missing method `size`
+DECLINE	tests/suite/contracts/r2_j4_shape_mut_self_mismatch_rejected.ryn	R0450	`C` method `bump` must take `mut self` to satisfy `Bump`
+DECLINE	tests/suite/contracts/r2_lead_generic_calls_method_outside_bound_rejected.ryn	R0450	method `extra` is not part of the bound `Show` of type parameter `T`
+DECLINE	tests/suite/contracts/shape_bound_rejects_missing_method.ryn	R0450	`B` does not satisfy shape `Show`: missing method `show`
+DECLINE	tests/suite/contracts/unknown_shape_bound_rejected.ryn	R0452	unknown shape `Missing` in the bound on `i32`
+DECLINE	tests/suite/contracts/w3_wrong_param_count_rejected.ryn	R0450	`B` method `scale` has 0 parameter(s) but `Scale` requires 1
+DECLINE	tests/suite/contracts/w3_wrong_param_type_rejected.ryn	R0450	`B` method `scale` parameter 1 has type `bool` but `Scale` requires `i32`
+EXACT	tests/suite/contracts/w3_wrong_return_type_rejected.ryn	R0450	`B` method `show` return type does not match `Show`
+EXACT	tests/suite/ffi/owned_string_parameter_rejected.ryn	R0247	`extern "C"` supports scalar values, one-field scalar records, and packed integer/float `#[repr(C)]` records of 1, 2, 4, or 8 bytes
+EXACT	tests/suite/ffi/r2_lead_null_needs_pointer_context_rejected.ryn	R0203	`null` needs a raw pointer type from its context
+EXACT	tests/suite/ffi/vec_parameter_rejected.ryn	R0247	`extern "C"` supports scalar values, one-field scalar records, and packed integer/float `#[repr(C)]` records of 1, 2, 4, or 8 bytes
+DECLINE	tests/suite/generics/generic_conflicting_types_rejected.ryn	R0263	generic parameter `T` has conflicting types
+EXACT	tests/suite/generics/generic_extend_parameter_mismatch_rejected.ryn	R0243	`extend<...>` must repeat its parameters in order, expected `T`
+EXACT	tests/suite/generics/generic_extend_unknown_structure_rejected.ryn	R0243	`extend<...>` names `Plain`, which is not a generic structure
+EXACT	tests/suite/generics/generic_extend_wrong_method_type_rejected.ryn	R0212	method argument has type `bool` but `i32` is required
+DECLINE	tests/suite/generics/generic_structure_argument_mismatch_rejected.ryn	R0263	generic argument has type `i32` but the parameter pattern is `$RynStructParam#0`
+EXACT	tests/suite/generics/generic_struct_wrong_argument_rejected.ryn	R0205	field `second` requires `i32` but the value has type `bool`
+EXACT	tests/suite/generics/i2_generic_extend_as_shape_missing_method_rejected.ryn	R0450	`$RynStruct#0` does not satisfy shape `Sized`: missing method `size`
+EXACT	tests/suite/generics/i2_generic_extend_as_shape_wrong_signature_rejected.ryn	R0450	`$RynStruct#0` method `size` return type does not match `Sized`
+DECLINE	tests/suite/generics/r2_j2_generic_enum_mismatch_rejected.ryn	R0263	generic argument has type `Other` but the parameter pattern is `Outcome`
+DECLINE	tests/suite/generics/r2_j4_generic_call_angle_hint.ryn	R0203	unknown variable `id`
+DECLINE	tests/suite/generics/uninstantiated_generic_structure_reported.ryn	R0262	a generic structure has no instance for the inferred type arguments
+DECLINE	tests/suite/generics/unresolved_type_parameter_rejected.ryn	R0262	cannot infer generic parameter `T` for `make`
+DECLINE	tests/suite/generics/w2_shape_bound_violated_through_generic.ryn	R0450	`Plain` does not satisfy shape `Show`: missing method `show`
+DECLINE	tests/suite/generics/w2_turbofish_arity_rejected.ryn	R0264	generic function `id` expects 1 type argument(s), found 2
+EXACT	tests/suite/guard/assign_to_immutable_rejected.ryn	R0204	`x` is immutable
+EXACT	tests/suite/guard/borrowed_slice_cannot_be_stored_rejected.ryn	R0240	a borrowed slice cannot be stored in a local binding
+EXACT	tests/suite/guard/conditional_move_then_use_rejected.ryn	R0240	use of a moved value
+EXACT	tests/suite/guard/constant_array_index_out_of_bounds_rejected.ryn	R0257	array index 5 is out of bounds for an array of length 3
+EXACT	tests/suite/guard/i3_raw_copy_escape_inner_block_rejected.ryn	R0252	a raw pointer to a local value would outlive its block
+EXACT	tests/suite/guard/i3_raw_field_escape_inner_block_rejected.ryn	R0252	a raw pointer to a local value would outlive its block
+EXACT	tests/suite/guard/i3_raw_if_join_escape_rejected.ryn	R0252	a raw pointer to a local value would outlive its block
+EXACT	tests/suite/guard/i3_raw_loop_body_escape_rejected.ryn	R0248	a raw pointer to a local value would outlive its block
+EXACT	tests/suite/guard/i3_raw_loop_copy_escape_rejected.ryn	R0252	a raw pointer to a local value would outlive its block
+EXACT	tests/suite/guard/i3_ref_escape_inner_block_rejected.ryn	R0251	a reference to a local value would outlive its block
+EXACT	tests/suite/guard/i3_ref_field_escape_inner_block_rejected.ryn	R0251	a reference to a local value would outlive its block
+EXACT	tests/suite/guard/i3_ref_loop_escape_rejected.ryn	R0251	a reference to a local value would outlive its block
+EXACT	tests/suite/guard/immutable_string_cannot_append.ryn	R0204	method `append` requires a mutable String
+EXACT	tests/suite/guard/move_inside_loop_rejected.ryn	R0241	a moved value would be reused on the next loop iteration
+EXACT	tests/suite/guard/move_then_redeclare_same_scope_rejected.ryn	R0202	`a` is already declared in this scope
+EXACT	tests/suite/guard/move_while_borrowed_rejected.ryn	R0249	cannot move a value while a reference to it is active
+EXACT	tests/suite/guard/mutable_and_shared_reference_conflict_rejected.ryn	R0249	conflicting references to the same value in one call
+EXACT	tests/suite/guard/mutable_reference_of_immutable_rejected.ryn	R0206	cannot create a mutable reference to an immutable binding
+EXACT	tests/suite/guard/r2_j3_borrow_string_after_move_rejected.ryn	R0240	use of a moved value
+EXACT	tests/suite/guard/r2_j3_borrow_struct_after_move_rejected.ryn	R0240	use of a moved value
+EXACT	tests/suite/guard/r2_j3_choose_owned_payload_through_reference_rejected.ryn	R0240	cannot move an owned payload out of a reference
+EXACT	tests/suite/guard/r2_j3_move_dereference_argument_rejected.ryn	R0240	cannot move a value out of a reference
+EXACT	tests/suite/guard/r2_j3_move_out_of_reference_rejected.ryn	R0240	cannot move a value out of a reference
+EXACT	tests/suite/guard/r2_j3_raw_pointer_after_move_rejected.ryn	R0240	use of a raw pointer to a moved value
+EXACT	tests/suite/guard/r2_lead_returned_struct_holds_local_pointer_rejected.ryn	R0248	a raw pointer to a local value would outlive its function
+EXACT	tests/suite/guard/r2_lead_struct_raw_pointer_escape_g1.ryn	R0252	a raw pointer to a local value would outlive its block
+EXACT	tests/suite/guard/r2_lead_struct_raw_pointer_escape_g2.ryn	R0252	a raw pointer to a local value would outlive its block
+EXACT	tests/suite/guard/raw_pointer_to_inner_local_outliving_block_rejected.ryn	R0248	a raw pointer to a local value would outlive its block
+EXACT	tests/suite/guard/reference_to_temporary_rejected.ryn	R0206	address-of currently requires a local variable or a borrowed slice element
+EXACT	tests/suite/guard/returning_raw_pointer_to_local_rejected.ryn	R0248	a raw pointer to a local value cannot escape its stack frame
+EXACT	tests/suite/guard/return_local_reference_rejected.ryn	R0248	a reference to a local value cannot escape its stack frame
+EXACT	tests/suite/guard/two_mutable_references_to_one_value_rejected.ryn	R0249	conflicting references to the same value in one call
+EXACT	tests/suite/guard/unknown_provenance_reference_rejected.ryn	R0250	cannot store a reference with unknown lifetime provenance
+EXACT	tests/suite/guard/use_after_move_into_call.ryn	R0240	use of a moved value
+EXACT	tests/suite/guard/use_after_move_string.ryn	R0240	use of a moved value
+EXACT	tests/suite/guard/use_after_move_struct.ryn	R0240	use of a moved value
+EXACT	tests/suite/guard/use_after_move_vec.ryn	R0240	use of a moved value
+EXACT	tests/suite/guard/use_while_mutably_borrowed_rejected.ryn	R0249	cannot use a value while a mutable reference to it is active
+DECLINE	tests/suite/guard/w3_move_in_choose_arm_then_use_rejected.ryn	R0240	use of a moved value
+EXACT	tests/suite/guard/w3_mut_ref_alias_same_value_rejected.ryn	R0249	conflicting references to the same value in one call
+EXACT	tests/suite/guard/w3_ref_via_fn_escapes_block_rejected.ryn	R0251	a reference to a local value would outlive its block
+EXACT	tests/suite/guard/w3_write_while_shared_borrow_rejected.ryn	R0249	cannot assign to a value while it is borrowed
+EXACT	tests/suite/guard/write_through_shared_reference_rejected.ryn	R0206	cannot assign through a shared reference
+EXACT	tests/suite/literals/r2_j5_number_followed_by_name_rejected.ryn	R0011	numeric literal is directly followed by letters or `_`
+EXACT	tests/suite/literals/r2_j5_second_decimal_point_rejected.ryn	R0011	numeric literal is followed by another decimal point
+EXACT	tests/suite/metaprogramming/derive_default_unsupported_field_rejected.ryn	R0466	`#[derive(Default)]` cannot build a default for a field of type `Plain`
+EXACT	tests/suite/metaprogramming/metadata_assertion_failure_rejected.ryn	R0460	static assertion failed: expected three fields
+EXACT	tests/suite/metaprogramming/metadata_needs_type_argument_rejected.ryn	R0465	`field_count` takes exactly one type argument, written `field_count::<Type>()`
+EXACT	tests/suite/metaprogramming/r2_j1_derive_on_enum_rejected.ryn	R0010	`#[derive]` applies only to structs
+EXACT	tests/suite/metaprogramming/unknown_derive_rejected.ryn	R0014	unsupported derive `Magic`
+EXACT	tests/suite/metaprogramming/w1_static_assert_negated_has_field_rejected.ryn	R0460	static assertion failed: x exists
+WRONG_CODE	tests/suite/modules/circular_dependency_rejected/src/main.ryn	R0427	circular module dependency: a -> b -> a
+ACCEPT	tests/suite/modules/missing_module_rejected/src/main.ryn	R0420	module `nothing` not found (looked for /home/v3nn7/Ryn-Lang/Ryn/tests/suite/modules/missing_module_rejected/src/nothing.ryn and /home/v3nn7/Ryn-Lang/Ryn/tests/suite/modules/missing_module_rejected/src/nothing/mod.ryn)
+ACCEPT	tests/suite/modules/module_function_conflicts_with_root_rejected/src/main.ryn	R0421	module function `helper` conflicts with a root function
+WRONG_CODE	tests/suite/modules/private_constant_rejected/src/main.ryn	R0425	constant `util::SECRET` is private to its module
+WRONG_CODE	tests/suite/modules/private_field_rejected/src/main.ryn	R0426	field `secret` of `P` is private
+WRONG_CODE	tests/suite/modules/private_function_rejected/src/main.ryn	R0425	function `util::hidden` is private to its module
+WRONG_CODE	tests/suite/modules/private_method_rejected/src/main.ryn	R0425	method `hidden` is private to `P`'s module
+EXACT	tests/suite/modules/r2_j4_missing_module_item_rejected/src/main.ryn	R0230	unknown item `HIDDEN_CONST` in module `helper`
+WRONG_CODE	tests/suite/modules/r2_j6_private_nested_module_fn_rejected/src/main.ryn	R0425	function `util::hidden` is private to its module
+WRONG_CODE	tests/suite/modules/r2_j6_private_nested_module_method_rejected/src/main.ryn	R0425	method `secret` is private to `Rect`'s module
+WRONG_CODE	tests/suite/modules/w9_circular_three_modules/src/main.ryn	R0427	circular module dependency: ring::one -> ring::two -> ring::three -> ring::one
+EXACT	tests/suite/modules/w9_missing_item_rejected/src/main.ryn	R0210	unknown function `util::absent`
+ACCEPT	tests/suite/modules/w9_missing_path_dependency/src/main.ryn	R0420	module `ghost::x` not found (looked for /home/v3nn7/Ryn-Lang/Ryn/tests/suite/modules/w9_missing_path_dependency/src/ghost/x.ryn and /home/v3nn7/Ryn-Lang/Ryn/tests/suite/modules/w9_missing_path_dependency/src/ghost/x/mod.ryn)
+WRONG_CODE	tests/suite/modules/w9_private_field_read_after_literal_rejected/src/main.ryn	R0426	field `y` of `P` is private
+EXACT	tests/suite/modules/w9_private_struct_rejected/src/main.ryn	R0227	unknown structure `hid::Secret`
+EXACT	tests/suite/output/print_malformed_format_rejected.ryn	R0014	malformed format string in `print`
+EXACT	tests/suite/output/print_needs_literal_format.ryn	R0210	`print` expects a format string literal as its first argument
+EXACT	tests/suite/output/print_wrong_arity_rejected.ryn	R0208	`print` format string has 2 placeholder(s) but 1 value(s) were given
+DECLINE	tests/suite/patterns/arm_after_binding_is_unreachable.ryn	R0235	this pattern can never match
+DECLINE	tests/suite/patterns/arm_after_wildcard_is_unreachable.ryn	R0235	this pattern can never match
+DECLINE	tests/suite/patterns/duplicate_literal_is_unreachable.ryn	R0235	this pattern can never match
+EXACT	tests/suite/patterns/duplicate_variant_arm_rejected.ryn	R0235	`choose` handles variant `E::A` more than once
+DECLINE	tests/suite/patterns/literal_patterns_need_wildcard_rejected.ryn	R0235	literal patterns must be followed by a `_` arm
+DECLINE	tests/suite/patterns/mixing_literal_and_variant_rejected.ryn	R0235	a literal pattern cannot be mixed with other kinds of patterns
+WRONG_CODE	tests/suite/patterns/nested_pattern_missing_inner_variant_rejected.ryn	R0235	`choose` is not exhaustive; missing variant(s): Nothing
+EXACT	tests/suite/patterns/non_exhaustive_variants_rejected.ryn	R0235	`choose` is not exhaustive; missing variant(s): C
+EXACT	tests/suite/patterns/r2_j1_empty_struct_declaration_rejected.ryn	R0221	a structure must declare at least one field
+EXACT	tests/suite/patterns/r2_j1_empty_struct_literal_missing_field.ryn	R0229	missing field `x` in `E` literal
+EXACT	tests/suite/patterns/r2_j1_keyword_as_name_rejected.ryn	R0012	`shape` is a reserved keyword
+DECLINE	tests/suite/patterns/r2_j4_struct_pattern_on_i32_rejected.ryn	R0235	pattern does not match the type of the value
+DECLINE	tests/suite/patterns/r2_j4_tuple_pattern_arity_rejected.ryn	R0235	tuple pattern has 3 element(s) but the value has 2
+DECLINE	tests/suite/patterns/r2_j4_tuple_pattern_on_i32_rejected.ryn	R0235	pattern does not match the type of the value
+EXACT	tests/suite/patterns/r2_j4_unknown_variant_lists_variants.ryn	R0233	enum `Color` has no variant `Blue`
+EXACT	tests/suite/patterns/r2_j6_mut_method_on_pattern_binding_rejected.ryn	R0204	method `grow` requires a mutable receiver
+DECLINE	tests/suite/patterns/string_patterns_need_wildcard_rejected.ryn	R0235	literal patterns must be followed by a `_` arm
+DECLINE	tests/suite/patterns/tuple_length_mismatch_rejected.ryn	R0235	tuple patterns have different lengths
+DECLINE	tests/suite/patterns/unreachable_after_catch_all_tuple.ryn	R0235	this pattern can never match
+DECLINE	tests/suite/patterns/w2_bool_tuple_missing_rejected.ryn	R0235	literal patterns must be followed by a `_` arm
+DECLINE	tests/suite/patterns/w2_tuple_subsumed_arm_unreachable.ryn	R0235	this pattern can never match
+EXACT	tests/suite/raii/destructor_cannot_be_called_directly.ryn	R0255	destructor functions are called automatically by Ryn Guard
+EXACT	tests/suite/raii/destructor_requires_handle_first_field.ryn	R0255	custom destructors currently require non-`repr(C)` structs with scalar or raw-pointer fields
+EXACT	tests/suite/raii/destructor_unknown_function_rejected.ryn	R0255	destructor function `missing` was not found
+EXACT	tests/suite/raii/move_owned_field_out_of_destructor_value_rejected.ryn	R0255	cannot move an owned field out of a value with a custom destructor
+EXACT	tests/suite/raii/use_after_move_rejected.ryn	R0240	use of a moved value
+EXACT	tests/suite/result_option/choose_result_not_exhaustive_rejected.ryn	R0235	`choose` is not exhaustive; missing variant(s): Err
+DECLINE	tests/suite/result_option/optional_chain_on_struct_is_r0234.ryn	R0234	`choose` requires an enum value
+EXACT	tests/suite/result_option/question_in_non_result_function_rejected.ryn	R0234	`?` can only be used in a function returning the matching `Option` or `Result` type
+EXACT	tests/suite/result_option/r2_j4_bare_none_hint.ryn	R0203	unknown variable `None`
+EXACT	tests/suite/result_option/r2_j4_bare_some_hint.ryn	R0210	unknown function `Some`
+EXACT	tests/suite/result_option/w4_option_question_in_result_fn_rejected.ryn	R0234	the enclosing function must return the same generic type used with `?`
+EXACT	tests/suite/structs/struct_destructuring_type_mismatch_is_r0205.ryn	R0205	declared type `structure` does not match initializer type `structure`
+EXACT	tests/suite/structs/unknown_type_annotation_is_r0230.ryn	R0230	unknown type `Strng`
+EXACT	tests/programs/fail/array_repeat_bad_length.ryn	R0012	array length must be an integer literal
+EXACT	tests/programs/fail/array_repeat_length.ryn	R0240	array repeat has length 2 but the expected array needs 3
+EXACT	tests/programs/fail/array_repeat_string.ryn	R0256	array repeat cannot copy `String` elements
+EXACT	tests/programs/fail/coalesce_not_option.ryn	R0234	`choose` requires an enum value
+EXACT	tests/programs/fail/defer_break_outside.ryn	R0268	`break` cannot leave a `defer` block
+EXACT	tests/programs/fail/defer_owned_moved.ryn	R0240	use of a moved value
+EXACT	tests/programs/fail/defer_reference.ryn	R0269	a function returning a reference cannot use `defer`
+EXACT	tests/programs/fail/defer_return_inside.ryn	R0267	`return` cannot leave a `defer` block
+EXACT	tests/programs/fail/ffi_unsupported_record.ryn	R0247	`extern "C"` supports scalar values, one-field scalar records, and packed integer/float `#[repr(C)]` records of 1, 2, 4, or 8 bytes
+EXACT	tests/programs/fail/malformed_interpolation.ryn	R0014	unterminated echo interpolation
+EXACT	tests/programs/fail/mut_ref_immutable.ryn	R0206	cannot create a mutable reference to an immutable binding
+EXACT	tests/programs/fail/operator_type_mismatch.ryn	R0206	arithmetic operands must have matching numeric types, found `i32` and `i64`
+DECLINE	tests/programs/fail/optional_field_on_struct.ryn	R0234	`choose` requires an enum value
+EXACT	tests/programs/fail/pipe_bad_target.ryn	R0265	the right side of `|>` must be a function name or a function call
+EXACT	tests/programs/fail/range_mixed_types.ryn	R0205	range end has type `i64` but the start has type `i32`
+DECLINE	tests/programs/fail/return_aliased_local_reference.ryn	R0248	a reference to a local value cannot escape its stack frame
+EXACT	tests/programs/fail/return_local_reference.ryn	R0248	a reference to a local value cannot escape its stack frame
+DECLINE	tests/programs/fail/shape_bound_unknown_shape.ryn	R0452	unknown shape `Missing` in the bound on `B`
+EXACT	tests/programs/fail/struct_destructuring_unknown_field.ryn	R0225	structure `Point` has no field `z`
+EXACT	tests/programs/fail/struct_destructuring_wrong_type.ryn	R0205	declared type `structure` does not match initializer type `structure`
+DECLINE	tests/programs/fail/tuple_destructuring_arity.ryn	R0225	structure `$RynTuple#inferred0` has no field `_2`
+EXACT	tests/programs/fail/unknown_variable.ryn	R0203	unknown variable `missing`
+EXACT	tests/programs/fail/w5_argument_count.ryn	R0211	function `add` expects 2 arguments but got 1
+EXACT	tests/programs/fail/w5_argument_type.ryn	R0212	argument to `double` has type `str` but `i32` is required
+DECLINE	tests/programs/fail/w5_choose_literal_no_wildcard.ryn	R0235	literal patterns must be followed by a `_` arm
+EXACT	tests/programs/fail/w5_choose_missing_variant.ryn	R0235	`choose` is not exhaustive; missing variant(s): Box
+EXACT	tests/programs/fail/w5_choose_unknown_variant.ryn	R0233	enum `Mode` has no variant `Execute`
+EXACT	tests/programs/fail/w5_duplicate_main.ryn	R0201	duplicate function `main`
+EXACT	tests/programs/fail/w5_duplicate_struct_field.ryn	R0228	field `x` is initialized more than once
+EXACT	tests/programs/fail/w5_main_wrong_return.ryn	R0208	`main` must take no parameters and return either no value or `i32`
+EXACT	tests/programs/fail/w5_missing_return_value.ryn	R0213	function `answer` must return a `i32` value
+EXACT	tests/programs/fail/w5_missing_struct_field.ryn	R0229	missing field `y` in `Point` literal
+EXACT	tests/programs/fail/w5_recursive_struct.ryn	R0232	structure `Node` contains itself by value
+EXACT	tests/programs/fail/w5_unknown_enum_variant.ryn	R0233	enum `Mode` has no variant `Execute`
+EXACT	tests/programs/fail/w5_unknown_type.ryn	R0230	unknown type `Strng`
+EXACT	tests/programs/fail/w5_unsigned_negation.ryn	R0206	unary `-` requires a signed integer or floating-point value
+EXACT	tests/programs/fail/w5_use_after_move.ryn	R0240	use of a moved value
+EXACT	tests/programs/fail/write_through_shared_ref.ryn	R0206	cannot assign through a shared reference

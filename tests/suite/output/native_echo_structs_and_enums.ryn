@@ -1,0 +1,26 @@
+// test: run
+// out: Pair { first: 1, second: 2 }
+// out: Pair { first: 5, second: 6 }
+// out: Named { label: box, count: 3, flag: true }
+// out: Empty
+// out: Circle(7)
+// out: Labelled(box, 3)
+// out: Circle(9)
+// exit: 0
+// A structure and an enum are written as the Rust backend writes them, whether they are places or temporaries.
+struct Pair { first: i32, second: i32 }
+struct Named { label: String, count: u64, flag: bool }
+enum Shape { Empty, Circle(i32), Labelled(String, i32) }
+fun make(n: i32) -> Pair { return Pair { first: n, second: n + 1 } }
+fun main() {
+    pair := Pair { first: 1, second: 2 }
+    echo pair
+    echo make(5)
+    named := Named { label: String("box"), count: 3, flag: true }
+    echo named
+    echo Shape::Empty
+    echo Shape::Circle(7)
+    echo Shape::Labelled(String("box"), 3)
+    figure := Shape::Circle(9)
+    echo figure
+}

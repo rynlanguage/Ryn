@@ -1,0 +1,69 @@
+// test: run
+// out: 4950
+// out: 10 45
+// out: 0-1-2-3-4
+// out: 55
+// out: 3
+fun total(n: i64) -> i64 {
+    mut sum: i64 = 0
+    mut i: i64 = 0
+    while i < n {
+        sum += i
+        i += 1
+    }
+    return sum
+}
+struct Acc { count: i64, sum: i64 }
+fun accumulate(n: i64) -> Acc {
+    mut acc := Acc { count: 0, sum: 0 }
+    for i in 0..n {
+        acc.count += 1
+        acc.sum = acc.sum + i
+    }
+    return acc
+}
+fun joined(n: i64) -> String {
+    mut text := String("")
+    for i in 0..n {
+        when i > 0 {
+            text.append("-")
+        }
+        text.append(String(i))
+    }
+    return text
+}
+fun vec_sum(n: i64) -> i64 {
+    mut items: Vec<i64> = Vec()
+    for i in 1..=n {
+        items.push(i)
+    }
+    mut sum: i64 = 0
+    mut at: u64 = 0
+    while at < items.len() {
+        sum += items.index(at)
+        at += 1
+    }
+    return sum
+}
+fun last_of(n: i64) -> i64 {
+    mut best := Acc { count: 0, sum: 0 }
+    mut i: i64 = 0
+    while i < n {
+        candidate := Acc { count: i, sum: i * 2 }
+        best = candidate
+        i += 1
+    }
+    return best.count
+}
+const T: i64 = total(100)
+const A: Acc = accumulate(10)
+const J: String = joined(5)
+const V: i64 = vec_sum(10)
+const L: i64 = last_of(4)
+fun main() {
+    echo T
+    echo "{A.count} {A.sum}"
+    echo J
+    echo V
+    echo L
+}

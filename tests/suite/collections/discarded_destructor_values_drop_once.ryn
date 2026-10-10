@@ -1,0 +1,34 @@
+// test: run
+// out: 1
+// out: 2
+// out: 9
+// exit: 0
+// A value that a statement discards is dropped at the end of that statement: a call whose structure holds a destructor in a
+// field drops it once, and so does a bare `take` of such a structure from a vector. Both backends print each value once.
+#[drop(release)]
+struct Resource {
+    handle: *i32,
+}
+
+fun release(resource: Resource) {
+    echo *resource.handle
+}
+
+struct Bundle {
+    resource: Resource,
+    label: String,
+}
+
+fun make(handle: *i32) -> Bundle {
+    return Bundle { resource: Resource { handle: handle }, label: String("kept") }
+}
+
+fun main() {
+    mut a: i32 = 1
+    make(&raw mut a)
+    mut b: i32 = 2
+    mut bundles := Vec<Bundle>()
+    bundles.push(make(&raw mut b))
+    bundles.take(0)
+    echo 9
+}

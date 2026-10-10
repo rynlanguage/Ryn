@@ -12,6 +12,7 @@ use ryn::{
     frontend::{self, Frontend},
     lockfile::{validate_project_lock_if_present, write_project_lock},
     manifest::{Dependency, Manifest, Optimize},
+    native::{self, Backend},
     registry,
     source::SourceFile,
 };
@@ -139,10 +140,21 @@ fn run_cli() -> Result<Option<i32>, String> {
         return Ok(None);
     }
     if command == "bootstrap" {
-        if args.next().is_some() {
-            return Err(usage());
+        let mut native_only = false;
+        let mut frontend_only = false;
+        for argument in args.by_ref() {
+            match argument.to_str() {
+                Some("--native") if !native_only && !frontend_only => native_only = true,
+                Some("--frontend") if !native_only && !frontend_only => frontend_only = true,
+                _ => return Err(usage()),
+            }
         }
-        bootstrap()?;
+        if !native_only {
+            bootstrap()?;
+        }
+        if !frontend_only {
+            bootstrap_native()?;
+        }
         return Ok(None);
     }
     if !matches!(command.as_str(), "check" | "build" | "run") {
@@ -152,6 +164,7 @@ fn run_cli() -> Result<Option<i32>, String> {
     let mut output = None;
     let mut release = false;
     let mut frontend_name = None;
+    let mut backend_name = None;
     let mut program_args = Vec::new();
     while let Some(argument) = args.next() {
         match argument.to_str() {
@@ -165,6 +178,13 @@ fn run_cli() -> Result<Option<i32>, String> {
                     .and_then(|name| name.into_string().ok())
                     .ok_or_else(usage)?;
                 frontend_name = Some(name);
+            }
+            Some("--backend") if backend_name.is_none() => {
+                let name = args
+                    .next()
+                    .and_then(|name| name.into_string().ok())
+                    .ok_or_else(usage)?;
+                backend_name = Some(name);
             }
             Some("-o" | "--output") if command != "check" && output.is_none() => {
                 let path = args
@@ -201,9 +221,64 @@ fn run_cli() -> Result<Option<i32>, String> {
     let input = source_path(&requested_input)?;
     let source = SourceFile::load(&input)
         .map_err(|e| format!("error[R0001]: cannot read {}: {e}", input.display()))?;
-    let frontend = frontend::select(frontend_name.as_deref())?;
+    // `--frontend` chooses the parser of the Cranelift pipeline, so naming one selects that backend unless the
+    // native one is asked for explicitly, which has its own frontend.
+    let backend = match (backend_name.as_deref(), frontend_name.as_deref()) {
+        (None, Some(_)) => Backend::Cranelift,
+        (Some(_), Some(_)) if Backend::select(backend_name.as_deref())? == Backend::Native => {
+            return Err(
+                "error[R0907]: `--frontend` applies to the cranelift backend; the native backend uses its own frontend"
+                    .into(),
+            );
+        }
+        (name, _) => Backend::select(name)?,
+    };
+    // `run` of a single file without `-o` builds its program into a scratch directory, so no executable is left beside
+    // the source; the directory is removed when the command ends.
+    let scratch = if command == "run" && output.is_none() && project_manifest.is_none() {
+        Some(ScratchDirectory::create()?)
+    } else {
+        None
+    };
+    let output = match &scratch {
+        Some(directory) => Some(
+            directory.0.join(
+                default_output_path(&requested_input, &input, release)
+                    .file_name()
+                    .unwrap_or_default(),
+            ),
+        ),
+        None => output,
+    };
     // A standalone file with `use` declarations goes through the module loader.
     let file_imports = project_manifest.is_none() && has_use_declaration(source.text());
+    if backend == Backend::Native && command != "check" {
+        // `build` and `run` accept only what `check` accepts: the same analysis runs before the native compiler does.
+        let frontend = frontend::select(frontend_name.as_deref())?;
+        if project_manifest.is_some() {
+            check_project_with_frontend(&requested_input, &frontend)?;
+        } else if file_imports {
+            check_file_with_imports(&input, &frontend)?;
+        } else {
+            check_source_with_frontend(&source, &frontend).map_err(|errors| {
+                errors
+                    .iter()
+                    .map(|error| error.render(&source))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            })?;
+        }
+        return build_native(
+            &command,
+            &requested_input,
+            &input,
+            project_manifest.is_some(),
+            file_imports,
+            output.unwrap_or_else(|| default_output_path(&requested_input, &input, release)),
+            &program_args,
+        );
+    }
+    let frontend = frontend::select(frontend_name.as_deref())?;
 
     match command.as_str() {
         "check" => {
@@ -219,6 +294,25 @@ fn run_cli() -> Result<Option<i32>, String> {
                         .collect::<Vec<_>>()
                         .join("\n\n")
                 })?;
+            }
+            // The native compiler must accept what the analysis accepts, so that `ryn build` succeeds after `ryn check`.
+            if backend == Backend::Native {
+                let compiler = native::locate_or_build()?;
+                let (native_input, packages) = native_input(
+                    &requested_input,
+                    &input,
+                    project_manifest.is_some(),
+                    file_imports,
+                )?;
+                native::run(
+                    &compiler,
+                    &native::Invocation {
+                        check: true,
+                        input: &native_input,
+                        output: None,
+                        packages,
+                    },
+                )?;
             }
             println!("{}: ok", input.display());
             Ok(None)
@@ -304,6 +398,211 @@ fn run_cli() -> Result<Option<i32>, String> {
         }
         _ => Err(usage()),
     }
+}
+
+/// The input `rync` reads, and the dependency packages it needs: a project is passed as its canonical directory with every
+/// resolved dependency; a file with imports by its canonical path, as the bootstrap compiler's module loader names it in
+/// diagnostics; and a file without imports by the path as written.
+fn native_input(
+    requested_input: &Path,
+    input: &Path,
+    project: bool,
+    file_imports: bool,
+) -> Result<(PathBuf, Vec<(String, PathBuf)>), String> {
+    if project {
+        let directory = fs::canonicalize(requested_input).map_err(|error| {
+            format!(
+                "error[R0420]: cannot resolve project directory {}: {error}",
+                requested_input.display()
+            )
+        })?;
+        let packages = ryn::project_dependency_roots(&directory)?;
+        return Ok((directory, packages));
+    }
+    if file_imports {
+        let canonical = fs::canonicalize(input).map_err(|error| {
+            format!("error[R0420]: cannot resolve {}: {error}", input.display())
+        })?;
+        return Ok((canonical, Vec::new()));
+    }
+    Ok((input.to_path_buf(), Vec::new()))
+}
+
+/// `ryn build` and `ryn run` with the native compiler.
+fn build_native(
+    command: &str,
+    requested_input: &Path,
+    input: &Path,
+    project: bool,
+    file_imports: bool,
+    output: PathBuf,
+    program_args: &[std::ffi::OsString],
+) -> Result<Option<i32>, String> {
+    let (native_input, packages) = native_input(requested_input, input, project, file_imports)?;
+    // The output must not replace a source file of the program.
+    let mut sources = vec![input.to_path_buf()];
+    if project {
+        let mut visited = HashSet::new();
+        collect_project_inputs(requested_input, &mut visited, &mut sources)?;
+    }
+    for source in &sources {
+        if ryn::output_overwrites_source(source, &output) {
+            return Err(format!(
+                "error[R0303]: output {} would overwrite {}",
+                output.display(),
+                source.display()
+            ));
+        }
+    }
+    let compiler = native::locate_or_build()?;
+    let cache = if project {
+        Some(native_cache_entry(requested_input, &output, &compiler)?)
+    } else {
+        None
+    };
+    let cache_hit = cache.as_ref().is_some_and(|(path, key)| {
+        output_fingerprint(&output).is_some_and(|artifact| {
+            fs::read_to_string(path).ok().as_deref() == Some(format!("{key}:{artifact}").as_str())
+        })
+    });
+    if !cache_hit {
+        if let Some(parent) = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "error[R0401]: cannot create output directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        native::run(
+            &compiler,
+            &native::Invocation {
+                check: false,
+                input: &native_input,
+                output: Some(&output),
+                packages,
+            },
+        )?;
+        if let Some((path, key)) = cache {
+            let artifact = output_fingerprint(&output).ok_or_else(|| {
+                format!(
+                    "error[R0401]: cannot fingerprint build output {}",
+                    output.display()
+                )
+            })?;
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("error[R0401]: cannot create build cache: {error}"))?;
+            }
+            fs::write(path, format!("{key}:{artifact}"))
+                .map_err(|error| format!("error[R0401]: cannot write build cache: {error}"))?;
+        }
+    }
+    if command == "run" {
+        let executable = fs::canonicalize(&output).map_err(|e| {
+            format!(
+                "error[R0301]: could not resolve executable {}: {e}",
+                output.display()
+            )
+        })?;
+        let status = process::Command::new(&executable)
+            .args(program_args)
+            .status()
+            .map_err(|e| format!("error[R0301]: could not run {}: {e}", output.display()))?;
+        let code = status
+            .code()
+            .ok_or_else(|| format!("program terminated with {status}"))?;
+        return Ok(Some(code));
+    }
+    println!(
+        "{} {}",
+        if cache_hit { "up-to-date" } else { "built" },
+        output.display()
+    );
+    Ok(None)
+}
+
+fn native_cache_entry(
+    project: &Path,
+    output: &Path,
+    compiler: &Path,
+) -> Result<(PathBuf, String), String> {
+    let project = fs::canonicalize(project).map_err(|error| {
+        format!("error[R0401]: cannot resolve project for build cache: {error}")
+    })?;
+    let mut files = Vec::new();
+    let mut visited_projects = HashSet::new();
+    collect_project_inputs(&project, &mut visited_projects, &mut files)?;
+    files.sort();
+    let mut hash = StableHash::new();
+    hash.feed(env!("CARGO_PKG_VERSION").as_bytes());
+    hash.feed(b"backend:native");
+    hash.feed(output.to_string_lossy().as_bytes());
+    hash_file(&mut hash, compiler)?;
+    for file in files {
+        hash_file(&mut hash, &file)?;
+    }
+    let key = format!("{:016x}", hash.finish());
+    let mut output_hash = StableHash::new();
+    output_hash.feed(output.to_string_lossy().as_bytes());
+    Ok((
+        project
+            .join("build")
+            .join("cache")
+            .join("native")
+            .join(format!("{:016x}.fingerprint", output_hash.finish())),
+        key,
+    ))
+}
+
+/// Builds the native compiler from its embedded sources through the bootstrap compiler, lets the result compile itself,
+/// and requires the two to be byte-identical; the verified compiler becomes the cached `rync`.
+fn bootstrap_native() -> Result<(), String> {
+    if !native::native_supported() {
+        println!("native compiler: skipped (it targets Linux x86-64 only)");
+        return Ok(());
+    }
+    let directory = native::cache_directory();
+    let work = directory.join("bootstrap");
+    if work.exists() {
+        fs::remove_dir_all(&work)
+            .map_err(|error| format!("error[R0902]: cannot clear {}: {error}", work.display()))?;
+    }
+    let report = native::bootstrap(&work, true, &mut |line| println!("native {line}"))?;
+    let stage3 = report
+        .stage3
+        .as_ref()
+        .ok_or("error[R0903]: the native bootstrap did not build stage 3")?;
+    let bytes = fs::read(stage3)
+        .map_err(|error| format!("error[R0902]: cannot read {}: {error}", stage3.display()))?;
+    let installed = directory.join("rync");
+    if installed.is_file() {
+        fs::remove_file(&installed).map_err(|error| {
+            format!(
+                "error[R0902]: cannot replace {}: {error}",
+                installed.display()
+            )
+        })?;
+    }
+    fs::rename(&report.stage2, &installed).map_err(|error| {
+        format!(
+            "error[R0902]: cannot install {}: {error}",
+            installed.display()
+        )
+    })?;
+    let mut hash = StableHash::new();
+    hash.feed(&bytes);
+    println!(
+        "native fixpoint reached: stage 2 and stage 3 are byte-identical ({} bytes, {:016x})",
+        bytes.len(),
+        hash.finish()
+    );
+    println!("installed {}", installed.display());
+    let _ = fs::remove_dir_all(&work);
+    Ok(())
 }
 
 fn project_cache_entry(
@@ -618,6 +917,32 @@ fn clean_project(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// A directory that one `ryn run` builds its program into; it is removed, with the program, when the guard is dropped.
+struct ScratchDirectory(PathBuf);
+
+impl ScratchDirectory {
+    fn create() -> Result<Self, String> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let path = std::env::temp_dir().join(format!("ryn-run-{}-{stamp}", process::id()));
+        fs::create_dir(&path).map_err(|error| {
+            format!(
+                "error[R0401]: cannot create a scratch directory {}: {error}",
+                path.display()
+            )
+        })?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for ScratchDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn default_output_path(requested_input: &Path, source: &Path, release: bool) -> PathBuf {
     if requested_input.is_dir() {
         let name = fs::canonicalize(requested_input)
@@ -662,7 +987,7 @@ fn has_use_declaration(text: &str) -> bool {
 }
 
 fn usage() -> String {
-    "usage:\n  ryn new <path>\n  ryn check <file.ryn|project-dir> [--frontend <ryn|rust>]\n  ryn build <file.ryn|project-dir> [--release] [-o|--output <path>] [--frontend <ryn|rust>]\n  ryn run <file.ryn|project-dir> [--release] [-o|--output <path>] [--frontend <ryn|rust>] [-- <program-args...>]\n  ryn clean <project-dir>\n  ryn lock <project-dir>\n  ryn login <token>\n  ryn publish [project-dir]\n  ryn bootstrap".into()
+    "usage:\n  ryn new <path>\n  ryn check <file.ryn|project-dir> [--backend <native|cranelift>] [--frontend <ryn|rust>]\n  ryn build <file.ryn|project-dir> [--release] [-o|--output <path>] [--backend <native|cranelift>] [--frontend <ryn|rust>]\n  ryn run <file.ryn|project-dir> [--release] [-o|--output <path>] [--backend <native|cranelift>] [--frontend <ryn|rust>] [-- <program-args...>]\n  ryn clean <project-dir>\n  ryn lock <project-dir>\n  ryn login <token>\n  ryn publish [project-dir]\n  ryn bootstrap [--native|--frontend]".into()
 }
 
 /// Rebuilds the self-hosted frontend with itself until it reproduces itself.
@@ -746,7 +1071,7 @@ fn bootstrap() -> Result<(), String> {
 
 fn help_text() -> String {
     format!(
-        "Ryn — Reliable. Fast. Native.\n\n{}\n\nCommands:\n  new <path>        Create a project with a native Hello World example\n  check <source>    Check a .ryn file or project directory\n  build <source>    Compile a .ryn file or project directory\n  run <source>      Compile and run a .ryn file or project directory\n  lock <project>    Resolve and write ryn.lock for supported dependencies\n  login <token>     Save a pods registry token for publishing\n  publish [project] Check, pack and upload the project to the pods registry\n  clean <project>   Remove the project's build directory\n  bootstrap         Rebuild the self-hosted frontend with itself and verify the fixpoint\n\nA project directory uses src/main.ryn as its entry point.\nProject outputs go under build/debug or build/release; build/cache is reserved for compiler caches.\nAn i32 result from main becomes the process exit code for run.\nPass program arguments to run after --.\nclean removes only the direct build directory and refuses symbolic links.\n\nOptions:\n  --release            Use the project's release output directory\n  -o, --output <path>  Set the executable path for build or run\n  --frontend <name>    Parse with the self-hosted `ryn` frontend (default) or the `rust` bootstrap parser\n  -h, --help           Show this help\n  -V, --version        Show compiler version\n",
+        "Ryn — Reliable. Fast. Native.\n\n{}\n\nCommands:\n  new <path>        Create a project with a native Hello World example\n  check <source>    Check a .ryn file or project directory\n  build <source>    Compile a .ryn file or project directory\n  run <source>      Compile and run a .ryn file or project directory\n  lock <project>    Resolve and write ryn.lock for supported dependencies\n  login <token>     Save a pods registry token for publishing\n  publish [project] Check, pack and upload the project to the pods registry\n  clean <project>   Remove the project's build directory\n  bootstrap         Rebuild the self-hosted frontend and the native compiler with themselves and verify both fixpoints\n\nA project directory uses src/main.ryn as its entry point.\nProject outputs go under build/debug or build/release; build/cache is reserved for compiler caches.\nAn i32 result from main becomes the process exit code for run.\nPass program arguments to run after --.\nclean removes only the direct build directory and refuses symbolic links.\n\nOptions:\n  --release            Use the project's release output directory\n  -o, --output <path>  Set the executable path for build or run\n  --backend <name>     Compile with the self-hosted `native` compiler rync (default on Linux x86-64) or `cranelift`\n  --frontend <name>    For the cranelift backend: parse with the self-hosted `ryn` frontend (default) or the `rust` parser\n  -h, --help           Show this help\n  -V, --version        Show compiler version\n",
         usage()
     )
 }

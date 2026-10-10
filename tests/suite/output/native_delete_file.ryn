@@ -1,0 +1,18 @@
+// test: run
+// out: true
+// out: false
+// out: false
+// out: false
+// A file is removed once; a missing path and a directory are not removed (`delete_file` gives false).
+fun main() {
+    file := path_join(temp_dir(), "ryn-suite-native-delete-file.txt")
+    folder := path_join(temp_dir(), "ryn-suite-native-delete-file-dir")
+    remove_dir_all(folder.clone())
+    create_dir(folder.clone())
+    write_file(file.clone(), "data")
+    echo delete_file(file.clone())
+    echo delete_file(file.clone())
+    echo delete_file(folder.clone())
+    echo file_exists(file)
+    remove_dir_all(folder)
+}

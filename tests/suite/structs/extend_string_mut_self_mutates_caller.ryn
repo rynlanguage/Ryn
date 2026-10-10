@@ -1,0 +1,34 @@
+// test: run
+// out: false
+// out: hey!
+// out: hey!?
+// out: false
+// out: true
+// exit: 0
+// A `mut self` method of `extend String` changes the caller's String: growing operations (`append`, `push`) reach the
+// caller's handle through the reference, the same as `clear`.
+extend String {
+    fun empty(self) -> bool {
+        return self.len() == 0
+    }
+
+    fun shout(mut self) {
+        self.append("!")
+    }
+
+    fun question(mut self) {
+        self.push('?')
+    }
+}
+
+fun main() {
+    mut text := String("hey")
+    echo text.empty()
+    text.shout()
+    echo text
+    text.question()
+    echo text
+    echo text.empty()
+    mut empty_text := String("")
+    echo empty_text.empty()
+}

@@ -3616,6 +3616,8 @@ extend Tree {
         for function in concrete.clone() {
             self.rewrite_function(function)?
         }
+        // The limit bounds the specializations that monomorphization creates, not the ordinary functions of the program.
+        ordinary := concrete.len() as u64
         mut cursor: u64 = 0
         while cursor < self.pending.len() {
             function := self.pending[cursor]
@@ -3623,7 +3625,7 @@ extend Tree {
             self.rewrite_function(function)?
             self.known.insert(self.functions[function].name, function)
             concrete.push(function)
-            when concrete.len() as u64 > Limit::SPECIALIZATIONS {
+            when concrete.len() as u64 - ordinary > Limit::SPECIALIZATIONS {
                 last := self.functions[function]
                 return Result::Err(diag_help(
                     "R0261",

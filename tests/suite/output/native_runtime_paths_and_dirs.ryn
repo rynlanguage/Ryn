@@ -1,0 +1,27 @@
+// test: run
+// out: /abs/dir/file.txt
+// out: true
+// out: true
+// out: 2
+// out: b.txt
+// out: nested
+// out: true
+// out: false
+// The native runtime joins owned texts internally (`path_absolute`, `read_dir`, `delete_dir_all`); this covers those paths.
+fun main() {
+    echo path_absolute("/abs/dir/file.txt")
+    echo path_absolute("relative/name.txt") == path_join(current_dir(), "relative/name.txt")
+    root := path_join(temp_dir(), "ryn-suite-native-paths")
+    remove_dir_all(root.clone())
+    nested := path_join(root.clone(), "nested")
+    echo create_dir_all(nested.clone())
+    write_file(path_join(root.clone(), "b.txt"), "b")
+    write_file(path_join(nested.clone(), "a.txt"), "a")
+    entries := read_dir(root.clone())
+    echo entries.len()
+    for entry in entries {
+        echo path_file_name(entry)
+    }
+    echo remove_dir_all(root.clone())
+    echo is_directory(root)
+}

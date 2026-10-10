@@ -18,7 +18,16 @@ use back::floats
 use back::float_runtime_ir
 use back::textops
 use back::rt
+use back::ffi_helpers
 use middle::ir
+
+// The precision in bytes of a float: 4 for `f32`, 8 otherwise.
+fun if_f32(is_f32: bool) -> u64 {
+    when is_f32 {
+        return 4
+    }
+    return 8
+}
 
 fun if_text(keys: bool, key_text: bool, value_text: bool) -> bool {
     when keys {
@@ -29,6 +38,9 @@ fun if_text(keys: bool, key_text: bool, value_text: bool) -> bool {
 
 // Whether the freestanding runtime has a routine for the C function `name`.
 fun rt_provides(name: String) -> bool {
+    when ffi_helpers::is_helper(name.clone()) {
+        return true
+    }
     return name == "ryn_native_live_allocations" || name == "ryn_native_live_bytes" || name == "malloc" || name == "free" || name == "realloc" || name == "calloc" || name == "memcpy" || name == "memmove" || name == "strlen" || name == "fopen" || name == "fseek" || name == "ftell" || name == "fread" || name == "fwrite" || name == "fclose" || name == "strerror" || name == "__errno_location" || name == "putchar" || name == "chmod"
 }
 
@@ -131,6 +143,9 @@ pub struct Gen {
     write_label: u64,
     map_hash_scalar: u64,
     map_hash_string: u64,
+    // The slot of the structure key whose words are being written.
+    key_base: u64,
+    struct_key_drop: u64,
     map_find_scalar: u64,
     map_find_string: u64,
     map_grow: u64,
@@ -143,6 +158,8 @@ pub struct Gen {
     vec_routine_labels: Vec<u64>,
     // The C runtime's argc and argv, which the entry stores: a zero-filled cell of 16 bytes.
     arguments_symbol: u64,
+    // One zero-filled cell of the runtime, which a Ryn runtime function reads and writes through `RuntimeCell`.
+    runtime_cell_symbol: u64,
     map_clone_plain: u64,
     map_clone_key_text: u64,
     map_clone_value_text: u64,
@@ -174,6 +191,21 @@ pub struct Gen {
     // The enums whose values are copied by a routine of their own, and its labels.
     // Whether the object runs without the C library (its own `_start` and the routines of `back/rt.ryn`), and their labels.
     freestanding: bool,
+    // Whether the program's own foreign functions come from the system's shared C library: a freestanding program that
+    // declares a C function the runtime does not provide is linked dynamically, and every foreign call it makes itself goes
+    // to the library, so that memory and handles it gets from C are given back to C.
+    dynamic_imports: bool,
+    // Whether a freestanding build met a call it can only make through the C library.
+    wants_libc: bool,
+    // The source span of the statement or expression being generated, and the one where generation failed: a construct
+    // the backend lacks is reported at its place in the program.
+    span_start: u64,
+    span_end: u64,
+    failed_start: u64,
+    failed_end: u64,
+    // The `ryn_ffi_*` test routines the program calls, and their labels.
+    helper_names: Vec<String>,
+    helper_labels: Vec<u64>,
     rt: rt::Labels,
     enum_clone_ids: Vec<u64>,
     enum_clone_labels: Vec<u64>,
@@ -183,6 +215,9 @@ pub struct Gen {
     glue_labels: Vec<u64>,
     scratch_base: u64,
     scratch_used: u64,
+    // The roots of the function's IR cells that hold an array: a parameter or a `let` (base slot and type). See `phys_slot`.
+    regions_base: Vec<u64>,
+    regions_type: Vec<u64>,
     // The functions whose address is taken, and the labels of their C-convention entry points.
     thunk_functions: Vec<u64>,
     thunk_labels: Vec<u64>,
@@ -230,9 +265,46 @@ pub fun generate(program: ir::IrProgram) -> Result<Vec<u8>, String> {
     return build(program, false, false)
 }
 
-// The program as a static executable, when it needs nothing from the C library.
+// The program as an executable. A program that needs nothing from the C library becomes a static executable with the
+// backend's own runtime (`back/rt.ryn`). A program that calls a C function the runtime does not provide is generated
+// again against the C library: its runtime calls go to libc, its `_start` hands `main` to `__libc_start_main`, and the
+// executable is linked dynamically with `libc.so.6` and `libm.so.6` (`elf::link_executable`).
 pub fun generate_executable(program: ir::IrProgram) -> Result<Vec<u8>, String> {
-    return build(program, true, false)
+    first := build(program, true, false)
+    when first.is_err() {
+        reason := first.unwrap_err()
+        when reason == needs_libc_marker() {
+            return Result::Err(String("the program calls the C library; generate it from its IR text"))
+        }
+        return Result::Err(reason)
+    }
+    return first
+}
+
+// `generate_executable` from the encoded typed IR, which is read again for the build against the C library.
+pub fun generate_executable_text(text: String) -> Result<Vec<u8>, String> {
+    program := ir::decode_ir(text.clone())
+    when program.is_err() {
+        return Result::Err(String("the typed IR does not decode"))
+    }
+    first := build(program.unwrap(), true, false)
+    when first.is_err() {
+        reason := first.unwrap_err()
+        when reason == needs_libc_marker() {
+            again := ir::decode_ir(text)
+            when again.is_err() {
+                return Result::Err(String("the typed IR does not decode"))
+            }
+            return build(again.unwrap(), true, true)
+        }
+        return Result::Err(reason)
+    }
+    return first
+}
+
+// The reason a freestanding build gives up when the program needs the C library.
+fun needs_libc_marker() -> String {
+    return String("$needs-libc")
 }
 
 // An object linked against libc, including its floating-point formatting and parsing routines.
@@ -268,6 +340,8 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>,
         write_label: 0,
         map_hash_scalar: 0,
         map_hash_string: 0,
+        key_base: 0,
+        struct_key_drop: 0,
         map_find_scalar: 0,
         map_find_string: 0,
         map_grow: 0,
@@ -277,6 +351,7 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>,
         vec_routine_elements: Vec(),
         vec_routine_labels: Vec(),
         arguments_symbol: 0,
+        runtime_cell_symbol: 0,
         map_clone_plain: 0,
         map_clone_key_text: 0,
         map_clone_value_text: 0,
@@ -298,6 +373,14 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>,
         shadow_images: Vec(),
         shadow_ids: Vec(),
         freestanding: false,
+        dynamic_imports: false,
+        wants_libc: false,
+        helper_names: Vec(),
+        helper_labels: Vec(),
+        span_start: 0,
+        span_end: 0,
+        failed_start: 0,
+        failed_end: 0,
         rt: rt::Labels { malloc: 0, free: 0, realloc: 0, calloc: 0, memcpy: 0, memmove: 0, strlen: 0, fopen: 0, fseek: 0, ftell: 0, fread: 0, fwrite: 0, fclose: 0, strerror: 0, errno_location: 0, putchar: 0, chmod: 0, sigreturn: 0, live_allocations: 0, live_bytes: 0, state: 0 },
         enum_clone_ids: Vec(),
         enum_clone_labels: Vec(),
@@ -307,6 +390,8 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>,
         glue_labels: Vec(),
         scratch_base: 0,
         scratch_used: 0,
+        regions_base: Vec(),
+        regions_type: Vec(),
         thunk_functions: Vec(),
         thunk_labels: Vec(),
         failed: false,
@@ -329,18 +414,20 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>,
     }
     // Symbol 0 is the entry point `main`, which the C runtime calls; its size is set when the object is made.
     gen.freestanding = !libc
+    gen.dynamic_imports = executable && libc
     for function in gen.program.functions.clone() {
-        when function.external_symbol.is_some() && !rt_provides(function.external_symbol.unwrap()) {
+        when function.external_symbol.is_some() && !rt_provides(function.external_symbol.unwrap()) && !executable {
             gen.freestanding = false
         }
     }
-    when gen.freestanding {
+    when gen.freestanding || gen.dynamic_imports {
         gen.symbol(String("_start"), elf::Where::TEXT, 0, 0, true)
     } else {
         gen.symbol(String("main"), elf::Where::TEXT, 0, 0, true)
     }
     gen.arguments_symbol = gen.symbol(String("ryn_arguments"), elf::Where::BSS, 0, 16, false)
     gen.rt.state = gen.symbol(String("ryn_runtime"), elf::Where::BSS, 16, rt::state_size(), false)
+    gen.runtime_cell_symbol = gen.symbol(String("ryn_runtime_cell"), elf::Where::BSS, 16 + rt::state_size(), 8, false)
     gen.rt.live_allocations = asm.new_label()
     gen.rt.live_bytes = asm.new_label()
     gen.rt.malloc = asm.new_label()
@@ -373,6 +460,7 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>,
     gen.division_literal = gen.literal(String("Ryn runtime error: integer division or remainder by zero\n"))
     gen.write_label = asm.new_label()
     gen.map_hash_scalar = asm.new_label()
+    gen.struct_key_drop = asm.new_label()
     gen.map_hash_string = asm.new_label()
     gen.map_find_scalar = asm.new_label()
     gen.map_find_string = asm.new_label()
@@ -415,7 +503,7 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>,
             when gen.needed[position] && !generated[position] {
                 generated.set(position, true)
                 when !gen.function(&mut asm, position) {
-                    return Result::Err(gen.reason.clone())
+                    return Result::Err(gen.failure())
                 }
                 progress = true
             }
@@ -423,25 +511,25 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>,
         }
         before := gen.drop_values_done + gen.drop_handles_done
         when !gen.emit_drop_routines(&mut asm) {
-            return Result::Err(gen.reason.clone())
+            return Result::Err(gen.failure())
         }
         when gen.drop_values_done + gen.drop_handles_done != before {
             progress = true
         }
     }
     when gen.failed {
-        return Result::Err(gen.reason.clone())
+        return Result::Err(gen.failure())
     }
     when !gen.emit_vec_routines(&mut asm) {
-        return Result::Err(gen.reason.clone())
+        return Result::Err(gen.failure())
     }
     when !gen.emit_thunks(&mut asm) {
-        return Result::Err(gen.reason.clone())
+        return Result::Err(gen.failure())
     }
     when gen.freestanding {
         gen.emit_freestanding(&mut asm)
         when gen.failed {
-            return Result::Err(gen.reason.clone())
+            return Result::Err(gen.failure())
         }
     }
     when gen.textops_used % 2 == 1 {
@@ -464,6 +552,11 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>,
     when gen.textops_used / 4 % 2 == 1 {
         textops::emit_find(&mut asm, gen.find_label)
     }
+    mut helper: u64 = 0
+    while helper < gen.helper_names.len() {
+        ffi_helpers::emit_helper(&mut asm, gen.helper_labels[helper], gen.helper_names[helper].clone())
+        helper += 1
+    }
     when gen.float_format_used {
         snprintf := gen.foreign_symbol(String("snprintf"))
         strtod := gen.foreign_symbol(String("strtod"))
@@ -475,8 +568,8 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool) -> Result<Vec<u8>,
         return Result::Err(String("a jump has no target"))
     }
     when executable {
-        when !gen.freestanding {
-            return Result::Err(String("the program calls the C library, so it cannot be linked without it"))
+        when gen.wants_libc && !libc {
+            return Result::Err(needs_libc_marker())
         }
         return elf::link_executable(gen.object(&mut asm, start_size))
     }
@@ -569,6 +662,8 @@ extend Gen {
         when !self.failed {
             self.failed = true
             self.reason = message
+            self.failed_start = self.span_start
+            self.failed_end = self.span_end
         }
         return false
     }
@@ -577,8 +672,54 @@ extend Gen {
         when !self.failed {
             self.failed = true
             self.reason = String(what)
+            self.failed_start = self.span_start
+            self.failed_end = self.span_end
         }
         return false
+    }
+
+    // The reason generation failed, as a diagnostic at its place when one is known.
+    fun failure(self) -> String {
+        when self.failed_end == 0 {
+            return self.reason.clone()
+        }
+        // The form `lower::diagnostic` writes: `diagnostic <code> <start> <end> <message> <help>`.
+        mut out := String("diagnostic R0905 ")
+        out.append(String(self.failed_start))
+        out.append(" ")
+        out.append(String(self.failed_end))
+        out.append(" ")
+        out.append(String(self.reason.len()))
+        out.append(":")
+        out.append(self.reason.clone())
+        out.append(" 0:")
+        return out
+    }
+
+    fun note_span(mut self, span: ir::IrSpan) -> bool {
+        when span.end > 0 {
+            self.span_start = span.start
+            self.span_end = span.end
+        }
+        return true
+    }
+
+    fun note_statement(mut self, index: u64) -> bool {
+        return choose self.program.stmts[index] {
+            ir::IrStmt::LetStmt(slot, ty, value, span) => self.note_span(span),
+            ir::IrStmt::AssignStmt(slot, ty, value, span) => self.note_span(span),
+            ir::IrStmt::ArrayAssignStmt(slot, ty, position, value, element, span) => self.note_span(span),
+            _ => true,
+        }
+    }
+
+    fun note_expression(mut self, index: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ir::IrExpr::LocalRef(slot, ty, span) => self.note_span(span),
+            ir::IrExpr::FieldRead(value, id, field, ty, span) => self.note_span(span),
+            ir::IrExpr::ReferenceFieldRead(value, id, field, ty, span, borrowed) => self.note_span(span),
+            _ => true,
+        }
     }
 
     // The scalar type word of a type index, or "" for a type that is not scalar.
@@ -608,6 +749,23 @@ extend Gen {
         // A freestanding object starts at `_start`: the stack holds argc, then argv. It sets the C registers and calls the
         // entry below, then exits with its result.
         entry_body := asm.new_label()
+        when self.dynamic_imports {
+            // An executable that uses the C library starts as the C runtime's `_start` does: the dynamic loader's
+            // finalizer is in rdx, argc and argv are on the stack, and `__libc_start_main` initializes the library, calls
+            // the entry below as `main`, and exits with its result (writing out the library's buffered streams).
+            asm.mov_ri(x64::Reg::RBP, 0)
+            asm.mov_rr(x64::Reg::R9, x64::Reg::RDX)
+            asm.pop(x64::Reg::RSI)
+            asm.mov_rr(x64::Reg::RDX, x64::Reg::RSP)
+            asm.alu_ri(4, x64::Reg::RSP, (0 as i64) - 16)
+            asm.push(x64::Reg::RAX)
+            asm.push(x64::Reg::RSP)
+            asm.mov_ri(x64::Reg::R8, 0)
+            asm.mov_ri(x64::Reg::RCX, 0)
+            asm.lea_label(x64::Reg::RDI, entry_body)
+            asm.call_symbol(self.foreign_symbol(String("__libc_start_main")))
+            asm.trap()
+        }
         when self.freestanding {
             asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 0)
             asm.lea(x64::Reg::RSI, x64::Reg::RSP, 8)
@@ -835,6 +993,17 @@ extend Gen {
         zero_at := asm.code.len() - 4
         asm.rep_stosb()
         self.scratch_base = definition.local_types.len()
+        self.regions_base = Vec()
+        self.regions_type = Vec()
+        mut parameter: u64 = 0
+        while parameter < definition.parameters.len() / 2 {
+            when self.contains_array(definition.parameters[parameter * 2 + 1]) {
+                self.regions_base.push(definition.parameters[parameter * 2])
+                self.regions_type.push(definition.parameters[parameter * 2 + 1])
+            }
+            parameter += 1
+        }
+        self.collect_regions(definition.statements.clone())
         self.scratch_used = 0
         self.shadow_slots = Vec()
         self.shadow_images = Vec()
@@ -844,7 +1013,7 @@ extend Gen {
         mut owner: u64 = 0
         while owner < definition.owned_slot_types.len() {
             when definition.owned_slot_types[owner].is_some() && self.needs_drop(definition.owned_slot_types[owner].unwrap()) {
-                self.owner_slots.push(owner)
+                self.owner_slots.push(self.phys_slot(owner))
                 self.owner_types.push(definition.owned_slot_types[owner].unwrap())
                 asm.mov_ri(x64::Reg::RAX, 0)
                 asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(owner))
@@ -907,6 +1076,7 @@ extend Gen {
     }
 
     fun stmt(mut self, asm: &mut x64::Asm, index: u64) -> bool {
+        self.note_statement(index)
         return choose self.program.stmts[index] {
             ir::IrStmt::BlockStmt(body) => self.body(asm, body),
             ir::IrStmt::DropStmt(slots, types) => self.drops(asm, slots, types),
@@ -922,15 +1092,152 @@ extend Gen {
             ir::IrStmt::ContinueStmt => self.jump_to(asm, false),
             ir::IrStmt::ReturnStmt(value) => self.return_statement(asm, value),
             ir::IrStmt::FieldAssignStmt(slot, ty, value) => self.field_assign(asm, value, slot, ty),
-            ir::IrStmt::ArrayAssignStmt(slot, element, length, index, value, span) => self.array_assign(asm, slot, element, length, index, value),
-            ir::IrStmt::DereferenceAssignStmt(pointer, ty, value) => self.store_through(asm, value, pointer, 0, ty),
-            ir::IrStmt::ReferenceFieldAssignStmt(pointer, id, field, ty, value) => self.store_field_through(asm, value, pointer, id, field, ty),
+            ir::IrStmt::ArrayAssignStmt(slot, element, length, index, value, span) => self.array_assign_statement(asm, slot, element, length, index, value),
+            ir::IrStmt::DereferenceAssignStmt(pointer, ty, value) => self.dereference_statement(asm, value, pointer, ty),
+            ir::IrStmt::ReferenceFieldAssignStmt(pointer, id, field, ty, value) => self.reference_field_statement(asm, value, pointer, id, field, ty),
             _ => self.fail("a statement of this kind"),
+        }
+    }
+
+    // A store of an element of a local array: a `repr(C)` copy that a pointer reaches is repacked after it.
+    fun array_assign_statement(mut self, asm: &mut x64::Asm, slot: u64, element: u64, length: u64, index: u64, value: u64) -> bool {
+        when !self.array_assign(asm, slot, element, length, index, value) {
+            return false
+        }
+        self.repack_shadows_at(asm, slot)
+        return true
+    }
+
+    // A store through a pointer, and then the `repr(C)` copies are read back: a local whose copy the pointer reaches shows
+    // what was stored.
+    fun dereference_statement(mut self, asm: &mut x64::Asm, value: u64, pointer: u64, ty: u64) -> bool {
+        when !self.store_through(asm, value, pointer, 0, ty) {
+            return false
+        }
+        self.read_back_shadows(asm)
+        return true
+    }
+
+    fun reference_field_statement(mut self, asm: &mut x64::Asm, value: u64, pointer: u64, id: u64, field: u64, ty: u64) -> bool {
+        when !self.store_field_through(asm, value, pointer, id, field, ty) {
+            return false
+        }
+        self.read_back_shadows(asm)
+        return true
+    }
+
+    fun read_back_shadows(mut self, asm: &mut x64::Asm) {
+        when self.shadow_slots.len() > 0 {
+            self.sync_shadows(asm, true)
         }
     }
 
     // The owners that a scope ends with: a destructor value is dropped, and an owned value that is not a destructor must
     // leak, since nothing else frees it.
+    // The roots of the arrays of a body: its `let`s with an array in their type, at any depth of its blocks.
+    fun collect_regions(mut self, body: Vec<u64>) {
+        for index in body {
+            let_slot := choose self.program.stmts[index] {
+                ir::IrStmt::LetStmt(slot, ty, value, span) => Option::Some(slot),
+                _ => Option::None,
+            }
+            when let_slot.is_some() {
+                let_type := choose self.program.stmts[index] {
+                    ir::IrStmt::LetStmt(slot, ty, value, span) => ty,
+                    _ => 0,
+                }
+                when self.contains_array(let_type) {
+                    self.regions_base.push(let_slot.unwrap())
+                    self.regions_type.push(let_type)
+                }
+            }
+            first := choose self.program.stmts[index] {
+                ir::IrStmt::BlockStmt(inner) => inner.clone(),
+                ir::IrStmt::IfStmt(condition, then_body, else_body) => then_body.clone(),
+                ir::IrStmt::WhileStmt(setup, condition, inner) => setup.clone(),
+                ir::IrStmt::ForStmt(slot, end_slot, ty, start, end, inclusive, inner) => inner.clone(),
+                _ => Vec(),
+            }
+            second := choose self.program.stmts[index] {
+                ir::IrStmt::IfStmt(condition, then_body, else_body) => else_body.clone(),
+                ir::IrStmt::WhileStmt(setup, condition, inner) => inner.clone(),
+                _ => Vec(),
+            }
+            self.collect_regions(first)
+            self.collect_regions(second)
+        }
+    }
+
+    // Whether a value of `ty` holds an array: an array, or a structure with one in a field, at any depth.
+    fun contains_array(self, ty: u64) -> bool {
+        return choose self.program.types[ty] {
+            ir::IrTy::ArrayOf(element, length) => true,
+            ir::IrTy::StructTy(id) => self.struct_holds_array(id),
+            _ => false,
+        }
+    }
+
+    fun struct_holds_array(self, id: u64) -> bool {
+        mut field: u64 = 0
+        while field < self.program.structs[id].fields.len() {
+            when self.contains_array(self.program.structs[id].fields[field].ty) {
+                return true
+            }
+            field += 1
+        }
+        return false
+    }
+
+    // The cell of a value of `ty` at IR offset `offset`, in gen's frame. The IR numbers an array's cells ascending, element `i` at
+    // `i * width`; gen keeps the elements ascending in memory, element `i` at `(length - 1 - i) * width`. Structure fields keep
+    // their offsets, and a field that holds an array is mapped inside it.
+    fun phys_in(self, ty: u64, offset: u64) -> u64 {
+        when !self.contains_array(ty) {
+            return offset
+        }
+        return choose self.program.types[ty] {
+            ir::IrTy::ArrayOf(element, length) => self.array_phys(element, length, offset),
+            ir::IrTy::StructTy(id) => self.struct_phys(id, offset),
+            _ => offset,
+        }
+    }
+
+    fun array_phys(self, element: u64, length: u64, offset: u64) -> u64 {
+        width := self.cells_of(element)
+        when width == 0 {
+            return offset
+        }
+        index := offset / width
+        return (length - 1 - index) * width + self.phys_in(element, offset % width)
+    }
+
+    fun struct_phys(self, id: u64, offset: u64) -> u64 {
+        mut field: u64 = 0
+        while field < self.program.structs[id].fields.len() {
+            start := self.program.structs[id].fields[field].slot_offset
+            ty := self.program.structs[id].fields[field].ty
+            when offset >= start && offset < start + self.cells_of(ty) {
+                return start + self.phys_in(ty, offset - start)
+            }
+            field += 1
+        }
+        return offset
+    }
+
+    // The frame cell of IR cell `slot`: the cell of the root that holds it, mapped by `phys_in`, or the cell itself.
+    fun phys_slot(self, slot: u64) -> u64 {
+        mut at: u64 = 0
+        while at < self.regions_base.len() {
+            base := self.regions_base[at]
+            ty := self.regions_type[at]
+            when slot >= base && slot < base + self.cells_of(ty) {
+                return base + self.phys_in(ty, slot - base)
+            }
+            at += 1
+        }
+        return slot
+    }
+
     fun drops(mut self, asm: &mut x64::Asm, slots: Vec<u64>, types: Vec<u64>) -> bool {
         mut position: u64 = 0
         while position < types.len() {
@@ -938,7 +1245,7 @@ extend Gen {
                 return self.fail("a drop")
             }
             when self.needs_drop(types[position]) {
-                self.drop_slot(asm, slots[position], types[position])
+                self.drop_slot(asm, self.phys_slot(slots[position]), types[position])
             }
             position += 1
         }
@@ -987,7 +1294,30 @@ extend Gen {
 
     // `x = value` for a value that holds a destructor: the new value is built, the old value is dropped, and then the
     // cells of the local are replaced.
+    // A value stored into a local: a `repr(C)` local whose address was given out keeps its copy in C's layout, which the
+    // store brings up to date.
     fun assign_value(mut self, asm: &mut x64::Asm, value: u64, slot: u64, ty: u64) -> bool {
+        when !self.assign_value_cells(asm, value, slot, ty) {
+            return false
+        }
+        self.repack_shadows_at(asm, slot)
+        return true
+    }
+
+    // Packs the copy of each `repr(C)` local that holds `slot`, from the cells of the local.
+    fun repack_shadows_at(mut self, asm: &mut x64::Asm, slot: u64) {
+        mut at: u64 = 0
+        while at < self.shadow_slots.len() {
+            base := self.shadow_slots[at]
+            count := self.program.structs[self.shadow_ids[at]].slot_count
+            when slot >= base && slot < base + count {
+                self.sync_shadow(asm, at, false)
+            }
+            at += 1
+        }
+    }
+
+    fun assign_value_cells(mut self, asm: &mut x64::Asm, value: u64, slot: u64, ty: u64) -> bool {
         when !self.has_owners(ty) {
             return self.store_into(asm, value, slot, ty)
         }
@@ -1012,6 +1342,12 @@ extend Gen {
     }
 
     // The destructor of a structure type, when it has one.
+    // A structure that holds a destructor, its own or one of its fields'. A vector or a map of these drops each value with
+    // its value drop, which runs every destructor the value owns.
+    fun destructor_element(self, ty: u64) -> bool {
+        return self.struct_of(ty).is_some() && self.has_destructor(ty)
+    }
+
     fun destructor_of(self, ty: u64) -> Option<u64> {
         return choose self.program.types[ty] {
             ir::IrTy::StructTy(id) => self.program.structs[id].drop_function,
@@ -1042,6 +1378,27 @@ extend Gen {
         when self.is_owner_type(ty) {
             pairs.push(0)
             pairs.push(ty)
+            return pairs
+        }
+        array_element := choose self.program.types[ty] {
+            ir::IrTy::ArrayOf(element, length) => Option::Some(element),
+            _ => Option::None,
+        }
+        when array_element.is_some() {
+            // Every element has the same owners at the same offsets, so the pairs of all elements are listed in cell order.
+            count := self.array_length_of(ty)
+            cells := self.cells_of(array_element.unwrap())
+            inner := self.owner_pairs(array_element.unwrap())
+            mut index: u64 = 0
+            while index < count {
+                mut at: u64 = 0
+                while at < inner.len() {
+                    pairs.push((count - 1 - index) * cells + inner[at])
+                    pairs.push(inner[at + 1])
+                    at += 2
+                }
+                index += 1
+            }
             return pairs
         }
         structure := choose self.program.types[ty] {
@@ -1264,8 +1621,8 @@ extend Gen {
     // A map's handle: {buckets, bucket count, length, ...}, and each bucket a chain of nodes {next, hash, key, value}. Every node's
     // owned key and value are dropped, then the node is freed; then the buckets and the header.
     fun emit_map_free(mut self, asm: &mut x64::Asm, key: u64, value: u64, header: bool) -> bool {
-        keys := self.owner_pairs(key).len() > 0
-        values := self.owner_pairs(value).len() > 0
+        keys := self.owner_pairs(key).len() > 0 || self.struct_key_ok(key)
+        values := self.owner_pairs(value).len() > 0 && !self.map_value_boxed(value)
         asm.push(x64::Reg::RBP)
         asm.mov_rr(x64::Reg::RBP, x64::Reg::RSP)
         asm.alu_ri(5, x64::Reg::RSP, 48)
@@ -1296,14 +1653,31 @@ extend Gen {
         when keys {
             asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
             asm.alu_ri(0, x64::Reg::RDI, 16)
-            label := self.value_drop_routine(asm, key, false)
-            asm.call_label(label)
+            when self.struct_key_ok(key) {
+                asm.call_label(self.struct_key_drop)
+            } else {
+                label := self.value_drop_routine(asm, key, false)
+                asm.call_label(label)
+            }
         }
         when values {
             asm.load(8, false, x64::Reg::RDI, x64::Reg::RBP, (0 as i64) - 24)
             asm.alu_ri(0, x64::Reg::RDI, 24)
             label := self.value_drop_routine(asm, value, false)
             asm.call_label(label)
+        }
+        // A boxed value's owners are dropped where its box lies, the first cell at the box's top.
+        when self.map_value_boxed(value) && self.has_owners(value) {
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RBP, (0 as i64) - 24)
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RDI, 24)
+            value_cells := self.cells_of(value)
+            asm.alu_ri(0, x64::Reg::RDI, (8 * (value_cells - 1)) as i64)
+            asm.call_label(self.value_drop_routine(asm, value, false))
+        }
+        when self.map_value_boxed(value) {
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RBP, (0 as i64) - 24)
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RDI, 24)
+            self.aligned_call(asm, String("free"))
         }
         asm.load(8, false, x64::Reg::RDI, x64::Reg::RBP, (0 as i64) - 24)
         self.aligned_call(asm, String("free"))
@@ -1442,7 +1816,9 @@ extend Gen {
         self.glue_kinds.push(kind)
         self.glue_elements.push(element)
         self.glue_labels.push(label)
-        self.needed.set(self.destructor_of(element).unwrap(), true)
+        when self.destructor_of(element).is_some() {
+            self.needed.set(self.destructor_of(element).unwrap(), true)
+        }
         return label
     }
 
@@ -1455,7 +1831,10 @@ extend Gen {
 
     // The routine that drops each element of a vector (last first) or each value of a map: the header is in rdi.
     fun emit_glue(mut self, asm: &mut x64::Asm, kind: u64, element: u64) {
-        fid := self.destructor_of(element).unwrap()
+        mut fid: u64 = 0
+        when self.destructor_of(element).is_some() {
+            fid = self.destructor_of(element).unwrap()
+        }
         cells := self.cells_of(element)
         asm.push(x64::Reg::RBP)
         asm.mov_rr(x64::Reg::RBP, x64::Reg::RSP)
@@ -1476,10 +1855,18 @@ extend Gen {
             asm.load(8, false, x64::Reg::RSI, x64::Reg::RBP, (0 as i64) - 8)
             asm.load(8, false, x64::Reg::RSI, x64::Reg::RSI, 0)
             asm.alu_rr(1, x64::Reg::RSI, x64::Reg::RAX)
-            asm.alu_ri(5, x64::Reg::RSP, (cells * 8) as i64)
-            self.copy_block(asm, x64::Reg::RSI, x64::Reg::RSP, cells)
-            asm.call_label(self.labels[fid])
-            asm.alu_ri(0, x64::Reg::RSP, (cells * 8) as i64)
+            when self.destructor_of(element).is_some() {
+                asm.alu_ri(5, x64::Reg::RSP, (cells * 8) as i64)
+                self.copy_block(asm, x64::Reg::RSI, x64::Reg::RSP, cells)
+                asm.call_label(self.labels[fid])
+                asm.alu_ri(0, x64::Reg::RSP, (cells * 8) as i64)
+            }
+            // A structure whose destructor is in its fields: its value drop runs them, in place. The value's first cell is
+            // at the top of its block, as `value_drop_routine` reads cells that fall in memory.
+            when self.destructor_of(element).is_none() {
+                asm.lea(x64::Reg::RDI, x64::Reg::RSI, (8 * (cells - 1)) as i64)
+                asm.call_label(self.value_drop_routine(asm, element, false))
+            }
             asm.jmp(top)
         } else {
             // Buckets in order; each bucket's chain of nodes, whose value is at offset 24.
@@ -1753,7 +2140,152 @@ extend Gen {
         when self.is_float(ty) {
             return self.print_float(asm, value, ty)
         }
+        return choose self.program.types[ty] {
+            ir::IrTy::StructTy(id) => self.print_value(asm, value, ty),
+            ir::IrTy::EnumTy(id) => self.print_value(asm, value, ty),
+            _ => self.fail("an echo of this type"),
+        }
+    }
+
+    // A structure or an enum written by `echo`, as the Rust backend writes it: a value with a place is read from the place;
+    // any other is built in scratch cells, and dropped once it is written.
+    fun print_value(mut self, asm: &mut x64::Asm, value: u64, ty: u64) -> bool {
+        place := self.place_of(value)
+        when place.is_some() {
+            return self.print_slot(asm, place.unwrap(), ty)
+        }
+        saved := self.scratch(self.cells_of(ty))
+        when !self.store_into(asm, value, saved, ty) {
+            return false
+        }
+        when !self.print_slot(asm, saved, ty) {
+            return false
+        }
+        // A temporary that `printed` takes for its own is dropped by it, once it is written; any other value is dropped here.
+        when self.temporary_type(value).is_none() && self.has_owners(ty) {
+            self.drop_value(asm, saved, ty)
+        }
+        return true
+    }
+
+    // The value that the frame holds in the cells from `slot`, written as `echo` writes it: a structure as its name and its
+    // fields, an enum as its variant and its payload, and a scalar or text as it prints.
+    fun print_slot(mut self, asm: &mut x64::Asm, slot: u64, ty: u64) -> bool {
+        when self.is_str(ty) {
+            asm.load(8, false, x64::Reg::RSI, x64::Reg::RBP, slot_disp(slot))
+            asm.load(8, false, x64::Reg::RDX, x64::Reg::RBP, slot_disp(slot + 1))
+            asm.call_label(self.write_label)
+            return true
+        }
+        when self.is_string(ty) {
+            asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, slot_disp(slot))
+            asm.load(8, false, x64::Reg::RSI, x64::Reg::RAX, 0)
+            asm.load(8, false, x64::Reg::RDX, x64::Reg::RAX, 8)
+            asm.call_label(self.write_label)
+            return true
+        }
+        return choose self.program.types[ty] {
+            ir::IrTy::StructTy(id) => self.print_struct_slot(asm, slot, id),
+            ir::IrTy::EnumTy(id) => self.print_enum_slot(asm, slot, id),
+            _ => self.print_scalar_slot(asm, slot, ty),
+        }
+    }
+
+    fun print_scalar_slot(mut self, asm: &mut x64::Asm, slot: u64, ty: u64) -> bool {
+        word := self.word(ty)
+        when is_integer_word(word.clone()) {
+            when !self.load_cell(asm, ty, x64::Reg::RBP, slot_disp(slot)) {
+                return false
+            }
+            when is_signed_word(word.clone()) {
+                asm.call_label(self.print_i64_label)
+            } else {
+                asm.call_label(self.print_u64_label)
+            }
+            return true
+        }
+        when word == "Bool" {
+            when !self.load_cell(asm, ty, x64::Reg::RBP, slot_disp(slot)) {
+                return false
+            }
+            asm.call_label(self.print_bool_label)
+            return true
+        }
+        when word == "Char" {
+            when !self.load_cell(asm, ty, x64::Reg::RBP, slot_disp(slot)) {
+                return false
+            }
+            self.write_char(asm)
+            return true
+        }
         return self.fail("an echo of this type")
+    }
+
+    fun print_struct_slot(mut self, asm: &mut x64::Asm, slot: u64, id: u64) -> bool {
+        self.text_part(asm, self.program.structs[id].name.clone())
+        self.text_part(asm, String(" { "))
+        mut index: u64 = 0
+        while index < self.program.structs[id].fields.len() {
+            when index != 0 {
+                self.text_part(asm, String(", "))
+            }
+            self.text_part(asm, self.program.structs[id].fields[index].name.clone())
+            self.text_part(asm, String(": "))
+            field_ty := self.program.structs[id].fields[index].ty
+            field_slot := slot + self.program.structs[id].fields[index].slot_offset
+            when !self.print_slot(asm, field_slot, field_ty) {
+                return false
+            }
+            index += 1
+        }
+        self.text_part(asm, String(" }"))
+        return true
+    }
+
+    // The variant whose tag the box holds is written with its payload, which is copied out of the box into scratch cells
+    // as a match copies it.
+    fun print_enum_slot(mut self, asm: &mut x64::Asm, slot: u64, id: u64) -> bool {
+        end := asm.new_label()
+        mut variant: u64 = 0
+        while variant < self.program.enums[id].variants.len() {
+            next := asm.new_label()
+            asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, slot_disp(slot))
+            asm.load(8, false, x64::Reg::RCX, x64::Reg::RAX, 0)
+            asm.alu_ri(7, x64::Reg::RCX, variant as i64)
+            asm.jcc(x64::Cc::NOT_EQUAL, next)
+            self.text_part(asm, self.program.enums[id].variants[variant].name.clone())
+            count := self.program.enums[id].variants[variant].fields.len()
+            when count > 0 {
+                self.text_part(asm, String("("))
+                mut field: u64 = 0
+                while field < count {
+                    when field != 0 {
+                        self.text_part(asm, String(", "))
+                    }
+                    field_ty := self.program.enums[id].variants[variant].fields[field]
+                    cells := self.cells_of(field_ty)
+                    at := self.enum_field_offset(id, variant, field)
+                    copies := self.scratch(cells)
+                    mut cell: u64 = 0
+                    while cell < cells {
+                        asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, slot_disp(slot))
+                        asm.load(8, false, x64::Reg::RCX, x64::Reg::RAX, (8 * (1 + at + cell)) as i64)
+                        asm.store(8, x64::Reg::RCX, x64::Reg::RBP, slot_disp(copies + cell))
+                        cell += 1
+                    }
+                    when !self.print_slot(asm, copies, field_ty) {
+                        return false
+                    }
+                    field += 1
+                }
+                self.text_part(asm, String(")"))
+            }
+            asm.jmp(end)
+            asm.bind(next)
+            variant += 1
+        }
+        asm.bind(end)
+        return true
     }
 
     // A float written to standard output: its text is formatted into a buffer on the stack and written.
@@ -2182,7 +2714,8 @@ extend Gen {
             ir::IrExpr::MoveRef(slot, ty) => Option::Some(ty),
             ir::IrExpr::IfExpr(condition, yes, no, ty) => Option::Some(ty),
             ir::IrExpr::EnumMatch(value, id, arms, ty) => Option::Some(ty),
-            ir::IrExpr::FieldRead(value, id, field, ty, span) => self.field_temporary_type(index, ty),
+            ir::IrExpr::FieldRead(value, id, field, ty, span) => self.element_field_temporary_type(index, value, ty),
+            ir::IrExpr::ArrayIndex(array, aindex, ty, length) => Option::Some(ty),
             ir::IrExpr::StringAsStr(inner) => self.temporary_type(inner),
             ir::IrExpr::ReferenceFieldRead(pointer, id, field, ty, span, borrowed) => self.reference_temporary_type(ty, borrowed),
             _ => Option::None,
@@ -2199,6 +2732,18 @@ extend Gen {
     fun reference_temporary_type(self, ty: u64, borrowed: bool) -> Option<u64> {
         when borrowed { return Option::None }
         return Option::Some(ty)
+    }
+
+    // A field of an element is cloned by its read, so the clone is a temporary of the read, as an element read is.
+    fun element_field_temporary_type(self, index: u64, value: u64, ty: u64) -> Option<u64> {
+        when choose self.program.exprs[value] {
+            ir::IrExpr::ArrayIndex(array, aindex, aty, length) => true,
+            ir::IrExpr::SliceIndex(slice, aindex, aty) => true,
+            _ => false,
+        } {
+            return Option::Some(ty)
+        }
+        return self.field_temporary_type(index, ty)
     }
 
     fun field_temporary_type(self, index: u64, ty: u64) -> Option<u64> {
@@ -2619,7 +3164,17 @@ extend Gen {
             total += cells
             position += 1
         }
+        // A `repr(C)` local whose address was given out is kept in its C layout by a copy: the callee may write through the
+        // address, so the copies are packed before the call and read back after it.
+        when self.shadow_slots.len() > 0 {
+            self.sync_shadows(asm, false)
+        }
         asm.call_label(self.labels[id])
+        when self.shadow_slots.len() > 0 {
+            asm.push(x64::Reg::RAX)
+            self.sync_shadows(asm, true)
+            asm.pop(x64::Reg::RAX)
+        }
         asm.alu_ri(0, x64::Reg::RSP, (total * 8) as i64)
         return true
     }
@@ -2764,8 +3319,24 @@ extend Gen {
             ir::IrExpr::FieldRead(value, id, field, fty, span) => self.load_field_string(asm, index, fty),
             ir::IrExpr::ReferenceFieldRead(pointer, id, field, fty, span, borrowed) => self.load_field_string(asm, index, fty),
             ir::IrExpr::StringAsStr(inner) => self.load_string_as_str(asm, inner),
+            ir::IrExpr::ArrayIndex(array, aindex, aty, length) => self.load_element_str(asm, array, aindex, aty, length),
+            // A String read through a `&mut String` receiver: its handle is loaded from the reference's home.
+            ir::IrExpr::Dereference(pointer, dty) => self.call_string_parts(asm, index, dty),
             _ => self.fail("a string argument that is not a literal or a local"),
         }
+    }
+
+    // A `str` element of a local array: its cells are read where the element lies, the pointer above the length.
+    fun load_element_str(mut self, asm: &mut x64::Asm, array: u64, index: u64, element: u64, length: u64) -> bool {
+        when !self.is_str(element) || self.array_local_of(array).is_none() {
+            return self.fail("a str element of this array")
+        }
+        when !self.array_element_address(asm, array, index, element, length) {
+            return false
+        }
+        asm.load(8, false, x64::Reg::RSI, x64::Reg::RAX, 8)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RAX, 0)
+        return true
     }
 
     // The data and length of a `str` that a call returns: its cells are on the stack, the length on top.
@@ -2888,6 +3459,13 @@ extend Gen {
             asm.store(8, x64::Reg::RCX, x64::Reg::RAX, 8)
             return true
         }
+        // `set` drops the element it replaces, before the new one is stored; `take` moves the element out, with no drop.
+        when op == "Set" && arguments.len() == 3 {
+            return self.vec_set(asm, element, arguments[0], arguments[1], arguments[2])
+        }
+        when op == "Take" && arguments.len() == 2 {
+            return self.vec_take(asm, element, arguments[0], arguments[1])
+        }
         return self.op_fail("a vector of destructor values and ", op)
     }
 
@@ -2895,7 +3473,7 @@ extend Gen {
     // (the first cell highest), so a structure element is one block that is copied whole. A vector of scalars or Strings
     // is one array of cells. The header is {data, len, capacity}, with the data from malloc and grown by realloc.
     fun vec_op(mut self, asm: &mut x64::Asm, op: String, element: u64, arguments: Vec<u64>) -> bool {
-        when self.destructor_of(element).is_some() {
+        when self.destructor_element(element) {
             return self.vec_of_destructors(asm, op, element, arguments)
         }
         when !self.is_cell(element) && !self.is_plain_structure(element) {
@@ -2968,6 +3546,9 @@ extend Gen {
         when op == "Clone" && arguments.len() == 1 {
             return self.vec_clone(asm, element, arguments[0])
         }
+        when op == "Reverse" && arguments.len() == 1 {
+            return self.vec_reverse(asm, element, arguments[0])
+        }
         when op == "Sort" && arguments.len() == 1 {
             when !self.is_cell(element) {
                 return self.fail("a sort of structures")
@@ -2995,9 +3576,15 @@ extend Gen {
     // A vector operation as a statement. An Index or Take of a structure leaves its cells on the stack, which nothing reads.
     fun vec_statement(mut self, asm: &mut x64::Asm, op: String, element: u64, arguments: Vec<u64>) -> bool {
         discards := (op == "Index" || op == "Take") && !self.is_cell(element)
+        // A taken destructor value that nothing names is dropped at the end of its statement, as a named one is.
+        drops := op == "Take" && self.destructor_element(element)
         cells := self.cells_of(element)
         when !self.vec_op(asm, op, element, arguments) {
             return false
+        }
+        when discards && drops {
+            self.drop_pushed(asm, element)
+            return true
         }
         when discards {
             asm.alu_ri(0, x64::Reg::RSP, (8 * cells) as i64)
@@ -3064,6 +3651,32 @@ extend Gen {
             cells.push(0)
             cells.push(3)
             cells.push(ty)
+            return Option::Some(cells)
+        }
+        // An array's elements lie in memory from its start, `8 * cells` apart, and each element's owners are at their offsets.
+        array_element := choose self.program.types[ty] {
+            ir::IrTy::ArrayOf(e, n) => Option::Some(e),
+            _ => Option::None,
+        }
+        when array_element.is_some() {
+            inner := self.owned_cells(array_element.unwrap())
+            when inner.is_none() {
+                return Option::None
+            }
+            list := inner.unwrap()
+            each := self.cells_of(array_element.unwrap())
+            count := self.array_length_of(ty)
+            mut index: u64 = 0
+            while index < count {
+                mut at: u64 = 0
+                while at < list.len() {
+                    cells.push(8 * each * index + list[at])
+                    cells.push(list[at + 1])
+                    cells.push(list[at + 2])
+                    at += 3
+                }
+                index += 1
+            }
             return Option::Some(cells)
         }
         structure := choose self.program.types[ty] {
@@ -3307,6 +3920,15 @@ extend Gen {
                 glue += 1
                 progress = true
             }
+            // A glue routine of nested elements asks for their value drop routines, which the drop pass has already
+            // walked past: they are written here, and the walk goes on while they ask for more.
+            drops := self.drop_values_done + self.drop_handles_done
+            when !self.emit_drop_routines(asm) {
+                return false
+            }
+            when self.drop_values_done + self.drop_handles_done != drops {
+                progress = true
+            }
             while done < self.vec_routine_elements.len() {
                 asm.bind(self.vec_routine_labels[done])
                 when !self.emit_vec_clone(asm, self.vec_routine_elements[done]) {
@@ -3500,8 +4122,23 @@ extend Gen {
         }
         return choose self.program.types[ty] {
             ir::IrTy::StructTy(id) => self.store_structure_in_box(asm, value, offset, id),
+            ir::IrTy::ArrayOf(element, length) => self.store_array_in_box(asm, value, offset, ty),
             _ => self.fail("an enum field of this type"),
         }
+    }
+
+    // An array field of an enum value: the array is built in scratch cells, which the box then takes cell by cell, in the
+    // order that the frame and the box share.
+    fun store_array_in_box(mut self, asm: &mut x64::Asm, value: u64, offset: u64, ty: u64) -> bool {
+        count := self.cells_of(ty)
+        when count == 0 {
+            return self.fail("an enum field of this type")
+        }
+        saved := self.scratch(count)
+        when !self.store_into(asm, value, saved, ty) {
+            return false
+        }
+        return self.copy_local_to_box(asm, saved, offset, count)
     }
 
     fun store_structure_in_box(mut self, asm: &mut x64::Asm, value: u64, offset: u64, id: u64) -> bool {
@@ -3991,8 +4628,8 @@ extend Gen {
         when code == 4 {
             key := choose self.program.types[ty] { ir::IrTy::MapOf(k, v) => k, ir::IrTy::SetOf(k, v) => k, _ => 0 }
             value := choose self.program.types[ty] { ir::IrTy::MapOf(k, v) => v, ir::IrTy::SetOf(k, v) => v, _ => 0 }
-            when self.is_string(key) && self.is_string(value) { return self.map_clone_both_text }
-            when self.is_string(key) { return self.map_clone_key_text }
+            when self.key_is_text(key) && self.is_string(value) { return self.map_clone_both_text }
+            when self.key_is_text(key) { return self.map_clone_key_text }
             when self.is_string(value) { return self.map_clone_value_text }
             return self.map_clone_plain
         }
@@ -4027,6 +4664,155 @@ extend Gen {
     }
 
     // `a op b` of floats: the operands are in xmm0 and xmm1, and an ordered comparison is false for a NaN, as in Rust.
+    // The structure type of a type, when it is one.
+    fun struct_of(self, ty: u64) -> Option<u64> {
+        return choose self.program.types[ty] {
+            ir::IrTy::StructTy(id) => Option::Some(id),
+            _ => Option::None,
+        }
+    }
+
+    // `left == right` (or `!=`) on structures, as the Rust backend compares them: every field in order, a text by its characters,
+    // a float by the IEEE equality, and a nested structure field by field. An operand that is not a place is built in scratch
+    // cells and dropped once compared.
+    fun struct_equal(mut self, asm: &mut x64::Asm, negate: bool, left: u64, right: u64, ty: u64) -> bool {
+        id := self.struct_of(ty).unwrap()
+        cells := self.cells_of(ty)
+        mut left_slot: u64 = 0
+        mut left_temp := false
+        when self.place_of(left).is_some() {
+            left_slot = self.place_of(left).unwrap()
+        } else {
+            left_slot = self.scratch(cells)
+            left_temp = true
+            when !self.store_into(asm, left, left_slot, ty) {
+                return false
+            }
+        }
+        mut right_slot: u64 = 0
+        mut right_temp := false
+        when self.place_of(right).is_some() {
+            right_slot = self.place_of(right).unwrap()
+        } else {
+            right_slot = self.scratch(cells)
+            right_temp = true
+            when !self.store_into(asm, right, right_slot, ty) {
+                return false
+            }
+        }
+        acc := self.scratch(1)
+        asm.mov_ri(x64::Reg::RAX, 1)
+        asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(acc))
+        when !self.compare_struct_slots(asm, left_slot, right_slot, id, acc) {
+            return false
+        }
+        when left_temp && self.has_owners(ty) {
+            self.drop_value(asm, left_slot, ty)
+        }
+        when right_temp && self.has_owners(ty) {
+            self.drop_value(asm, right_slot, ty)
+        }
+        asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, slot_disp(acc))
+        when negate {
+            asm.alu_ri(6, x64::Reg::RAX, 1)
+        }
+        return true
+    }
+
+    // Ands into the accumulator at `acc` the equality of each field of the structures at `left` and `right`.
+    fun compare_struct_slots(mut self, asm: &mut x64::Asm, left: u64, right: u64, id: u64, acc: u64) -> bool {
+        mut field: u64 = 0
+        while field < self.program.structs[id].fields.len() {
+            field_ty := self.program.structs[id].fields[field].ty
+            at := self.program.structs[id].fields[field].slot_offset
+            when self.struct_of(field_ty).is_some() {
+                when !self.compare_struct_slots(asm, left + at, right + at, self.struct_of(field_ty).unwrap(), acc) {
+                    return false
+                }
+            } else {
+                when !self.field_equal_slots(asm, left + at, right + at, field_ty) {
+                    return false
+                }
+                asm.load(8, false, x64::Reg::RCX, x64::Reg::RBP, slot_disp(acc))
+                asm.alu_rr(33, x64::Reg::RAX, x64::Reg::RCX)
+                asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(acc))
+            }
+            field += 1
+        }
+        return true
+    }
+
+    // The equality of a field of a structure at two slots, in RAX as 0 or 1.
+    fun field_equal_slots(mut self, asm: &mut x64::Asm, left: u64, right: u64, ty: u64) -> bool {
+        when self.is_string(ty) || self.is_str(ty) {
+            return self.text_slots_equal(asm, left, right, self.is_string(ty))
+        }
+        when self.is_float(ty) {
+            wide := self.word(ty) == "F64"
+            mut precision: u64 = 4
+            when wide {
+                precision = 8
+            }
+            when !self.load_cell(asm, ty, x64::Reg::RBP, slot_disp(left)) {
+                return false
+            }
+            asm.movq_to_xmm(wide, 0, x64::Reg::RAX)
+            when !self.load_cell(asm, ty, x64::Reg::RBP, slot_disp(right)) {
+                return false
+            }
+            asm.movq_to_xmm(wide, 1, x64::Reg::RAX)
+            asm.ucomis(precision, 0, 1)
+            asm.setcc(x64::Cc::EQUAL, x64::Reg::RAX)
+            asm.setcc(x64::Cc::NOT_PARITY, x64::Reg::RCX)
+            asm.alu_rr(33, x64::Reg::RAX, x64::Reg::RCX)
+            asm.alu_ri(4, x64::Reg::RAX, 1)
+            return true
+        }
+        word := self.word(ty)
+        when is_integer_word(word.clone()) || word == "Bool" || word == "Char" {
+            when !self.load_cell(asm, ty, x64::Reg::RBP, slot_disp(left)) {
+                return false
+            }
+            asm.push(x64::Reg::RAX)
+            when !self.load_cell(asm, ty, x64::Reg::RBP, slot_disp(right)) {
+                return false
+            }
+            asm.pop(x64::Reg::RCX)
+            asm.alu_rr(57, x64::Reg::RCX, x64::Reg::RAX)
+            asm.setcc(x64::Cc::EQUAL, x64::Reg::RAX)
+            asm.alu_ri(4, x64::Reg::RAX, 1)
+            return true
+        }
+        return self.fail("a structure field of this type")
+    }
+
+    // The equality of two texts in the cells from `left` and `right`, in RAX as 0 or 1: an owner holds the text's record, a
+    // `str` holds its pointer and its length.
+    fun text_slots_equal(mut self, asm: &mut x64::Asm, left: u64, right: u64, owned: bool) -> bool {
+        self.load_text_slot(asm, left, owned)
+        asm.push(x64::Reg::RSI)
+        asm.push(x64::Reg::RDX)
+        self.load_text_slot(asm, right, owned)
+        asm.mov_rr(x64::Reg::RDI, x64::Reg::RSI)
+        asm.mov_rr(x64::Reg::R8, x64::Reg::RDX)
+        asm.pop(x64::Reg::R9)
+        asm.pop(x64::Reg::R10)
+        self.text_compare_registers(asm)
+        return true
+    }
+
+    // The text in the cells from `slot` into RSI (pointer) and RDX (length).
+    fun load_text_slot(self, asm: &mut x64::Asm, slot: u64, owned: bool) {
+        when owned {
+            asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, slot_disp(slot))
+            asm.load(8, false, x64::Reg::RSI, x64::Reg::RAX, 0)
+            asm.load(8, false, x64::Reg::RDX, x64::Reg::RAX, 8)
+        } else {
+            asm.load(8, false, x64::Reg::RSI, x64::Reg::RBP, slot_disp(slot))
+            asm.load(8, false, x64::Reg::RDX, x64::Reg::RBP, slot_disp(slot + 1))
+        }
+    }
+
     fun float_binary(mut self, asm: &mut x64::Asm, op: String, left: u64, right: u64, ty: u64) -> bool {
         mut precision: u64 = 4
         when self.word(ty) == "F64" {
@@ -4243,7 +5029,20 @@ extend Gen {
 
     // `String(text)` for a str: the header {data, len, capacity} from malloc, and the data, a copy of the text from malloc.
     fun string_op(mut self, asm: &mut x64::Asm, op: String, arguments: Vec<u64>) -> bool {
-        when op == "Len" || op == "CharCount" {
+        // `__native_string_from_raw(pointer, length)`: a new String with a copy of the bytes, for the native runtime.
+        when op == "FromRaw" && arguments.len() == 2 {
+            when !self.expr(asm, arguments[0]) {
+                return false
+            }
+            asm.push(x64::Reg::RAX)
+            when !self.expr(asm, arguments[1]) {
+                return false
+            }
+            asm.mov_rr(x64::Reg::RDX, x64::Reg::RAX)
+            asm.pop(x64::Reg::RSI)
+            return self.string_from_parts(asm)
+        }
+        when op == "Len" || op == "CharCount" || op == "StrCharCount" {
             return self.string_query(asm, op, arguments)
         }
         when op == "Clone" && arguments.len() == 1 {
@@ -4353,7 +5152,18 @@ extend Gen {
             return true
         }
         when op == "ByteAt" && arguments.len() == 2 {
-            return self.string_byte_at(asm, arguments[0], arguments[1])
+            return self.string_byte_at(asm, arguments[0], arguments[1], String("Ryn runtime error: String byte index is out of bounds\n"))
+        }
+        // `str.len()` and `str.byte_at(index)` read the view's length and one of its bytes.
+        when op == "StrByteAt" && arguments.len() == 2 {
+            return self.string_byte_at(asm, arguments[0], arguments[1], String("Ryn runtime error: str byte index is out of bounds\n"))
+        }
+        when op == "StrLen" && arguments.len() == 1 {
+            when !self.load_string_parts(asm, arguments[0]) {
+                return false
+            }
+            asm.mov_rr(x64::Reg::RAX, x64::Reg::RDX)
+            return true
         }
         when op == "SliceChars" && arguments.len() == 3 {
             return self.string_slice_chars(asm, arguments[0], arguments[1], arguments[2])
@@ -4453,6 +5263,7 @@ extend Gen {
     // is {next, hash, key cell, value cell, sequence}. The hash of a key cell in rsi is left in rax; the node for the key
     // rsi in the map header rdi is left in rax, or 0; and the buckets of the header rdi are doubled.
     fun map_routines(mut self, asm: &mut x64::Asm) {
+        self.struct_key_drop_routine(asm, self.struct_key_drop)
         // FNV-1a over the eight bytes of a scalar key.
         asm.bind(self.map_hash_scalar)
         asm.mov_ri(x64::Reg::RAX, 14695981039346656037 as u64)
@@ -4488,10 +5299,10 @@ extend Gen {
         asm.bind(hashed)
         asm.ret()
         self.string_clone_routine(asm)
-        self.map_clone_routine(asm, self.map_clone_plain, false, false)
-        self.map_clone_routine(asm, self.map_clone_key_text, true, false)
-        self.map_clone_routine(asm, self.map_clone_value_text, false, true)
-        self.map_clone_routine(asm, self.map_clone_both_text, true, true)
+        self.map_clone_routine(asm, self.map_clone_plain, false, false, 0, Vec())
+        self.map_clone_routine(asm, self.map_clone_key_text, true, false, 0, Vec())
+        self.map_clone_routine(asm, self.map_clone_value_text, false, true, 0, Vec())
+        self.map_clone_routine(asm, self.map_clone_both_text, true, true, 0, Vec())
         asm.bind(self.string_less_label)
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RDI, 8)
         asm.load(8, false, x64::Reg::RDX, x64::Reg::RSI, 8)
@@ -4675,6 +5486,44 @@ extend Gen {
     // `sort()` of a vector of plain cells: an insertion sort, which is stable as the Rust sort is. A String is compared by
     // its bytes, and a scalar by its value, signed or unsigned as its type is. The frame holds the header, the index i,
     // the index j, and the key being placed.
+    // `reverse()`: the elements swap places pairwise, cell by cell, so the owners move with their elements.
+    fun vec_reverse(mut self, asm: &mut x64::Asm, element: u64, vec: u64) -> bool {
+        cells := self.cells_of(element)
+        when !self.expr(asm, vec) {
+            return false
+        }
+        asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
+        asm.load(8, false, x64::Reg::R9, x64::Reg::RDI, 8)
+        asm.load(8, false, x64::Reg::R10, x64::Reg::RDI, 0)
+        asm.mov_ri(x64::Reg::R8, 0)
+        top := asm.new_label()
+        done := asm.new_label()
+        asm.bind(top)
+        asm.mov_rr(x64::Reg::RCX, x64::Reg::R9)
+        asm.alu_ri(5, x64::Reg::RCX, 1)
+        asm.alu_rr(41, x64::Reg::RCX, x64::Reg::R8)
+        asm.alu_rr(57, x64::Reg::R8, x64::Reg::RCX)
+        asm.jcc(x64::Cc::ABOVE_EQUAL, done)
+        asm.mov_rr(x64::Reg::RSI, x64::Reg::R8)
+        self.scale_bytes(asm, x64::Reg::RSI, 8 * cells)
+        asm.alu_rr(1, x64::Reg::RSI, x64::Reg::R10)
+        asm.mov_rr(x64::Reg::RDX, x64::Reg::RCX)
+        self.scale_bytes(asm, x64::Reg::RDX, 8 * cells)
+        asm.alu_rr(1, x64::Reg::RDX, x64::Reg::R10)
+        mut cell: u64 = 0
+        while cell < cells {
+            asm.load(8, false, x64::Reg::RAX, x64::Reg::RSI, (8 * cell) as i64)
+            asm.load(8, false, x64::Reg::R11, x64::Reg::RDX, (8 * cell) as i64)
+            asm.store(8, x64::Reg::R11, x64::Reg::RSI, (8 * cell) as i64)
+            asm.store(8, x64::Reg::RAX, x64::Reg::RDX, (8 * cell) as i64)
+            cell += 1
+        }
+        asm.alu_ri(0, x64::Reg::R8, 1)
+        asm.jmp(top)
+        asm.bind(done)
+        return true
+    }
+
     fun vec_sort(mut self, asm: &mut x64::Asm, element: u64, vec: u64) -> bool {
         text := self.is_string(element)
         signed := choose self.program.types[element] {
@@ -4725,7 +5574,15 @@ extend Gen {
             asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
             asm.jcc(x64::Cc::EQUAL, place)
         }
-        when !text {
+        // Floats compare as floats: the key is in its slot, the element at rax.
+        when !text && self.is_float(element) {
+            precision := if_f32(self.word(element) == "F32")
+            asm.sse_load(precision, 0, x64::Reg::RSP, 24)
+            asm.sse_load(precision, 1, x64::Reg::RAX, 0)
+            asm.ucomis(precision, 0, 1)
+            asm.jcc(x64::Cc::ABOVE_EQUAL, place)
+        }
+        when !text && !self.is_float(element) {
             asm.alu_rr(57, x64::Reg::R8, x64::Reg::R10)
             when signed {
                 asm.jcc(x64::Cc::GREATER_EQUAL, place)
@@ -4857,7 +5714,7 @@ extend Gen {
     // The clone of the map whose header is in rdi, left in rax: a new header with the same buckets count, length and
     // sequence, and a copy of every node in its bucket. A String key or value is copied as a String. The frame holds the
     // bucket index, the new buckets, the new header, the source header, the node being copied and its copy.
-    fun map_clone_routine(mut self, asm: &mut x64::Asm, label: u64, text_key: bool, text_value: bool) {
+    fun map_clone_routine(mut self, asm: &mut x64::Asm, label: u64, text_key: bool, text_value: bool, boxed: u64, owned: Vec<u64>) {
         asm.bind(label)
         asm.alu_ri(5, x64::Reg::RSP, 48)
         asm.store(8, x64::Reg::RDI, x64::Reg::RSP, 24)
@@ -4919,16 +5776,58 @@ extend Gen {
             asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 40)
             asm.store(8, x64::Reg::RDI, x64::Reg::RCX, 16)
         }
-        asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 32)
-        asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, 24)
-        when text_value {
-            asm.call_label(self.string_clone_label)
-            asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 40)
-            asm.store(8, x64::Reg::RAX, x64::Reg::RCX, 24)
+        when boxed == 0 {
+            asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 32)
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, 24)
+            when text_value {
+                asm.call_label(self.string_clone_label)
+                asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 40)
+                asm.store(8, x64::Reg::RAX, x64::Reg::RCX, 24)
+            }
+            when !text_value && owned.len() == 0 {
+                asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 40)
+                asm.store(8, x64::Reg::RDI, x64::Reg::RCX, 24)
+            }
+            // A handle value: the copy takes a clone of the handle.
+            when !text_value && owned.len() > 0 {
+                asm.call_label(self.copy_routine(asm, owned[1], owned[2]))
+                asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 40)
+                asm.store(8, x64::Reg::RAX, x64::Reg::RCX, 24)
+            }
         }
-        when !text_value {
+        // A boxed value: the source box is kept in the new node's value cell while the new box is allocated, then its
+        // words are copied, and each owner in it is replaced by its clone.
+        when boxed > 0 {
+            asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 32)
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, 24)
             asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 40)
             asm.store(8, x64::Reg::RDI, x64::Reg::RCX, 24)
+            asm.mov_ri(x64::Reg::RDI, 8 * boxed)
+            self.aligned_call(asm, String("malloc"))
+            asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 40)
+            asm.load(8, false, x64::Reg::RDX, x64::Reg::RCX, 24)
+            mut word: u64 = 0
+            while word < boxed {
+                asm.load(8, false, x64::Reg::R8, x64::Reg::RDX, (8 * word) as i64)
+                asm.store(8, x64::Reg::R8, x64::Reg::RAX, (8 * word) as i64)
+                word += 1
+            }
+            asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 40)
+            asm.store(8, x64::Reg::RAX, x64::Reg::RCX, 24)
+            mut at: u64 = 0
+            while at < owned.len() {
+                offset := owned[at]
+                code := owned[at + 1]
+                owner := owned[at + 2]
+                asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 40)
+                asm.load(8, false, x64::Reg::RDI, x64::Reg::RCX, 24)
+                asm.load(8, false, x64::Reg::RDI, x64::Reg::RDI, offset as i64)
+                asm.call_label(self.copy_routine(asm, code, owner))
+                asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 40)
+                asm.load(8, false, x64::Reg::RDX, x64::Reg::RCX, 24)
+                asm.store(8, x64::Reg::RAX, x64::Reg::RDX, offset as i64)
+                at += 3
+            }
         }
         // The copy goes to the front of its bucket in the new array.
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 40)
@@ -5000,16 +5899,181 @@ extend Gen {
         when a == b {
             return true
         }
+        // A structure may have more than one entry in the type table, so structures are the same when their ids are.
         return choose self.program.types[a] {
             ir::IrTy::Scalar(word) => choose self.program.types[b] {
                 ir::IrTy::Scalar(other) => word == other,
+                _ => false,
+            },
+            ir::IrTy::StructTy(id) => choose self.program.types[b] {
+                ir::IrTy::StructTy(other) => id == other,
+                _ => false,
+            },
+            ir::IrTy::EnumTy(id) => choose self.program.types[b] {
+                ir::IrTy::EnumTy(other) => id == other,
+                _ => false,
+            },
+            ir::IrTy::VecOf(element) => choose self.program.types[b] {
+                ir::IrTy::VecOf(other) => self.same_type(element, other),
+                _ => false,
+            },
+            ir::IrTy::MapOf(key, value) => choose self.program.types[b] {
+                ir::IrTy::MapOf(other_key, other_value) => self.same_type(key, other_key) && self.same_type(value, other_value),
+                _ => false,
+            },
+            ir::IrTy::SetOf(key, value) => choose self.program.types[b] {
+                ir::IrTy::SetOf(other_key, other_value) => self.same_type(key, other_key) && self.same_type(value, other_value),
                 _ => false,
             },
             _ => false,
         }
     }
 
+    // A map's value that is a box of its own: a structure without owners. The node holds the box's pointer; the box holds the
+    // structure's cells in the layout of one Vec element (cell `k` at `8 * (cells - 1 - k)` from its start).
+    fun map_value_boxed(self, ty: u64) -> bool {
+        return (self.is_element_structure(ty) || self.destructor_element(ty)) && !self.is_handle_struct(ty)
+    }
+
+    // A one-cell handle value that is not a String: a vector, map, set or enum. The node holds the handle itself.
+    fun map_handle_value(self, ty: u64) -> bool {
+        return self.is_owner_cell(ty) && !self.is_string(ty) && !self.is_handle_struct(ty)
+    }
+
+    // The owned cells of a boxed value, with their byte offsets from the box (see `owned_cells`), or an empty list.
+    fun map_box_owned(self, ty: u64) -> Vec<u64> {
+        mut list: Vec<u64> = Vec()
+        owned := self.owned_cells(ty)
+        when owned.is_some() {
+            list = owned.unwrap()
+        }
+        return list
+    }
+
+    fun map_box_cells(self, ty: u64) -> u64 {
+        when self.map_value_boxed(ty) {
+            return self.cells_of(ty)
+        }
+        return 0
+    }
+
     // A key or value of a map: a scalar or a String, one cell.
+    // A structure key: a structure of integer, boolean and character fields, with no owner and no float. Its key is a text of
+    // its words in slot order, which is the order the Rust runtime hashes and compares a key's words in.
+    fun struct_key_ok(self, ty: u64) -> bool {
+        id := self.struct_of(ty)
+        when id.is_none() || self.has_owners(ty) {
+            return false
+        }
+        mut field: u64 = 0
+        while field < self.program.structs[id.unwrap()].fields.len() {
+            field_ty := self.program.structs[id.unwrap()].fields[field].ty
+            when self.struct_of(field_ty).is_some() {
+                when !self.struct_key_ok(field_ty) {
+                    return false
+                }
+            } else {
+                word := self.word(field_ty)
+                when !(is_integer_word(word.clone()) || word == "Bool" || word == "Char") {
+                    return false
+                }
+            }
+            field += 1
+        }
+        return true
+    }
+
+    // Whether a map key is kept as a text: a String, or a structure key.
+    fun key_is_text(self, key: u64) -> bool {
+        return self.is_string(key) || self.struct_key_ok(key)
+    }
+
+    // Writes the words of the structure at the slots from `base` into the key text whose data is in the slot `bytes`: word
+    // `key_word` is the cell of each scalar field, normalized to its value as an eight-byte word.
+    fun key_words(mut self, asm: &mut x64::Asm, base: u64, id: u64, bytes: u64) -> bool {
+        mut field: u64 = 0
+        while field < self.program.structs[id].fields.len() {
+            field_ty := self.program.structs[id].fields[field].ty
+            offset := self.program.structs[id].fields[field].slot_offset
+            when self.struct_of(field_ty).is_some() {
+                when !self.key_words(asm, base + offset, self.struct_of(field_ty).unwrap(), bytes) {
+                    return false
+                }
+            } else {
+                when !self.load_cell(asm, field_ty, x64::Reg::RBP, slot_disp(base + offset)) {
+                    return false
+                }
+                // A narrow field is a word of its own bits, as the runtime reads it: its value is not sign-extended.
+                width := width_of(self.word(field_ty))
+                when width > 0 && width < 8 {
+                    mut mask: u64 = 1
+                    mask = (mask << ((8 * width) as u32)) - 1
+                    asm.mov_ri(x64::Reg::RCX, mask)
+                    asm.alu_rr(33, x64::Reg::RAX, x64::Reg::RCX)
+                }
+                asm.load(8, false, x64::Reg::RDX, x64::Reg::RBP, slot_disp(bytes))
+                asm.store(8, x64::Reg::RAX, x64::Reg::RDX, (8 * (offset + base - self.key_base)) as i64)
+            }
+            field += 1
+        }
+        return true
+    }
+
+    // The key text of a structure key, in rax: a text header whose data holds the words of the structure, so that the
+    // text routines hash and compare it as the runtime does its words.
+    fun struct_key_header(mut self, asm: &mut x64::Asm, key: u64, ty: u64) -> bool {
+        id := self.struct_of(ty).unwrap()
+        count := self.cells_of(ty)
+        mut base: u64 = 0
+        when self.place_of(key).is_some() {
+            base = self.place_of(key).unwrap()
+        } else {
+            base = self.scratch(count)
+            when !self.store_into(asm, key, base, ty) {
+                return false
+            }
+        }
+        bytes := self.scratch(1)
+        asm.mov_ri(x64::Reg::RDI, 8 * count)
+        self.aligned_call(asm, String("malloc"))
+        asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(bytes))
+        self.key_base = base
+        when !self.key_words(asm, base, id, bytes) {
+            return false
+        }
+        asm.mov_ri(x64::Reg::RDI, 24)
+        self.aligned_call(asm, String("malloc"))
+        asm.load(8, false, x64::Reg::RCX, x64::Reg::RBP, slot_disp(bytes))
+        asm.store(8, x64::Reg::RCX, x64::Reg::RAX, 0)
+        asm.mov_ri(x64::Reg::RCX, 8 * count)
+        asm.store(8, x64::Reg::RCX, x64::Reg::RAX, 8)
+        asm.store(8, x64::Reg::RCX, x64::Reg::RAX, 16)
+        return true
+    }
+
+    // The key of a map operation, in rax: a structure key is built as its text, any other key is evaluated.
+    fun map_key_value(mut self, asm: &mut x64::Asm, key: u64, struct_ty: u64) -> bool {
+        when struct_ty != 0 {
+            return self.struct_key_header(asm, key, struct_ty)
+        }
+        return self.expr(asm, key)
+    }
+
+    // Frees a structure key's text: its data, then its header.
+    // The key cell is at rdi: its header is the text, and the header's data is freed before the header.
+    fun struct_key_drop_routine(mut self, asm: &mut x64::Asm, label: u64) {
+        asm.bind(label)
+        asm.push(x64::Reg::RDI)
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RDI, 0)
+        asm.push(x64::Reg::RDI)
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RDI, 0)
+        self.aligned_call(asm, String("free"))
+        asm.pop(x64::Reg::RDI)
+        self.aligned_call(asm, String("free"))
+        asm.pop(x64::Reg::RDI)
+        asm.ret()
+    }
+
     fun map_cell(self, ty: u64) -> bool {
         return self.is_string(ty) || self.is_handle_struct(ty) || choose self.program.types[ty] {
             ir::IrTy::Scalar(word) => string_width(word) != 0,
@@ -5020,8 +6084,19 @@ extend Gen {
     // A map operation. A key is hashed and compared by its word, or by its text for a String; the values are cells.
     fun map_op(mut self, asm: &mut x64::Asm, op: String, key: u64, value: u64, arguments: Vec<u64>) -> bool {
         self.map_value_type = value
-        when !self.map_cell(key) || !self.map_cell(value) {
+        when !(self.map_cell(key) || self.struct_key_ok(key)) || !(self.map_cell(value) || self.map_value_boxed(value) || self.map_handle_value(value)) {
             return self.fail("a map of this type")
+        }
+        // A boxed value with a destructor is dropped where its box lies, by insert, remove, clear and the scope's drop. The
+        // operations that copy a value out (get, values, clone) are not written for it.
+        when self.map_value_boxed(value) && self.destructor_element(value) && !(op == "New" || op == "Len" || op == "IsEmpty" || op == "Keys" || op == "ContainsKey" || op == "Insert" || op == "Remove" || op == "Clear") {
+            return self.op_fail("a map of destructor values and ", op)
+        }
+        // A structure key is a text of its words; the structure is passed to the key evaluation, which builds that text.
+        text_key := self.key_is_text(key)
+        mut struct_ty: u64 = 0
+        when self.struct_of(key).is_some() {
+            struct_ty = key
         }
         when op == "New" && arguments.len() == 0 {
             return self.map_new(asm)
@@ -5043,7 +6118,11 @@ extend Gen {
             return true
         }
         when (op == "Keys" || op == "Values") && arguments.len() == 1 {
-            return self.map_collect(asm, arguments[0], op == "Keys", if_text(op == "Keys", self.is_string(key), self.is_string(value)), self.is_handle_struct(value))
+            mut key_cells: u64 = 0
+            when op == "Keys" && struct_ty != 0 {
+                key_cells = self.cells_of(struct_ty)
+            }
+            return self.map_collect(asm, arguments[0], op == "Keys", if_text(op == "Keys", text_key, self.is_string(value)), self.is_handle_struct(value), key_cells)
         }
         when op == "Clear" && arguments.len() == 1 {
             clear := asm.new_label()
@@ -5070,7 +6149,7 @@ extend Gen {
             return true
         }
         when op == "ContainsKey" && arguments.len() == 2 {
-            when !self.find_key(asm, arguments[0], arguments[1], self.is_string(key)) {
+            when !self.find_key(asm, arguments[0], arguments[1], text_key, struct_ty) {
                 return false
             }
             asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
@@ -5078,29 +6157,42 @@ extend Gen {
             return true
         }
         when op == "Insert" && arguments.len() == 3 {
-            return self.map_insert(asm, arguments[0], arguments[1], arguments[2], self.is_string(key))
+            return self.map_insert(asm, arguments[0], arguments[1], arguments[2], text_key, self.map_box_cells(value), struct_ty)
         }
         when op == "Get" && arguments.len() == 2 {
-            return self.map_get(asm, arguments[0], arguments[1], value, self.is_string(key))
+            return self.map_get(asm, arguments[0], arguments[1], value, text_key, struct_ty)
         }
         when op == "Remove" && arguments.len() == 2 {
-            return self.map_remove(asm, arguments[0], arguments[1], self.is_string(key))
+            return self.map_remove(asm, arguments[0], arguments[1], text_key, struct_ty)
+        }
+        when op == "Clone" && arguments.len() == 1 && (self.map_value_boxed(value) || self.map_handle_value(value)) {
+            skip := asm.new_label()
+            label := asm.new_label()
+            asm.jmp(skip)
+            self.map_clone_routine(asm, label, text_key, false, self.map_box_cells(value), self.map_box_owned(value))
+            asm.bind(skip)
+            when !self.expr(asm, arguments[0]) {
+                return false
+            }
+            asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
+            asm.call_label(label)
+            return true
         }
         when op == "Clone" && arguments.len() == 1 {
             when !self.expr(asm, arguments[0]) {
                 return false
             }
             asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
-            when self.is_string(key) && self.is_string(value) {
+            when text_key && self.is_string(value) {
                 asm.call_label(self.map_clone_both_text)
             }
-            when self.is_string(key) && !self.is_string(value) {
+            when text_key && !self.is_string(value) {
                 asm.call_label(self.map_clone_key_text)
             }
-            when !self.is_string(key) && self.is_string(value) {
+            when !text_key && self.is_string(value) {
                 asm.call_label(self.map_clone_value_text)
             }
-            when !self.is_string(key) && !self.is_string(value) {
+            when !text_key && !self.is_string(value) {
                 asm.call_label(self.map_clone_plain)
             }
             return true
@@ -5111,9 +6203,17 @@ extend Gen {
     // `keys()` and `values()`: a new vector of copies, in the order of the hashes of the keys (the order the runtime walks its
     // map in; keys with the same hash are in an unspecified order). The nodes are collected, sorted by hash with a shell
     // sort, and copied; a String is copied with its text.
-    fun map_collect(mut self, asm: &mut x64::Asm, map: u64, keys: bool, text: bool, handle: bool) -> bool {
+    fun map_collect(mut self, asm: &mut x64::Asm, map: u64, keys: bool, text: bool, handle: bool, key_cells: u64) -> bool {
         when handle && !keys {
             return self.fail("the values of a map of values with destructors")
+        }
+        boxed := !keys && self.map_box_cells(self.map_value_type) > 0
+        mut width: u64 = 1
+        when boxed {
+            width = self.cells_of(self.map_value_type)
+        }
+        when key_cells > 0 {
+            width = key_cells
         }
         when !self.expr(asm, map) {
             return false
@@ -5237,13 +6337,13 @@ extend Gen {
         asm.store(8, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 64)
         asm.jmp(gap_top)
         asm.bind(gap_done)
-        // The vector: its header and a data block of one cell per node.
+        // The vector: its header and a data block of one element per node, each the cells of a boxed structure value.
         asm.mov_ri(x64::Reg::RDI, 24)
         self.aligned_call(asm, String("malloc"))
         asm.store(8, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 48)
         asm.load(8, false, x64::Reg::RDI, x64::Reg::RBP, (0 as i64) - 24)
         asm.alu_ri(0, x64::Reg::RDI, 1)
-        self.scale_bytes(asm, x64::Reg::RDI, 8)
+        self.scale_bytes(asm, x64::Reg::RDI, 8 * width)
         self.aligned_call(asm, String("malloc"))
         asm.store(8, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 40)
         asm.load(8, false, x64::Reg::RDX, x64::Reg::RBP, (0 as i64) - 48)
@@ -5269,21 +6369,77 @@ extend Gen {
         when keys {
             field = 16
         }
-        asm.load(8, false, x64::Reg::RDI, x64::Reg::R10, field)
-        when text {
-            asm.call_label(self.string_clone_label)
-            asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
+        // A structure key: the words of its text are the cells of the element, the first word at the top of the element, as a
+        // structure in memory lies.
+        when key_cells > 0 {
+            asm.load(8, false, x64::Reg::RSI, x64::Reg::R10, 16)
+            asm.load(8, false, x64::Reg::RSI, x64::Reg::RSI, 0)
+            asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 32)
+            self.scale_bytes(asm, x64::Reg::RAX, 8 * width)
+            asm.load(8, false, x64::Reg::RDX, x64::Reg::RBP, (0 as i64) - 40)
+            asm.alu_rr(1, x64::Reg::RDX, x64::Reg::RAX)
+            mut word: u64 = 0
+            while word < key_cells {
+                asm.load(8, false, x64::Reg::R8, x64::Reg::RSI, (8 * word) as i64)
+                asm.store(8, x64::Reg::R8, x64::Reg::RDX, (8 * (key_cells - 1 - word)) as i64)
+                word += 1
+            }
         }
-        asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 32)
-        self.scale_bytes(asm, x64::Reg::RAX, 8)
-        asm.load(8, false, x64::Reg::RDX, x64::Reg::RBP, (0 as i64) - 40)
-        asm.alu_rr(1, x64::Reg::RDX, x64::Reg::RAX)
-        asm.store(8, x64::Reg::RDI, x64::Reg::RDX, 0)
+        when !boxed && key_cells == 0 {
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::R10, field)
+            when text {
+                asm.call_label(self.string_clone_label)
+                asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
+            }
+            when !keys && self.map_handle_value(self.map_value_type) {
+                asm.call_label(self.copy_routine(asm, self.map_box_owned(self.map_value_type)[1], self.map_box_owned(self.map_value_type)[2]))
+                asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
+            }
+            asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 32)
+            self.scale_bytes(asm, x64::Reg::RAX, 8)
+            asm.load(8, false, x64::Reg::RDX, x64::Reg::RBP, (0 as i64) - 40)
+            asm.alu_rr(1, x64::Reg::RDX, x64::Reg::RAX)
+            asm.store(8, x64::Reg::RDI, x64::Reg::RDX, 0)
+        }
+        // A boxed value: its cells are copied from the box, word for word, into the element's cells.
+        when boxed {
+            asm.load(8, false, x64::Reg::RSI, x64::Reg::R10, 24)
+            asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 32)
+            self.scale_bytes(asm, x64::Reg::RAX, 8 * width)
+            asm.load(8, false, x64::Reg::RDX, x64::Reg::RBP, (0 as i64) - 40)
+            asm.alu_rr(1, x64::Reg::RDX, x64::Reg::RAX)
+            mut word: u64 = 0
+            while word < width {
+                asm.load(8, false, x64::Reg::R8, x64::Reg::RSI, (8 * word) as i64)
+                asm.store(8, x64::Reg::R8, x64::Reg::RDX, (8 * word) as i64)
+                word += 1
+            }
+            owned := self.map_box_owned(self.map_value_type)
+            mut at: u64 = 0
+            while at < owned.len() {
+                asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 32)
+                self.scale_bytes(asm, x64::Reg::RAX, 8 * width)
+                asm.load(8, false, x64::Reg::RDX, x64::Reg::RBP, (0 as i64) - 40)
+                asm.alu_rr(1, x64::Reg::RDX, x64::Reg::RAX)
+                asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, owned[at] as i64)
+                asm.call_label(self.copy_routine(asm, owned[at + 1], owned[at + 2]))
+                asm.mov_rr(x64::Reg::RCX, x64::Reg::RAX)
+                asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 32)
+                self.scale_bytes(asm, x64::Reg::RAX, 8 * width)
+                asm.load(8, false, x64::Reg::RDX, x64::Reg::RBP, (0 as i64) - 40)
+                asm.alu_rr(1, x64::Reg::RDX, x64::Reg::RAX)
+                asm.store(8, x64::Reg::RCX, x64::Reg::RDX, owned[at] as i64)
+                at += 3
+            }
+        }
         asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 32)
         asm.alu_ri(0, x64::Reg::RAX, 1)
         asm.store(8, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 32)
         asm.jmp(copy_top)
         asm.bind(copy_done)
+        // The temporary array of the nodes is freed; the vector keeps its own data block.
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RBP, (0 as i64) - 16)
+        self.aligned_call(asm, String("free"))
         asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 48)
         asm.mov_rr(x64::Reg::RSP, x64::Reg::RBP)
         asm.pop(x64::Reg::RBP)
@@ -5291,13 +6447,17 @@ extend Gen {
     }
 
     // The node of a key in a map, left in rax: the map is evaluated first, then the key.
-    fun find_key(mut self, asm: &mut x64::Asm, map: u64, key: u64, text: bool) -> bool {
+    fun find_key(mut self, asm: &mut x64::Asm, map: u64, key: u64, text: bool, struct_ty: u64) -> bool {
         when !self.expr(asm, map) {
             return false
         }
         asm.push(x64::Reg::RAX)
-        when !self.expr(asm, key) {
+        temp := self.scratch(1)
+        when !self.map_key_value(asm, key, struct_ty) {
             return false
+        }
+        when struct_ty != 0 {
+            asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(temp))
         }
         asm.mov_rr(x64::Reg::RSI, x64::Reg::RAX)
         asm.pop(x64::Reg::RDI)
@@ -5307,24 +6467,49 @@ extend Gen {
         when !text {
             asm.call_label(self.map_find_scalar)
         }
+        // A structure key built for the lookup is not kept by the map: its text is freed once the lookup is done.
+        when struct_ty != 0 {
+            asm.push(x64::Reg::RAX)
+            asm.lea(x64::Reg::RDI, x64::Reg::RBP, slot_disp(temp))
+            asm.call_label(self.struct_key_drop)
+            asm.pop(x64::Reg::RAX)
+        }
         return true
     }
 
     // `insert(key, value)`: an existing key takes the new value and the call returns 1; a new key gets a node, is linked
     // into its bucket, and the map doubles when it has more nodes than buckets. The call returns 0.
-    fun map_insert(mut self, asm: &mut x64::Asm, map: u64, key: u64, value: u64, text: bool) -> bool {
+    fun map_insert(mut self, asm: &mut x64::Asm, map: u64, key: u64, value: u64, text: bool, boxed: u64, struct_ty: u64) -> bool {
         when !self.expr(asm, map) {
             return false
         }
         asm.push(x64::Reg::RAX)
-        when !self.expr(asm, key) {
+        when !self.map_key_value(asm, key, struct_ty) {
             return false
         }
         asm.push(x64::Reg::RAX)
-        when !self.expr(asm, value) {
-            return false
+        when boxed == 0 {
+            when !self.expr(asm, value) {
+                return false
+            }
+            asm.push(x64::Reg::RAX)
         }
-        asm.push(x64::Reg::RAX)
+        when boxed > 0 {
+            // The value is evaluated into cells of its own, then copied into a new box, whose pointer is the value.
+            held := self.scratch(boxed)
+            when !self.store_into(asm, value, held, self.map_value_type) {
+                return false
+            }
+            asm.mov_ri(x64::Reg::RDI, 8 * boxed)
+            self.aligned_call(asm, String("malloc"))
+            mut cell: u64 = 0
+            while cell < boxed {
+                asm.load(8, false, x64::Reg::RCX, x64::Reg::RBP, slot_disp(held + cell))
+                asm.store(8, x64::Reg::RCX, x64::Reg::RAX, (8 * (boxed - 1 - cell)) as i64)
+                cell += 1
+            }
+            asm.push(x64::Reg::RAX)
+        }
         asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 16)
         asm.load(8, false, x64::Reg::RSI, x64::Reg::RSP, 8)
         when text {
@@ -5337,6 +6522,18 @@ extend Gen {
         done := asm.new_label()
         asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
         asm.jcc(x64::Cc::EQUAL, fresh)
+        when boxed > 0 {
+            asm.push(x64::Reg::RAX)
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RAX, 24)
+            when self.has_owners(self.map_value_type) {
+                asm.push(x64::Reg::RDI)
+                asm.lea(x64::Reg::RDI, x64::Reg::RDI, (8 * (boxed - 1)) as i64)
+                asm.call_label(self.value_drop_routine(asm, self.map_value_type, false))
+                asm.pop(x64::Reg::RDI)
+            }
+            self.aligned_call(asm, String("free"))
+            asm.pop(x64::Reg::RAX)
+        }
         when self.handle_destructor(self.map_value_type).is_some() {
             fid := self.handle_destructor(self.map_value_type).unwrap()
             self.needed.set(fid, true)
@@ -5347,7 +6544,7 @@ extend Gen {
             asm.alu_ri(0, x64::Reg::RSP, 8)
             asm.pop(x64::Reg::RAX)
         }
-        when self.handle_destructor(self.map_value_type).is_none() && self.has_owners(self.map_value_type) {
+        when self.handle_destructor(self.map_value_type).is_none() && self.has_owners(self.map_value_type) && !self.map_value_boxed(self.map_value_type) {
             asm.push(x64::Reg::RAX)
             asm.lea(x64::Reg::RDI, x64::Reg::RAX, 24)
             asm.call_label(self.value_drop_routine(asm, self.map_value_type, false))
@@ -5355,8 +6552,13 @@ extend Gen {
         }
         when text {
             asm.push(x64::Reg::RAX)
-            asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 16)
-            asm.call_label(self.handle_drop_routine(asm, self.string_type()))
+            when struct_ty != 0 {
+                asm.lea(x64::Reg::RDI, x64::Reg::RSP, 16)
+                asm.call_label(self.struct_key_drop)
+            } else {
+                asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 16)
+                asm.call_label(self.handle_drop_routine(asm, self.string_type()))
+            }
             asm.pop(x64::Reg::RAX)
         }
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 0)
@@ -5419,7 +6621,7 @@ extend Gen {
     }
 
     // `get(key)`: the Option of the value of a scalar value, or None; the value is copied into the box.
-    fun map_get(mut self, asm: &mut x64::Asm, map: u64, key: u64, value: u64, text: bool) -> bool {
+    fun map_get(mut self, asm: &mut x64::Asm, map: u64, key: u64, value: u64, text: bool, struct_ty: u64) -> bool {
         option := self.option_of(value)
         when option.is_none() {
             return self.fail("a map get without an Option of its value")
@@ -5429,7 +6631,7 @@ extend Gen {
         when some.is_none() || none.is_none() {
             return self.fail("a map get without an Option of its value")
         }
-        when !self.find_key(asm, map, key, text) {
+        when !self.find_key(asm, map, key, text, struct_ty) {
             return false
         }
         missing := asm.new_label()
@@ -5437,6 +6639,43 @@ extend Gen {
         asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
         asm.jcc(x64::Cc::EQUAL, missing)
         asm.load(8, false, x64::Reg::RAX, x64::Reg::RAX, 24)
+        when self.map_box_cells(value) > 0 {
+            // The value is a box: the Option holds its cells, word `m` of the box at `8 * (cells - m)`, as `vec_get_option` lays them.
+            cells := self.map_box_cells(value)
+            asm.push(x64::Reg::RAX)
+            asm.mov_ri(x64::Reg::RDI, 8 * (1 + cells))
+            self.aligned_call(asm, String("malloc"))
+            asm.pop(x64::Reg::RDX)
+            asm.mov_ri(x64::Reg::RCX, some.unwrap())
+            asm.store(8, x64::Reg::RCX, x64::Reg::RAX, 0)
+            mut word: u64 = 0
+            while word < cells {
+                asm.load(8, false, x64::Reg::R8, x64::Reg::RDX, (8 * word) as i64)
+                asm.store(8, x64::Reg::R8, x64::Reg::RAX, (8 * (cells - word)) as i64)
+                word += 1
+            }
+            // The owners of the copy are clones: a box word at `offset` is the Option's word at `8 * (cells - offset / 8)`.
+            owned := self.map_box_owned(value)
+            asm.push(x64::Reg::RAX)
+            mut at: u64 = 0
+            while at < owned.len() {
+                disp := (8 * (cells - owned[at] / 8)) as i64
+                asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 0)
+                asm.load(8, false, x64::Reg::RDI, x64::Reg::RCX, disp)
+                asm.call_label(self.copy_routine(asm, owned[at + 1], owned[at + 2]))
+                asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 0)
+                asm.store(8, x64::Reg::RAX, x64::Reg::RCX, disp)
+                at += 3
+            }
+            asm.pop(x64::Reg::RAX)
+            asm.jmp(done)
+        }
+        when self.map_box_cells(value) == 0 {
+        when self.map_handle_value(value) {
+            owned := self.map_box_owned(value)
+            asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
+            asm.call_label(self.copy_routine(asm, owned[1], owned[2]))
+        }
         when self.is_string(value) {
             self.clone_header(asm)
         }
@@ -5448,6 +6687,7 @@ extend Gen {
         asm.mov_ri(x64::Reg::RDX, some.unwrap())
         asm.store(8, x64::Reg::RDX, x64::Reg::RAX, 0)
         asm.jmp(done)
+        }
         asm.bind(missing)
         asm.mov_ri(x64::Reg::RDI, 16)
         self.aligned_call(asm, String("malloc"))
@@ -5458,13 +6698,17 @@ extend Gen {
     }
 
     // `remove(key)`: the node is unlinked from its bucket and the call returns 1; a key that is not there gives 0.
-    fun map_remove(mut self, asm: &mut x64::Asm, map: u64, key: u64, text: bool) -> bool {
+    fun map_remove(mut self, asm: &mut x64::Asm, map: u64, key: u64, text: bool, struct_ty: u64) -> bool {
         when !self.expr(asm, map) {
             return false
         }
         asm.push(x64::Reg::RAX)
-        when !self.expr(asm, key) {
+        temp := self.scratch(1)
+        when !self.map_key_value(asm, key, struct_ty) {
             return false
+        }
+        when struct_ty != 0 {
+            asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(temp))
         }
         asm.push(x64::Reg::RAX)
         asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 8)
@@ -5521,26 +6765,53 @@ extend Gen {
             asm.call_label(self.labels[fid])
             asm.alu_ri(0, x64::Reg::RSP, 8)
         }
-        when self.handle_destructor(self.map_value_type).is_none() && self.has_owners(self.map_value_type) {
+        when self.handle_destructor(self.map_value_type).is_none() && self.has_owners(self.map_value_type) && !self.map_value_boxed(self.map_value_type) {
             asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 0)
             asm.alu_ri(0, x64::Reg::RDI, 24)
             asm.call_label(self.value_drop_routine(asm, self.map_value_type, false))
         }
-        when text {
+        when text && struct_ty != 0 {
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 0)
+            asm.alu_ri(0, x64::Reg::RDI, 16)
+            asm.call_label(self.struct_key_drop)
+        }
+        when text && struct_ty == 0 {
             asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 0)
             asm.alu_ri(0, x64::Reg::RDI, 16)
             asm.call_label(self.value_drop_routine(asm, self.string_type(), false))
         }
+        when self.map_value_boxed(self.map_value_type) && self.has_owners(self.map_value_type) {
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 0)
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RDI, 24)
+            kept_cells := self.cells_of(self.map_value_type)
+            asm.alu_ri(0, x64::Reg::RDI, (8 * (kept_cells - 1)) as i64)
+            asm.call_label(self.value_drop_routine(asm, self.map_value_type, false))
+        }
+        when self.map_value_boxed(self.map_value_type) {
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 0)
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RDI, 24)
+            self.aligned_call(asm, String("free"))
+        }
         asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 0)
         self.aligned_call(asm, String("free"))
+        self.free_lookup_key(asm, temp, struct_ty)
         asm.mov_ri(x64::Reg::RAX, 1)
         asm.alu_ri(0, x64::Reg::RSP, 24)
         asm.jmp(done)
         asm.bind(missing)
+        self.free_lookup_key(asm, temp, struct_ty)
         asm.mov_ri(x64::Reg::RAX, 0)
         asm.alu_ri(0, x64::Reg::RSP, 16)
         asm.bind(done)
         return true
+    }
+
+    // Frees the text of a structure key that a lookup built, which the map does not keep.
+    fun free_lookup_key(mut self, asm: &mut x64::Asm, temp: u64, struct_ty: u64) {
+        when struct_ty != 0 {
+            asm.lea(x64::Reg::RDI, x64::Reg::RBP, slot_disp(temp))
+            asm.call_label(self.struct_key_drop)
+        }
     }
 
     // The owned String that a `str` argument is converted from, when the argument is one.
@@ -5623,7 +6894,7 @@ extend Gen {
     }
 
     // The byte at `index` of a String, which fails past its end, as the runtime does.
-    fun string_byte_at(mut self, asm: &mut x64::Asm, text: u64, index: u64) -> bool {
+    fun string_byte_at(mut self, asm: &mut x64::Asm, text: u64, index: u64, message: String) -> bool {
         when !self.expr(asm, index) {
             return false
         }
@@ -5635,7 +6906,7 @@ extend Gen {
         ok := asm.new_label()
         asm.alu_rr(57, x64::Reg::RCX, x64::Reg::RDX)
         asm.jcc(x64::Cc::BELOW, ok)
-        self.fail_exit(asm, String("Ryn runtime error: String byte index is out of bounds\n"))
+        self.fail_exit(asm, message)
         asm.bind(ok)
         asm.mov_rr(x64::Reg::R8, x64::Reg::RSI)
         asm.alu_rr(1, x64::Reg::R8, x64::Reg::RCX)
@@ -7199,6 +8470,10 @@ extend Gen {
 
     // A call of a C function with its arguments already in the registers, from an aligned stack.
     fun aligned_call(mut self, asm: &mut x64::Asm, name: String) {
+        when ffi_helpers::is_helper(name.clone()) {
+            asm.call_label(self.helper_label(asm, name))
+            return
+        }
         when self.freestanding {
             self.call_runtime(asm, name)
             return
@@ -7209,6 +8484,10 @@ extend Gen {
 
     // A call of a C function in a freestanding object: the runtime routine of that name, or a decline.
     fun call_runtime(mut self, asm: &mut x64::Asm, name: String) {
+        when ffi_helpers::is_helper(name.clone()) {
+            asm.call_label(self.helper_label(asm, name))
+            return
+        }
         label := self.runtime_label(name.clone())
         when label.is_none() {
             mut message := String("the C library function ")
@@ -7221,6 +8500,21 @@ extend Gen {
             return
         }
         asm.call_label(label.unwrap())
+    }
+
+    // The label of a `ryn_ffi_*` routine, which is written once at the end of the code.
+    fun helper_label(mut self, asm: &mut x64::Asm, name: String) -> u64 {
+        mut at: u64 = 0
+        while at < self.helper_names.len() {
+            when self.helper_names[at] == name {
+                return self.helper_labels[at]
+            }
+            at += 1
+        }
+        label := asm.new_label()
+        self.helper_names.push(name)
+        self.helper_labels.push(label)
+        return label
     }
 
     fun runtime_label(self, name: String) -> Option<u64> {
@@ -7244,6 +8538,29 @@ extend Gen {
         when name == "putchar" { return Option::Some(self.rt.putchar) }
         when name == "chmod" { return Option::Some(self.rt.chmod) }
         return Option::None
+    }
+
+    // A message with no effects of its own: a literal, or a local string.
+    fun is_plain_message(self, index: u64) -> bool {
+        return self.string_literal(index).is_some() || self.struct_local_of(index).is_some()
+    }
+
+    // Writes `text` to the file descriptor `descriptor` from a literal of the program.
+    fun write_fixed(mut self, asm: &mut x64::Asm, descriptor: u64, text: String) {
+        index := self.literal(text.clone())
+        asm.lea_symbol(x64::Reg::RSI, self.literal_symbols[index])
+        asm.mov_ri(x64::Reg::RDX, self.literal_lengths[index])
+        asm.mov_ri(x64::Reg::RDI, descriptor)
+        asm.mov_ri(x64::Reg::RAX, 1)
+        asm.syscall()
+    }
+
+    // The failure exit: the owners of the function are dropped, as a return does, and the process exits with status 1.
+    fun exit_failure(mut self, asm: &mut x64::Asm) {
+        self.drop_owners(asm)
+        asm.mov_ri(x64::Reg::RDI, 1)
+        asm.mov_ri(x64::Reg::RAX, 231)
+        asm.syscall()
     }
 
     // The stream builtins: a write sends a string to standard output or error, and a flush has nothing to do.
@@ -7271,6 +8588,11 @@ extend Gen {
             asm.syscall()
             return true
         }
+        // The address of the runtime cell, for the Ryn runtime functions that keep state across calls.
+        when op == "RuntimeCell" && arguments.len() == 0 {
+            asm.lea_symbol(x64::Reg::RAX, self.runtime_cell_symbol)
+            return true
+        }
         when op == "PointerIsNull" && arguments.len() == 1 {
             when !self.expr(asm, arguments[0]) {
                 return false
@@ -7282,8 +8604,55 @@ extend Gen {
         when op.starts_with("Math") {
             return self.math_call(asm, op, arguments)
         }
+        // A panic or a failed assertion writes its message to standard error, drops the owners of the function, and exits with
+        // status 1. A message is written only on failure, so it must have no effects of its own: a literal or a local.
+        when op == "Panic" && arguments.len() == 1 {
+            when !self.is_plain_message(arguments[0]) {
+                return self.fail("a panic message that is not a literal or a local")
+            }
+            self.write_fixed(asm, 2, String("Ryn panic: "))
+            when !self.system_call(asm, String("WriteStderr"), arguments.clone()) {
+                return false
+            }
+            self.write_fixed(asm, 2, String("\n"))
+            self.exit_failure(asm)
+            return true
+        }
+        when op == "Assert" && arguments.len() == 1 {
+            when !self.expr(asm, arguments[0]) {
+                return false
+            }
+            held := asm.new_label()
+            asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
+            asm.jcc(x64::Cc::NOT_EQUAL, held)
+            self.write_fixed(asm, 2, String("Ryn panic: assertion failed\n"))
+            self.exit_failure(asm)
+            asm.bind(held)
+            return true
+        }
+        when op == "AssertMessage" && arguments.len() == 2 {
+            when !self.is_plain_message(arguments[1]) {
+                return self.fail("an assertion message that is not a literal or a local")
+            }
+            when !self.expr(asm, arguments[0]) {
+                return false
+            }
+            held := asm.new_label()
+            asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
+            asm.jcc(x64::Cc::NOT_EQUAL, held)
+            self.write_fixed(asm, 2, String("Ryn panic: "))
+            mut message: Vec<u64> = Vec()
+            message.push(arguments[1])
+            when !self.system_call(asm, String("WriteStderr"), message) {
+                return false
+            }
+            self.write_fixed(asm, 2, String("\n"))
+            self.exit_failure(asm)
+            asm.bind(held)
+            return true
+        }
         when (op != "WriteStdout" && op != "WriteStderr") || arguments.len() != 1 {
-            return self.fail("a system call")
+            return self.op_fail("a system call ", op)
         }
         when self.string_literal(arguments[0]).is_some() {
             index := self.literal(self.string_literal(arguments[0]).unwrap())
@@ -7733,6 +9102,15 @@ extend Gen {
         when arguments.len() != parameters.len() / 2 {
             return self.fail("a foreign call with this number of arguments")
         }
+        // A `ryn_` shim belongs to the runtime; one the native compiler does not provide would not resolve when it runs.
+        when name.starts_with("ryn_") && !rt_provides(name.clone()) {
+            return self.fail("a runtime shim that the native compiler does not provide")
+        }
+        // The live counters belong to the freestanding allocator; a program linked against the C library allocates with
+        // libc's `malloc`, which they do not count, so the counter is declined rather than left unresolved at run time.
+        when !self.freestanding && (name == "ryn_native_live_allocations" || name == "ryn_native_live_bytes") {
+            return self.fail("the live allocation counter of a program that uses the C library")
+        }
         mut types: Vec<u64> = Vec()
         mut position: u64 = 0
         for argument in arguments.clone() {
@@ -7746,7 +9124,13 @@ extend Gen {
             return false
         }
         self.sync_shadows(asm, false)
-        self.aligned_call(asm, name)
+        when self.freestanding && !rt_provides(name.clone()) {
+            // A freestanding program cannot make this call: it is built again against the C library.
+            self.wants_libc = true
+            asm.trap()
+        } else {
+            self.aligned_call(asm, name)
+        }
         return self.finish_c_call(asm, result)
     }
 
@@ -7901,7 +9285,7 @@ extend Gen {
             return structure_cells
         }
         when self.array_element_of(ty).is_some() {
-            return self.array_length_of(ty)
+            return self.array_cells(ty)
         }
         when self.slice_element(ty).is_some() {
             return 2
@@ -7918,7 +9302,7 @@ extend Gen {
             return 2
         }
         when self.array_element_of(ty).is_some() {
-            return self.array_length_of(ty)
+            return self.array_cells(ty)
         }
         when self.slice_element(ty).is_some() {
             return 2
@@ -7964,10 +9348,56 @@ extend Gen {
         when found.is_none() {
             return Option::None
         }
-        when !self.is_plain_scalar(found.unwrap()) {
+        when !self.is_plain_scalar(found.unwrap()) && !self.is_array_element_structure(found.unwrap()) && !self.is_owner_cell(found.unwrap()) && !self.is_plain_array(found.unwrap()) && !self.is_str(found.unwrap()) {
             return Option::None
         }
         return found
+    }
+
+    // A value that is one cell and owns memory: a String, vector, map, set or enum. Such an element is cloned when read.
+    fun is_owner_cell(self, ty: u64) -> bool {
+        return self.is_cell(ty) && self.has_owners(ty)
+    }
+
+    // A structure that holds no owner and no destructor: its value is only its cells, so it can be an array element.
+    fun is_value_structure(self, ty: u64) -> bool {
+        return self.is_plain_structure(ty) && !self.has_owners(ty)
+    }
+
+    // An array of plain scalars, as an element of a nested array: it takes its own cells, element `j` above element `j - 1`.
+    fun is_plain_array(self, ty: u64) -> bool {
+        element := choose self.program.types[ty] {
+            ir::IrTy::ArrayOf(e, n) => Option::Some(e),
+            _ => Option::None,
+        }
+        when element.is_none() {
+            return false
+        }
+        return self.is_plain_scalar(element.unwrap())
+    }
+
+    // A structure element: any structure without a destructor whose owners a clone can copy (see `owned_cells`).
+    // A structure element of an array: any structure whose owners a clone can copy, destructors included. The array's drops run
+    // the owners in the bootstrap's order (see `phys_slot`).
+    fun is_array_element_structure(self, ty: u64) -> bool {
+        return choose self.program.types[ty] {
+            ir::IrTy::StructTy(id) => self.program.structs[id].slot_count > 0 && self.owned_cells(ty).is_some(),
+            _ => false,
+        }
+    }
+
+    // A structure without a destructor, of its own or in a field: a map keeps its value in a box only when it can clone it.
+    fun is_element_structure(self, ty: u64) -> bool {
+        return self.is_plain_structure(ty) && self.owned_cells(ty).is_some()
+    }
+
+    // The cells of an array value: each of its elements takes `cells_of(element)` cells.
+    fun array_cells(self, ty: u64) -> u64 {
+        element := self.array_element_of(ty)
+        when element.is_none() {
+            return self.array_length_of(ty)
+        }
+        return self.array_length_of(ty) * self.cells_of(element.unwrap())
     }
 
     // The number of elements of an array type, and zero for any other type.
@@ -7982,10 +9412,34 @@ extend Gen {
     // its lowest cell, `s + n - 1`, and element `i` is `8 * i` above it, at `rdx + slot_disp(s + n - 1)`. The index is
     // copied to rcx and scaled there, so rcx and r11 are clobbered and the index register is kept.
     fun element_base(self, asm: &mut x64::Asm, index: u64) {
+        self.element_base_stride(asm, index, 1)
+    }
+
+    // The same for elements of `cells` cells: element `i` is `8 * cells * i` above element 0.
+    fun element_base_stride(self, asm: &mut x64::Asm, index: u64, cells: u64) {
         asm.mov_rr(x64::Reg::RCX, index)
-        self.scale_bytes(asm, x64::Reg::RCX, 8)
+        self.scale_bytes(asm, x64::Reg::RCX, 8 * cells)
         asm.mov_rr(x64::Reg::RDX, x64::Reg::RBP)
         asm.alu_rr(1, x64::Reg::RDX, x64::Reg::RCX)
+    }
+
+    // The address in rax of element `index` of an array local, as `memory_address` takes it: the lowest cell of the element.
+    // Element `i` lies `8 * cells` above element `i - 1`, and the cell `k` of an element is `8 * (cells - 1 - k)` above its
+    // lowest cell, so the frame's cells are read as memory the same way a structure in memory is.
+    fun array_element_address(mut self, asm: &mut x64::Asm, array: u64, index: u64, element: u64, length: u64) -> bool {
+        slot := self.array_local_of(array)
+        when slot.is_none() {
+            return self.fail("an index into an array that is not a local")
+        }
+        cells := self.cells_of(element)
+        when !self.expr(asm, index) {
+            return false
+        }
+        asm.alu_ri(7, x64::Reg::RAX, length as i64)
+        asm.jcc(x64::Cc::ABOVE_EQUAL, self.index_error_label)
+        self.element_base_stride(asm, x64::Reg::RAX, cells)
+        asm.lea(x64::Reg::RAX, x64::Reg::RDX, slot_disp(slot.unwrap() + length * cells - 1))
+        return true
     }
 
     // Pushes the value of each item in order, so that item `i` is the cell that a pushed array has at position `i`.
@@ -8019,12 +9473,12 @@ extend Gen {
         when self.array_element_of(ty).is_none() {
             return self.fail("an array of this element type")
         }
-        length := self.array_length_of(ty)
+        cells := self.array_cells(ty)
         return choose self.program.exprs[value] {
             ir::IrExpr::ArrayValue(items) => self.push_array_through_scratch(asm, value, ty),
             ir::IrExpr::ArrayRepeat(item, count) => self.push_array_through_scratch(asm, value, ty),
-            ir::IrExpr::LocalRef(slot, lty, span) => self.push_local_cells(asm, slot, length),
-            ir::IrExpr::MoveRef(slot, mty) => self.push_local_cells(asm, slot, length),
+            ir::IrExpr::LocalRef(slot, lty, span) => self.push_local_array(asm, slot, ty),
+            ir::IrExpr::MoveRef(slot, mty) => self.push_moved_array(asm, slot, ty),
             ir::IrExpr::CallExpr(target, arguments, cty) => self.call_expression(asm, target, arguments),
             _ => self.fail("an array argument of this kind"),
         }
@@ -8036,18 +9490,50 @@ extend Gen {
         when self.array_element_of(ty).is_none() {
             return self.fail("an array of this element type")
         }
-        return self.store_array_parts(asm, value, base, self.array_element_of(ty).unwrap(), self.array_length_of(ty))
+        when self.has_owners(ty) && self.array_local_of(value).is_some() && !self.is_move_expr(value) {
+            return self.fail("an owning array read without a move")
+        }
+        result := self.store_array_parts(asm, value, base, self.array_element_of(ty).unwrap(), self.array_length_of(ty))
+        when result && self.is_move_expr(value) && self.has_owners(ty) {
+            self.null_owners(asm, self.array_local_of(value).unwrap(), ty)
+        }
+        return result
+    }
+
+    // Whether an expression moves a local (as opposed to reading it).
+    fun is_move_expr(self, index: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ir::IrExpr::MoveRef(slot, mty) => true,
+            _ => false,
+        }
+    }
+
+    // An owning array read from a local would alias its owners, so only a moved one is pushed.
+    fun push_local_array(mut self, asm: &mut x64::Asm, slot: u64, ty: u64) -> bool {
+        when self.has_owners(ty) {
+            return self.fail("an owning array read without a move")
+        }
+        return self.push_local_cells(asm, slot, self.array_cells(ty))
+    }
+
+    // A moved array: its cells are pushed, and the owners in them are cleared, so the local no longer frees them.
+    fun push_moved_array(mut self, asm: &mut x64::Asm, slot: u64, ty: u64) -> bool {
+        when !self.push_local_cells(asm, slot, self.array_cells(ty)) {
+            return false
+        }
+        self.null_owners(asm, slot, ty)
+        return true
     }
 
     // An array value pushed as its cells: it is built in scratch cells first, since its cells are in the reverse of the
     // order its items are evaluated in.
     fun push_array_through_scratch(mut self, asm: &mut x64::Asm, value: u64, ty: u64) -> bool {
-        length := self.array_length_of(ty)
-        base := self.scratch(length)
+        cells := self.array_cells(ty)
+        base := self.scratch(cells)
         when !self.store_array(asm, value, base, ty) {
             return false
         }
-        return self.push_local_cells(asm, base, length)
+        return self.push_local_cells(asm, base, cells)
     }
 
     // `count` scratch cells of the function being generated, as the slot of the first.
@@ -8058,12 +9544,13 @@ extend Gen {
     }
 
     fun store_array_parts(mut self, asm: &mut x64::Asm, value: u64, base: u64, element: u64, length: u64) -> bool {
+        cells := length * self.cells_of(element)
         return choose self.program.exprs[value] {
             ir::IrExpr::ArrayValue(items) => self.store_array_items(asm, items, base, element),
             ir::IrExpr::ArrayRepeat(item, count) => self.store_array_repeat(asm, item, base, element, count),
-            ir::IrExpr::LocalRef(slot, lty, span) => self.copy_cells(asm, slot, base, length),
-            ir::IrExpr::MoveRef(slot, mty) => self.copy_cells(asm, slot, base, length),
-            ir::IrExpr::CallExpr(target, arguments, cty) => self.call_into(asm, target, arguments, base, length),
+            ir::IrExpr::LocalRef(slot, lty, span) => self.copy_cells(asm, slot, base, cells),
+            ir::IrExpr::MoveRef(slot, mty) => self.copy_cells(asm, slot, base, cells),
+            ir::IrExpr::CallExpr(target, arguments, cty) => self.call_into(asm, target, arguments, base, cells),
             _ => self.fail("an array value of this kind"),
         }
     }
@@ -8071,6 +9558,9 @@ extend Gen {
     // The items are pushed, then stored last to first. Element `i` of an array of `n` is in cell `base + n - 1 - i`, so the
     // elements ascend in memory from the lowest cell, as a slice of them reads them.
     fun store_array_items(mut self, asm: &mut x64::Asm, items: Vec<u64>, base: u64, element: u64) -> bool {
+        when !self.is_plain_scalar(element) {
+            return self.store_structure_items(asm, items, base, element)
+        }
         count := items.len()
         mut at: u64 = count
         when !self.push_array_items(asm, items) {
@@ -8084,8 +9574,57 @@ extend Gen {
         return true
     }
 
+    // Structure elements: every item is evaluated into cells of its own before any element is written, since an item may
+    // read the array it is written into. Element `i` of `n` is `(n - 1 - i)` elements below `base`'s top, as for scalars.
+    fun store_structure_items(mut self, asm: &mut x64::Asm, items: Vec<u64>, base: u64, element: u64) -> bool {
+        cells := self.cells_of(element)
+        count := items.len()
+        mut held: Vec<u64> = Vec()
+        mut position: u64 = 0
+        while position < count {
+            slot := self.scratch(cells)
+            when !self.store_into(asm, items[position], slot, element) {
+                return false
+            }
+            held.push(slot)
+            position += 1
+        }
+        position = 0
+        while position < count {
+            mut cell: u64 = 0
+            while cell < cells {
+                asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, slot_disp(held[position] + cell))
+                asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(base + (count - 1 - position) * cells + cell))
+                cell += 1
+            }
+            position += 1
+        }
+        return true
+    }
+
     // `[item; count]` stored into the cells from `base` on: the item is evaluated once, and its value goes to every cell.
     fun store_array_repeat(mut self, asm: &mut x64::Asm, item: u64, base: u64, element: u64, count: u64) -> bool {
+        when self.has_owners(element) {
+            return self.fail("a repeat of an array element that owns memory")
+        }
+        when !self.is_plain_scalar(element) {
+            cells := self.cells_of(element)
+            held := self.scratch(cells)
+            when !self.store_into(asm, item, held, element) {
+                return false
+            }
+            mut at: u64 = 0
+            while at < count {
+                mut cell: u64 = 0
+                while cell < cells {
+                    asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, slot_disp(held + cell))
+                    asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(base + at * cells + cell))
+                    cell += 1
+                }
+                at += 1
+            }
+            return true
+        }
         when !self.expr(asm, item) {
             return false
         }
@@ -8101,11 +9640,18 @@ extend Gen {
     // type is a huge unsigned value, so it fails the same check as one past the end. The element is loaded from its cell.
     fun array_index(mut self, asm: &mut x64::Asm, array: u64, index: u64, element: u64, length: u64) -> bool {
         when !self.is_plain_scalar(element) {
+            when self.is_owner_cell(element) {
+                return self.array_owner_index(asm, array, index, element, length)
+            }
             return self.fail("an element of this array type")
         }
         slot := self.array_local_of(array)
         when slot.is_none() {
-            return self.fail("an index into an array that is not a local")
+            // An element of a nested array: the element is read in the cells of the element that holds it.
+            return choose self.program.exprs[array] {
+                ir::IrExpr::ArrayIndex(outer, outer_index, inner, outer_length) => self.nested_index(asm, outer, outer_index, inner, outer_length, index, element, length),
+                _ => self.fail("an index into an array that is not a local"),
+            }
         }
         when !self.expr(asm, index) {
             return false
@@ -8114,6 +9660,53 @@ extend Gen {
         asm.jcc(x64::Cc::ABOVE_EQUAL, self.index_error_label)
         self.element_base(asm, x64::Reg::RAX)
         return self.load_cell(asm, element, x64::Reg::RDX, slot_disp(slot.unwrap() + length - 1))
+    }
+
+    // `outer[outer_index][index]`: the inner array is the element `outer_index` of the local `outer`, whose address is found
+    // first; the element `index` of it is `8 * index` above the inner array's lowest cell, as in any array in memory.
+    fun nested_index(mut self, asm: &mut x64::Asm, outer: u64, outer_index: u64, inner: u64, outer_length: u64, index: u64, element: u64, length: u64) -> bool {
+        when !self.is_plain_array(inner) || self.array_local_of(outer).is_none() {
+            return self.fail("an index into a nested array of this kind")
+        }
+        when !self.array_element_address(asm, outer, outer_index, inner, outer_length) {
+            return false
+        }
+        asm.push(x64::Reg::RAX)
+        when !self.expr(asm, index) {
+            return false
+        }
+        asm.alu_ri(7, x64::Reg::RAX, length as i64)
+        asm.jcc(x64::Cc::ABOVE_EQUAL, self.index_error_label)
+        self.scale_bytes(asm, x64::Reg::RAX, 8)
+        asm.pop(x64::Reg::RDX)
+        asm.alu_rr(1, x64::Reg::RDX, x64::Reg::RAX)
+        return self.load_cell(asm, element, x64::Reg::RDX, 0)
+    }
+
+    // `array[index]` of an owning element: the element is cloned, as `vec_index` clones a vector's element, so the value read is
+    // an owner of its own. An element whose clone is not defined is declined rather than shared.
+    fun array_owner_index(mut self, asm: &mut x64::Asm, array: u64, index: u64, element: u64, length: u64) -> bool {
+        slot := self.array_local_of(array)
+        when slot.is_none() {
+            return self.fail("an index into an array that is not a local")
+        }
+        owned := self.owned_cells(element)
+        when owned.is_none() {
+            return self.fail("a clone of this array element")
+        }
+        copies := owned.unwrap()
+        when copies.len() != 3 {
+            return self.fail("a clone of this array element")
+        }
+        when !self.expr(asm, index) {
+            return false
+        }
+        asm.alu_ri(7, x64::Reg::RAX, length as i64)
+        asm.jcc(x64::Cc::ABOVE_EQUAL, self.index_error_label)
+        self.element_base(asm, x64::Reg::RAX)
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, slot_disp(slot.unwrap() + length - 1))
+        asm.call_label(self.copy_routine(asm, copies[1], copies[2]))
+        return true
     }
 
     // The element type of a slice type, or None for any other type. A slice is two cells: the address of its first
@@ -8151,7 +9744,8 @@ extend Gen {
     // `array` viewed as a slice; the IR names the element type.
     fun array_as_slice(mut self, asm: &mut x64::Asm, array: u64, element_ty: u64, length: u64) -> bool {
         element: Option<u64> = Option::Some(element_ty)
-        when !self.is_plain_scalar(element.unwrap()) {
+        // An element is one cell: a scalar, or an owner whose slice reads clone it.
+        when !self.is_plain_scalar(element.unwrap()) && !self.is_owner_cell(element.unwrap()) {
             return self.fail("a slice of an array of this element type")
         }
         when length == 0 {
@@ -8164,6 +9758,9 @@ extend Gen {
         when local.is_some() {
             slot = local.unwrap()
         } else {
+            when !self.is_plain_scalar(element.unwrap()) {
+                return self.fail("a slice of a temporary array of this element type")
+            }
             slot = self.scratch(length)
             when !self.store_array_parts(asm, array, slot, element.unwrap(), length) {
                 return false
@@ -8254,7 +9851,61 @@ extend Gen {
 
     // `slice[index]` (or `&slice[index]` when `address`): the index is checked against the length, and the element, a
     // value of one cell that owns nothing, is read at its place (or its address is the value).
+    // The address in rax of element `index` of a slice of structures: the slice's pointer is the lowest cell of its first
+    // element, and element `i` lies `8 * cells` above element `i - 1`, as in an array.
+    fun slice_element_address(mut self, asm: &mut x64::Asm, slice: u64, index: u64, element: u64) -> bool {
+        cells := self.cells_of(element)
+        when !self.slice_parts(asm, slice) {
+            return false
+        }
+        asm.push(x64::Reg::RAX)
+        asm.push(x64::Reg::RDX)
+        when !self.expr(asm, index) {
+            return false
+        }
+        asm.pop(x64::Reg::RDX)
+        asm.pop(x64::Reg::RCX)
+        asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RDX)
+        asm.jcc(x64::Cc::ABOVE_EQUAL, self.index_error_label)
+        self.scale_bytes(asm, x64::Reg::RAX, 8 * cells)
+        asm.alu_rr(1, x64::Reg::RCX, x64::Reg::RAX)
+        asm.mov_rr(x64::Reg::RAX, x64::Reg::RCX)
+        return true
+    }
+
+    // A read of an element of a slice that owns memory is a clone of it, as an array element read is.
+    fun slice_owner_index(mut self, asm: &mut x64::Asm, slice: u64, index: u64, element: u64) -> bool {
+        owned := self.owned_cells(element)
+        when owned.is_none() {
+            return self.fail("a clone of this slice element")
+        }
+        copies := owned.unwrap()
+        when copies.len() != 3 {
+            return self.fail("a clone of this slice element")
+        }
+        when !self.slice_parts(asm, slice) {
+            return false
+        }
+        asm.push(x64::Reg::RAX)
+        asm.push(x64::Reg::RDX)
+        when !self.expr(asm, index) {
+            return false
+        }
+        asm.pop(x64::Reg::RDX)
+        asm.pop(x64::Reg::RCX)
+        asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RDX)
+        asm.jcc(x64::Cc::ABOVE_EQUAL, self.index_error_label)
+        self.scale_bytes(asm, x64::Reg::RAX, 8)
+        asm.alu_rr(1, x64::Reg::RCX, x64::Reg::RAX)
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RCX, 0)
+        asm.call_label(self.copy_routine(asm, copies[1], copies[2]))
+        return true
+    }
+
     fun slice_index(mut self, asm: &mut x64::Asm, slice: u64, index: u64, element: u64, address: bool) -> bool {
+        when !address && self.is_owner_cell(element) {
+            return self.slice_owner_index(asm, slice, index, element)
+        }
         when !self.is_cell(element) || self.is_leakable(element) {
             return self.fail("a slice element of this type")
         }
@@ -8573,8 +10224,12 @@ extend Gen {
     // `array[index] = value` for a mutable array local. The index is checked before the value is evaluated, as the
     // bootstrap compiler does, and it waits on the stack while the value is computed.
     fun array_assign(mut self, asm: &mut x64::Asm, slot: u64, element: u64, length: u64, index: u64, value: u64) -> bool {
+        when !self.is_plain_scalar(element) && self.is_owner_cell(element) {
+            return self.assign_owner_element(asm, slot, element, length, index, value)
+        }
+        // A structure element that owns memory is dropped where it lies, after its new value is evaluated.
         when !self.is_plain_scalar(element) {
-            return self.fail("an element of this array type")
+            return self.assign_structure_element(asm, slot, element, length, index, value)
         }
         when !self.expr(asm, index) {
             return false
@@ -8590,7 +10245,64 @@ extend Gen {
         return self.store_cell(asm, element, x64::Reg::RAX, x64::Reg::RDX, slot_disp(slot + length - 1))
     }
 
+    // `array[index] = value` for a structure element: the index is checked, the value is evaluated into cells of its own, and
+    // only then are its cells copied into the element.
+    fun assign_structure_element(mut self, asm: &mut x64::Asm, slot: u64, element: u64, length: u64, index: u64, value: u64) -> bool {
+        cells := self.cells_of(element)
+        when !self.expr(asm, index) {
+            return false
+        }
+        asm.alu_ri(7, x64::Reg::RAX, length as i64)
+        asm.jcc(x64::Cc::ABOVE_EQUAL, self.index_error_label)
+        asm.push(x64::Reg::RAX)
+        held := self.scratch(cells)
+        when !self.store_into(asm, value, held, element) {
+            return false
+        }
+        asm.pop(x64::Reg::RCX)
+        self.element_base_stride(asm, x64::Reg::RCX, cells)
+        when self.has_owners(element) {
+            asm.lea(x64::Reg::RDI, x64::Reg::RDX, slot_disp(slot + (length - 1) * cells))
+            asm.push(x64::Reg::RDX)
+            asm.call_label(self.value_drop_routine(asm, element, false))
+            asm.pop(x64::Reg::RDX)
+        }
+        mut cell: u64 = 0
+        while cell < cells {
+            asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, slot_disp(held + cell))
+            asm.store(8, x64::Reg::RAX, x64::Reg::RDX, slot_disp(slot + (length - 1) * cells + cell))
+            cell += 1
+        }
+        return true
+    }
+
+    // `array[index] = value` for an owning element: the value is evaluated first, then the old element is dropped where it
+    // lies, and the new value takes its cell. As `vec_set` does, so a value that reads the element is safe.
+    fun assign_owner_element(mut self, asm: &mut x64::Asm, slot: u64, element: u64, length: u64, index: u64, value: u64) -> bool {
+        when !self.expr(asm, index) {
+            return false
+        }
+        asm.alu_ri(7, x64::Reg::RAX, length as i64)
+        asm.jcc(x64::Cc::ABOVE_EQUAL, self.index_error_label)
+        asm.push(x64::Reg::RAX)
+        when !self.expr(asm, value) {
+            return false
+        }
+        asm.push(x64::Reg::RAX)
+        asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 8)
+        self.element_base(asm, x64::Reg::RCX)
+        asm.lea(x64::Reg::RDI, x64::Reg::RDX, slot_disp(slot + length - 1))
+        asm.push(x64::Reg::RDX)
+        asm.call_label(self.value_drop_routine(asm, element, false))
+        asm.pop(x64::Reg::RDX)
+        asm.pop(x64::Reg::RAX)
+        asm.alu_ri(0, x64::Reg::RSP, 8)
+        asm.store(8, x64::Reg::RAX, x64::Reg::RDX, slot_disp(slot + length - 1))
+        return true
+    }
+
     fun expr(mut self, asm: &mut x64::Asm, index: u64) -> bool {
+        self.note_expression(index)
         mut at: u64 = 0
         while at < self.temp_exprs.len() {
             when self.temp_exprs[at] == index {
@@ -8630,7 +10342,7 @@ extend Gen {
             ir::IrExpr::ArrayIndex(array, index, ty, length) => self.array_index(asm, array, index, ty, length),
             ir::IrExpr::SliceIndex(slice, index, ty) => self.slice_index(asm, slice, index, ty, false),
             ir::IrExpr::AddressOf(slot, ty, pointer, span) => self.address_of(asm, slot, ty),
-            ir::IrExpr::ValueAddress(value, ty, pointer, span) => self.fail("an address of a value"),
+            ir::IrExpr::ValueAddress(value, ty, pointer, span) => self.value_address(asm, value, ty),
             ir::IrExpr::Dereference(pointer, ty) => self.load_through(asm, pointer, 0, ty),
             ir::IrExpr::MoveRef(slot, ty) => self.move_local(asm, slot, ty),
             ir::IrExpr::FloatLit(bits, ty) => self.float_literal(asm, bits, ty),
@@ -8882,10 +10594,23 @@ extend Gen {
             ir::IrExpr::CallExpr(target, arguments, cty) => self.call_into(asm, target, arguments, base, 2),
             ir::IrExpr::FieldRead(fv, fid, field, fty, fspan) => self.store_field_str(asm, value, base),
             ir::IrExpr::ReferenceFieldRead(rp, rid, rfield, rty, rspan, rborrowed) => self.store_field_str(asm, value, base),
+            ir::IrExpr::ArrayIndex(array, aindex, aty, length) => self.store_element_str(asm, array, aindex, aty, length, base),
             ir::IrExpr::IfExpr(condition, then_value, else_value, ity) => self.store_aggregate_result(asm, value, base, 2, ity),
             ir::IrExpr::EnumMatch(matched, mid, arms, mty) => self.store_aggregate_result(asm, value, base, 2, mty),
             _ => self.fail_at("a string value", value),
         }
+    }
+
+    // A `str` element copied into the cells from `base` on, from the element's lowest cell as memory (see `memory_address`).
+    fun store_element_str(mut self, asm: &mut x64::Asm, array: u64, index: u64, element: u64, length: u64, base: u64) -> bool {
+        when self.array_local_of(array).is_none() || !self.is_str(element) {
+            return self.fail("a str element of this array")
+        }
+        when !self.array_element_address(asm, array, index, element, length) {
+            return false
+        }
+        self.copy_ty_id = 0
+        return self.copy_memory_to_cells(asm, base, 2)
     }
 
     fun store_literal_cells(mut self, asm: &mut x64::Asm, text: String, base: u64) -> bool {
@@ -8976,6 +10701,8 @@ extend Gen {
             ir::IrExpr::MoveRef(slot, mty) => self.moved_local_field(asm, slot, id, field, ty, mty),
             ir::IrExpr::Dereference(pointer, dty) => self.field_through(asm, pointer, id, field, ty),
             ir::IrExpr::CallExpr(target, arguments, cty) => self.call_field(asm, target, arguments, id, field, ty),
+            ir::IrExpr::ArrayIndex(array, index, aty, length) => self.element_field_read(asm, value, id, field, ty),
+            ir::IrExpr::SliceIndex(slice, index, aty) => self.element_field_read(asm, value, id, field, ty),
             _ => self.field_of_value(asm, value, id, field, ty),
         }
     }
@@ -9066,6 +10793,8 @@ extend Gen {
             ir::IrExpr::ReferenceFieldRead(pointer, id, field, ty, span, borrowed) => true,
             ir::IrExpr::FieldRead(value, id, field, ty, span) => self.is_memory_place(value),
             ir::IrExpr::Dereference(pointer, ty) => true,
+            ir::IrExpr::ArrayIndex(array, index, ty, length) => self.is_element_structure(ty),
+            ir::IrExpr::SliceIndex(slice, index, ty) => self.is_element_structure(ty),
             _ => false,
         }
     }
@@ -9074,8 +10803,32 @@ extend Gen {
         return choose self.program.exprs[index] {
             ir::IrExpr::ReferenceFieldRead(pointer, id, field, ty, span, borrowed) => borrowed,
             ir::IrExpr::FieldRead(value, id, field, ty, span) => self.memory_borrowed(value),
+            // A read of an element is a copy of it, so the copy clones the owners it holds.
+            ir::IrExpr::ArrayIndex(array, index, ty, length) => false,
+            ir::IrExpr::SliceIndex(slice, index, ty) => false,
             _ => true,
         }
+    }
+
+    // A field of an element: a scalar is loaded from the element; an owner is cloned, as `vec_index` clones an owner.
+    fun element_field_read(mut self, asm: &mut x64::Asm, value: u64, id: u64, field: u64, ty: u64) -> bool {
+        when !self.has_owners(ty) {
+            return self.field_through_place(asm, value, id, field, ty)
+        }
+        owned := self.owned_cells(ty)
+        when owned.is_none() || !self.is_cell(ty) {
+            return self.fail("a field of an array element that owns memory")
+        }
+        copies := owned.unwrap()
+        when copies.len() != 3 {
+            return self.fail("a field of an array element that owns memory")
+        }
+        when !self.memory_address(asm, value) {
+            return false
+        }
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RAX, self.field_displacement(id, field))
+        asm.call_label(self.copy_routine(asm, copies[1], copies[2]))
+        return true
     }
 
     // The address of a structure in memory, in rax: its lowest cell, and its cell k lies `8 * (N - 1 - k)` above that.
@@ -9084,6 +10837,8 @@ extend Gen {
             ir::IrExpr::ReferenceFieldRead(pointer, id, field, ty, span, borrowed) => self.reference_field_address(asm, pointer, id, field),
             ir::IrExpr::FieldRead(value, id, field, ty, span) => self.value_field_address(asm, value, id, field),
             ir::IrExpr::Dereference(pointer, ty) => self.expr(asm, pointer),
+            ir::IrExpr::ArrayIndex(array, index, ty, length) => self.array_element_address(asm, array, index, ty, length),
+            ir::IrExpr::SliceIndex(slice, index, ty) => self.slice_element_address(asm, slice, index, ty),
             _ => self.fail("a structure in memory that is not reached through a reference"),
         }
     }
@@ -9376,9 +11131,24 @@ extend Gen {
         mut field: u64 = 0
         while field < self.program.structs[id].fields.len() {
             offset := self.program.structs[id].fields[field].slot_offset
-            width := self.value_width(self.program.structs[id].fields[field].ty)
-            asm.load(width, false, x64::Reg::RAX, cells, (8 * (count - 1 - offset)) as i64)
-            asm.store(width, x64::Reg::RAX, image, self.c_field_offset(id, field) as i64)
+            ty := self.program.structs[id].fields[field].ty
+            when self.array_element_of(ty).is_some() {
+                // An array's element i is the cell `length - 1 - i` above the array's first cell, and C lays it out in order.
+                element := self.array_element_of(ty).unwrap()
+                length := self.array_length_of(ty)
+                width := self.value_width(element)
+                mut index: u64 = 0
+                while index < length {
+                    cell := offset + length - 1 - index
+                    asm.load(width, false, x64::Reg::RAX, cells, (8 * (count - 1 - cell)) as i64)
+                    asm.store(width, x64::Reg::RAX, image, (self.c_field_offset(id, field) + index * self.c_size_of(element)) as i64)
+                    index += 1
+                }
+            } else {
+                width := self.value_width(ty)
+                asm.load(width, false, x64::Reg::RAX, cells, (8 * (count - 1 - offset)) as i64)
+                asm.store(width, x64::Reg::RAX, image, self.c_field_offset(id, field) as i64)
+            }
             field += 1
         }
     }
@@ -9390,13 +11160,30 @@ extend Gen {
         while field < self.program.structs[id].fields.len() {
             offset := self.program.structs[id].fields[field].slot_offset
             ty := self.program.structs[id].fields[field].ty
-            width := self.value_width(ty)
-            signed := choose self.program.types[ty] {
-                ir::IrTy::Scalar(word) => is_signed_word(word),
-                _ => false,
+            when self.array_element_of(ty).is_some() {
+                element := self.array_element_of(ty).unwrap()
+                length := self.array_length_of(ty)
+                width := self.value_width(element)
+                signed := choose self.program.types[element] {
+                    ir::IrTy::Scalar(word) => is_signed_word(word),
+                    _ => false,
+                }
+                mut index: u64 = 0
+                while index < length {
+                    cell := offset + length - 1 - index
+                    asm.load(width, signed, x64::Reg::RAX, image, (self.c_field_offset(id, field) + index * self.c_size_of(element)) as i64)
+                    asm.store(8, x64::Reg::RAX, cells, (8 * (count - 1 - cell)) as i64)
+                    index += 1
+                }
+            } else {
+                width := self.value_width(ty)
+                signed := choose self.program.types[ty] {
+                    ir::IrTy::Scalar(word) => is_signed_word(word),
+                    _ => false,
+                }
+                asm.load(width, signed, x64::Reg::RAX, image, self.c_field_offset(id, field) as i64)
+                asm.store(8, x64::Reg::RAX, cells, (8 * (count - 1 - offset)) as i64)
             }
-            asm.load(width, signed, x64::Reg::RAX, image, self.c_field_offset(id, field) as i64)
-            asm.store(8, x64::Reg::RAX, cells, (8 * (count - 1 - offset)) as i64)
             field += 1
         }
     }
@@ -9436,6 +11223,23 @@ extend Gen {
         return self.load_cell(asm, ty, x64::Reg::RAX, displacement)
     }
 
+    // The address of a value that is not a local, as an operator method takes its operand: a place is addressed where it lies,
+    // and any other value is built in scratch cells, which live as long as the frame. A value that owns memory is declined,
+    // since its drop would have to wait until the call is over.
+    fun value_address(mut self, asm: &mut x64::Asm, value: u64, ty: u64) -> bool {
+        when self.place_of(value).is_some() {
+            return self.address_of(asm, self.place_of(value).unwrap(), ty)
+        }
+        when self.has_owners(ty) {
+            return self.fail("an address of a temporary that owns memory")
+        }
+        saved := self.scratch(self.cells_of(ty))
+        when !self.store_into(asm, value, saved, ty) {
+            return false
+        }
+        return self.address_of(asm, saved, ty)
+    }
+
     // The address of a local: the frame address of its first cell.
     fun address_of(mut self, asm: &mut x64::Asm, slot: u64, ty: u64) -> bool {
         // A `repr(C)` structure is laid out in memory as C lays it out, which the cells of a frame are not: its address
@@ -9452,7 +11256,7 @@ extend Gen {
     // after, which is where C code can look at it or change it.
     fun shadow_address(mut self, asm: &mut x64::Asm, slot: u64, ty: u64) -> bool {
         id := self.struct_id_of(ty)
-        when !self.c_fields_are_scalars(id) {
+        when !self.c_shadow_fields_ok(id) {
             return self.fail("the address of a repr(C) structure with a field that is not a plain scalar")
         }
         mut image: u64 = 0
@@ -9525,6 +11329,7 @@ extend Gen {
         return choose self.program.types[ty] {
             ir::IrTy::Scalar(word) => string_width(word),
             ir::IrTy::StructTy(id) => self.struct_c_size(id),
+            ir::IrTy::ArrayOf(element, length) => length * self.c_size_of(element),
             _ => 8,
         }
     }
@@ -9536,6 +11341,7 @@ extend Gen {
         return choose self.program.types[ty] {
             ir::IrTy::Scalar(word) => string_width(word),
             ir::IrTy::StructTy(id) => self.struct_c_align(id),
+            ir::IrTy::ArrayOf(element, length) => self.c_align_of(element),
             _ => 8,
         }
     }
@@ -9556,6 +11362,26 @@ extend Gen {
             position += 1
         }
         return size
+    }
+
+    // Whether every field of a `repr(C)` structure, for its copy in C's layout, is a plain scalar or an array of them.
+    fun c_shadow_fields_ok(self, id: u64) -> bool {
+        mut position: u64 = 0
+        while position < self.program.structs[id].fields.len() {
+            field_ty := self.program.structs[id].fields[position].ty
+            element := self.array_element_of(field_ty)
+            when element.is_some() {
+                when !self.is_plain_scalar(element.unwrap()) {
+                    return false
+                }
+            } else {
+                when !self.is_plain_scalar(field_ty) {
+                    return false
+                }
+            }
+            position += 1
+        }
+        return true
     }
 
     // Whether every field of a `repr(C)` structure is a plain scalar, as the layout supports.
@@ -9600,6 +11426,9 @@ extend Gen {
     }
 
     fun binary(mut self, asm: &mut x64::Asm, op: String, left: u64, right: u64, ty: u64) -> bool {
+        when (op == "Eq" || op == "Ne") && self.struct_of(ty).is_some() {
+            return self.struct_equal(asm, op == "Ne", left, right, ty)
+        }
         when self.is_float(ty) {
             return self.float_binary(asm, op, left, right, ty)
         }
@@ -9774,6 +11603,15 @@ extend Gen {
         asm.mov_rr(x64::Reg::R8, x64::Reg::RDX)
         asm.pop(x64::Reg::R9)
         asm.pop(x64::Reg::R10)
+        self.text_compare_registers(asm)
+        when negate {
+            asm.alu_ri(6, x64::Reg::RAX, 1)
+        }
+        return true
+    }
+
+    // Whether the text of R10 (length R9) equals the text of RDI (length R8): RAX is 1 when it does, else 0.
+    fun text_compare_registers(self, asm: &mut x64::Asm) {
         end := asm.new_label()
         same := asm.new_label()
         looping := asm.new_label()
@@ -9797,10 +11635,6 @@ extend Gen {
         asm.bind(same)
         asm.mov_ri(x64::Reg::RAX, 1)
         asm.bind(end)
-        when negate {
-            asm.alu_ri(6, x64::Reg::RAX, 1)
-        }
-        return true
     }
 
     fun logical(mut self, asm: &mut x64::Asm, is_and: bool, left: u64, right: u64) -> bool {
@@ -9882,6 +11716,13 @@ extend Gen {
         }
         // A raw pointer keeps the bits of its address, from an integer or from another pointer.
         when self.is_raw_pointer(target) {
+            return self.expr(asm, value)
+        }
+        // A function pointer is the address of its entry point, so a pointer converts to it with the same bits.
+        when choose self.program.types[target] {
+            ir::IrTy::FunctionPointerTo(parameters, result, external) => true,
+            _ => false,
+        } {
             return self.expr(asm, value)
         }
         return self.fail("a conversion to this type")
@@ -9989,7 +11830,7 @@ extend Gen {
         return elf::ObjectInput {
             text: asm.code.clone(),
             rodata: self.rodata.clone(),
-            bss_size: 16 + rt::state_size(),
+            bss_size: 16 + rt::state_size() + 8,
             symbol_names: names,
             symbol_sections: sections,
             symbol_values: values,

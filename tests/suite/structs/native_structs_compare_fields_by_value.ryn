@@ -1,0 +1,21 @@
+// test: run
+// out: true
+// out: true
+// out: false
+// out: false
+// out: true
+// exit: 0
+// Structures compare by their fields, nested structures and floats included, and a call result is compared as a value.
+struct Meta { label: String, active: bool, weight: f32, ratio: f64 }
+struct Item { id: i32, meta: Meta }
+fun identity(value: Item) -> Item { return value }
+fun main() {
+    first := Item { id: 7, meta: Meta { label: String("Ryn"), active: true, weight: 1.25, ratio: 2.5 } }
+    same := Item { id: 7, meta: Meta { label: String("Ryn"), active: true, weight: 1.25, ratio: 2.5 } }
+    different := Item { id: 7, meta: Meta { label: String("Ryn"), active: false, weight: 1.25, ratio: 2.5 } }
+    echo first == same
+    echo first != different
+    echo first == different
+    echo first != same
+    echo first == identity(same)
+}

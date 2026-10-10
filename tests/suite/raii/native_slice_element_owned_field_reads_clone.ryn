@@ -1,0 +1,29 @@
+// test: run
+// out: nested
+// out: 0
+// exit: 0
+// A field of a slice element that owns memory is cloned by its read, so the returned text and the element are each freed once.
+extern "C" fun ryn_native_live_allocations() -> u64;
+struct LabelledValues {
+    label: String,
+    values: Vec<i32>
+}
+
+fun first_label(values: &[LabelledValues]) -> String {
+    return values[0].label
+}
+
+fun main() {
+    mut records := Vec<LabelledValues>()
+    mut scores := Vec<i32>()
+    scores.push(9)
+    records.push(LabelledValues { label: String("nested"), values: scores })
+    before := ryn_native_live_allocations()
+    mut i: u64 = 0
+    while i < 1000 {
+        label := first_label(records.as_slice())
+        i += 1
+    }
+    echo first_label(records.as_slice())
+    echo ryn_native_live_allocations() - before
+}

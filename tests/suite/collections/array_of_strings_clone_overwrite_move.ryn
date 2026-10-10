@@ -1,0 +1,25 @@
+// test: run
+// out: Ryn
+// out: compiler
+// out: Ryn
+// out: Ryn
+// out: compiler
+// out: 4
+// An owning element is cloned when it is read by value, overwritten by dropping the old element, and the whole array
+// is moved into a call, which leaves the local with no owners to free.
+fun first(values: [String; 2]) -> i32 {
+    echo values[1]
+    return 4
+}
+
+fun main() {
+    mut labels: [String; 2] = [String("Ryn"), String("language")]
+    echo labels[0]
+    labels[1] = String("compiler")
+    echo labels[1]
+    labels[0] = labels[0]
+    echo labels[0]
+    copy := labels[0]
+    echo copy
+    echo first(labels)
+}

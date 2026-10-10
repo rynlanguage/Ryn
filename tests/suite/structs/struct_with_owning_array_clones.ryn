@@ -1,0 +1,23 @@
+// test: run
+// out: 1
+// out: right
+// out: first
+// A structure that holds an owning array is cloned with its owners: the copy and the original free their own elements.
+struct Pair {
+    name: String
+    words: [String; 2]
+}
+
+fun make(name: str) -> Pair {
+    return Pair { name: String(name), words: [String("left"), String("right")] }
+}
+
+fun main() {
+    mut pairs: Vec<Pair> = Vec<Pair>()
+    pairs.push(make("first"))
+    copies := pairs.clone()
+    echo copies.len()
+    item := copies.index(0)
+    echo item.words[1]
+    echo item.name
+}

@@ -192,6 +192,18 @@ pub extern "C" fn ryn_str_char_count(pointer: *const u8, length: u64) -> u64 {
     text(pointer, length).chars().count() as u64
 }
 #[unsafe(no_mangle)]
+pub extern "C" fn ryn_str_len(_pointer: *const u8, length: u64) -> u64 {
+    length
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ryn_str_byte_at(pointer: *const u8, length: u64, index: u64) -> u8 {
+    if index >= length {
+        fail("str byte index is out of bounds");
+    }
+    // SAFETY: the index is below the length of the view, which points into live text.
+    unsafe { *pointer.add(index as usize) }
+}
+#[unsafe(no_mangle)]
 pub extern "C" fn ryn_string_byte_at(pointer: *const RynString, index: u64) -> u8 {
     usize::try_from(index)
         .ok()

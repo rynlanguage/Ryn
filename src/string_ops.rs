@@ -70,10 +70,12 @@ pub enum StringOp {
     Bytes,
     Repeat,
     Reverse,
+    StrLen,
+    StrByteAt,
 }
 
 impl StringOp {
-    pub const ALL: [Self; 65] = [
+    pub const ALL: [Self; 67] = [
         Self::New,
         Self::Clone,
         Self::Drop,
@@ -139,6 +141,8 @@ impl StringOp {
         Self::Bytes,
         Self::Repeat,
         Self::Reverse,
+        Self::StrLen,
+        Self::StrByteAt,
     ];
 
     pub fn symbol(self) -> &'static str {
@@ -208,6 +212,8 @@ impl StringOp {
             Self::Bytes => "ryn_string_bytes",
             Self::Repeat => "ryn_string_repeat",
             Self::Reverse => "ryn_string_reverse",
+            Self::StrLen => "ryn_str_len",
+            Self::StrByteAt => "ryn_str_byte_at",
         }
     }
 
@@ -219,6 +225,8 @@ impl StringOp {
             Self::PrintChar => vec![Char],
             Self::StrCharCount => vec![Str],
             Self::StrCharAt => vec![Str, U64],
+            Self::StrLen => vec![Str],
+            Self::StrByteAt => vec![Str, U64],
             Self::ReplaceStr => vec![S, Str, Str],
             Self::Repeat => vec![S, U64],
             Self::Equals
@@ -288,8 +296,8 @@ impl StringOp {
             Self::Bytes => Some(Type::Vec(intern_vec_elem(Type::U8))),
             Self::IsEmpty => Some(Type::Bool),
             Self::Len | Self::CharCount => Some(Type::U64),
-            Self::StrCharCount => Some(Type::U64),
-            Self::ByteAt => Some(Type::U8),
+            Self::StrCharCount | Self::StrLen => Some(Type::U64),
+            Self::ByteAt | Self::StrByteAt => Some(Type::U8),
             Self::CharAt | Self::StrCharAt => Some(Type::Char),
             Self::CharFromU32 => Some(Type::Char),
             Self::FromI8

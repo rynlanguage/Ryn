@@ -1,0 +1,28 @@
+// test: run
+// out: 4000
+// out: 0
+// Owning structure elements are cloned on each read and freed on overwrite and scope exit: the native runtime's live count is unchanged.
+extern "C" fun ryn_native_live_allocations() -> u64;
+struct Named {
+    id: i32
+    label: String
+}
+fun first_label(items: [Named; 2]) -> u64 {
+    return items[1].id as u64
+}
+fun main() {
+    before := ryn_native_live_allocations()
+    mut i: u64 = 0
+    mut total: u64 = 0
+    while i < 1000 {
+        mut items: [Named; 2] = [Named { id: 1, label: String("x") }, Named { id: 2, label: String("yy") }]
+        items[0] = Named { id: 3, label: String("zzz") }
+        copy := items[1]
+        total += copy.label.len()
+        items[1] = copy
+        total += first_label(items)
+        i += 1
+    }
+    echo total
+    echo ryn_native_live_allocations() - before
+}

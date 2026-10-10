@@ -1,0 +1,15 @@
+// test: run
+// out: 1
+// out: 1
+// A map whose values are vectors: the value found by `get` is a copy with the same length.
+fun main() {
+    mut groups := Map<i32, Vec<String>>()
+    mut names := Vec<String>()
+    names.push(String("ryn"))
+    groups.insert(1, names)
+    echo choose groups.get(1) {
+        Option::Some(found) => found.len(),
+        Option::None => 0
+    }
+    echo groups.len()
+}

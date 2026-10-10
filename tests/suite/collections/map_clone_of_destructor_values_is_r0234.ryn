@@ -1,0 +1,20 @@
+// test: fail
+// code: R0234
+// msg: cannot duplicate move-only custom-destructor values
+// A map whose values have a destructor cannot be cloned: each value has one owner, so the map is moved, not copied.
+#[drop(release)]
+struct Resource {
+    handle: *i32,
+}
+
+fun release(resource: Resource) {
+    echo *resource.handle
+}
+
+fun main() {
+    mut a: i32 = 1
+    mut values := Map<i32, Resource>()
+    values.insert(1, Resource { handle: &raw mut a })
+    copy := values.clone()
+    echo copy.len()
+}

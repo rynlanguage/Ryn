@@ -1,0 +1,608 @@
+// test: run
+// out: 44850
+// exit: 0
+// Ordinary functions do not count against the specialization limit; only generic instances do.
+fun f0() -> i32 { return 0 }
+fun f1() -> i32 { return 1 }
+fun f2() -> i32 { return 2 }
+fun f3() -> i32 { return 3 }
+fun f4() -> i32 { return 4 }
+fun f5() -> i32 { return 5 }
+fun f6() -> i32 { return 6 }
+fun f7() -> i32 { return 7 }
+fun f8() -> i32 { return 8 }
+fun f9() -> i32 { return 9 }
+fun f10() -> i32 { return 10 }
+fun f11() -> i32 { return 11 }
+fun f12() -> i32 { return 12 }
+fun f13() -> i32 { return 13 }
+fun f14() -> i32 { return 14 }
+fun f15() -> i32 { return 15 }
+fun f16() -> i32 { return 16 }
+fun f17() -> i32 { return 17 }
+fun f18() -> i32 { return 18 }
+fun f19() -> i32 { return 19 }
+fun f20() -> i32 { return 20 }
+fun f21() -> i32 { return 21 }
+fun f22() -> i32 { return 22 }
+fun f23() -> i32 { return 23 }
+fun f24() -> i32 { return 24 }
+fun f25() -> i32 { return 25 }
+fun f26() -> i32 { return 26 }
+fun f27() -> i32 { return 27 }
+fun f28() -> i32 { return 28 }
+fun f29() -> i32 { return 29 }
+fun f30() -> i32 { return 30 }
+fun f31() -> i32 { return 31 }
+fun f32() -> i32 { return 32 }
+fun f33() -> i32 { return 33 }
+fun f34() -> i32 { return 34 }
+fun f35() -> i32 { return 35 }
+fun f36() -> i32 { return 36 }
+fun f37() -> i32 { return 37 }
+fun f38() -> i32 { return 38 }
+fun f39() -> i32 { return 39 }
+fun f40() -> i32 { return 40 }
+fun f41() -> i32 { return 41 }
+fun f42() -> i32 { return 42 }
+fun f43() -> i32 { return 43 }
+fun f44() -> i32 { return 44 }
+fun f45() -> i32 { return 45 }
+fun f46() -> i32 { return 46 }
+fun f47() -> i32 { return 47 }
+fun f48() -> i32 { return 48 }
+fun f49() -> i32 { return 49 }
+fun f50() -> i32 { return 50 }
+fun f51() -> i32 { return 51 }
+fun f52() -> i32 { return 52 }
+fun f53() -> i32 { return 53 }
+fun f54() -> i32 { return 54 }
+fun f55() -> i32 { return 55 }
+fun f56() -> i32 { return 56 }
+fun f57() -> i32 { return 57 }
+fun f58() -> i32 { return 58 }
+fun f59() -> i32 { return 59 }
+fun f60() -> i32 { return 60 }
+fun f61() -> i32 { return 61 }
+fun f62() -> i32 { return 62 }
+fun f63() -> i32 { return 63 }
+fun f64() -> i32 { return 64 }
+fun f65() -> i32 { return 65 }
+fun f66() -> i32 { return 66 }
+fun f67() -> i32 { return 67 }
+fun f68() -> i32 { return 68 }
+fun f69() -> i32 { return 69 }
+fun f70() -> i32 { return 70 }
+fun f71() -> i32 { return 71 }
+fun f72() -> i32 { return 72 }
+fun f73() -> i32 { return 73 }
+fun f74() -> i32 { return 74 }
+fun f75() -> i32 { return 75 }
+fun f76() -> i32 { return 76 }
+fun f77() -> i32 { return 77 }
+fun f78() -> i32 { return 78 }
+fun f79() -> i32 { return 79 }
+fun f80() -> i32 { return 80 }
+fun f81() -> i32 { return 81 }
+fun f82() -> i32 { return 82 }
+fun f83() -> i32 { return 83 }
+fun f84() -> i32 { return 84 }
+fun f85() -> i32 { return 85 }
+fun f86() -> i32 { return 86 }
+fun f87() -> i32 { return 87 }
+fun f88() -> i32 { return 88 }
+fun f89() -> i32 { return 89 }
+fun f90() -> i32 { return 90 }
+fun f91() -> i32 { return 91 }
+fun f92() -> i32 { return 92 }
+fun f93() -> i32 { return 93 }
+fun f94() -> i32 { return 94 }
+fun f95() -> i32 { return 95 }
+fun f96() -> i32 { return 96 }
+fun f97() -> i32 { return 97 }
+fun f98() -> i32 { return 98 }
+fun f99() -> i32 { return 99 }
+fun f100() -> i32 { return 100 }
+fun f101() -> i32 { return 101 }
+fun f102() -> i32 { return 102 }
+fun f103() -> i32 { return 103 }
+fun f104() -> i32 { return 104 }
+fun f105() -> i32 { return 105 }
+fun f106() -> i32 { return 106 }
+fun f107() -> i32 { return 107 }
+fun f108() -> i32 { return 108 }
+fun f109() -> i32 { return 109 }
+fun f110() -> i32 { return 110 }
+fun f111() -> i32 { return 111 }
+fun f112() -> i32 { return 112 }
+fun f113() -> i32 { return 113 }
+fun f114() -> i32 { return 114 }
+fun f115() -> i32 { return 115 }
+fun f116() -> i32 { return 116 }
+fun f117() -> i32 { return 117 }
+fun f118() -> i32 { return 118 }
+fun f119() -> i32 { return 119 }
+fun f120() -> i32 { return 120 }
+fun f121() -> i32 { return 121 }
+fun f122() -> i32 { return 122 }
+fun f123() -> i32 { return 123 }
+fun f124() -> i32 { return 124 }
+fun f125() -> i32 { return 125 }
+fun f126() -> i32 { return 126 }
+fun f127() -> i32 { return 127 }
+fun f128() -> i32 { return 128 }
+fun f129() -> i32 { return 129 }
+fun f130() -> i32 { return 130 }
+fun f131() -> i32 { return 131 }
+fun f132() -> i32 { return 132 }
+fun f133() -> i32 { return 133 }
+fun f134() -> i32 { return 134 }
+fun f135() -> i32 { return 135 }
+fun f136() -> i32 { return 136 }
+fun f137() -> i32 { return 137 }
+fun f138() -> i32 { return 138 }
+fun f139() -> i32 { return 139 }
+fun f140() -> i32 { return 140 }
+fun f141() -> i32 { return 141 }
+fun f142() -> i32 { return 142 }
+fun f143() -> i32 { return 143 }
+fun f144() -> i32 { return 144 }
+fun f145() -> i32 { return 145 }
+fun f146() -> i32 { return 146 }
+fun f147() -> i32 { return 147 }
+fun f148() -> i32 { return 148 }
+fun f149() -> i32 { return 149 }
+fun f150() -> i32 { return 150 }
+fun f151() -> i32 { return 151 }
+fun f152() -> i32 { return 152 }
+fun f153() -> i32 { return 153 }
+fun f154() -> i32 { return 154 }
+fun f155() -> i32 { return 155 }
+fun f156() -> i32 { return 156 }
+fun f157() -> i32 { return 157 }
+fun f158() -> i32 { return 158 }
+fun f159() -> i32 { return 159 }
+fun f160() -> i32 { return 160 }
+fun f161() -> i32 { return 161 }
+fun f162() -> i32 { return 162 }
+fun f163() -> i32 { return 163 }
+fun f164() -> i32 { return 164 }
+fun f165() -> i32 { return 165 }
+fun f166() -> i32 { return 166 }
+fun f167() -> i32 { return 167 }
+fun f168() -> i32 { return 168 }
+fun f169() -> i32 { return 169 }
+fun f170() -> i32 { return 170 }
+fun f171() -> i32 { return 171 }
+fun f172() -> i32 { return 172 }
+fun f173() -> i32 { return 173 }
+fun f174() -> i32 { return 174 }
+fun f175() -> i32 { return 175 }
+fun f176() -> i32 { return 176 }
+fun f177() -> i32 { return 177 }
+fun f178() -> i32 { return 178 }
+fun f179() -> i32 { return 179 }
+fun f180() -> i32 { return 180 }
+fun f181() -> i32 { return 181 }
+fun f182() -> i32 { return 182 }
+fun f183() -> i32 { return 183 }
+fun f184() -> i32 { return 184 }
+fun f185() -> i32 { return 185 }
+fun f186() -> i32 { return 186 }
+fun f187() -> i32 { return 187 }
+fun f188() -> i32 { return 188 }
+fun f189() -> i32 { return 189 }
+fun f190() -> i32 { return 190 }
+fun f191() -> i32 { return 191 }
+fun f192() -> i32 { return 192 }
+fun f193() -> i32 { return 193 }
+fun f194() -> i32 { return 194 }
+fun f195() -> i32 { return 195 }
+fun f196() -> i32 { return 196 }
+fun f197() -> i32 { return 197 }
+fun f198() -> i32 { return 198 }
+fun f199() -> i32 { return 199 }
+fun f200() -> i32 { return 200 }
+fun f201() -> i32 { return 201 }
+fun f202() -> i32 { return 202 }
+fun f203() -> i32 { return 203 }
+fun f204() -> i32 { return 204 }
+fun f205() -> i32 { return 205 }
+fun f206() -> i32 { return 206 }
+fun f207() -> i32 { return 207 }
+fun f208() -> i32 { return 208 }
+fun f209() -> i32 { return 209 }
+fun f210() -> i32 { return 210 }
+fun f211() -> i32 { return 211 }
+fun f212() -> i32 { return 212 }
+fun f213() -> i32 { return 213 }
+fun f214() -> i32 { return 214 }
+fun f215() -> i32 { return 215 }
+fun f216() -> i32 { return 216 }
+fun f217() -> i32 { return 217 }
+fun f218() -> i32 { return 218 }
+fun f219() -> i32 { return 219 }
+fun f220() -> i32 { return 220 }
+fun f221() -> i32 { return 221 }
+fun f222() -> i32 { return 222 }
+fun f223() -> i32 { return 223 }
+fun f224() -> i32 { return 224 }
+fun f225() -> i32 { return 225 }
+fun f226() -> i32 { return 226 }
+fun f227() -> i32 { return 227 }
+fun f228() -> i32 { return 228 }
+fun f229() -> i32 { return 229 }
+fun f230() -> i32 { return 230 }
+fun f231() -> i32 { return 231 }
+fun f232() -> i32 { return 232 }
+fun f233() -> i32 { return 233 }
+fun f234() -> i32 { return 234 }
+fun f235() -> i32 { return 235 }
+fun f236() -> i32 { return 236 }
+fun f237() -> i32 { return 237 }
+fun f238() -> i32 { return 238 }
+fun f239() -> i32 { return 239 }
+fun f240() -> i32 { return 240 }
+fun f241() -> i32 { return 241 }
+fun f242() -> i32 { return 242 }
+fun f243() -> i32 { return 243 }
+fun f244() -> i32 { return 244 }
+fun f245() -> i32 { return 245 }
+fun f246() -> i32 { return 246 }
+fun f247() -> i32 { return 247 }
+fun f248() -> i32 { return 248 }
+fun f249() -> i32 { return 249 }
+fun f250() -> i32 { return 250 }
+fun f251() -> i32 { return 251 }
+fun f252() -> i32 { return 252 }
+fun f253() -> i32 { return 253 }
+fun f254() -> i32 { return 254 }
+fun f255() -> i32 { return 255 }
+fun f256() -> i32 { return 256 }
+fun f257() -> i32 { return 257 }
+fun f258() -> i32 { return 258 }
+fun f259() -> i32 { return 259 }
+fun f260() -> i32 { return 260 }
+fun f261() -> i32 { return 261 }
+fun f262() -> i32 { return 262 }
+fun f263() -> i32 { return 263 }
+fun f264() -> i32 { return 264 }
+fun f265() -> i32 { return 265 }
+fun f266() -> i32 { return 266 }
+fun f267() -> i32 { return 267 }
+fun f268() -> i32 { return 268 }
+fun f269() -> i32 { return 269 }
+fun f270() -> i32 { return 270 }
+fun f271() -> i32 { return 271 }
+fun f272() -> i32 { return 272 }
+fun f273() -> i32 { return 273 }
+fun f274() -> i32 { return 274 }
+fun f275() -> i32 { return 275 }
+fun f276() -> i32 { return 276 }
+fun f277() -> i32 { return 277 }
+fun f278() -> i32 { return 278 }
+fun f279() -> i32 { return 279 }
+fun f280() -> i32 { return 280 }
+fun f281() -> i32 { return 281 }
+fun f282() -> i32 { return 282 }
+fun f283() -> i32 { return 283 }
+fun f284() -> i32 { return 284 }
+fun f285() -> i32 { return 285 }
+fun f286() -> i32 { return 286 }
+fun f287() -> i32 { return 287 }
+fun f288() -> i32 { return 288 }
+fun f289() -> i32 { return 289 }
+fun f290() -> i32 { return 290 }
+fun f291() -> i32 { return 291 }
+fun f292() -> i32 { return 292 }
+fun f293() -> i32 { return 293 }
+fun f294() -> i32 { return 294 }
+fun f295() -> i32 { return 295 }
+fun f296() -> i32 { return 296 }
+fun f297() -> i32 { return 297 }
+fun f298() -> i32 { return 298 }
+fun f299() -> i32 { return 299 }
+fun main() {
+    mut total: i32 = 0
+    total += f0()
+    total += f1()
+    total += f2()
+    total += f3()
+    total += f4()
+    total += f5()
+    total += f6()
+    total += f7()
+    total += f8()
+    total += f9()
+    total += f10()
+    total += f11()
+    total += f12()
+    total += f13()
+    total += f14()
+    total += f15()
+    total += f16()
+    total += f17()
+    total += f18()
+    total += f19()
+    total += f20()
+    total += f21()
+    total += f22()
+    total += f23()
+    total += f24()
+    total += f25()
+    total += f26()
+    total += f27()
+    total += f28()
+    total += f29()
+    total += f30()
+    total += f31()
+    total += f32()
+    total += f33()
+    total += f34()
+    total += f35()
+    total += f36()
+    total += f37()
+    total += f38()
+    total += f39()
+    total += f40()
+    total += f41()
+    total += f42()
+    total += f43()
+    total += f44()
+    total += f45()
+    total += f46()
+    total += f47()
+    total += f48()
+    total += f49()
+    total += f50()
+    total += f51()
+    total += f52()
+    total += f53()
+    total += f54()
+    total += f55()
+    total += f56()
+    total += f57()
+    total += f58()
+    total += f59()
+    total += f60()
+    total += f61()
+    total += f62()
+    total += f63()
+    total += f64()
+    total += f65()
+    total += f66()
+    total += f67()
+    total += f68()
+    total += f69()
+    total += f70()
+    total += f71()
+    total += f72()
+    total += f73()
+    total += f74()
+    total += f75()
+    total += f76()
+    total += f77()
+    total += f78()
+    total += f79()
+    total += f80()
+    total += f81()
+    total += f82()
+    total += f83()
+    total += f84()
+    total += f85()
+    total += f86()
+    total += f87()
+    total += f88()
+    total += f89()
+    total += f90()
+    total += f91()
+    total += f92()
+    total += f93()
+    total += f94()
+    total += f95()
+    total += f96()
+    total += f97()
+    total += f98()
+    total += f99()
+    total += f100()
+    total += f101()
+    total += f102()
+    total += f103()
+    total += f104()
+    total += f105()
+    total += f106()
+    total += f107()
+    total += f108()
+    total += f109()
+    total += f110()
+    total += f111()
+    total += f112()
+    total += f113()
+    total += f114()
+    total += f115()
+    total += f116()
+    total += f117()
+    total += f118()
+    total += f119()
+    total += f120()
+    total += f121()
+    total += f122()
+    total += f123()
+    total += f124()
+    total += f125()
+    total += f126()
+    total += f127()
+    total += f128()
+    total += f129()
+    total += f130()
+    total += f131()
+    total += f132()
+    total += f133()
+    total += f134()
+    total += f135()
+    total += f136()
+    total += f137()
+    total += f138()
+    total += f139()
+    total += f140()
+    total += f141()
+    total += f142()
+    total += f143()
+    total += f144()
+    total += f145()
+    total += f146()
+    total += f147()
+    total += f148()
+    total += f149()
+    total += f150()
+    total += f151()
+    total += f152()
+    total += f153()
+    total += f154()
+    total += f155()
+    total += f156()
+    total += f157()
+    total += f158()
+    total += f159()
+    total += f160()
+    total += f161()
+    total += f162()
+    total += f163()
+    total += f164()
+    total += f165()
+    total += f166()
+    total += f167()
+    total += f168()
+    total += f169()
+    total += f170()
+    total += f171()
+    total += f172()
+    total += f173()
+    total += f174()
+    total += f175()
+    total += f176()
+    total += f177()
+    total += f178()
+    total += f179()
+    total += f180()
+    total += f181()
+    total += f182()
+    total += f183()
+    total += f184()
+    total += f185()
+    total += f186()
+    total += f187()
+    total += f188()
+    total += f189()
+    total += f190()
+    total += f191()
+    total += f192()
+    total += f193()
+    total += f194()
+    total += f195()
+    total += f196()
+    total += f197()
+    total += f198()
+    total += f199()
+    total += f200()
+    total += f201()
+    total += f202()
+    total += f203()
+    total += f204()
+    total += f205()
+    total += f206()
+    total += f207()
+    total += f208()
+    total += f209()
+    total += f210()
+    total += f211()
+    total += f212()
+    total += f213()
+    total += f214()
+    total += f215()
+    total += f216()
+    total += f217()
+    total += f218()
+    total += f219()
+    total += f220()
+    total += f221()
+    total += f222()
+    total += f223()
+    total += f224()
+    total += f225()
+    total += f226()
+    total += f227()
+    total += f228()
+    total += f229()
+    total += f230()
+    total += f231()
+    total += f232()
+    total += f233()
+    total += f234()
+    total += f235()
+    total += f236()
+    total += f237()
+    total += f238()
+    total += f239()
+    total += f240()
+    total += f241()
+    total += f242()
+    total += f243()
+    total += f244()
+    total += f245()
+    total += f246()
+    total += f247()
+    total += f248()
+    total += f249()
+    total += f250()
+    total += f251()
+    total += f252()
+    total += f253()
+    total += f254()
+    total += f255()
+    total += f256()
+    total += f257()
+    total += f258()
+    total += f259()
+    total += f260()
+    total += f261()
+    total += f262()
+    total += f263()
+    total += f264()
+    total += f265()
+    total += f266()
+    total += f267()
+    total += f268()
+    total += f269()
+    total += f270()
+    total += f271()
+    total += f272()
+    total += f273()
+    total += f274()
+    total += f275()
+    total += f276()
+    total += f277()
+    total += f278()
+    total += f279()
+    total += f280()
+    total += f281()
+    total += f282()
+    total += f283()
+    total += f284()
+    total += f285()
+    total += f286()
+    total += f287()
+    total += f288()
+    total += f289()
+    total += f290()
+    total += f291()
+    total += f292()
+    total += f293()
+    total += f294()
+    total += f295()
+    total += f296()
+    total += f297()
+    total += f298()
+    total += f299()
+    echo total
+}

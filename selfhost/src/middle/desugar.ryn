@@ -1,0 +1,1373 @@
+// The rewrite of the extended `choose` patterns, as the bootstrap's `src/patterns.rs` performs it, on the Ryn syntax tree.
+//
+// The parsers accept, besides `Enum::Variant(a, b)` and `_`, literal patterns (`0`, `-3`, `'x'`, `true`, `"text"`), tuple
+// and structure patterns, and nested variant patterns (`Outer::Inner(Inner::Leaf(n))`). They keep these in the existing
+// arm shape: a literal arm has the enum name `$lit` and the canonical literal as its variant, a nested arm has `$pat` and
+// the canonical text of its pattern, and a payload position that is not a plain name holds the text of its pattern. This
+// pass rewrites every such `choose` with the pattern-matrix algorithm, so the lowering only sees variant and `_` arms and
+// `when` chains, and it reports arms that can never be selected (`R0235`).
+//
+// The pass runs after the compile-time pass and before the lowering. Expressions are copied where the bootstrap clones
+// them, so no node of the rewritten tree is shared by two places.
+
+use middle::ast
+use middle::lower
+
+// A pattern. `kind`: 0 wildcard, 1 binding (`text` is the name), 2 literal (`text` is its canonical form), 3 variant
+// (`text` the enum, `variant` the variant, `children` the payload), 4 tuple (`children`), 5 structure fields (`names` and
+// `children`).
+pub struct Pat {
+    kind: u64,
+    text: String,
+    variant: String,
+    children: Vec<u64>,
+    names: Vec<String>,
+}
+
+// A row of the matrix: its patterns, the names it binds so far, its arm body, its arm, and the arm's span.
+#[derive(Clone)]
+pub struct MRow {
+    pats: Vec<u64>,
+    bind_names: Vec<String>,
+    bind_vars: Vec<u64>,
+    body: u64,
+    index: u64,
+    span: ast::Span,
+}
+
+pub struct Desugar {
+    program: ast::Program,
+    exprs: Vec<ast::ExprTree>,
+    arms: Vec<ast::ChooseArm>,
+    inits: Vec<ast::FieldInit>,
+    pats: Vec<Pat>,
+    used: Vec<bool>,
+    fresh: u64,
+    // The pattern text being parsed, and the position in it.
+    text: String,
+    at: u64,
+    // The span of the arm whose pattern text is being parsed.
+    parse_start: u64,
+    parse_end: u64,
+}
+
+fun ds_error(message: String, span: ast::Span) -> String {
+    return lower::diagnostic("R0235", span.start, span.end, message, String(""))
+}
+
+fun ds_error_help(message: String, span: ast::Span, help: str) -> String {
+    return lower::diagnostic("R0235", span.start, span.end, message, String(help))
+}
+
+fun ds_word_byte(byte: u64) -> bool {
+    return byte == 95 || byte == 36 || (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+}
+
+// A binding the parser keeps as written: letters, digits, `_` and `$`, not starting with a digit, and not a boolean.
+fun ds_plain_name(text: String) -> bool {
+    when text.is_empty() || text == "true" || text == "false" {
+        return false
+    }
+    first := text.byte_at(0) as u64
+    when first >= 48 && first <= 57 {
+        return false
+    }
+    mut at: u64 = 0
+    while at < text.len() {
+        when !ds_word_byte(text.byte_at(at) as u64) {
+            return false
+        }
+        at += 1
+    }
+    return true
+}
+
+fun ds_contains(names: Vec<String>, name: String) -> bool {
+    for candidate in names {
+        when candidate == name {
+            return true
+        }
+    }
+    return false
+}
+
+fun ds_list1(first: u64) -> Vec<u64> {
+    mut items: Vec<u64> = Vec()
+    items.push(first)
+    return items
+}
+
+fun ds_list2(first: u64, second: u64) -> Vec<u64> {
+    mut items: Vec<u64> = Vec()
+    items.push(first)
+    items.push(second)
+    return items
+}
+
+fun ds_list3(first: u64, second: u64, third: u64) -> Vec<u64> {
+    mut items: Vec<u64> = Vec()
+    items.push(first)
+    items.push(second)
+    items.push(third)
+    return items
+}
+
+fun ds_prefixed(first: u64, rest: Vec<u64>) -> Vec<u64> {
+    mut items: Vec<u64> = Vec()
+    items.push(first)
+    for item in rest {
+        items.push(item)
+    }
+    return items
+}
+
+fun ds_optional(value: Option<u64>) -> Vec<u64> {
+    mut items: Vec<u64> = Vec()
+    when value.is_some() {
+        items.push(value.unwrap())
+    }
+    return items
+}
+
+// Rewrites every `choose` of the program that uses a literal or nested pattern.
+pub fun desugar_program(program: ast::Program) -> Result<ast::Program, String> {
+    mut source := program
+    exprs := source.exprs
+    arms := source.arms
+    inits := source.inits
+    source.exprs = Vec()
+    source.arms = Vec()
+    source.inits = Vec()
+    mut pass := Desugar {
+        program: source,
+        exprs: exprs,
+        arms: arms,
+        inits: inits,
+        pats: Vec(),
+        used: Vec(),
+        fresh: 0,
+        text: String(""),
+        at: 0,
+        parse_start: 0,
+        parse_end: 0,
+    }
+    // Pattern 0 is the wildcard.
+    pass.pats.push(Pat { kind: 0, text: String(""), variant: String(""), children: Vec(), names: Vec() })
+    pass.run()?
+    return Result::Ok(pass.finish())
+}
+
+extend Desugar {
+    fun finish(self) -> ast::Program {
+        mut result := self.program
+        result.exprs = self.exprs
+        result.arms = self.arms
+        result.inits = self.inits
+        return result
+    }
+
+    fun run(mut self) -> Result<bool, String> {
+        for index in self.program.functions.clone() {
+            function := self.program.function_defs[index]
+            self.visit_list(function.body.clone())?
+            when function.return_value.is_some() {
+                self.visit_expr(function.return_value.unwrap())?
+            }
+        }
+        for shape_index in self.program.shapes.clone() {
+            definition := self.program.shape_defs[shape_index]
+            for method in definition.methods.clone() {
+                record := self.program.shape_methods[method]
+                when record.default_body.is_some() {
+                    self.visit_list(record.default_body.unwrap())?
+                }
+                when record.default_value.is_some() {
+                    self.visit_expr(record.default_value.unwrap())?
+                }
+            }
+        }
+        return Result::Ok(true)
+    }
+
+    // ---- walking the tree ----
+
+    fun visit_list(mut self, body: Vec<u64>) -> Result<bool, String> {
+        for index in body {
+            for expression in self.statement_expressions(index) {
+                self.visit_expr(expression)?
+            }
+            count := self.body_count(index)
+            mut position: u64 = 0
+            while position < count {
+                self.visit_list(self.body_at(index, position))?
+                position += 1
+            }
+        }
+        return Result::Ok(true)
+    }
+
+    // Children first; then a `choose` with an extended arm is compiled and its node replaced.
+    fun visit_expr(mut self, index: u64) -> Result<bool, String> {
+        for child in self.children(index) {
+            self.visit_expr(child)?
+        }
+        parts := self.choose_parts(index)
+        when parts.is_empty() {
+            return Result::Ok(true)
+        }
+        arms := self.choose_arm_list(index)
+        mut extended := false
+        for arm in arms.clone() {
+            record := self.arms[arm]
+            when record.enum_name.is_some() {
+                name := record.enum_name.unwrap()
+                when name == "$lit" || name == "$pat" {
+                    extended = true
+                }
+            }
+            for binding in record.bindings {
+                when !ds_plain_name(binding) {
+                    extended = true
+                }
+            }
+        }
+        when !extended {
+            return Result::Ok(true)
+        }
+        result := self.compile_choose(parts[0], arms, self.span_of(index))?
+        self.exprs.set(index, self.exprs[result])
+        return Result::Ok(true)
+    }
+
+    fun choose_parts(self, index: u64) -> Vec<u64> {
+        return choose self.exprs[index] {
+            ast::ExprTree::ChooseE(value, arms, span) => ds_list1(value),
+            _ => Vec(),
+        }
+    }
+
+    fun choose_arm_list(self, index: u64) -> Vec<u64> {
+        return choose self.exprs[index] {
+            ast::ExprTree::ChooseE(value, arms, span) => arms,
+            _ => Vec(),
+        }
+    }
+
+    fun name_of(self, index: u64) -> Option<String> {
+        return choose self.exprs[index] {
+            ast::ExprTree::NameRef(name, span) => Option::Some(name),
+            _ => Option::None,
+        }
+    }
+
+    fun span_of(self, index: u64) -> ast::Span {
+        return choose self.exprs[index] {
+            ast::ExprTree::IntLit(value, span) => span,
+            ast::ExprTree::FloatLit(text, span) => span,
+            ast::ExprTree::StrLit(text, span) => span,
+            ast::ExprTree::CharLit(value, span) => span,
+            ast::ExprTree::BoolLit(value, span) => span,
+            ast::ExprTree::NameRef(name, span) => span,
+            ast::ExprTree::CallE(name, type_arguments, arguments, span) => span,
+            ast::ExprTree::MethodCallE(value, name, type_arguments, arguments, span) => span,
+            ast::ExprTree::StructLit(name, inits, span) => span,
+            ast::ExprTree::FieldE(value, name, name_span, span) => span,
+            ast::ExprTree::RangeE(start, end, inclusive, span) => span,
+            ast::ExprTree::IfE(condition, then_value, else_value, span) => span,
+            ast::ExprTree::BinaryE(op, left, right, span) => span,
+            ast::ExprTree::NegateE(inner, span) => span,
+            ast::ExprTree::NotE(inner, span) => span,
+            ast::ExprTree::BitNotE(inner, span) => span,
+            ast::ExprTree::AddressOfE(mutable, raw, inner, span) => span,
+            ast::ExprTree::DerefE(inner, span) => span,
+            ast::ExprTree::CastE(inner, ty, span) => span,
+            ast::ExprTree::LayoutE(ty, alignment, span) => span,
+            ast::ExprTree::VecNewE(ty, span) => span,
+            ast::ExprTree::MapNewE(key, value, span) => span,
+            ast::ExprTree::SetNewE(ty, span) => span,
+            ast::ExprTree::TupleE(values, span) => span,
+            ast::ExprTree::ArrayE(values, span) => span,
+            ast::ExprTree::RepeatE(value, length, span) => span,
+            ast::ExprTree::IndexE(value, position, span) => span,
+            ast::ExprTree::PropagateE(value, span) => span,
+            ast::ExprTree::EnumE(enum_name, variant, arguments, span) => span,
+            ast::ExprTree::ChooseE(value, arms, span) => span,
+            ast::ExprTree::PipeE(left, right, span) => span,
+            ast::ExprTree::CoalesceE(left, right, span) => span,
+            ast::ExprTree::OptionalFieldE(value, name, name_span, span) => span,
+        }
+    }
+
+    // The children of an expression, in the order the bootstrap visits them.
+    fun children(self, index: u64) -> Vec<u64> {
+        return choose self.exprs[index] {
+            ast::ExprTree::CallE(name, type_arguments, arguments, span) => arguments,
+            ast::ExprTree::EnumE(enum_name, variant, arguments, span) => arguments,
+            ast::ExprTree::MethodCallE(value, name, type_arguments, arguments, span) => ds_prefixed(value, arguments),
+            ast::ExprTree::StructLit(name, inits, span) => self.init_values(inits),
+            ast::ExprTree::FieldE(value, name, name_span, span) => ds_list1(value),
+            ast::ExprTree::NegateE(inner, span) => ds_list1(inner),
+            ast::ExprTree::NotE(inner, span) => ds_list1(inner),
+            ast::ExprTree::BitNotE(inner, span) => ds_list1(inner),
+            ast::ExprTree::DerefE(inner, span) => ds_list1(inner),
+            ast::ExprTree::CastE(inner, ty, span) => ds_list1(inner),
+            ast::ExprTree::PropagateE(inner, span) => ds_list1(inner),
+            ast::ExprTree::AddressOfE(mutable, raw, inner, span) => ds_list1(inner),
+            ast::ExprTree::RepeatE(value, length, span) => ds_list1(value),
+            ast::ExprTree::RangeE(start, end, inclusive, span) => ds_list2(start, end),
+            ast::ExprTree::IfE(condition, then_value, else_value, span) => ds_list3(condition, then_value, else_value),
+            ast::ExprTree::BinaryE(op, left, right, span) => ds_list2(left, right),
+            ast::ExprTree::TupleE(values, span) => values,
+            ast::ExprTree::ArrayE(values, span) => values,
+            ast::ExprTree::IndexE(value, position, span) => ds_list2(value, position),
+            ast::ExprTree::ChooseE(value, arms, span) => ds_prefixed(value, self.arm_bodies(arms)),
+            ast::ExprTree::PipeE(left, right, span) => ds_list2(left, right),
+            ast::ExprTree::CoalesceE(left, right, span) => ds_list2(left, right),
+            ast::ExprTree::OptionalFieldE(value, name, name_span, span) => ds_list1(value),
+            _ => Vec(),
+        }
+    }
+
+    fun init_values(self, inits: Vec<u64>) -> Vec<u64> {
+        mut values: Vec<u64> = Vec()
+        for init in inits {
+            values.push(self.inits[init].value)
+        }
+        return values
+    }
+
+    fun arm_bodies(self, arms: Vec<u64>) -> Vec<u64> {
+        mut bodies: Vec<u64> = Vec()
+        for arm in arms {
+            bodies.push(self.arms[arm].body)
+        }
+        return bodies
+    }
+
+    fun statement_expressions(self, index: u64) -> Vec<u64> {
+        return choose self.program.stmts[index] {
+            ast::Stmt::LetS(name, mutable, annotation, value, span) => ds_list1(value),
+            ast::Stmt::AssignS(name, value, span) => ds_list1(value),
+            ast::Stmt::CompoundS(name, op, value, span) => ds_list1(value),
+            ast::Stmt::FieldAssignS(object, names, spans, op, value, span) => ds_list1(value),
+            ast::Stmt::PrintS(value, span) => ds_list1(value),
+            ast::Stmt::IndexAssignS(name, position, value, span) => ds_list2(position, value),
+            ast::Stmt::DerefAssignS(pointer, value, span) => ds_list2(pointer, value),
+            ast::Stmt::TemplateS(parts, span) => self.part_values(parts),
+            ast::Stmt::CallS(name, type_arguments, arguments, span) => arguments,
+            ast::Stmt::MethodCallS(value, name, arguments, span) => ds_prefixed(value, arguments),
+            ast::Stmt::IfS(condition, then_body, else_body, span) => ds_list1(condition),
+            ast::Stmt::WhileS(condition, body, span) => ds_list1(condition),
+            ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => ds_list2(start, end),
+            ast::Stmt::ForEachS(name, name_span, iterable, body, span) => ds_list1(iterable),
+            ast::Stmt::ReturnS(value, span) => ds_optional(value),
+            _ => Vec(),
+        }
+    }
+
+    fun body_count(self, index: u64) -> u64 {
+        return choose self.program.stmts[index] {
+            ast::Stmt::IfS(condition, then_body, else_body, span) => 2,
+            ast::Stmt::WhileS(condition, body, span) => 1,
+            ast::Stmt::DeferS(body, span) => 1,
+            ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => 1,
+            ast::Stmt::ForEachS(name, name_span, iterable, body, span) => 1,
+            _ => 0,
+        }
+    }
+
+    fun body_at(self, index: u64, position: u64) -> Vec<u64> {
+        return choose self.program.stmts[index] {
+            ast::Stmt::IfS(condition, then_body, else_body, span) => ds_pick(position, then_body, else_body),
+            ast::Stmt::WhileS(condition, body, span) => body,
+            ast::Stmt::DeferS(body, span) => body,
+            ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => body,
+            ast::Stmt::ForEachS(name, name_span, iterable, body, span) => body,
+            _ => Vec(),
+        }
+    }
+
+    fun part_value(self, part: u64) -> Option<u64> {
+        return choose self.program.parts[part] {
+            ast::TemplatePart::ValuePart(value) => Option::Some(value),
+            _ => Option::None,
+        }
+    }
+
+    fun part_values(self, parts: Vec<u64>) -> Vec<u64> {
+        mut values: Vec<u64> = Vec()
+        for part in parts {
+            value := self.part_value(part)
+            when value.is_some() {
+                values.push(value.unwrap())
+            }
+        }
+        return values
+    }
+}
+
+fun ds_pick(position: u64, first: Vec<u64>, second: Vec<u64>) -> Vec<u64> {
+    when position == 0 {
+        return first
+    }
+    return second
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Copies, renames and replacements of expression trees
+
+extend Desugar {
+    fun push_expr(mut self, node: ast::ExprTree) -> u64 {
+        index := self.exprs.len()
+        self.exprs.push(node)
+        return index
+    }
+
+    fun push_arm(mut self, arm: ast::ChooseArm) -> u64 {
+        index := self.arms.len()
+        self.arms.push(arm)
+        return index
+    }
+
+    fun copy_list(mut self, items: Vec<u64>) -> Vec<u64> {
+        mut copies: Vec<u64> = Vec()
+        for item in items {
+            copies.push(self.copy_expr(item))
+        }
+        return copies
+    }
+
+    // A copy of an expression tree that shares no node with the original.
+    fun copy_expr(mut self, index: u64) -> u64 {
+        node := choose self.exprs[index] {
+            ast::ExprTree::CallE(name, type_arguments, arguments, span) => ast::ExprTree::CallE(name, type_arguments, self.copy_list(arguments), span),
+            ast::ExprTree::EnumE(enum_name, variant, arguments, span) => ast::ExprTree::EnumE(enum_name, variant, self.copy_list(arguments), span),
+            ast::ExprTree::MethodCallE(value, name, type_arguments, arguments, span) => ast::ExprTree::MethodCallE(self.copy_expr(value), name, type_arguments, self.copy_list(arguments), span),
+            ast::ExprTree::StructLit(name, inits, span) => ast::ExprTree::StructLit(name, self.copy_inits(inits), span),
+            ast::ExprTree::FieldE(value, name, name_span, span) => ast::ExprTree::FieldE(self.copy_expr(value), name, name_span, span),
+            ast::ExprTree::NegateE(inner, span) => ast::ExprTree::NegateE(self.copy_expr(inner), span),
+            ast::ExprTree::NotE(inner, span) => ast::ExprTree::NotE(self.copy_expr(inner), span),
+            ast::ExprTree::BitNotE(inner, span) => ast::ExprTree::BitNotE(self.copy_expr(inner), span),
+            ast::ExprTree::DerefE(inner, span) => ast::ExprTree::DerefE(self.copy_expr(inner), span),
+            ast::ExprTree::CastE(inner, ty, span) => ast::ExprTree::CastE(self.copy_expr(inner), ty, span),
+            ast::ExprTree::PropagateE(inner, span) => ast::ExprTree::PropagateE(self.copy_expr(inner), span),
+            ast::ExprTree::AddressOfE(mutable, raw, inner, span) => ast::ExprTree::AddressOfE(mutable, raw, self.copy_expr(inner), span),
+            ast::ExprTree::RepeatE(value, length, span) => ast::ExprTree::RepeatE(self.copy_expr(value), length, span),
+            ast::ExprTree::RangeE(start, end, inclusive, span) => ast::ExprTree::RangeE(self.copy_expr(start), self.copy_expr(end), inclusive, span),
+            ast::ExprTree::IfE(condition, then_value, else_value, span) => ast::ExprTree::IfE(self.copy_expr(condition), self.copy_expr(then_value), self.copy_expr(else_value), span),
+            ast::ExprTree::BinaryE(op, left, right, span) => ast::ExprTree::BinaryE(op, self.copy_expr(left), self.copy_expr(right), span),
+            ast::ExprTree::TupleE(values, span) => ast::ExprTree::TupleE(self.copy_list(values), span),
+            ast::ExprTree::ArrayE(values, span) => ast::ExprTree::ArrayE(self.copy_list(values), span),
+            ast::ExprTree::IndexE(value, position, span) => ast::ExprTree::IndexE(self.copy_expr(value), self.copy_expr(position), span),
+            ast::ExprTree::ChooseE(value, arms, span) => ast::ExprTree::ChooseE(self.copy_expr(value), self.copy_arms(arms), span),
+            ast::ExprTree::PipeE(left, right, span) => ast::ExprTree::PipeE(self.copy_expr(left), self.copy_expr(right), span),
+            ast::ExprTree::CoalesceE(left, right, span) => ast::ExprTree::CoalesceE(self.copy_expr(left), self.copy_expr(right), span),
+            ast::ExprTree::OptionalFieldE(value, name, name_span, span) => ast::ExprTree::OptionalFieldE(self.copy_expr(value), name, name_span, span),
+            _ => self.exprs[index],
+        }
+        return self.push_expr(node)
+    }
+
+    fun copy_inits(mut self, inits: Vec<u64>) -> Vec<u64> {
+        mut copies: Vec<u64> = Vec()
+        for init in inits {
+            record := self.inits[init]
+            value := self.copy_expr(record.value)
+            copies.push(self.inits.len())
+            self.inits.push(ast::FieldInit { name: record.name, value: value, span: record.span })
+        }
+        return copies
+    }
+
+    fun copy_arms(mut self, arms: Vec<u64>) -> Vec<u64> {
+        mut copies: Vec<u64> = Vec()
+        for arm in arms {
+            record := self.arms[arm]
+            body := self.copy_expr(record.body)
+            copies.push(self.push_arm(ast::ChooseArm { enum_name: record.enum_name, variant: record.variant, bindings: record.bindings, body: body, span: record.span }))
+        }
+        return copies
+    }
+
+    // Replaces the free uses of `from` in the tree at `index` with copies of the tree at `with`.
+    fun replace_name(mut self, index: u64, from: String, with: u64) {
+        named := self.name_of(index)
+        when named.is_some() {
+            when named.unwrap() == from {
+                copy := self.copy_expr(with)
+                self.exprs.set(index, self.exprs[copy])
+            }
+            return
+        }
+        arms := self.choose_arm_list(index)
+        parts := self.choose_parts(index)
+        when !parts.is_empty() {
+            self.replace_name(parts[0], from.clone(), with)
+            for arm in arms {
+                record := self.arms[arm]
+                when !ds_contains(record.bindings, from.clone()) {
+                    self.replace_name(record.body, from.clone(), with)
+                }
+            }
+            return
+        }
+        for child in self.children(index) {
+            self.replace_name(child, from.clone(), with)
+        }
+    }
+
+    // Renames the free uses of `from` in the tree at `index` to `to`.
+    fun rename(mut self, index: u64, from: String, to: String) {
+        named := self.name_of(index)
+        when named.is_some() {
+            when named.unwrap() == from {
+                self.exprs.set(index, ast::ExprTree::NameRef(to, self.span_of(index)))
+            }
+            return
+        }
+        arms := self.choose_arm_list(index)
+        parts := self.choose_parts(index)
+        when !parts.is_empty() {
+            self.rename(parts[0], from.clone(), to.clone())
+            for arm in arms {
+                record := self.arms[arm]
+                when !ds_contains(record.bindings, from.clone()) {
+                    self.rename(record.body, from.clone(), to.clone())
+                }
+            }
+            return
+        }
+        for child in self.children(index) {
+            self.rename(child, from.clone(), to.clone())
+        }
+    }
+
+    // Whether `name` occurs in the tree at `index`.
+    fun uses_name(self, index: u64, name: String) -> bool {
+        named := self.name_of(index)
+        when named.is_some() && named.unwrap() == name {
+            return true
+        }
+        for child in self.children(index) {
+            when self.uses_name(child, name.clone()) {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Pattern texts
+
+extend Desugar {
+    fun add_pat(mut self, kind: u64, text: String, variant: String, children: Vec<u64>, names: Vec<String>) -> u64 {
+        index := self.pats.len()
+        self.pats.push(Pat { kind: kind, text: text, variant: variant, children: children, names: names })
+        return index
+    }
+
+    fun malformed(self) -> String {
+        return ds_error(String("malformed pattern"), ast::Span { start: self.parse_start, end: self.parse_end })
+    }
+
+    fun parse_pattern_text(mut self, text: String, span: ast::Span) -> Result<u64, String> {
+        self.text = text
+        self.at = 0
+        self.parse_start = span.start
+        self.parse_end = span.end
+        pattern := self.pattern()?
+        when self.at != self.text.len() {
+            return Result::Err(self.malformed())
+        }
+        return Result::Ok(pattern)
+    }
+
+    fun peek(self) -> u64 {
+        when self.at >= self.text.len() {
+            return 0
+        }
+        return self.text.byte_at(self.at) as u64
+    }
+
+    fun word(mut self) -> String {
+        start := self.at
+        while ds_word_byte(self.peek()) && self.at < self.text.len() {
+            self.at += 1
+        }
+        return self.text.slice(start, self.at)
+    }
+
+    // A quoted literal kept with its quotes; `quote` is the quote byte.
+    fun quoted(mut self, quote: u64) -> u64 {
+        start := self.at
+        self.at += 1
+        while self.at < self.text.len() && self.peek() != quote {
+            self.at += 1
+        }
+        self.at += 1
+        mut end := self.at
+        when end > self.text.len() {
+            end = self.text.len()
+        }
+        return self.add_pat(2, self.text.slice(start, end), String(""), Vec(), Vec())
+    }
+
+    fun pattern(mut self) -> Result<u64, String> {
+        next := self.peek()
+        when next == 40 {
+            self.at += 1
+            mut elements: Vec<u64> = Vec()
+            when self.peek() != 41 {
+                while true {
+                    elements.push(self.pattern()?)
+                    when self.peek() == 44 {
+                        self.at += 1
+                    } else {
+                        break
+                    }
+                }
+            }
+            when self.peek() != 41 {
+                return Result::Err(self.malformed())
+            }
+            self.at += 1
+            return Result::Ok(self.add_pat(4, String(""), String(""), elements, Vec()))
+        }
+        when next == 34 || next == 39 {
+            return Result::Ok(self.quoted(next))
+        }
+        when next == 45 || (next >= 48 && next <= 57) {
+            start := self.at
+            self.at += 1
+            while self.peek() >= 48 && self.peek() <= 57 && self.at < self.text.len() {
+                self.at += 1
+            }
+            return Result::Ok(self.add_pat(2, self.text.slice(start, self.at), String(""), Vec(), Vec()))
+        }
+        first := self.word()
+        when first.is_empty() {
+            return Result::Err(self.malformed())
+        }
+        when first == "true" || first == "false" {
+            return Result::Ok(self.add_pat(2, first, String(""), Vec(), Vec()))
+        }
+        when self.peek() == 123 {
+            self.at += 1
+            mut names: Vec<String> = Vec()
+            mut fields: Vec<u64> = Vec()
+            when self.peek() != 125 {
+                while true {
+                    name := self.word()
+                    when name.is_empty() {
+                        return Result::Err(self.malformed())
+                    }
+                    when self.peek() == 58 {
+                        self.at += 1
+                        names.push(name)
+                        fields.push(self.pattern()?)
+                    } else {
+                        names.push(name.clone())
+                        fields.push(self.add_pat(1, name, String(""), Vec(), Vec()))
+                    }
+                    when self.peek() == 44 {
+                        self.at += 1
+                    } else {
+                        break
+                    }
+                }
+            }
+            when self.peek() != 125 {
+                return Result::Err(self.malformed())
+            }
+            self.at += 1
+            return Result::Ok(self.add_pat(5, String(""), String(""), fields, names))
+        }
+        mut path: Vec<String> = Vec()
+        path.push(first)
+        while self.at + 1 < self.text.len() && self.peek() == 58 && (self.text.byte_at(self.at + 1) as u64) == 58 {
+            self.at += 2
+            path.push(self.word())
+        }
+        mut args: Vec<u64> = Vec()
+        when self.peek() == 40 {
+            self.at += 1
+            when self.peek() != 41 {
+                while true {
+                    args.push(self.pattern()?)
+                    when self.peek() == 44 {
+                        self.at += 1
+                    } else {
+                        break
+                    }
+                }
+            }
+            when self.peek() != 41 {
+                return Result::Err(self.malformed())
+            }
+            self.at += 1
+        }
+        when path.len() == 1 {
+            name := path[0].clone()
+            when name == "_" {
+                return Result::Ok(0)
+            }
+            return Result::Ok(self.add_pat(1, name, String(""), Vec(), Vec()))
+        }
+        variant := path[path.len() - 1].clone()
+        mut enum_name := String("")
+        mut part: u64 = 0
+        while part + 1 < path.len() {
+            when part > 0 {
+                enum_name.append("::")
+            }
+            enum_name.append(path[part].clone())
+            part += 1
+        }
+        return Result::Ok(self.add_pat(3, enum_name, variant, args, Vec()))
+    }
+
+    // The expression a literal pattern compares with.
+    fun literal_expression(mut self, text: String, span: ast::Span) -> u64 {
+        when text.starts_with("\"") {
+            return self.push_expr(ast::ExprTree::StrLit(ds_string_of_bytes(text), span))
+        }
+        when text == "true" {
+            return self.push_expr(ast::ExprTree::BoolLit(true, span))
+        }
+        when text == "false" {
+            return self.push_expr(ast::ExprTree::BoolLit(false, span))
+        }
+        when text.starts_with("'") {
+            mut code: u64 = 0
+            mut at: u64 = 1
+            while at < text.len() && (text.byte_at(at) as u64) >= 48 && (text.byte_at(at) as u64) <= 57 {
+                code = code * 10 + ((text.byte_at(at) as u64) - 48)
+                at += 1
+            }
+            when code > 1114111 || (code >= 55296 && code <= 57343) {
+                code = 0
+            }
+            return self.push_expr(ast::ExprTree::CharLit(code, span))
+        }
+        negative := text.starts_with("-")
+        mut at: u64 = 0
+        when negative {
+            at = 1
+        }
+        mut value: u64 = 0
+        while at < text.len() {
+            value = value * 10 + ((text.byte_at(at) as u64) - 48)
+            at += 1
+        }
+        literal := self.push_expr(ast::ExprTree::IntLit(value, span))
+        when negative {
+            return self.push_expr(ast::ExprTree::NegateE(literal, span))
+        }
+        return literal
+    }
+}
+
+// The text of a string literal pattern: `"104.105"` holds the decimal bytes of the string, separated by dots.
+fun ds_string_of_bytes(text: String) -> String {
+    mut bytes: Vec<u64> = Vec()
+    mut current: u64 = 0
+    mut digits := false
+    mut at: u64 = 1
+    while at < text.len() {
+        byte := text.byte_at(at) as u64
+        when byte >= 48 && byte <= 57 {
+            current = current * 10 + (byte - 48)
+            digits = true
+        } else {
+            when digits {
+                bytes.push(current)
+            }
+            current = 0
+            digits = false
+        }
+        at += 1
+    }
+    when digits {
+        bytes.push(current)
+    }
+    // The bytes are UTF-8: each character is read back from its sequence.
+    mut out := String("")
+    mut position: u64 = 0
+    while position < bytes.len() {
+        lead := bytes[position]
+        mut length: u64 = 1
+        mut code := lead
+        when lead >= 240 {
+            length = 4
+            code = lead & 7
+        } else when lead >= 224 {
+            length = 3
+            code = lead & 15
+        } else when lead >= 192 {
+            length = 2
+            code = lead & 31
+        }
+        mut follow: u64 = 1
+        while follow < length && position + follow < bytes.len() {
+            code = (code << (6 as u32)) | (bytes[position + follow] & 63)
+            follow += 1
+        }
+        out.push(char_from_u32(code as u32))
+        position += length
+    }
+    return out
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The matrix compiler
+
+fun ds_without(pats: Vec<u64>, column: u64) -> Vec<u64> {
+    mut kept: Vec<u64> = Vec()
+    mut position: u64 = 0
+    while position < pats.len() {
+        when position != column {
+            kept.push(pats[position])
+        }
+        position += 1
+    }
+    return kept
+}
+
+fun ds_concat(first: Vec<u64>, second: Vec<u64>) -> Vec<u64> {
+    mut items := first
+    for item in second {
+        items.push(item)
+    }
+    return items
+}
+
+fun ds_wilds(count: u64) -> Vec<u64> {
+    mut items: Vec<u64> = Vec()
+    mut at: u64 = 0
+    while at < count {
+        items.push(0)
+        at += 1
+    }
+    return items
+}
+
+extend Desugar {
+    fun fresh_name(mut self) -> String {
+        self.fresh += 1
+        mut name := String("$p")
+        name.append(String(self.fresh))
+        return name
+    }
+
+    fun pat_kind(self, pattern: u64) -> u64 {
+        return self.pats[pattern].kind
+    }
+
+    fun compile_choose(mut self, value: u64, arms: Vec<u64>, span: ast::Span) -> Result<u64, String> {
+        value_name := self.name_of(value)
+        value_is_name := value_name.is_some()
+        mut root := String("")
+        when value_is_name {
+            root = value_name.unwrap()
+        } else {
+            self.fresh += 1
+            root = String("$m")
+            root.append(String(self.fresh))
+        }
+        root_expression := self.push_expr(ast::ExprTree::NameRef(root.clone(), span))
+        mut rows: Vec<MRow> = Vec()
+        mut position: u64 = 0
+        while position < arms.len() {
+            arm := self.arms[arms[position]]
+            mut pattern: u64 = 0
+            when arm.enum_name.is_some() {
+                enum_name := arm.enum_name.unwrap()
+                when arm.variant.is_none() {
+                    return Result::Err(ds_error(String("malformed pattern"), arm.span))
+                }
+                variant := arm.variant.unwrap()
+                when enum_name == "$lit" {
+                    pattern = self.add_pat(2, variant, String(""), Vec(), Vec())
+                } else when enum_name == "$pat" {
+                    pattern = self.parse_pattern_text(variant, arm.span)?
+                } else {
+                    mut args: Vec<u64> = Vec()
+                    for binding in arm.bindings.clone() {
+                        args.push(self.parse_pattern_text(binding, arm.span)?)
+                    }
+                    pattern = self.add_pat(3, enum_name, variant, args, Vec())
+                }
+            }
+            rows.push(MRow { pats: ds_list1(pattern), bind_names: Vec(), bind_vars: Vec(), body: arm.body, index: position, span: arm.span })
+            position += 1
+        }
+        saved_used := self.used.clone()
+        mut used: Vec<bool> = Vec()
+        position = 0
+        while position < arms.len() {
+            used.push(false)
+            position += 1
+        }
+        self.used = used
+        compiled := self.compile(ds_list1(root_expression), rows, span)
+        reached := self.used.clone()
+        self.used = saved_used
+        found := compiled?
+        position = 0
+        while position < arms.len() {
+            when !reached[position] {
+                arm := self.arms[arms[position]]
+                return Result::Err(ds_error_help(String("this pattern can never match"), arm.span, "an earlier pattern already covers every value it would match"))
+            }
+            position += 1
+        }
+        when found.is_none() {
+            return Result::Err(ds_error(String("`choose` has no arms"), span))
+        }
+        result := found.unwrap()
+        when value_is_name {
+            return Result::Ok(result)
+        }
+        // The root is only bound by the scrutinee itself; an arm that still names it (through a shape probe or a bound
+        // pattern) needs the payload wrapper below.
+        result_parts := self.choose_parts(result)
+        when !result_parts.is_empty() {
+            scrutinee := self.name_of(result_parts[0])
+            when scrutinee.is_some() && scrutinee.unwrap() == root {
+                mut named := false
+                for arm in self.choose_arm_list(result) {
+                    when self.uses_name(self.arms[arm].body, root.clone()) {
+                        named = true
+                    }
+                }
+                when !named {
+                    self.exprs.set(result_parts[0], self.exprs[value])
+                    return Result::Ok(result)
+                }
+            }
+        }
+        // A literal chain tests the scrutinee several times: evaluate it once.
+        mut payload := String("$w")
+        payload.append(String(self.fresh))
+        self.fresh += 1
+        chain := result
+        unreachable_chain := self.copy_expr(chain)
+        self.rename(chain, root.clone(), payload.clone())
+        // The `None` arm never runs; it only has to type-check without the payload name.
+        self.replace_name(unreachable_chain, root, value)
+        some_value := self.copy_expr(value)
+        wrapped := self.push_expr(ast::ExprTree::EnumE(String("Option"), String("Some"), ds_list1(some_value), span))
+        mut payload_names: Vec<String> = Vec()
+        payload_names.push(payload)
+        some_arm := self.push_arm(ast::ChooseArm { enum_name: Option::Some(String("Option")), variant: Option::Some(String("Some")), bindings: payload_names, body: chain, span: span })
+        none_arm := self.push_arm(ast::ChooseArm { enum_name: Option::Some(String("Option")), variant: Option::Some(String("None")), bindings: Vec(), body: unreachable_chain, span: span })
+        return Result::Ok(self.push_expr(ast::ExprTree::ChooseE(wrapped, ds_list2(some_arm, none_arm), span)))
+    }
+
+    // Compiles the rows against the scrutinee expressions `vars`; nothing when no row can match.
+    fun compile(mut self, vars: Vec<u64>, rows: Vec<MRow>, span: ast::Span) -> Result<Option<u64>, String> {
+        when rows.is_empty() {
+            return Result::Ok(Option::None)
+        }
+        first := rows[0]
+        mut column: u64 = 0
+        mut found := false
+        while column < first.pats.len() && !found {
+            kind := self.pat_kind(first.pats[column])
+            when kind >= 2 {
+                found = true
+            } else {
+                column += 1
+            }
+        }
+        when !found {
+            // The first row matches everything that reaches it.
+            self.used.set(first.index, true)
+            mut names := first.bind_names.clone()
+            mut values := first.bind_vars.clone()
+            mut position: u64 = 0
+            while position < first.pats.len() {
+                pattern := self.pats[first.pats[position]]
+                when pattern.kind == 1 {
+                    names.push(pattern.text)
+                    values.push(vars[position])
+                }
+                position += 1
+            }
+            body := self.copy_expr(first.body)
+            position = 0
+            while position < names.len() {
+                self.replace_name(body, names[position].clone(), values[position])
+                position += 1
+            }
+            return Result::Ok(Option::Some(body))
+        }
+        remaining := ds_without(vars.clone(), column)
+        kind := self.pat_kind(first.pats[column])
+        when kind == 3 {
+            return self.switch_variants(vars, remaining, column, rows, span)
+        }
+        when kind == 4 || kind == 5 {
+            return self.switch_product(vars, remaining, column, rows, span)
+        }
+        return self.switch_literals(vars, remaining, column, rows, span)
+    }
+
+    fun switch_variants(mut self, vars: Vec<u64>, remaining: Vec<u64>, column: u64, rows: Vec<MRow>, span: ast::Span) -> Result<Option<u64>, String> {
+        mut enum_names: Vec<String> = Vec()
+        mut variants: Vec<String> = Vec()
+        mut arities: Vec<u64> = Vec()
+        for row in rows.clone() {
+            pattern := self.pats[row.pats[column]]
+            when pattern.kind == 3 {
+                mut known: Option<u64> = Option::None
+                mut at: u64 = 0
+                while at < enum_names.len() {
+                    when known.is_none() && enum_names[at] == pattern.text && variants[at] == pattern.variant {
+                        known = Option::Some(at)
+                    }
+                    at += 1
+                }
+                when known.is_some() {
+                    when arities[known.unwrap()] != pattern.children.len() {
+                        mut message := String("pattern `")
+                        message.append(pattern.text.clone())
+                        message.append("::")
+                        message.append(pattern.variant.clone())
+                        message.append("` has inconsistent arity")
+                        return Result::Err(ds_error(message, row.span))
+                    }
+                } else {
+                    enum_names.push(pattern.text.clone())
+                    variants.push(pattern.variant.clone())
+                    arities.push(pattern.children.len())
+                }
+            } else when pattern.kind == 2 || pattern.kind == 4 || pattern.kind == 5 {
+                return Result::Err(ds_error(String("a variant pattern cannot be mixed with other kinds of patterns"), row.span))
+            } else when pattern.kind == 1 {
+                when self.uses_name(row.body, pattern.text.clone()) {
+                    return Result::Err(ds_error_help(String("a name cannot bind a value that other arms destructure"), row.span, "use `_` or destructure the value in every arm"))
+                }
+            }
+        }
+        // A name the arm never uses matches like `_`.
+        mut plain: Vec<MRow> = Vec()
+        for row in rows {
+            mut changed := row
+            when self.pat_kind(changed.pats[column]) == 1 {
+                changed.pats.set(column, 0)
+            }
+            plain.push(changed)
+        }
+        mut arms: Vec<u64> = Vec()
+        mut constructor: u64 = 0
+        while constructor < enum_names.len() {
+            arity := arities[constructor]
+            mut fresh: Vec<String> = Vec()
+            mut fresh_vars: Vec<u64> = Vec()
+            mut slot: u64 = 0
+            while slot < arity {
+                name := self.fresh_name()
+                fresh_vars.push(self.push_expr(ast::ExprTree::NameRef(name.clone(), span)))
+                fresh.push(name)
+                slot += 1
+            }
+            mut specialized: Vec<MRow> = Vec()
+            for row in plain.clone() {
+                pattern := self.pats[row.pats[column]]
+                mut keep := false
+                mut pats: Vec<u64> = Vec()
+                when pattern.kind == 3 && pattern.text == enum_names[constructor] && pattern.variant == variants[constructor] {
+                    pats = pattern.children.clone()
+                    keep = true
+                } else when pattern.kind == 0 {
+                    pats = ds_wilds(arity)
+                    keep = true
+                }
+                when keep {
+                    mut next := row
+                    next.pats = ds_concat(pats, ds_without(next.pats.clone(), column))
+                    specialized.push(next)
+                }
+            }
+            inner_vars := ds_concat(fresh_vars, remaining.clone())
+            body := self.compile(inner_vars, specialized, span)?
+            when body.is_some() {
+                arms.push(self.push_arm(ast::ChooseArm { enum_name: Option::Some(enum_names[constructor].clone()), variant: Option::Some(variants[constructor].clone()), bindings: fresh, body: body.unwrap(), span: span }))
+            }
+            constructor += 1
+        }
+        mut defaults: Vec<MRow> = Vec()
+        for row in plain {
+            when self.pat_kind(row.pats[column]) == 0 {
+                mut next := row
+                next.pats = ds_without(next.pats.clone(), column)
+                defaults.push(next)
+            }
+        }
+        default_body := self.compile(remaining, defaults, span)?
+        when default_body.is_some() {
+            arms.push(self.push_arm(ast::ChooseArm { enum_name: Option::None, variant: Option::None, bindings: Vec(), body: default_body.unwrap(), span: span }))
+        }
+        scrutinee := self.copy_expr(vars[column])
+        return Result::Ok(Option::Some(self.push_expr(ast::ExprTree::ChooseE(scrutinee, arms, span))))
+    }
+
+    // Tuples and structures have one constructor: the column becomes one column per field.
+    fun switch_product(mut self, vars: Vec<u64>, remaining: Vec<u64>, column: u64, rows: Vec<MRow>, span: ast::Span) -> Result<Option<u64>, String> {
+        mut names: Vec<String> = Vec()
+        mut has_arity := false
+        mut tuple_arity: u64 = 0
+        for row in rows.clone() {
+            pattern := self.pats[row.pats[column]]
+            when pattern.kind == 4 {
+                when has_arity && tuple_arity != pattern.children.len() {
+                    return Result::Err(ds_error(String("tuple patterns have different lengths"), row.span))
+                }
+                has_arity = true
+                tuple_arity = pattern.children.len()
+            } else when pattern.kind == 5 {
+                for name in pattern.names.clone() {
+                    when !ds_contains(names.clone(), name.clone()) {
+                        names.push(name)
+                    }
+                }
+            } else when pattern.kind != 0 {
+                return Result::Err(ds_error(String("this pattern cannot be mixed with a tuple or structure pattern"), row.span))
+            }
+        }
+        when has_arity {
+            when !names.is_empty() {
+                return Result::Err(ds_error(String("a tuple pattern cannot be mixed with a structure pattern"), span))
+            }
+            mut index: u64 = 0
+            while index < tuple_arity {
+                mut name := String("_")
+                name.append(String(index))
+                names.push(name)
+                index += 1
+            }
+        }
+        mut inner_vars: Vec<u64> = Vec()
+        for name in names.clone() {
+            value := self.copy_expr(vars[column])
+            inner_vars.push(self.push_expr(ast::ExprTree::FieldE(value, name, span, span)))
+        }
+        inner_vars = ds_concat(inner_vars, remaining)
+        mut specialized: Vec<MRow> = Vec()
+        for row in rows {
+            pattern := self.pats[row.pats[column]]
+            mut pats: Vec<u64> = Vec()
+            when pattern.kind == 4 {
+                pats = pattern.children.clone()
+            } else when pattern.kind == 5 {
+                for name in names.clone() {
+                    mut chosen: u64 = 0
+                    mut at: u64 = 0
+                    mut matched := false
+                    while at < pattern.names.len() {
+                        when !matched && pattern.names[at] == name {
+                            chosen = pattern.children[at]
+                            matched = true
+                        }
+                        at += 1
+                    }
+                    pats.push(chosen)
+                }
+            } else {
+                pats = ds_wilds(names.len())
+            }
+            mut next := row
+            next.pats = ds_concat(pats, ds_without(next.pats.clone(), column))
+            specialized.push(next)
+        }
+        body := self.compile(inner_vars, specialized, span)?
+        when body.is_none() {
+            return Result::Ok(Option::None)
+        }
+        // A probe that the lowering checks against the scrutinee's type: without it, a pattern whose fields are never read
+        // would not be checked at all.
+        mut variant := String("struct")
+        when has_arity {
+            variant = String("tuple:")
+            variant.append(String(tuple_arity))
+        }
+        probe := self.push_arm(ast::ChooseArm { enum_name: Option::Some(String("$shape")), variant: Option::Some(variant), bindings: Vec(), body: body.unwrap(), span: span })
+        scrutinee := self.copy_expr(vars[column])
+        return Result::Ok(Option::Some(self.push_expr(ast::ExprTree::ChooseE(scrutinee, ds_list1(probe), span))))
+    }
+
+    // The rows that reach a literal test, with the binding of the column recorded and the column removed.
+    fun bound_row(self, row: MRow, column: u64, var: u64) -> MRow {
+        mut next := row
+        pattern := self.pats[next.pats[column]]
+        when pattern.kind == 1 {
+            next.bind_names.push(pattern.text)
+            next.bind_vars.push(var)
+        }
+        next.pats = ds_without(next.pats.clone(), column)
+        return next
+    }
+
+    fun switch_literals(mut self, vars: Vec<u64>, remaining: Vec<u64>, column: u64, rows: Vec<MRow>, span: ast::Span) -> Result<Option<u64>, String> {
+        mut literals: Vec<String> = Vec()
+        for row in rows.clone() {
+            pattern := self.pats[row.pats[column]]
+            when pattern.kind == 2 {
+                when !ds_contains(literals.clone(), pattern.text.clone()) {
+                    literals.push(pattern.text)
+                }
+            } else when pattern.kind >= 3 {
+                return Result::Err(ds_error(String("a literal pattern cannot be mixed with other kinds of patterns"), row.span))
+            }
+        }
+        var := vars[column]
+        mut defaults: Vec<MRow> = Vec()
+        for row in rows.clone() {
+            when self.pat_kind(row.pats[column]) <= 1 {
+                defaults.push(self.bound_row(row, column, var))
+            }
+        }
+        mut boolean_complete := literals.len() == 2 && defaults.is_empty()
+        for text in literals.clone() {
+            when text != "true" && text != "false" {
+                boolean_complete = false
+            }
+        }
+        mut tests := literals.clone()
+        mut otherwise: Option<u64> = Option::None
+        when boolean_complete {
+            // With both booleans covered, the last one is the `else` branch.
+            last := tests[1].clone()
+            tests = Vec()
+            tests.push(literals[0].clone())
+            mut matching: Vec<MRow> = Vec()
+            for row in rows.clone() {
+                pattern := self.pats[row.pats[column]]
+                when pattern.kind == 2 && pattern.text == last {
+                    matching.push(self.bound_row(row, column, var))
+                }
+            }
+            otherwise = self.compile(remaining.clone(), matching, span)?
+        } else {
+            otherwise = self.compile(remaining.clone(), defaults, span)?
+        }
+        when otherwise.is_none() {
+            mut blame := span
+            when !rows.is_empty() {
+                blame = rows[0].span
+            }
+            return Result::Err(ds_error_help(String("literal patterns must be followed by a `_` arm"), blame, "integers and characters cannot be matched exhaustively"))
+        }
+        mut chain := otherwise.unwrap()
+        mut position := tests.len()
+        while position > 0 {
+            position -= 1
+            text := tests[position].clone()
+            mut matching: Vec<MRow> = Vec()
+            for row in rows.clone() {
+                pattern := self.pats[row.pats[column]]
+                when pattern.kind != 2 || pattern.text == text {
+                    matching.push(self.bound_row(row, column, var))
+                }
+            }
+            then_value := self.compile(remaining.clone(), matching, span)?
+            when then_value.is_none() {
+                return Result::Err(ds_error(String("malformed pattern"), span))
+            }
+            left := self.copy_expr(var)
+            right := self.literal_expression(text, span)
+            condition := self.push_expr(ast::ExprTree::BinaryE(String("Eq"), left, right, span))
+            chain = self.push_expr(ast::ExprTree::IfE(condition, then_value.unwrap(), chain, span))
+        }
+        return Result::Ok(Option::Some(chain))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The operators the syntax tree keeps as written: `|>`, `??` and `?.`
+
+// Rewrites `value |> f(args)` into `f(value, args)`, `value ?? fallback` and `value?.name` into `choose` over the
+// `Option`, as the bootstrap's reader of the syntax tree does, before generic specialization sees the program.
+pub fun rewrite_operators(program: ast::Program) -> Result<ast::Program, String> {
+    mut source := program
+    exprs := source.exprs
+    arms := source.arms
+    inits := source.inits
+    source.exprs = Vec()
+    source.arms = Vec()
+    source.inits = Vec()
+    mut pass := Desugar {
+        program: source,
+        exprs: exprs,
+        arms: arms,
+        inits: inits,
+        pats: Vec(),
+        used: Vec(),
+        fresh: 0,
+        text: String(""),
+        at: 0,
+        parse_start: 0,
+        parse_end: 0,
+    }
+    count := pass.exprs.len()
+    mut index: u64 = 0
+    while index < count {
+        pass.rewrite_operator(index)?
+        index += 1
+    }
+    return Result::Ok(pass.finish())
+}
+
+extend Desugar {
+    fun rewrite_operator(mut self, index: u64) -> Result<bool, String> {
+        return choose self.exprs[index] {
+            ast::ExprTree::PipeE(value, target, span) => self.rewrite_pipe(index, value, target, span),
+            ast::ExprTree::CoalesceE(value, fallback, span) => self.rewrite_coalesce(index, value, fallback, span),
+            ast::ExprTree::OptionalFieldE(value, name, name_span, span) => self.rewrite_optional_field(index, value, name, name_span, span),
+            _ => Result::Ok(false),
+        }
+    }
+
+    fun rewrite_pipe(mut self, index: u64, value: u64, target: u64, span: ast::Span) -> Result<bool, String> {
+        node := choose self.exprs[target] {
+            ast::ExprTree::NameRef(name, name_span) => Option::Some(ast::ExprTree::CallE(name, Vec(), ds_list1(value), span)),
+            ast::ExprTree::CallE(name, type_arguments, arguments, call_span) => Option::Some(ast::ExprTree::CallE(name, type_arguments, ds_prefixed(value, arguments), span)),
+            _ => Option::None,
+        }
+        when node.is_none() {
+            target_span := self.span_of(target)
+            return Result::Err(lower::diagnostic("R0012", target_span.start, target_span.end, String("the right side of `|>` must be a function name or a function call"), String("")))
+        }
+        self.exprs.set(index, node.unwrap())
+        return Result::Ok(true)
+    }
+
+    fun option_arm(mut self, variant: str, bindings: Vec<String>, body: u64, span: ast::Span) -> u64 {
+        return self.push_arm(ast::ChooseArm { enum_name: Option::Some(String("Option")), variant: Option::Some(String(variant)), bindings: bindings, body: body, span: span })
+    }
+
+    fun rewrite_coalesce(mut self, index: u64, value: u64, fallback: u64, span: ast::Span) -> Result<bool, String> {
+        bound := self.push_expr(ast::ExprTree::NameRef(String("$coalesce"), span))
+        mut names: Vec<String> = Vec()
+        names.push(String("$coalesce"))
+        some_arm := self.option_arm("Some", names, bound, span)
+        none_arm := self.option_arm("None", Vec(), fallback, span)
+        self.exprs.set(index, ast::ExprTree::ChooseE(value, ds_list2(some_arm, none_arm), span))
+        return Result::Ok(true)
+    }
+
+    fun rewrite_optional_field(mut self, index: u64, value: u64, name: String, name_span: ast::Span, span: ast::Span) -> Result<bool, String> {
+        bound := self.push_expr(ast::ExprTree::NameRef(String("$chain"), name_span))
+        field := self.push_expr(ast::ExprTree::FieldE(bound, name, name_span, name_span))
+        wrapped := self.push_expr(ast::ExprTree::EnumE(String("Option"), String("Some"), ds_list1(field), span))
+        nothing := self.push_expr(ast::ExprTree::EnumE(String("Option"), String("None"), Vec(), span))
+        mut names: Vec<String> = Vec()
+        names.push(String("$chain"))
+        some_arm := self.option_arm("Some", names, wrapped, span)
+        none_arm := self.option_arm("None", Vec(), nothing, span)
+        self.exprs.set(index, ast::ExprTree::ChooseE(value, ds_list2(some_arm, none_arm), span))
+        return Result::Ok(true)
+    }
+}

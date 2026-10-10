@@ -1,0 +1,34 @@
+// test: run
+// out: 14000
+// out: 0
+// out: 4000
+// out: 0
+// exit: 0
+// Enum payloads that are arrays or structures own their elements: a thousand rounds of building, reading and dropping them leave
+// no live allocation behind.
+extern "C" fun ryn_native_live_allocations() -> u64;
+struct Person { name: String, visits: i32 }
+fun main() {
+    before := ryn_native_live_allocations()
+    mut i: u64 = 0
+    mut total: u64 = 0
+    mut visits: u64 = 0
+    while i < 1000 {
+        result: Result<[String; 2], String> = Result::Ok([String("zażółć"), String("你好")])
+        array := result.expect("array")
+        first := array[0]
+        total += first.len()
+        error: Result<String, [String; 2]> = Result::Err([String("first"), String("🦀")])
+        error_array := error.unwrap_err()
+        second := error_array[1]
+        total += second.len()
+        maybe: Option<Person> = Option::Some(Person { name: String("Krystian"), visits: 4 })
+        person := maybe.unwrap()
+        visits += person.visits as u64
+        i += 1
+    }
+    echo total
+    echo ryn_native_live_allocations() - before
+    echo visits
+    echo ryn_native_live_allocations() - before
+}

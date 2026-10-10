@@ -1,0 +1,10 @@
+// test: fail
+// code: R0244
+// msg: does not implement Hash and Eq
+// A map key must derive Hash and Eq; a structure without the derive is rejected where its map is made.
+struct Cell { row: i64, col: i32 }
+fun main() {
+    mut board := Map<Cell, i32>()
+    board.insert(Cell { row: 1, col: 2 }, 3)
+    echo board.len()
+}

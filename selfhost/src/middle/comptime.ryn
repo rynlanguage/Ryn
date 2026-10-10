@@ -1,0 +1,3464 @@
+// Compile-time evaluation, as the bootstrap's `src/comptime.rs` performs it, on the Ryn syntax tree.
+//
+// The pass runs after generic specialization and before the pattern rewrite and the lowering:
+//
+// * `#[derive(Default)]` structures get a `Type::default()` function (`derive_defaults`);
+// * top-level `const NAME: Type = expression` items are evaluated and folded into their uses;
+// * `comptime(expression)` and the metadata calls `field_count::<S>()`, `variant_count::<E>()`, `type_name::<T>()` and
+//   `has_field::<S>("name")` are replaced by their values;
+// * `static_assert(condition)` and `static_assert(condition, "message")` statements are checked and removed;
+// * a `when` whose condition names a constant keeps only the branch that is taken (conditional compilation).
+//
+// The evaluator runs the same pure subset of the language as the bootstrap: integers, floats, booleans, characters,
+// strings, structures and vectors held in locals, `when`, `while`, `for` over ranges, `return`, and calls. A step budget
+// and a recursion limit keep evaluation bounded and deterministic. Integers are exact over the range of an i128, like the
+// bootstrap's, so the values and the diagnostics agree with it.
+//
+// Values live in an arena (`Comptime.vals`); a structure or a vector refers to its parts by index. A local owns its value
+// tree: reading a structure or vector from a local copies it, so a change through one local never shows through another.
+
+use middle::ast
+use middle::lower
+use middle::floatlib
+
+// An integer of the range of an i128: a sign and a 128-bit magnitude (`hi`, `lo`). Zero is never negative.
+#[derive(Clone)]
+pub struct Wide {
+    neg: bool,
+    hi: u64,
+    lo: u64,
+}
+
+// A compile-time value. `kind`: 1 integer, 2 float, 3 bool, 4 char, 5 str, 6 String, 7 structure, 8 vector.
+// `ity` is the integer type code (0 for a literal that has not met a typed operand), `fty` the float type (0 none, 1 f32,
+// 2 f64). A structure has its name in `text`, its field names in `names` and their values in `items`; a vector has its
+// elements in `items`.
+#[derive(Clone)]
+pub struct CtVal {
+    kind: u64,
+    int: Wide,
+    ity: u64,
+    flt: f64,
+    fty: u64,
+    flag: bool,
+    ch: u64,
+    text: String,
+    names: Vec<String>,
+    items: Vec<u64>,
+}
+
+pub struct Comptime {
+    // The program; the arenas this pass changes are held apart from it while it runs.
+    program: ast::Program,
+    exprs: Vec<ast::ExprTree>,
+    stmts: Vec<ast::Stmt>,
+    types: Vec<ast::TypeTree>,
+    inits: Vec<ast::FieldInit>,
+    function_defs: Vec<ast::Function>,
+    functions: Vec<u64>,
+    vals: Vec<CtVal>,
+    vals_used: u64,
+    // The first function of each name, in program order.
+    by_name: Map<String, u64>,
+    // `alias::NAME` for every constant of a module that a `use` imports, with the constant and whether it is public.
+    alias_keys: Vec<String>,
+    alias_targets: Vec<u64>,
+    alias_public: Vec<bool>,
+    // The values of the constants evaluated so far (by function index), and those being evaluated now.
+    const_done: Map<u64, u64>,
+    in_progress: Vec<u64>,
+    steps: u64,
+    depth: u64,
+    // The locals of the frames being run: name, value, mutability and block depth. The current frame starts at `base`.
+    local_names: Vec<String>,
+    local_values: Vec<u64>,
+    local_mutable: Vec<bool>,
+    local_depths: Vec<u64>,
+    base: u64,
+    block_depth: u64,
+    module: String,
+    // The value of the `return` that ended a body (when `returned` is set).
+    returned: bool,
+    return_value: u64,
+    // The lowest value changed in place since the current loop iteration began, and the number of constants evaluated:
+    // an iteration that changed neither older values nor the constants releases the values it made and no local keeps.
+    lowest_changed: u64,
+}
+
+// The flows of a statement.
+fun ct_normal() -> u64 {
+    return 0
+}
+
+fun ct_return() -> u64 {
+    return 1
+}
+
+fun ct_break() -> u64 {
+    return 2
+}
+
+fun ct_continue() -> u64 {
+    return 3
+}
+
+fun ct_step_limit() -> u64 {
+    return 2000000
+}
+
+fun ct_depth_limit() -> u64 {
+    return 200
+}
+
+fun ct_max_u64() -> u64 {
+    return 18446744073709551615
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Diagnostics
+
+fun ct_error(code: str, message: String, span: ast::Span) -> String {
+    return lower::diagnostic(code, span.start, span.end, message, String(""))
+}
+
+fun ct_error_help(code: str, message: String, span: ast::Span, help: str) -> String {
+    return lower::diagnostic(code, span.start, span.end, message, String(help))
+}
+
+fun ct_not_constant(what: String, span: ast::Span) -> String {
+    mut message := what
+    message.append(" cannot be evaluated at compile time")
+    return ct_error_help("R0461", message, span, "compile-time code may use literals, constants, locals declared in the same function, and calls to functions made of the same constructs")
+}
+
+fun ct_quoted(name: String) -> String {
+    mut text := String("`")
+    text.append(name)
+    text.append("`")
+    return text
+}
+
+fun ct_private_constant(name: String, span: ast::Span) -> String {
+    mut message := String("constant `")
+    message.append(name)
+    message.append("` is private to its module")
+    return ct_error_help("R0425", message, span, "mark the constant `pub` to use it from another module")
+}
+
+fun ct_message_of(text: String) -> String {
+    // A diagnostic is `diagnostic CODE START END <length>:<message> <length>:<help>`; the message is read back here.
+    mut at: u64 = 0
+    mut spaces: u64 = 0
+    while at < text.len() && spaces < 4 {
+        when text.byte_at(at) == (32 as u8) {
+            spaces += 1
+        }
+        at += 1
+    }
+    mut digits: u64 = 0
+    mut cursor := at
+    while cursor < text.len() && text.byte_at(cursor) >= (48 as u8) && text.byte_at(cursor) <= (57 as u8) {
+        digits = digits * 10 + ((text.byte_at(cursor) - (48 as u8)) as u64)
+        cursor += 1
+    }
+    when cursor >= text.len() {
+        return String("")
+    }
+    start := cursor + 1
+    mut end := start + digits
+    when end > text.len() {
+        end = text.len()
+    }
+    return text.slice(start, end)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Integer types: 1 i8, 2 i16, 3 i32, 4 i64, 5 u8, 6 u16, 7 u32, 8 u64.
+
+fun ct_int_code(word: String) -> u64 {
+    when word == "i8" {
+        return 1
+    }
+    when word == "i16" {
+        return 2
+    }
+    when word == "i32" {
+        return 3
+    }
+    when word == "i64" {
+        return 4
+    }
+    when word == "u8" {
+        return 5
+    }
+    when word == "u16" {
+        return 6
+    }
+    when word == "u32" {
+        return 7
+    }
+    when word == "u64" {
+        return 8
+    }
+    return 0
+}
+
+fun ct_int_name(code: u64) -> String {
+    when code == 1 {
+        return String("i8")
+    }
+    when code == 2 {
+        return String("i16")
+    }
+    when code == 3 {
+        return String("i32")
+    }
+    when code == 4 {
+        return String("i64")
+    }
+    when code == 5 {
+        return String("u8")
+    }
+    when code == 6 {
+        return String("u16")
+    }
+    when code == 7 {
+        return String("u32")
+    }
+    return String("u64")
+}
+
+fun ct_int_bits(code: u64) -> u64 {
+    when code == 1 || code == 5 {
+        return 8
+    }
+    when code == 2 || code == 6 {
+        return 16
+    }
+    when code == 3 || code == 7 {
+        return 32
+    }
+    return 64
+}
+
+fun ct_int_signed(code: u64) -> bool {
+    return code >= 1 && code <= 4
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Wide integers
+
+fun w_zero() -> Wide {
+    return Wide { neg: false, hi: 0, lo: 0 }
+}
+
+fun w_make(neg: bool, hi: u64, lo: u64) -> Wide {
+    when hi == 0 && lo == 0 {
+        return Wide { neg: false, hi: 0, lo: 0 }
+    }
+    return Wide { neg: neg, hi: hi, lo: lo }
+}
+
+fun w_of_u64(value: u64) -> Wide {
+    return w_make(false, 0, value)
+}
+
+// 2^(bits) as a wide value (bits up to 127).
+fun w_power(bits: u64) -> Wide {
+    when bits >= 64 {
+        return w_make(false, (1 as u64) << ((bits - 64) as u32), 0)
+    }
+    return w_make(false, 0, (1 as u64) << (bits as u32))
+}
+
+fun w_negated(value: Wide) -> Wide {
+    return w_make(!value.neg, value.hi, value.lo)
+}
+
+// Compares magnitudes: -1, 0 or 1.
+fun mag_cmp(ahi: u64, alo: u64, bhi: u64, blo: u64) -> i64 {
+    when ahi != bhi {
+        when ahi < bhi {
+            return 0 - 1
+        }
+        return 1
+    }
+    when alo != blo {
+        when alo < blo {
+            return 0 - 1
+        }
+        return 1
+    }
+    return 0
+}
+
+fun w_cmp(a: Wide, b: Wide) -> i64 {
+    when a.neg != b.neg {
+        when a.neg {
+            return 0 - 1
+        }
+        return 1
+    }
+    order := mag_cmp(a.hi, a.lo, b.hi, b.lo)
+    when a.neg {
+        return 0 - order
+    }
+    return order
+}
+
+fun w_add(a: Wide, b: Wide) -> Wide {
+    when a.neg == b.neg {
+        lo := a.lo + b.lo
+        mut carry: u64 = 0
+        when lo < a.lo {
+            carry = 1
+        }
+        return w_make(a.neg, a.hi + b.hi + carry, lo)
+    }
+    // Different signs: the larger magnitude minus the smaller, with the larger one's sign.
+    order := mag_cmp(a.hi, a.lo, b.hi, b.lo)
+    when order == 0 {
+        return w_zero()
+    }
+    when order > 0 {
+        return w_make(a.neg, mag_sub_hi(a.hi, a.lo, b.hi, b.lo), a.lo - b.lo)
+    }
+    return w_make(b.neg, mag_sub_hi(b.hi, b.lo, a.hi, a.lo), b.lo - a.lo)
+}
+
+// The high word of `a - b` for magnitudes with a >= b.
+fun mag_sub_hi(ahi: u64, alo: u64, bhi: u64, blo: u64) -> u64 {
+    when alo < blo {
+        return ahi - bhi - 1
+    }
+    return ahi - bhi
+}
+
+fun w_sub(a: Wide, b: Wide) -> Wide {
+    return w_add(a, w_negated(b))
+}
+
+// The product, or the largest i128 when the bootstrap's `checked_mul` would overflow.
+fun w_mul(a: Wide, b: Wide) -> Wide {
+    when a.hi != 0 || b.hi != 0 {
+        when (a.hi == 0 && a.lo == 0) || (b.hi == 0 && b.lo == 0) {
+            return w_zero()
+        }
+        return w_i128_max()
+    }
+    mask: u64 = 4294967295
+    a0 := a.lo & mask
+    a1 := a.lo >> (32 as u32)
+    b0 := b.lo & mask
+    b1 := b.lo >> (32 as u32)
+    p00 := a0 * b0
+    p01 := a0 * b1
+    p10 := a1 * b0
+    p11 := a1 * b1
+    middle := (p00 >> (32 as u32)) + (p01 & mask) + (p10 & mask)
+    lo := (p00 & mask) | ((middle & mask) << (32 as u32))
+    hi := p11 + (p01 >> (32 as u32)) + (p10 >> (32 as u32)) + (middle >> (32 as u32))
+    // 2^127 and above does not fit in an i128 (except -2^127, which these operands cannot make).
+    when hi >= ((1 as u64) << (63 as u32)) {
+        return w_i128_max()
+    }
+    return w_make(a.neg != b.neg, hi, lo)
+}
+
+fun w_i128_max() -> Wide {
+    return w_make(false, 9223372036854775807, ct_max_u64())
+}
+
+// Division and remainder of magnitudes that fit in 64 bits, truncating toward zero as Rust's `/` and `%` on i128 do.
+fun w_div(a: Wide, b: Wide) -> Wide {
+    when a.hi != 0 {
+        return mag_div_wide(a, b.lo, true)
+    }
+    return w_make(a.neg != b.neg, 0, a.lo / b.lo)
+}
+
+fun w_rem(a: Wide, b: Wide) -> Wide {
+    when a.hi != 0 {
+        return mag_div_wide(a, b.lo, false)
+    }
+    return w_make(a.neg, 0, a.lo % b.lo)
+}
+
+// Long division of a 128-bit magnitude by a 64-bit one, a bit at a time: the quotient (signed as `/`) or the remainder.
+fun mag_div_wide(a: Wide, divisor: u64, quotient: bool) -> Wide {
+    mut qhi: u64 = 0
+    mut qlo: u64 = 0
+    mut rem_hi: u64 = 0
+    mut rem: u64 = 0
+    mut bit: u64 = 128
+    while bit > 0 {
+        bit -= 1
+        mut current: u64 = 0
+        when bit >= 64 {
+            current = (a.hi >> ((bit - 64) as u32)) & 1
+        } else {
+            current = (a.lo >> (bit as u32)) & 1
+        }
+        rem_hi = (rem_hi << (1 as u32)) | (rem >> (63 as u32))
+        rem = (rem << (1 as u32)) | current
+        when rem_hi != 0 || rem >= divisor {
+            rem = rem - divisor
+            rem_hi = 0
+            when bit >= 64 {
+                qhi = qhi | ((1 as u64) << ((bit - 64) as u32))
+            } else {
+                qlo = qlo | ((1 as u64) << (bit as u32))
+            }
+        }
+    }
+    when quotient {
+        return w_make(a.neg, qhi, qlo)
+    }
+    return w_make(a.neg, 0, rem)
+}
+
+// The decimal text of a wide value.
+fun w_text(value: Wide) -> String {
+    when value.hi == 0 {
+        mut text := String("")
+        when value.neg {
+            text.append("-")
+        }
+        text.append(String(value.lo))
+        return text
+    }
+    mut digits := String("")
+    mut current := w_make(false, value.hi, value.lo)
+    while current.hi != 0 || current.lo != 0 {
+        digit := mag_div_wide(current.clone(), 10, false)
+        mut next := String("0123456789").slice(digit.lo, digit.lo + 1)
+        next.append(digits)
+        digits = next
+        current = mag_div_wide(current, 10, true)
+    }
+    mut text := String("")
+    when value.neg {
+        text.append("-")
+    }
+    text.append(digits)
+    return text
+}
+
+// The 128-bit two's complement pattern of a value, as (high word, low word).
+fun w_pattern_hi(value: Wide) -> u64 {
+    when !value.neg {
+        return value.hi
+    }
+    mut hi := ~value.hi
+    when value.lo == 0 {
+        hi = hi + 1
+    }
+    return hi
+}
+
+fun w_pattern_lo(value: Wide) -> u64 {
+    when !value.neg {
+        return value.lo
+    }
+    return (~value.lo) + 1
+}
+
+fun w_from_pattern(hi: u64, lo: u64) -> Wide {
+    when (hi >> (63 as u32)) == 0 {
+        return w_make(false, hi, lo)
+    }
+    mut magnitude_hi := ~hi
+    magnitude_lo := (~lo) + 1
+    when magnitude_lo == 0 {
+        magnitude_hi = magnitude_hi + 1
+    }
+    return w_make(true, magnitude_hi, magnitude_lo)
+}
+
+// A bitwise operator on the two's complement patterns: 1 and, 2 or, 3 xor.
+fun w_bits(op: u64, a: Wide, b: Wide) -> Wide {
+    ahi := w_pattern_hi(a.clone())
+    alo := w_pattern_lo(a)
+    bhi := w_pattern_hi(b.clone())
+    blo := w_pattern_lo(b)
+    when op == 1 {
+        return w_from_pattern(ahi & bhi, alo & blo)
+    }
+    when op == 2 {
+        return w_from_pattern(ahi | bhi, alo | blo)
+    }
+    return w_from_pattern(ahi ^ bhi, alo ^ blo)
+}
+
+fun w_not(a: Wide) -> Wide {
+    return w_from_pattern(~w_pattern_hi(a.clone()), ~w_pattern_lo(a))
+}
+
+fun w_shift_left(a: Wide, count: u64) -> Wide {
+    hi := w_pattern_hi(a.clone())
+    lo := w_pattern_lo(a)
+    when count == 0 {
+        return w_from_pattern(hi, lo)
+    }
+    when count >= 64 {
+        return w_from_pattern(lo << ((count - 64) as u32), 0)
+    }
+    return w_from_pattern((hi << (count as u32)) | (lo >> ((64 - count) as u32)), lo << (count as u32))
+}
+
+// An arithmetic shift right of the i128 pattern.
+fun w_shift_right(a: Wide, count: u64) -> Wide {
+    hi := w_pattern_hi(a.clone())
+    lo := w_pattern_lo(a)
+    when count == 0 {
+        return w_from_pattern(hi, lo)
+    }
+    fill := (hi >> (63 as u32)) == 1
+    when count >= 64 {
+        shifted := ((hi as i64) >> ((count - 64) as u32)) as u64
+        mut top: u64 = 0
+        when fill {
+            top = ct_max_u64()
+        }
+        return w_from_pattern(top, shifted)
+    }
+    new_hi := ((hi as i64) >> (count as u32)) as u64
+    new_lo := (lo >> (count as u32)) | (hi << ((64 - count) as u32))
+    return w_from_pattern(new_hi, new_lo)
+}
+
+// The bounds of an integer type.
+fun ct_low(code: u64) -> Wide {
+    when ct_int_signed(code) {
+        return w_negated(w_power(ct_int_bits(code) - 1))
+    }
+    return w_zero()
+}
+
+fun ct_high(code: u64) -> Wide {
+    when ct_int_signed(code) {
+        return w_sub(w_power(ct_int_bits(code) - 1), w_of_u64(1))
+    }
+    return w_sub(w_power(ct_int_bits(code)), w_of_u64(1))
+}
+
+// `IntType::wrap`: the value reduced to the range of the type, as an `as` cast keeps it.
+fun ct_wrap(code: u64, value: Wide) -> Wide {
+    bits := ct_int_bits(code)
+    lo := w_pattern_lo(value)
+    mut kept := lo
+    when bits < 64 {
+        kept = lo & (((1 as u64) << (bits as u32)) - 1)
+    }
+    when !ct_int_signed(code) {
+        return w_of_u64(kept)
+    }
+    sign := (kept >> ((bits - 1) as u32)) & 1
+    when sign == 0 {
+        return w_of_u64(kept)
+    }
+    // Negative: the pattern minus 2^bits.
+    return w_sub(w_of_u64(kept), w_power(bits))
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Floats as bits
+
+fun ct_bits_of(value: f64) -> u64 {
+    mut cell := value
+    pointer: *f64 = &raw mut cell
+    words := pointer as *u64
+    return *words
+}
+
+fun ct_float_of(bits: u64) -> f64 {
+    mut cell := bits
+    pointer: *u64 = &raw mut cell
+    floats := pointer as *f64
+    return *floats
+}
+
+fun ct_round_f32(value: f64) -> f64 {
+    narrow := value as f32
+    return narrow as f64
+}
+
+fun ct_is_nan(value: f64) -> bool {
+    return value != value
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Values
+
+fun ct_blank(kind: u64) -> CtVal {
+    return CtVal { kind: kind, int: w_zero(), ity: 0, flt: 0.0, fty: 0, flag: false, ch: 0, text: String(""), names: Vec(), items: Vec() }
+}
+
+fun ct_describe(kind: u64) -> String {
+    when kind == 1 {
+        return String("an integer")
+    }
+    when kind == 2 {
+        return String("a float")
+    }
+    when kind == 3 {
+        return String("a bool")
+    }
+    when kind == 4 {
+        return String("a char")
+    }
+    when kind == 5 {
+        return String("a string")
+    }
+    when kind == 6 {
+        return String("a String")
+    }
+    when kind == 7 {
+        return String("a structure")
+    }
+    return String("a Vec")
+}
+
+fun ct_has_name(names: Vec<String>, name: String) -> bool {
+    for candidate in names {
+        when candidate == name {
+            return true
+        }
+    }
+    return false
+}
+
+fun ct_is_metadata(name: String) -> bool {
+    return name == "field_count" || name == "variant_count" || name == "type_name" || name == "has_field"
+}
+
+// Runs the compile-time pass on a specialized program: derived defaults, then constants, assertions and folding.
+pub fun evaluate_program(program: ast::Program) -> Result<ast::Program, String> {
+    mut source := program
+    exprs := source.exprs
+    stmts := source.stmts
+    types := source.types
+    inits := source.inits
+    function_defs := source.function_defs
+    functions := source.functions
+    source.exprs = Vec()
+    source.stmts = Vec()
+    source.types = Vec()
+    source.inits = Vec()
+    source.function_defs = Vec()
+    source.functions = Vec()
+    mut pass := Comptime {
+        program: source,
+        exprs: exprs,
+        stmts: stmts,
+        types: types,
+        inits: inits,
+        function_defs: function_defs,
+        functions: functions,
+        vals: Vec(),
+        vals_used: 0,
+        by_name: Map<String, u64>(),
+        alias_keys: Vec(),
+        alias_targets: Vec(),
+        alias_public: Vec(),
+        const_done: Map<u64, u64>(),
+        in_progress: Vec(),
+        steps: 0,
+        depth: 0,
+        local_names: Vec(),
+        local_values: Vec(),
+        local_mutable: Vec(),
+        local_depths: Vec(),
+        base: 0,
+        block_depth: 0,
+        module: String(""),
+        returned: false,
+        return_value: 0,
+        lowest_changed: ct_max_u64(),
+    }
+    pass.derive_defaults()?
+    pass.evaluate()?
+    return Result::Ok(pass.finish())
+}
+
+extend Comptime {
+    // The program with the changed arenas put back.
+    fun finish(self) -> ast::Program {
+        mut result := self.program
+        result.exprs = self.exprs
+        result.stmts = self.stmts
+        result.types = self.types
+        result.inits = self.inits
+        result.function_defs = self.function_defs
+        result.functions = self.functions
+        return result
+    }
+
+    // ---- the arena ----
+
+    // The arena's entries past `vals_used` are free and are reused before it grows.
+    fun push_val(mut self, value: CtVal) -> u64 {
+        index := self.vals_used
+        when index < self.vals.len() {
+            self.vals.set(index, value)
+        } else {
+            self.vals.push(value)
+        }
+        self.vals_used = index + 1
+        return index
+    }
+
+    fun int_val(mut self, value: Wide, ity: u64) -> u64 {
+        mut made := ct_blank(1)
+        made.int = value
+        made.ity = ity
+        return self.push_val(made)
+    }
+
+    fun float_val(mut self, value: f64, fty: u64) -> u64 {
+        mut made := ct_blank(2)
+        made.flt = value
+        made.fty = fty
+        return self.push_val(made)
+    }
+
+    fun bool_val(mut self, value: bool) -> u64 {
+        mut made := ct_blank(3)
+        made.flag = value
+        return self.push_val(made)
+    }
+
+    fun char_val(mut self, value: u64) -> u64 {
+        mut made := ct_blank(4)
+        made.ch = value
+        return self.push_val(made)
+    }
+
+    fun text_val(mut self, kind: u64, value: String) -> u64 {
+        mut made := ct_blank(kind)
+        made.text = value
+        return self.push_val(made)
+    }
+
+    fun kind_of(self, index: u64) -> u64 {
+        return self.vals[index].kind
+    }
+
+    // A copy of a value that no other value shares: structures and vectors are copied part by part.
+    fun copy_val(mut self, index: u64) -> u64 {
+        kind := self.vals[index].kind
+        when kind != 7 && kind != 8 {
+            return index
+        }
+        mut made := self.vals[index]
+        mut parts: Vec<u64> = Vec()
+        for part in made.items.clone() {
+            parts.push(self.copy_val(part))
+        }
+        made.items = parts
+        return self.push_val(made)
+    }
+
+    fun describe_val(self, index: u64) -> String {
+        return ct_describe(self.vals[index].kind)
+    }
+
+    // ---- names and lookup ----
+
+    fun setup(mut self) {
+        mut position: u64 = 0
+        while position < self.functions.len() {
+            index := self.functions[position]
+            name := self.function_defs[index].name.clone()
+            when !self.by_name.contains_key(name.clone()) {
+                self.by_name.insert(name, index)
+            }
+            position += 1
+        }
+        mut use_at: u64 = 0
+        while use_at < self.program.uses.len() {
+            import := self.program.use_decls[self.program.uses[use_at]]
+            mut local := String("")
+            mut has_local := false
+            when import.alias.is_some() {
+                local = import.alias.unwrap()
+                has_local = true
+            } else when import.path.len() > 0 {
+                local = import.path[import.path.len() - 1].clone()
+                has_local = true
+            }
+            when has_local {
+                mut module_path := String("")
+                mut part: u64 = 0
+                while part < import.path.len() {
+                    when part > 0 {
+                        module_path.append("::")
+                    }
+                    module_path.append(import.path[part].clone())
+                    part += 1
+                }
+                mut prefix := module_path.clone()
+                prefix.append("::")
+                position = 0
+                while position < self.functions.len() {
+                    index := self.functions[position]
+                    function := self.function_defs[index]
+                    when self.is_constant(index) && function.module_path == module_path && function.name.starts_with(prefix.clone()) {
+                        mut key := local.clone()
+                        key.append("::")
+                        key.append(function.name.slice(prefix.len(), function.name.len()))
+                        self.alias_keys.push(key)
+                        self.alias_targets.push(index)
+                        self.alias_public.push(function.public)
+                    }
+                    position += 1
+                }
+            }
+            use_at += 1
+        }
+    }
+
+    fun is_constant(self, index: u64) -> bool {
+        symbol := self.function_defs[index].external_symbol
+        when symbol.is_none() {
+            return false
+        }
+        return symbol.unwrap() == "$const"
+    }
+
+    fun tick(mut self, span: ast::Span) -> Result<bool, String> {
+        self.steps += 1
+        when self.steps > ct_step_limit() {
+            mut message := String("compile-time evaluation exceeded the limit of ")
+            message.append(String(ct_step_limit()))
+            message.append(" steps")
+            return Result::Err(ct_error("R0463", message, span))
+        }
+        return Result::Ok(true)
+    }
+
+    // A function by the name written at a use, preferring the caller's module.
+    fun resolve(self, name: String, module_path: String) -> Option<u64> {
+        when !module_path.is_empty() {
+            mut qualified := module_path
+            qualified.append("::")
+            qualified.append(name.clone())
+            when self.by_name.contains_key(qualified.clone()) {
+                return Option::Some(self.by_name.get(qualified).unwrap())
+            }
+        }
+        when self.by_name.contains_key(name.clone()) {
+            return Option::Some(self.by_name.get(name).unwrap())
+        }
+        return Option::None
+    }
+
+    fun resolve_constant(self, name: String, module_path: String, span: ast::Span) -> Result<Option<u64>, String> {
+        found := self.resolve(name.clone(), module_path.clone())
+        when found.is_some() && self.is_constant(found.unwrap()) {
+            index := found.unwrap()
+            when !self.function_defs[index].public && self.function_defs[index].module_path != module_path {
+                return Result::Err(ct_private_constant(name, span))
+            }
+            return Result::Ok(Option::Some(index))
+        }
+        // The last import that names the constant decides, as the bootstrap's map keeps the last insertion.
+        mut at := self.alias_keys.len()
+        while at > 0 {
+            at -= 1
+            when self.alias_keys[at] == name {
+                when self.alias_public[at] {
+                    return Result::Ok(Option::Some(self.alias_targets[at]))
+                }
+                return Result::Err(ct_private_constant(name, span))
+            }
+        }
+        return Result::Ok(Option::None)
+    }
+
+    // The value of the constant at `index`, evaluated once. `span` is where it is used.
+    fun constant(mut self, index: u64, span: ast::Span) -> Result<u64, String> {
+        when self.const_done.contains_key(index) {
+            done := self.const_done.get(index).unwrap()
+            return Result::Ok(self.copy_val(done))
+        }
+        function := self.function_defs[index]
+        for open in self.in_progress.clone() {
+            when open == index {
+                mut message := String("constant `")
+                message.append(function.name.clone())
+                message.append("` depends on itself")
+                return Result::Err(ct_error("R0462", message, span))
+            }
+        }
+        when function.return_value.is_none() {
+            return Result::Err(ct_not_constant(String("this constant"), function.span))
+        }
+        self.in_progress.push(index)
+        // The constant runs in a frame of its own, in its module.
+        saved_base := self.base
+        saved_module := self.module.clone()
+        saved_depth := self.block_depth
+        self.base = self.local_names.len()
+        self.module = function.module_path.clone()
+        self.block_depth += 1
+        expression := function.return_value.unwrap()
+        mut result := self.expression(expression)
+        when result.is_ok() {
+            value := result.unwrap()
+            when function.return_type.is_some() {
+                result = self.coerce(value, function.return_type.unwrap(), self.span_of(expression))
+            } else {
+                result = self.coerce_word(value, String("i64"), self.span_of(expression))
+            }
+        }
+        self.truncate_locals(self.base)
+        self.base = saved_base
+        self.module = saved_module
+        self.block_depth = saved_depth
+        mut remaining: Vec<u64> = Vec()
+        for open in self.in_progress.clone() {
+            when open != index {
+                remaining.push(open)
+            }
+        }
+        self.in_progress = remaining
+        value := result?
+        self.const_done.insert(index, value)
+        return Result::Ok(self.copy_val(value))
+    }
+
+    // ---- locals ----
+
+    fun truncate_locals(mut self, length: u64) {
+        while self.local_names.len() > length {
+            self.local_names.pop()
+            self.local_values.pop()
+            self.local_mutable.pop()
+            self.local_depths.pop()
+        }
+    }
+
+    fun find_local(self, name: String) -> Option<u64> {
+        mut at := self.local_names.len()
+        while at > self.base {
+            at -= 1
+            when self.local_names[at] == name {
+                return Option::Some(at)
+            }
+        }
+        return Option::None
+    }
+
+    fun declare(mut self, name: String, value: u64, mutable: bool) {
+        self.local_names.push(name)
+        self.local_values.push(value)
+        self.local_mutable.push(mutable)
+        self.local_depths.push(self.block_depth)
+    }
+
+    fun enter_block(mut self) {
+        self.block_depth += 1
+    }
+
+    fun leave_block(mut self) {
+        while self.local_names.len() > self.base && self.local_depths[self.local_depths.len() - 1] == self.block_depth {
+            self.local_names.pop()
+            self.local_values.pop()
+            self.local_mutable.pop()
+            self.local_depths.pop()
+        }
+        self.block_depth -= 1
+    }
+
+    // A name read: a local, then a constant.
+    fun name_value(mut self, name: String, span: ast::Span) -> Result<u64, String> {
+        local := self.find_local(name.clone())
+        when local.is_some() {
+            return Result::Ok(self.copy_val(self.local_values[local.unwrap()]))
+        }
+        resolved := self.resolve_constant(name.clone(), self.module.clone(), span)?
+        when resolved.is_some() {
+            return self.constant(resolved.unwrap(), span)
+        }
+        return Result::Err(ct_not_constant(ct_quoted(name), span))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Expressions
+
+extend Comptime {
+    fun span_of(self, index: u64) -> ast::Span {
+        return choose self.exprs[index] {
+            ast::ExprTree::IntLit(value, span) => span,
+            ast::ExprTree::FloatLit(text, span) => span,
+            ast::ExprTree::StrLit(text, span) => span,
+            ast::ExprTree::CharLit(value, span) => span,
+            ast::ExprTree::BoolLit(value, span) => span,
+            ast::ExprTree::NameRef(name, span) => span,
+            ast::ExprTree::CallE(name, type_arguments, arguments, span) => span,
+            ast::ExprTree::MethodCallE(value, name, type_arguments, arguments, span) => span,
+            ast::ExprTree::StructLit(name, inits, span) => span,
+            ast::ExprTree::FieldE(value, name, name_span, span) => span,
+            ast::ExprTree::RangeE(start, end, inclusive, span) => span,
+            ast::ExprTree::IfE(condition, then_value, else_value, span) => span,
+            ast::ExprTree::BinaryE(op, left, right, span) => span,
+            ast::ExprTree::NegateE(inner, span) => span,
+            ast::ExprTree::NotE(inner, span) => span,
+            ast::ExprTree::BitNotE(inner, span) => span,
+            ast::ExprTree::AddressOfE(mutable, raw, inner, span) => span,
+            ast::ExprTree::DerefE(inner, span) => span,
+            ast::ExprTree::CastE(inner, ty, span) => span,
+            ast::ExprTree::LayoutE(ty, alignment, span) => span,
+            ast::ExprTree::VecNewE(ty, span) => span,
+            ast::ExprTree::MapNewE(key, value, span) => span,
+            ast::ExprTree::SetNewE(ty, span) => span,
+            ast::ExprTree::TupleE(values, span) => span,
+            ast::ExprTree::ArrayE(values, span) => span,
+            ast::ExprTree::RepeatE(value, length, span) => span,
+            ast::ExprTree::IndexE(value, position, span) => span,
+            ast::ExprTree::PropagateE(value, span) => span,
+            ast::ExprTree::EnumE(enum_name, variant, arguments, span) => span,
+            ast::ExprTree::ChooseE(value, arms, span) => span,
+            ast::ExprTree::PipeE(left, right, span) => span,
+            ast::ExprTree::CoalesceE(left, right, span) => span,
+            ast::ExprTree::OptionalFieldE(value, name, name_span, span) => span,
+        }
+    }
+
+    fun expression(mut self, index: u64) -> Result<u64, String> {
+        self.tick(self.span_of(index))?
+        return choose self.exprs[index] {
+            ast::ExprTree::IntLit(value, span) => Result::Ok(self.int_val(w_of_u64(value), 0)),
+            ast::ExprTree::FloatLit(text, span) => self.float_literal(text, span),
+            ast::ExprTree::BoolLit(value, span) => Result::Ok(self.bool_val(value)),
+            ast::ExprTree::CharLit(value, span) => Result::Ok(self.char_val(value)),
+            ast::ExprTree::StrLit(text, span) => Result::Ok(self.text_val(5, text)),
+            ast::ExprTree::NameRef(name, span) => self.name_value(name, span),
+            ast::ExprTree::EnumE(enum_name, variant, arguments, span) => self.enum_value(enum_name, variant, arguments, span),
+            ast::ExprTree::NegateE(inner, span) => self.negate(inner, span),
+            ast::ExprTree::NotE(inner, span) => self.logical_not(inner, span),
+            ast::ExprTree::BitNotE(inner, span) => self.bit_not(inner, span),
+            ast::ExprTree::BinaryE(op, left, right, span) => self.binary_expression(op, left, right, span),
+            ast::ExprTree::IfE(condition, then_value, else_value, span) => self.if_expression(condition, then_value, else_value, span),
+            ast::ExprTree::CastE(inner, ty, span) => self.cast_expression(inner, ty, span),
+            ast::ExprTree::LayoutE(ty, alignment, span) => self.layout_expression(ty, alignment, span),
+            ast::ExprTree::CallE(name, type_arguments, arguments, span) => self.call(name, type_arguments, arguments, span),
+            ast::ExprTree::PipeE(left, right, span) => self.pipe(left, right, span),
+            ast::ExprTree::VecNewE(ty, span) => Result::Ok(self.push_val(ct_blank(8))),
+            ast::ExprTree::StructLit(name, inits, span) => self.struct_literal(name, inits, span),
+            ast::ExprTree::FieldE(value, name, name_span, span) => self.field_read(value, name, span),
+            ast::ExprTree::MethodCallE(value, name, type_arguments, arguments, span) => self.method_value(value, name, arguments, span),
+            _ => Result::Err(ct_not_constant(String("this expression"), self.span_of(index))),
+        }
+    }
+
+    fun float_literal(mut self, text: String, span: ast::Span) -> Result<u64, String> {
+        bits := floatlib::parse_f64(text.clone())
+        when bits.is_none() {
+            return Result::Err(ct_not_constant(String("this float"), span))
+        }
+        return Result::Ok(self.float_val(ct_float_of(bits.unwrap()), 0))
+    }
+
+    fun enum_value(mut self, enum_name: String, variant: String, arguments: Vec<u64>, span: ast::Span) -> Result<u64, String> {
+        mut name := enum_name
+        name.append("::")
+        name.append(variant)
+        when !arguments.is_empty() {
+            return Result::Err(ct_not_constant(String("this expression"), span))
+        }
+        resolved := self.resolve_constant(name.clone(), self.module.clone(), span)?
+        when resolved.is_some() {
+            return self.constant(resolved.unwrap(), span)
+        }
+        return Result::Err(ct_not_constant(ct_quoted(name), span))
+    }
+
+    fun negate(mut self, inner: u64, span: ast::Span) -> Result<u64, String> {
+        value := self.expression(inner)?
+        record := self.vals[value]
+        when record.kind == 1 {
+            return self.checked_int(w_negated(record.int), record.ity, span)
+        }
+        when record.kind == 2 {
+            return Result::Ok(self.float_val(0.0 - record.flt, record.fty))
+        }
+        mut message := String("cannot negate ")
+        message.append(ct_describe(record.kind))
+        return Result::Err(ct_error("R0464", message, span))
+    }
+
+    fun logical_not(mut self, inner: u64, span: ast::Span) -> Result<u64, String> {
+        value := self.expression(inner)?
+        record := self.vals[value]
+        when record.kind == 3 {
+            return Result::Ok(self.bool_val(!record.flag))
+        }
+        mut message := String("`!` needs a bool, found ")
+        message.append(ct_describe(record.kind))
+        return Result::Err(ct_error("R0464", message, span))
+    }
+
+    fun bit_not(mut self, inner: u64, span: ast::Span) -> Result<u64, String> {
+        value := self.expression(inner)?
+        record := self.vals[value]
+        when record.kind == 1 {
+            when record.ity != 0 {
+                return self.checked_int(ct_wrap(record.ity, w_not(record.int)), record.ity, span)
+            }
+            return Result::Ok(self.int_val(w_not(record.int), 0))
+        }
+        mut message := String("`~` needs an integer, found ")
+        message.append(ct_describe(record.kind))
+        return Result::Err(ct_error("R0464", message, span))
+    }
+
+    fun binary_expression(mut self, op: String, left: u64, right: u64, span: ast::Span) -> Result<u64, String> {
+        when op == "And" || op == "Or" {
+            first := self.expression(left)?
+            when self.kind_of(first) != 3 {
+                return Result::Err(ct_error("R0464", String("`&&` and `||` need bool operands"), span))
+            }
+            flag := self.vals[first].flag
+            when (op == "And") != flag {
+                return Result::Ok(self.bool_val(flag))
+            }
+            second := self.expression(right)?
+            when self.kind_of(second) != 3 {
+                return Result::Err(ct_error("R0464", String("`&&` and `||` need bool operands"), span))
+            }
+            return Result::Ok(self.bool_val(self.vals[second].flag))
+        }
+        first := self.expression(left)?
+        second := self.expression(right)?
+        return self.binary(op, first, second, span)
+    }
+
+    fun if_expression(mut self, condition: u64, then_value: u64, else_value: u64, span: ast::Span) -> Result<u64, String> {
+        value := self.expression(condition)?
+        record := self.vals[value]
+        when record.kind == 3 {
+            when record.flag {
+                return self.expression(then_value)
+            }
+            return self.expression(else_value)
+        }
+        mut message := String("a `when` condition needs a bool, found ")
+        message.append(ct_describe(record.kind))
+        return Result::Err(ct_error("R0464", message, span))
+    }
+
+    fun cast_expression(mut self, inner: u64, ty: u64, span: ast::Span) -> Result<u64, String> {
+        value := self.expression(inner)?
+        return self.cast(value, ty, span)
+    }
+
+    fun layout_expression(mut self, ty: u64, alignment: bool, span: ast::Span) -> Result<u64, String> {
+        sizes := self.layout(ty)
+        when sizes.is_empty() {
+            return Result::Err(ct_not_constant(String("the layout of this type"), span))
+        }
+        mut chosen := sizes[0]
+        when alignment {
+            chosen = sizes[1]
+        }
+        return Result::Ok(self.int_val(w_of_u64(chosen), 8))
+    }
+
+    // `left |> f(args)` is the call `f(left, args)`.
+    fun pipe(mut self, left: u64, right: u64, span: ast::Span) -> Result<u64, String> {
+        return choose self.exprs[right] {
+            ast::ExprTree::CallE(name, type_arguments, arguments, call_span) => self.call(name, type_arguments, ct_prefixed(left, arguments), call_span),
+            ast::ExprTree::NameRef(name, call_span) => self.call(name, Vec(), ct_prefixed(left, Vec()), call_span),
+            _ => Result::Err(ct_not_constant(String("this expression"), span)),
+        }
+    }
+
+    fun struct_literal(mut self, name: String, inits: Vec<u64>, span: ast::Span) -> Result<u64, String> {
+        found := self.struct_named(name.clone())
+        when found.is_none() {
+            mut what := String("the structure `")
+            what.append(name)
+            what.append("`")
+            return Result::Err(ct_not_constant(what, span))
+        }
+        definition := self.program.struct_defs[found.unwrap()]
+        mut names: Vec<String> = Vec()
+        mut items: Vec<u64> = Vec()
+        for field in definition.fields.clone() {
+            declared := self.program.struct_fields[field]
+            mut init: Option<u64> = Option::None
+            for candidate in inits.clone() {
+                when init.is_none() && self.inits[candidate].name == declared.name {
+                    init = Option::Some(candidate)
+                }
+            }
+            when init.is_none() {
+                mut message := String("field `")
+                message.append(declared.name.clone())
+                message.append("` of `")
+                message.append(name.clone())
+                message.append("` has no value")
+                return Result::Err(ct_error("R0464", message, span))
+            }
+            record := self.inits[init.unwrap()]
+            value := self.expression(record.value)?
+            names.push(declared.name.clone())
+            items.push(self.coerce(value, declared.ty, record.span)?)
+        }
+        mut made := ct_blank(7)
+        made.text = name
+        made.names = names
+        made.items = items
+        return Result::Ok(self.push_val(made))
+    }
+
+    fun field_read(mut self, value: u64, name: String, span: ast::Span) -> Result<u64, String> {
+        object := self.expression(value)?
+        record := self.vals[object]
+        when record.kind == 7 {
+            mut at: u64 = 0
+            while at < record.names.len() {
+                when record.names[at] == name {
+                    return Result::Ok(record.items[at])
+                }
+                at += 1
+            }
+            mut message := String("no field `")
+            message.append(name)
+            message.append("`")
+            return Result::Err(ct_error("R0464", message, span))
+        }
+        mut message := ct_describe(record.kind)
+        message.append(" has no field `")
+        message.append(name)
+        message.append("`")
+        return Result::Err(ct_error("R0464", message, span))
+    }
+
+    fun method_value(mut self, value: u64, name: String, arguments: Vec<u64>, span: ast::Span) -> Result<u64, String> {
+        receiver := self.expression(value)?
+        mut values: Vec<u64> = Vec()
+        for argument in arguments {
+            values.push(self.expression(argument)?)
+        }
+        return self.pure_method(receiver, name, values, span)
+    }
+
+    fun struct_named(self, name: String) -> Option<u64> {
+        for index in self.program.structs.clone() {
+            when self.program.struct_defs[index].name == name {
+                return Option::Some(index)
+            }
+        }
+        return Option::None
+    }
+
+    fun enum_named(self, name: String) -> Option<u64> {
+        for index in self.program.enums.clone() {
+            when self.program.enum_defs[index].name == name {
+                return Option::Some(index)
+            }
+        }
+        return Option::None
+    }
+}
+
+fun ct_min(first: u64, second: u64) -> u64 {
+    when first < second {
+        return first
+    }
+    return second
+}
+
+fun ct_prefixed(first: u64, rest: Vec<u64>) -> Vec<u64> {
+    mut items: Vec<u64> = Vec()
+    items.push(first)
+    for item in rest {
+        items.push(item)
+    }
+    return items
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Calls and statements
+
+extend Comptime {
+    fun call(mut self, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: ast::Span) -> Result<u64, String> {
+        when name == "comptime" && arguments.len() == 1 {
+            return self.expression(arguments[0])
+        }
+        when name == "Vec" && arguments.is_empty() {
+            return Result::Ok(self.push_val(ct_blank(8)))
+        }
+        when name == "String" && arguments.len() == 1 && self.resolve(name.clone(), self.module.clone()).is_none() {
+            value := self.expression(arguments[0])?
+            record := self.vals[value]
+            when record.kind == 5 || record.kind == 6 {
+                return Result::Ok(self.text_val(6, record.text))
+            }
+            when record.kind == 1 {
+                return Result::Ok(self.text_val(6, w_text(record.int)))
+            }
+            mut message := String("`String` cannot be built from ")
+            message.append(ct_describe(record.kind))
+            message.append(" at compile time")
+            return Result::Err(ct_error("R0464", message, span))
+        }
+        when ct_is_metadata(name.clone()) {
+            return self.metadata(name, type_arguments, arguments, span)
+        }
+        found := self.resolve(name.clone(), self.module.clone())
+        mut what := String("a call to `")
+        what.append(name.clone())
+        what.append("`")
+        when found.is_none() {
+            return Result::Err(ct_not_constant(what, span))
+        }
+        index := found.unwrap()
+        function := self.function_defs[index]
+        when function.extern_c || !function.type_parameters.is_empty() || function.parameters.len() != arguments.len() {
+            return Result::Err(ct_not_constant(what, span))
+        }
+        // The arguments are evaluated in the caller's frame, then bound in the callee's.
+        mut values: Vec<u64> = Vec()
+        mut position: u64 = 0
+        while position < arguments.len() {
+            value := self.expression(arguments[position])?
+            parameter := self.program.parameters[function.parameters[position]]
+            values.push(self.coerce(value, parameter.ty, self.span_of(arguments[position]))?)
+            position += 1
+        }
+        when self.depth >= ct_depth_limit() {
+            mut message := String("compile-time recursion in `")
+            message.append(function.name.clone())
+            message.append("` is deeper than ")
+            message.append(String(ct_depth_limit()))
+            message.append(" calls")
+            return Result::Err(ct_error("R0463", message, span))
+        }
+        saved_base := self.base
+        saved_module := self.module.clone()
+        saved_depth := self.block_depth
+        self.base = self.local_names.len()
+        self.module = function.module_path.clone()
+        self.block_depth += 1
+        position = 0
+        while position < values.len() {
+            parameter := self.program.parameters[function.parameters[position]]
+            self.declare(parameter.name, values[position], true)
+            position += 1
+        }
+        self.depth += 1
+        outcome := self.run_function(index)
+        self.depth -= 1
+        self.truncate_locals(self.base)
+        self.base = saved_base
+        self.module = saved_module
+        self.block_depth = saved_depth
+        result := outcome?
+        when result.is_some() && function.return_type.is_some() {
+            return self.coerce(result.unwrap(), function.return_type.unwrap(), span)
+        }
+        when result.is_none() && function.return_type.is_none() {
+            what.append(", which returns no value")
+            return Result::Err(ct_not_constant(what, span))
+        }
+        return Result::Err(ct_not_constant(what, span))
+    }
+
+    fun run_function(mut self, index: u64) -> Result<Option<u64>, String> {
+        function := self.function_defs[index]
+        flow := self.block(function.body.clone())?
+        when flow == ct_return() {
+            self.returned = false
+            when self.return_value == ct_max_u64() {
+                return Result::Ok(Option::None)
+            }
+            return Result::Ok(Option::Some(self.return_value))
+        }
+        when flow == ct_break() || flow == ct_continue() {
+            return Result::Err(ct_not_constant(String("`break` or `continue` outside a loop"), function.span))
+        }
+        when function.return_value.is_some() {
+            return Result::Ok(Option::Some(self.expression(function.return_value.unwrap())?))
+        }
+        return Result::Ok(Option::None)
+    }
+
+    fun block(mut self, statements: Vec<u64>) -> Result<u64, String> {
+        self.enter_block()
+        mut flow := ct_normal()
+        for statement in statements {
+            outcome := self.statement(statement)
+            when outcome.is_err() {
+                self.leave_block()
+                return outcome
+            }
+            step := outcome.unwrap()
+            when step != ct_normal() {
+                flow = step
+                break
+            }
+        }
+        self.leave_block()
+        return Result::Ok(flow)
+    }
+
+    fun statement(mut self, index: u64) -> Result<u64, String> {
+        return choose self.stmts[index] {
+            ast::Stmt::LetS(name, mutable, annotation, value, span) => self.let_statement(name, mutable, annotation, value, span),
+            ast::Stmt::AssignS(name, value, span) => self.assign_statement(name, value, span),
+            ast::Stmt::CompoundS(name, op, value, span) => self.compound_statement(name, op, value, span),
+            ast::Stmt::IfS(condition, then_body, else_body, span) => self.if_statement(condition, then_body, else_body, span),
+            ast::Stmt::WhileS(condition, body, span) => self.while_statement(condition, body, span),
+            ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => self.for_statement(name, start, end, inclusive, body, span),
+            ast::Stmt::ReturnS(value, span) => self.return_statement(value),
+            ast::Stmt::BreakS(span) => Result::Ok(ct_break()),
+            ast::Stmt::ContinueS(span) => Result::Ok(ct_continue()),
+            ast::Stmt::CallS(name, type_arguments, arguments, span) => self.call_statement(name, type_arguments, arguments, span),
+            ast::Stmt::MethodCallS(value, name, arguments, span) => self.method_statement(value, name, arguments, span),
+            ast::Stmt::FieldAssignS(object, names, spans, op, value, span) => self.field_assign(object, names, op, value, span),
+            ast::Stmt::IndexAssignS(name, position, value, span) => Result::Err(ct_not_constant(String("this statement"), span)),
+            ast::Stmt::DerefAssignS(pointer, value, span) => Result::Err(ct_not_constant(String("this statement"), span)),
+            ast::Stmt::PrintS(value, span) => Result::Err(ct_not_constant(String("this statement"), span)),
+            ast::Stmt::TemplateS(parts, span) => Result::Err(ct_not_constant(String("this statement"), span)),
+            ast::Stmt::DeferS(body, span) => Result::Err(ct_not_constant(String("this statement"), span)),
+            ast::Stmt::ForEachS(name, name_span, iterable, body, span) => Result::Err(ct_not_constant(String("this statement"), span)),
+        }
+    }
+
+    fun let_statement(mut self, name: String, mutable: bool, annotation: Option<u64>, value: u64, span: ast::Span) -> Result<u64, String> {
+        self.tick(span)?
+        mut result := self.expression(value)?
+        when annotation.is_some() {
+            result = self.coerce(result, annotation.unwrap(), span)?
+        }
+        self.declare(name, result, mutable)
+        return Result::Ok(ct_normal())
+    }
+
+    fun assign_local(mut self, name: String, value: u64, span: ast::Span) -> Result<bool, String> {
+        found := self.find_local(name.clone())
+        when found.is_none() {
+            mut what := String("assignment to `")
+            what.append(name)
+            what.append("`")
+            return Result::Err(ct_not_constant(what, span))
+        }
+        slot := found.unwrap()
+        when !self.local_mutable[slot] {
+            mut message := String("`")
+            message.append(name)
+            message.append("` is immutable")
+            return Result::Err(ct_error("R0204", message, span))
+        }
+        current := self.vals[self.local_values[slot]]
+        incoming := self.vals[value]
+        mut stored := value
+        when current.kind == 1 && current.ity != 0 && incoming.kind == 1 && incoming.ity == 0 {
+            stored = self.checked_int(incoming.int, current.ity, span)?
+        } else when current.kind == 2 && current.fty != 0 && incoming.kind == 2 && incoming.fty == 0 {
+            stored = self.float_val(incoming.flt, current.fty)
+        }
+        self.local_values.set(slot, stored)
+        return Result::Ok(true)
+    }
+
+    fun assign_statement(mut self, name: String, value: u64, span: ast::Span) -> Result<u64, String> {
+        result := self.expression(value)?
+        self.assign_local(name, result, span)?
+        return Result::Ok(ct_normal())
+    }
+
+    fun compound_statement(mut self, name: String, op: String, value: u64, span: ast::Span) -> Result<u64, String> {
+        self.tick(span)?
+        current := self.name_value(name.clone(), span)?
+        operand := self.expression(value)?
+        result := self.binary(op, current, operand, span)?
+        self.assign_local(name, result, span)?
+        return Result::Ok(ct_normal())
+    }
+
+    fun if_statement(mut self, condition: u64, then_body: Vec<u64>, else_body: Vec<u64>, span: ast::Span) -> Result<u64, String> {
+        value := self.expression(condition)?
+        record := self.vals[value]
+        when record.kind == 3 {
+            when record.flag {
+                return self.block(then_body)
+            }
+            return self.block(else_body)
+        }
+        mut message := String("a `when` condition needs a bool, found ")
+        message.append(ct_describe(record.kind))
+        return Result::Err(ct_error("R0464", message, span))
+    }
+
+    fun while_statement(mut self, condition: u64, body: Vec<u64>, span: ast::Span) -> Result<u64, String> {
+        mark := self.vals_used
+        outer_changed := self.lowest_changed
+        outcome := self.while_loop(condition, body, span, mark)
+        self.lowest_changed = ct_min(outer_changed, self.lowest_changed)
+        return outcome
+    }
+
+    fun while_loop(mut self, condition: u64, body: Vec<u64>, span: ast::Span, mark: u64) -> Result<u64, String> {
+        while true {
+            self.begin_iteration()
+            self.tick(span)?
+            value := self.expression(condition)?
+            record := self.vals[value]
+            when record.kind != 3 {
+                mut message := String("a `while` condition needs a bool, found ")
+                message.append(ct_describe(record.kind))
+                return Result::Err(ct_error("R0464", message, span))
+            }
+            when !record.flag {
+                break
+            }
+            flow := self.block(body.clone())?
+            when flow == ct_break() {
+                break
+            }
+            when flow == ct_return() {
+                return Result::Ok(flow)
+            }
+            self.end_iteration(mark)
+        }
+        return Result::Ok(ct_normal())
+    }
+
+    fun for_statement(mut self, name: String, start: u64, end: u64, inclusive: bool, body: Vec<u64>, span: ast::Span) -> Result<u64, String> {
+        first := self.expression(start)?
+        last := self.expression(end)?
+        first_record := self.vals[first]
+        last_record := self.vals[last]
+        when first_record.kind != 1 || last_record.kind != 1 {
+            return Result::Err(ct_error("R0464", String("a `for` range needs integer bounds"), span))
+        }
+        mut ty := first_record.ity
+        when ty == 0 {
+            ty = last_record.ity
+        }
+        mark := self.vals_used
+        outer_changed := self.lowest_changed
+        outcome := self.for_loop(name, first_record.int, last_record.int, inclusive, ty, body, span, mark)
+        self.lowest_changed = ct_min(outer_changed, self.lowest_changed)
+        return outcome
+    }
+
+    fun for_loop(mut self, name: String, first: Wide, last: Wide, inclusive: bool, ty: u64, body: Vec<u64>, span: ast::Span, mark: u64) -> Result<u64, String> {
+        mut current := first
+        while true {
+            self.begin_iteration()
+            order := w_cmp(current.clone(), last.clone())
+            when !(order < 0 || (inclusive && order == 0)) {
+                break
+            }
+            self.tick(span)?
+            self.enter_block()
+            self.declare(name.clone(), self.int_val(current.clone(), ty), false)
+            outcome := self.block(body.clone())
+            self.leave_block()
+            flow := outcome?
+            when flow == ct_break() {
+                break
+            }
+            when flow == ct_return() {
+                return Result::Ok(flow)
+            }
+            current = w_add(current, w_of_u64(1))
+            self.end_iteration(mark)
+        }
+        return Result::Ok(ct_normal())
+    }
+
+    // Records that the value at `index` is changed in place.
+    fun changed(mut self, index: u64) {
+        when index < self.lowest_changed {
+            self.lowest_changed = index
+        }
+    }
+
+    fun begin_iteration(mut self) {
+        self.lowest_changed = ct_max_u64()
+    }
+
+    // After an iteration, the values made since `mark` that no local holds are released and the kept ones move down, so
+    // a long compile-time loop needs memory for its live values only. Nothing older than `mark` can refer to a newer
+    // value unless it was changed in place, and a constant evaluated during the iteration is kept by `const_done`.
+    fun end_iteration(mut self, mark: u64) {
+        when self.lowest_changed < mark || self.vals_used <= mark {
+            return
+        }
+        for done in self.const_done.values() {
+            when done >= mark {
+                return
+            }
+        }
+        count := self.vals_used - mark
+        mut kept: Vec<bool> = Vec()
+        mut at: u64 = 0
+        while at < count {
+            kept.push(false)
+            at += 1
+        }
+        mut pending: Vec<u64> = Vec()
+        for value in self.local_values.clone() {
+            when value >= mark {
+                pending.push(value)
+            }
+        }
+        while !pending.is_empty() {
+            value := pending.pop().unwrap()
+            when !kept[value - mark] {
+                kept.set(value - mark, true)
+                record := self.vals[value]
+                for part in record.items {
+                    when part >= mark {
+                        pending.push(part)
+                    }
+                }
+            }
+        }
+        // The new place of every kept value, in order.
+        mut places: Vec<u64> = Vec()
+        mut next := mark
+        at = 0
+        while at < count {
+            places.push(next)
+            when kept[at] {
+                next += 1
+            }
+            at += 1
+        }
+        at = 0
+        while at < count {
+            when kept[at] {
+                mut record := self.vals[mark + at]
+                mut parts: Vec<u64> = Vec()
+                for part in record.items.clone() {
+                    when part >= mark {
+                        parts.push(places[part - mark])
+                    } else {
+                        parts.push(part)
+                    }
+                }
+                record.items = parts
+                self.vals.set(places[at], record)
+            }
+            at += 1
+        }
+        self.vals_used = next
+        mut slot: u64 = 0
+        while slot < self.local_values.len() {
+            value := self.local_values[slot]
+            when value >= mark {
+                self.local_values.set(slot, places[value - mark])
+            }
+            slot += 1
+        }
+    }
+
+    fun return_statement(mut self, value: Option<u64>) -> Result<u64, String> {
+        when value.is_some() {
+            self.return_value = self.expression(value.unwrap())?
+        } else {
+            self.return_value = ct_max_u64()
+        }
+        self.returned = true
+        return Result::Ok(ct_return())
+    }
+
+    fun call_statement(mut self, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: ast::Span) -> Result<u64, String> {
+        outcome := self.call(name, type_arguments, arguments, span)
+        when outcome.is_err() {
+            failure := outcome.unwrap_err()
+            // A call statement may discard a function that returns nothing.
+            when ct_message_of(failure.clone()).contains("returns no value") {
+                return Result::Ok(ct_normal())
+            }
+            return Result::Err(failure)
+        }
+        return Result::Ok(ct_normal())
+    }
+
+    fun method_statement(mut self, value: u64, name: String, arguments: Vec<u64>, span: ast::Span) -> Result<u64, String> {
+        mut values: Vec<u64> = Vec()
+        for argument in arguments {
+            values.push(self.expression(argument)?)
+        }
+        place := self.place(value)
+        when place.is_none() {
+            return Result::Err(ct_not_constant(String("a method call on this expression"), span))
+        }
+        self.mutate(place.unwrap(), name, values, span)?
+        return Result::Ok(ct_normal())
+    }
+
+    // The value a local, or a field path inside one, holds in place: changes to it change the local.
+    fun place(mut self, index: u64) -> Option<u64> {
+        return choose self.exprs[index] {
+            ast::ExprTree::NameRef(name, span) => self.local_place(name),
+            ast::ExprTree::FieldE(value, name, name_span, span) => self.field_place(value, name),
+            _ => Option::None,
+        }
+    }
+
+    fun local_place(self, name: String) -> Option<u64> {
+        found := self.find_local(name)
+        when found.is_none() {
+            return Option::None
+        }
+        return Option::Some(self.local_values[found.unwrap()])
+    }
+
+    fun field_place(mut self, value: u64, name: String) -> Option<u64> {
+        outer := self.place(value)
+        when outer.is_none() {
+            return Option::None
+        }
+        record := self.vals[outer.unwrap()]
+        when record.kind != 7 {
+            return Option::None
+        }
+        mut at: u64 = 0
+        while at < record.names.len() {
+            when record.names[at] == name {
+                return Option::Some(record.items[at])
+            }
+            at += 1
+        }
+        return Option::None
+    }
+
+    fun field_assign(mut self, object: String, names: Vec<String>, op: Option<String>, value: u64, span: ast::Span) -> Result<u64, String> {
+        mut result := self.expression(value)?
+        when op.is_some() {
+            mut read := self.name_value(object.clone(), span)?
+            for step in names.clone() {
+                record := self.vals[read]
+                when record.kind != 7 {
+                    mut message := ct_describe(record.kind)
+                    message.append(" has no field `")
+                    message.append(step)
+                    message.append("`")
+                    return Result::Err(ct_error("R0464", message, span))
+                }
+                mut found: Option<u64> = Option::None
+                mut at: u64 = 0
+                while at < record.names.len() {
+                    when found.is_none() && record.names[at] == step {
+                        found = Option::Some(record.items[at])
+                    }
+                    at += 1
+                }
+                when found.is_none() {
+                    mut message := String("no field `")
+                    message.append(step)
+                    message.append("`")
+                    return Result::Err(ct_error("R0464", message, span))
+                }
+                read = found.unwrap()
+            }
+            result = self.binary(op.unwrap(), read, result, span)?
+        }
+        local := self.find_local(object.clone())
+        when local.is_none() {
+            return Result::Err(ct_not_constant(ct_quoted(object), span))
+        }
+        // The structure that holds the last field, and the position of that field in it.
+        mut holder := self.local_values[local.unwrap()]
+        mut position: u64 = 0
+        mut step_at: u64 = 0
+        while step_at < names.len() {
+            step := names[step_at]
+            record := self.vals[holder]
+            when record.kind != 7 {
+                mut message := String("no field `")
+                message.append(step)
+                message.append("`")
+                return Result::Err(ct_error("R0464", message, span))
+            }
+            mut found: Option<u64> = Option::None
+            mut at: u64 = 0
+            while at < record.names.len() {
+                when found.is_none() && record.names[at] == step {
+                    found = Option::Some(at)
+                }
+                at += 1
+            }
+            when found.is_none() {
+                mut message := String("no field `")
+                message.append(step)
+                message.append("`")
+                return Result::Err(ct_error("R0464", message, span))
+            }
+            when step_at + 1 == names.len() {
+                position = found.unwrap()
+            } else {
+                holder = record.items[found.unwrap()]
+            }
+            step_at += 1
+        }
+        mut target := self.vals[holder]
+        old := self.vals[target.items[position]]
+        incoming := self.vals[result]
+        mut stored := result
+        when old.kind == 1 && old.ity != 0 && incoming.kind == 1 && incoming.ity == 0 {
+            stored = self.checked_int(incoming.int, old.ity, span)?
+        }
+        target.items.set(position, stored)
+        self.changed(holder)
+        self.vals.set(holder, target)
+        return Result::Ok(ct_normal())
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Metadata and layouts
+
+extend Comptime {
+    fun metadata(mut self, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: ast::Span) -> Result<u64, String> {
+        when type_arguments.len() != 1 {
+            mut message := String("`")
+            message.append(name.clone())
+            message.append("` takes exactly one type argument, written `")
+            message.append(name.clone())
+            message.append("::<Type>()`")
+            return Result::Err(ct_error("R0465", message, span))
+        }
+        ty := type_arguments[0]
+        wanted_type := self.named_type(ty)
+        has_wanted := wanted_type.is_some()
+        mut wanted := String("")
+        when has_wanted {
+            wanted = wanted_type.unwrap()
+        }
+        mut structure: Option<u64> = Option::None
+        when has_wanted {
+            structure = self.struct_named(wanted.clone())
+        }
+        when name == "type_name" {
+            return Result::Ok(self.text_val(5, self.type_label(ty)))
+        }
+        when name == "field_count" {
+            when structure.is_none() {
+                return Result::Err(ct_error("R0465", String("`field_count` needs a structure type"), span))
+            }
+            count := self.program.struct_defs[structure.unwrap()].fields.len()
+            return Result::Ok(self.int_val(w_of_u64(count), 8))
+        }
+        when name == "has_field" {
+            when structure.is_none() {
+                return Result::Err(ct_error("R0465", String("`has_field` needs a structure type"), span))
+            }
+            mut field_name: Option<String> = Option::None
+            when arguments.len() == 1 {
+                field_name = self.string_literal(arguments[0])
+            }
+            when field_name.is_none() {
+                return Result::Err(ct_error("R0465", String("`has_field` takes the field name as a string literal"), span))
+            }
+            wanted_field := field_name.unwrap()
+            mut found := false
+            for field in self.program.struct_defs[structure.unwrap()].fields.clone() {
+                when self.program.struct_fields[field].name == wanted_field {
+                    found = true
+                }
+            }
+            return Result::Ok(self.bool_val(found))
+        }
+        mut definition: Option<u64> = Option::None
+        when has_wanted {
+            definition = self.enum_named(wanted)
+        }
+        when definition.is_none() {
+            return Result::Err(ct_error("R0465", String("`variant_count` needs an enumeration type declared in this program"), span))
+        }
+        count := self.program.enum_defs[definition.unwrap()].variants.len()
+        return Result::Ok(self.int_val(w_of_u64(count), 8))
+    }
+
+    fun string_literal(self, index: u64) -> Option<String> {
+        return choose self.exprs[index] {
+            ast::ExprTree::StrLit(text, span) => Option::Some(text),
+            _ => Option::None,
+        }
+    }
+
+    fun named_type(self, ty: u64) -> Option<String> {
+        return choose self.types[ty] {
+            ast::TypeTree::NamedTy(name, span) => Option::Some(name),
+            _ => Option::None,
+        }
+    }
+
+    fun simple_word(self, ty: u64) -> String {
+        return choose self.types[ty] {
+            ast::TypeTree::Simple(word) => word,
+            _ => String(""),
+        }
+    }
+
+    // Size and alignment of types whose layout does not depend on the target's ABI details: [size, align], or nothing.
+    fun layout(self, ty: u64) -> Vec<u64> {
+        return choose self.types[ty] {
+            ast::TypeTree::Simple(word) => ct_simple_layout(word),
+            ast::TypeTree::RawTy(inner, span) => ct_pair(8, 8),
+            ast::TypeTree::RefTy(inner, mutable, span) => ct_pair(8, 8),
+            ast::TypeTree::FnPtrTy(parameters, result, variadic, span) => ct_pair(8, 8),
+            ast::TypeTree::ArrayTy(element, length, span) => self.array_layout(element, length),
+            ast::TypeTree::NamedTy(name, span) => self.struct_layout(name),
+            _ => Vec(),
+        }
+    }
+
+    fun array_layout(self, element: u64, length: u64) -> Vec<u64> {
+        inner := self.layout(element)
+        when inner.is_empty() {
+            return inner
+        }
+        return ct_pair(inner[0] * length, inner[1])
+    }
+
+    fun struct_layout(self, name: String) -> Vec<u64> {
+        found := self.struct_named(name)
+        when found.is_none() {
+            return Vec()
+        }
+        mut offset: u64 = 0
+        mut align_max: u64 = 1
+        for field in self.program.struct_defs[found.unwrap()].fields.clone() {
+            inner := self.layout(self.program.struct_fields[field].ty)
+            when inner.is_empty() {
+                return inner
+            }
+            offset = (offset + inner[1] - 1) / inner[1] * inner[1] + inner[0]
+            when inner[1] > align_max {
+                align_max = inner[1]
+            }
+        }
+        return ct_pair((offset + align_max - 1) / align_max * align_max, align_max)
+    }
+
+    // The readable name of a type, as `type_name` gives it.
+    fun type_label(self, ty: u64) -> String {
+        return choose self.types[ty] {
+            ast::TypeTree::Simple(word) => word,
+            ast::TypeTree::NamedTy(name, span) => self.instance_label(name),
+            ast::TypeTree::ParamTy(name, span) => name,
+            ast::TypeTree::VecTy(element, span) => ct_wrapped("Vec<", self.type_label(element), ">"),
+            ast::TypeTree::SetTy(element, span) => ct_wrapped("Set<", self.type_label(element), ">"),
+            ast::TypeTree::MapTy(key, value, span) => self.map_label(key, value),
+            ast::TypeTree::ArrayTy(element, length, span) => self.array_label(element, length),
+            ast::TypeTree::SliceTy(element, span) => ct_wrapped("&[", self.type_label(element), "]"),
+            ast::TypeTree::RefTy(inner, mutable, span) => self.reference_label(inner, mutable),
+            ast::TypeTree::RawTy(inner, span) => ct_wrapped("*", self.type_label(inner), ""),
+            ast::TypeTree::FnPtrTy(parameters, result, variadic, span) => String("fun"),
+        }
+    }
+
+    fun map_label(self, key: u64, value: u64) -> String {
+        mut text := String("Map<")
+        text.append(self.type_label(key))
+        text.append(", ")
+        text.append(self.type_label(value))
+        text.append(">")
+        return text
+    }
+
+    fun array_label(self, element: u64, length: u64) -> String {
+        mut text := String("[")
+        text.append(self.type_label(element))
+        text.append("; ")
+        text.append(String(length))
+        text.append("]")
+        return text
+    }
+
+    fun reference_label(self, inner: u64, mutable: bool) -> String {
+        mut text := String("&")
+        when mutable {
+            text.append("mut ")
+        }
+        text.append(self.type_label(inner))
+        return text
+    }
+
+    // Instances of generic structures are called `$RynStruct#N`; their `display` text names the template and arguments.
+    fun instance_label(self, name: String) -> String {
+        mut display := String("")
+        for index in self.program.structs.clone() {
+            definition := self.program.struct_defs[index]
+            when display.is_empty() && definition.name == name && !definition.display.is_empty() {
+                display = definition.display
+            }
+        }
+        when display.is_empty() {
+            return name
+        }
+        marker := "$RynStruct#"
+        mut label := String("")
+        mut rest := display
+        while true {
+            at := rest.find(marker)
+            when at.is_none() {
+                break
+            }
+            position := at.unwrap()
+            label.append(ct_spaced_commas(rest.slice(0, position)))
+            mut end := position + 11
+            while end < rest.len() && rest.byte_at(end) >= (48 as u8) && rest.byte_at(end) <= (57 as u8) {
+                end += 1
+            }
+            label.append(self.instance_label(rest.slice(position, end)))
+            rest = rest.slice(end, rest.len())
+        }
+        label.append(ct_spaced_commas(rest))
+        return label
+    }
+}
+
+fun ct_pair(first: u64, second: u64) -> Vec<u64> {
+    mut items: Vec<u64> = Vec()
+    items.push(first)
+    items.push(second)
+    return items
+}
+
+fun ct_simple_layout(word: String) -> Vec<u64> {
+    when word == "i8" || word == "u8" || word == "bool" {
+        return ct_pair(1, 1)
+    }
+    when word == "i16" || word == "u16" {
+        return ct_pair(2, 2)
+    }
+    when word == "i32" || word == "u32" || word == "f32" || word == "char" {
+        return ct_pair(4, 4)
+    }
+    when word == "i64" || word == "u64" || word == "f64" {
+        return ct_pair(8, 8)
+    }
+    return Vec()
+}
+
+fun ct_wrapped(before: str, inner: String, after: str) -> String {
+    mut text := String(before)
+    text.append(inner)
+    text.append(after)
+    return text
+}
+
+fun ct_spaced_commas(text: String) -> String {
+    mut out := String("")
+    mut start: u64 = 0
+    mut at: u64 = 0
+    while at < text.len() {
+        when text.byte_at(at) == (44 as u8) {
+            out.append(text.slice(start, at))
+            out.append(", ")
+            start = at + 1
+        }
+        at += 1
+    }
+    out.append(text.slice(start, text.len()))
+    return out
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Operators, casts and conversions
+
+fun w_to_f64(value: Wide) -> f64 {
+    magnitude := value.lo as f64
+    when value.neg {
+        return 0.0 - magnitude
+    }
+    return magnitude
+}
+
+// `f64::trunc`: below 2^63 in magnitude through an i64; larger values have no fraction.
+fun ct_trunc(value: f64) -> f64 {
+    when value < 9223372036854775808.0 && value > 0.0 - 9223372036854775808.0 {
+        whole := value as i64
+        return whole as f64
+    }
+    return value
+}
+
+// The integer value of a float with no fraction that lies inside the range of some integer type.
+fun ct_float_to_wide(value: f64) -> Wide {
+    when value < 0.0 {
+        whole := value as i64
+        return w_make(true, 0, (0 - whole) as u64)
+    }
+    when value < 9223372036854775808.0 {
+        whole := value as i64
+        return w_of_u64(whole as u64)
+    }
+    return w_of_u64(value as u64)
+}
+
+// `char::from_u32`: a Unicode scalar value.
+fun ct_valid_char(value: Wide) -> bool {
+    when value.neg || value.hi != 0 || value.lo > 1114111 {
+        return false
+    }
+    return value.lo < 55296 || value.lo > 57343
+}
+
+// The number of characters of UTF-8 text.
+fun ct_char_count(text: String) -> u64 {
+    mut count: u64 = 0
+    mut at: u64 = 0
+    while at < text.len() {
+        byte := text.byte_at(at)
+        when byte < (128 as u8) || byte >= (192 as u8) {
+            count += 1
+        }
+        at += 1
+    }
+    return count
+}
+
+extend Comptime {
+    // `checked_int`: an integer of a type must lie in its range; an untyped one in the range of i64 and u64 together.
+    fun checked_int(mut self, value: Wide, ty: u64, span: ast::Span) -> Result<u64, String> {
+        when ty != 0 {
+            when w_cmp(value.clone(), ct_low(ty)) < 0 || w_cmp(value.clone(), ct_high(ty)) > 0 {
+                mut message := w_text(value)
+                message.append(" does not fit in `")
+                message.append(ct_int_name(ty))
+                message.append("` during compile-time evaluation")
+                return Result::Err(ct_error("R0464", message, span))
+            }
+        } else when w_cmp(value.clone(), ct_low(4)) < 0 || w_cmp(value.clone(), ct_high(8)) > 0 {
+            mut message := w_text(value)
+            message.append(" is out of range during compile-time evaluation")
+            return Result::Err(ct_error("R0464", message, span))
+        }
+        return Result::Ok(self.int_val(value, ty))
+    }
+
+    fun binary(mut self, op: String, left: u64, right: u64, span: ast::Span) -> Result<u64, String> {
+        a := self.vals[left]
+        b := self.vals[right]
+        when a.kind == 1 && b.kind == 1 {
+            return self.int_binary(op, a, b, span)
+        }
+        when a.kind == 2 && b.kind == 2 {
+            return self.float_binary(op, a, b, span)
+        }
+        when a.kind == 3 && b.kind == 3 {
+            when op == "Eq" {
+                return Result::Ok(self.bool_val(a.flag == b.flag))
+            }
+            when op == "Ne" {
+                return Result::Ok(self.bool_val(a.flag != b.flag))
+            }
+            return Result::Err(ct_error("R0464", String("this operator does not apply to bool values"), span))
+        }
+        when a.kind == 4 && b.kind == 4 {
+            compared := self.compare(op, a.ch < b.ch, a.ch == b.ch)
+            when compared.is_some() {
+                return Result::Ok(compared.unwrap())
+            }
+            return Result::Err(ct_error("R0464", String("this operator does not apply to char values"), span))
+        }
+        when (a.kind == 5 || a.kind == 6) && (b.kind == 5 || b.kind == 6) {
+            when op == "Eq" {
+                return Result::Ok(self.bool_val(a.text == b.text))
+            }
+            when op == "Ne" {
+                return Result::Ok(self.bool_val(a.text != b.text))
+            }
+            return Result::Err(ct_error("R0464", String("this operator does not apply to strings"), span))
+        }
+        mut message := String("operands have different types: ")
+        message.append(ct_describe(a.kind))
+        message.append(" and ")
+        message.append(ct_describe(b.kind))
+        return Result::Err(ct_error("R0464", message, span))
+    }
+
+    // A comparison operator from `less` and `equal`; nothing for another operator.
+    fun compare(mut self, op: String, less: bool, equal: bool) -> Option<u64> {
+        when op == "Eq" {
+            return Option::Some(self.bool_val(equal))
+        }
+        when op == "Ne" {
+            return Option::Some(self.bool_val(!equal))
+        }
+        when op == "Lt" {
+            return Option::Some(self.bool_val(less))
+        }
+        when op == "Le" {
+            return Option::Some(self.bool_val(less || equal))
+        }
+        when op == "Gt" {
+            return Option::Some(self.bool_val(!less && !equal))
+        }
+        when op == "Ge" {
+            return Option::Some(self.bool_val(!less))
+        }
+        return Option::None
+    }
+
+    fun int_binary(mut self, op: String, a: CtVal, b: CtVal, span: ast::Span) -> Result<u64, String> {
+        when a.ity != 0 && b.ity != 0 && a.ity != b.ity {
+            mut message := String("operands have different integer types `")
+            message.append(ct_int_name(a.ity))
+            message.append("` and `")
+            message.append(ct_int_name(b.ity))
+            message.append("`")
+            return Result::Err(ct_error("R0464", message, span))
+        }
+        mut ty := a.ity
+        when ty == 0 {
+            ty = b.ity
+        }
+        x := a.int.clone()
+        y := b.int.clone()
+        when op == "Add" {
+            return self.checked_int(w_add(x, y), ty, span)
+        }
+        when op == "Sub" {
+            return self.checked_int(w_sub(x, y), ty, span)
+        }
+        when op == "Mul" {
+            return self.checked_int(w_mul(x, y), ty, span)
+        }
+        when op == "Div" || op == "Rem" {
+            when y.hi == 0 && y.lo == 0 {
+                return Result::Err(ct_error("R0464", String("division by zero during compile-time evaluation"), span))
+            }
+            when op == "Div" {
+                return self.checked_int(w_div(x, y), ty, span)
+            }
+            return self.checked_int(w_rem(x, y), ty, span)
+        }
+        order := w_cmp(x.clone(), y.clone())
+        compared := self.compare(op.clone(), order < 0, order == 0)
+        when compared.is_some() {
+            return Result::Ok(compared.unwrap())
+        }
+        when op == "BitAnd" {
+            return self.checked_int(w_bits(1, x, y), ty, span)
+        }
+        when op == "BitOr" {
+            return self.checked_int(w_bits(2, x, y), ty, span)
+        }
+        when op == "BitXor" {
+            return self.checked_int(w_bits(3, x, y), ty, span)
+        }
+        when op == "Shl" || op == "Shr" {
+            mut bits: u64 = 64
+            when ty != 0 {
+                bits = ct_int_bits(ty)
+            }
+            when y.neg || y.hi != 0 || y.lo >= bits {
+                return Result::Err(ct_error("R0464", String("shift amount is out of range during compile-time evaluation"), span))
+            }
+            mut shifted := w_zero()
+            when op == "Shl" {
+                shifted = w_shift_left(x, y.lo)
+            } else {
+                shifted = w_shift_right(x, y.lo)
+            }
+            when ty != 0 {
+                shifted = ct_wrap(ty, shifted)
+            }
+            return self.checked_int(shifted, ty, span)
+        }
+        return Result::Err(ct_error("R0464", String("`&&` and `||` need bool operands"), span))
+    }
+
+    fun float_binary(mut self, op: String, a: CtVal, b: CtVal, span: ast::Span) -> Result<u64, String> {
+        mut ty := a.fty
+        when ty == 0 {
+            ty = b.fty
+        }
+        x := a.flt
+        y := b.flt
+        mut result: f64 = 0.0
+        mut arithmetic := true
+        when op == "Add" {
+            result = x + y
+        } else when op == "Sub" {
+            result = x - y
+        } else when op == "Mul" {
+            result = x * y
+        } else when op == "Div" {
+            result = x / y
+        } else {
+            arithmetic = false
+        }
+        when arithmetic {
+            when ty == 1 {
+                result = ct_round_f32(result)
+            }
+            return Result::Ok(self.float_val(result, ty))
+        }
+        when op == "Eq" {
+            return Result::Ok(self.bool_val(x == y))
+        }
+        when op == "Ne" {
+            return Result::Ok(self.bool_val(x != y))
+        }
+        when op == "Lt" {
+            return Result::Ok(self.bool_val(x < y))
+        }
+        when op == "Le" {
+            return Result::Ok(self.bool_val(x <= y))
+        }
+        when op == "Gt" {
+            return Result::Ok(self.bool_val(x > y))
+        }
+        when op == "Ge" {
+            return Result::Ok(self.bool_val(x >= y))
+        }
+        return Result::Err(ct_error("R0464", String("this operator does not apply to floating-point values"), span))
+    }
+
+    fun cast(mut self, value: u64, ty: u64, span: ast::Span) -> Result<u64, String> {
+        word := self.simple_word(ty)
+        record := self.vals[value]
+        target := ct_int_code(word.clone())
+        when target != 0 {
+            when record.kind == 1 {
+                return Result::Ok(self.int_val(ct_wrap(target, record.int), target))
+            }
+            when record.kind == 3 {
+                mut bit: u64 = 0
+                when record.flag {
+                    bit = 1
+                }
+                return Result::Ok(self.int_val(w_of_u64(bit), target))
+            }
+            when record.kind == 4 {
+                return Result::Ok(self.int_val(ct_wrap(target, w_of_u64(record.ch)), target))
+            }
+            when record.kind == 2 {
+                low := ct_low(target)
+                high := ct_high(target)
+                truncated := ct_trunc(record.flt)
+                mut clamped := w_zero()
+                when ct_is_nan(truncated) {
+                    clamped = w_zero()
+                } else when truncated <= w_to_f64(low.clone()) {
+                    clamped = low
+                } else when truncated >= w_to_f64(high.clone()) {
+                    clamped = high
+                } else {
+                    clamped = ct_float_to_wide(truncated)
+                }
+                return Result::Ok(self.int_val(clamped, target))
+            }
+            mut message := String("cannot cast ")
+            message.append(ct_describe(record.kind))
+            message.append(" to an integer")
+            return Result::Err(ct_error("R0464", message, span))
+        }
+        when word == "f32" && record.kind == 1 {
+            mut narrow: f32 = 0.0 as f32
+            when record.int.neg {
+                narrow = (0 - (record.int.lo as i64)) as f32
+            } else {
+                narrow = record.int.lo as f32
+            }
+            return Result::Ok(self.float_val(narrow as f64, 1))
+        }
+        when word == "f64" && record.kind == 1 {
+            return Result::Ok(self.float_val(w_to_f64(record.int), 2))
+        }
+        when word == "f32" && record.kind == 2 {
+            return Result::Ok(self.float_val(ct_round_f32(record.flt), 1))
+        }
+        when word == "f64" && record.kind == 2 {
+            return Result::Ok(self.float_val(record.flt, 2))
+        }
+        when word == "bool" && record.kind == 3 {
+            return Result::Ok(self.bool_val(record.flag))
+        }
+        when word == "char" && record.kind == 4 {
+            return Result::Ok(self.char_val(record.ch))
+        }
+        when word == "char" && record.kind == 1 {
+            when !ct_valid_char(record.int.clone()) {
+                return Result::Err(ct_error("R0464", String("this value is not a valid character"), span))
+            }
+            return Result::Ok(self.char_val(record.int.lo))
+        }
+        mut message := String("cannot cast ")
+        message.append(ct_describe(record.kind))
+        message.append(" to this type at compile time")
+        return Result::Err(ct_error("R0464", message, span))
+    }
+
+    // Converts a value to the declared type of a constant, parameter, field, or result.
+    fun coerce(mut self, value: u64, ty: u64, span: ast::Span) -> Result<u64, String> {
+        word := self.simple_word(ty)
+        when !word.is_empty() {
+            return self.coerce_word(value, word, span)
+        }
+        record := self.vals[value]
+        named := self.named_type(ty)
+        when named.is_some() && record.kind == 7 && record.text == named.unwrap() {
+            return Result::Ok(value)
+        }
+        when record.kind == 8 && self.is_vec_type(ty) {
+            return Result::Ok(value)
+        }
+        return Result::Err(ct_cannot_be(record.kind, span))
+    }
+
+    fun is_vec_type(self, ty: u64) -> bool {
+        return choose self.types[ty] {
+            ast::TypeTree::VecTy(element, span) => true,
+            _ => false,
+        }
+    }
+
+    fun coerce_word(mut self, value: u64, word: String, span: ast::Span) -> Result<u64, String> {
+        record := self.vals[value]
+        target := ct_int_code(word.clone())
+        when target != 0 {
+            when record.kind == 1 && record.ity == 0 {
+                return self.checked_int(record.int, target, span)
+            }
+            when record.kind == 1 && record.ity == target {
+                return Result::Ok(value)
+            }
+            mut message := String("expected `")
+            message.append(ct_int_name(target))
+            when record.kind == 1 {
+                message.append("` but the value has type `")
+                message.append(ct_int_name(record.ity))
+                message.append("`")
+            } else {
+                message.append("` but found ")
+                message.append(ct_describe(record.kind))
+            }
+            return Result::Err(ct_error("R0464", message, span))
+        }
+        when word == "f32" && record.kind == 2 {
+            return Result::Ok(self.float_val(ct_round_f32(record.flt), 1))
+        }
+        when word == "f64" && record.kind == 2 {
+            return Result::Ok(self.float_val(record.flt, 2))
+        }
+        when (word == "bool" && record.kind == 3) || (word == "char" && record.kind == 4) || (word == "str" && record.kind == 5) {
+            return Result::Ok(value)
+        }
+        when word == "String" && (record.kind == 5 || record.kind == 6) {
+            return Result::Ok(self.text_val(6, record.text))
+        }
+        return Result::Err(ct_cannot_be(record.kind, span))
+    }
+
+    // Methods that only read their receiver.
+    fun pure_method(mut self, receiver: u64, name: String, arguments: Vec<u64>, span: ast::Span) -> Result<u64, String> {
+        record := self.vals[receiver]
+        textual := record.kind == 5 || record.kind == 6
+        when textual && name == "len" && arguments.is_empty() {
+            return Result::Ok(self.int_val(w_of_u64(record.text.len()), 8))
+        }
+        when textual && name == "char_count" && arguments.is_empty() {
+            return Result::Ok(self.int_val(w_of_u64(ct_char_count(record.text)), 8))
+        }
+        when record.kind == 6 && name == "clone" && arguments.is_empty() {
+            return Result::Ok(self.text_val(6, record.text))
+        }
+        when textual && name == "concat" && arguments.len() == 1 {
+            other := self.vals[arguments[0]]
+            when other.kind == 5 || other.kind == 6 {
+                mut joined := record.text.clone()
+                joined.append(other.text)
+                return Result::Ok(self.text_val(6, joined))
+            }
+        }
+        when record.kind == 8 && name == "len" && arguments.is_empty() {
+            return Result::Ok(self.int_val(w_of_u64(record.items.len()), 8))
+        }
+        when record.kind == 8 && name == "clone" && arguments.is_empty() {
+            return Result::Ok(receiver)
+        }
+        when record.kind == 8 && name == "index" && arguments.len() == 1 {
+            position := self.vals[arguments[0]]
+            when position.kind == 1 {
+                when position.int.neg || position.int.hi != 0 || position.int.lo >= record.items.len() {
+                    return Result::Err(ct_error("R0464", String("Vec index is out of range during compile-time evaluation"), span))
+                }
+                return Result::Ok(self.copy_val(record.items[position.int.lo]))
+            }
+        }
+        mut what := String("the method `")
+        what.append(name)
+        what.append("`")
+        return Result::Err(ct_not_constant(what, span))
+    }
+
+    // Methods that change a local value in place.
+    fun mutate(mut self, slot: u64, name: String, arguments: Vec<u64>, span: ast::Span) -> Result<bool, String> {
+        self.changed(slot)
+        mut record := self.vals[slot]
+        when record.kind == 8 {
+            when name == "push" && arguments.len() == 1 {
+                record.items.push(arguments[0])
+                self.vals.set(slot, record)
+                return Result::Ok(true)
+            }
+            when name == "clear" && arguments.is_empty() {
+                record.items = Vec()
+                self.vals.set(slot, record)
+                return Result::Ok(true)
+            }
+            when (name == "set" && arguments.len() == 2) || (name == "take" && arguments.len() == 1) {
+                position := self.vals[arguments[0]]
+                when position.kind == 1 {
+                    when position.int.neg || position.int.hi != 0 || position.int.lo >= record.items.len() {
+                        return Result::Err(ct_error("R0464", String("Vec index is out of range during compile-time evaluation"), span))
+                    }
+                    when name == "set" {
+                        record.items.set(position.int.lo, arguments[1])
+                    } else {
+                        mut kept: Vec<u64> = Vec()
+                        mut at: u64 = 0
+                        while at < record.items.len() {
+                            when at != position.int.lo {
+                                kept.push(record.items[at])
+                            }
+                            at += 1
+                        }
+                        record.items = kept
+                    }
+                    self.vals.set(slot, record)
+                    return Result::Ok(true)
+                }
+            }
+        }
+        when record.kind == 6 && name == "append" && arguments.len() == 1 {
+            other := self.vals[arguments[0]]
+            when other.kind == 5 || other.kind == 6 {
+                record.text.append(other.text)
+                self.vals.set(slot, record)
+                return Result::Ok(true)
+            }
+        }
+        mut what := String("the method `")
+        what.append(name)
+        what.append("`")
+        return Result::Err(ct_not_constant(what, span))
+    }
+}
+
+fun ct_cannot_be(kind: u64, span: ast::Span) -> String {
+    mut message := String("a compile-time value of this type cannot be ")
+    message.append(ct_describe(kind))
+    message.append(" here")
+    return ct_error("R0464", message, span)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The rewritten program
+
+extend Comptime {
+    fun push_expr(mut self, node: ast::ExprTree) -> u64 {
+        index := self.exprs.len()
+        self.exprs.push(node)
+        return index
+    }
+
+    fun push_type(mut self, node: ast::TypeTree) -> u64 {
+        index := self.types.len()
+        self.types.push(node)
+        return index
+    }
+
+    // A value that cannot be written as a literal: a vector, at any depth.
+    fun literal_check(self, value: u64, span: ast::Span) -> Result<bool, String> {
+        record := self.vals[value]
+        when record.kind == 8 {
+            return Result::Err(ct_error("R0464", String("a Vec cannot be a compile-time constant; build it at run time"), span))
+        }
+        when record.kind == 7 {
+            for part in record.items {
+                self.literal_check(part, span)?
+            }
+        }
+        return Result::Ok(true)
+    }
+
+    // The literal expression node that stands for `value` in the rewritten program.
+    fun literal_node(mut self, value: u64, span: ast::Span) -> Result<ast::ExprTree, String> {
+        record := self.vals[value]
+        when record.kind == 1 {
+            magnitude := ast::ExprTree::IntLit(record.int.lo, span)
+            mut signed := magnitude
+            when record.int.neg {
+                inner := self.push_expr(signed)
+                signed = ast::ExprTree::NegateE(inner, span)
+            }
+            when record.ity == 0 {
+                return Result::Ok(signed)
+            }
+            inner := self.push_expr(signed)
+            ty := self.push_type(ast::TypeTree::Simple(ct_int_name(record.ity)))
+            return Result::Ok(ast::ExprTree::CastE(inner, ty, span))
+        }
+        when record.kind == 2 {
+            bits := ct_bits_of(record.flt)
+            negative := (bits >> (63 as u32)) == 1
+            magnitude_bits := bits & 9223372036854775807
+            mut node := ast::ExprTree::FloatLit(floatlib::format_f64(magnitude_bits), span)
+            when negative {
+                inner := self.push_expr(node)
+                node = ast::ExprTree::NegateE(inner, span)
+            }
+            when record.fty == 0 {
+                return Result::Ok(node)
+            }
+            inner := self.push_expr(node)
+            mut word := String("f64")
+            when record.fty == 1 {
+                word = String("f32")
+            }
+            ty := self.push_type(ast::TypeTree::Simple(word))
+            return Result::Ok(ast::ExprTree::CastE(inner, ty, span))
+        }
+        when record.kind == 3 {
+            return Result::Ok(ast::ExprTree::BoolLit(record.flag, span))
+        }
+        when record.kind == 4 {
+            return Result::Ok(ast::ExprTree::CharLit(record.ch, span))
+        }
+        when record.kind == 5 {
+            return Result::Ok(ast::ExprTree::StrLit(record.text, span))
+        }
+        when record.kind == 6 {
+            text := self.push_expr(ast::ExprTree::StrLit(record.text, span))
+            mut arguments: Vec<u64> = Vec()
+            arguments.push(text)
+            return Result::Ok(ast::ExprTree::CallE(String("String"), Vec(), arguments, span))
+        }
+        when record.kind == 7 {
+            mut inits: Vec<u64> = Vec()
+            mut at: u64 = 0
+            while at < record.names.len() {
+                node := self.literal_node(record.items[at], span)?
+                part := self.push_expr(node)
+                init := self.inits.len()
+                self.inits.push(ast::FieldInit { name: record.names[at].clone(), value: part, span: span })
+                inits.push(init)
+                at += 1
+            }
+            return Result::Ok(ast::ExprTree::StructLit(record.text, inits, span))
+        }
+        return Result::Err(ct_error("R0464", String("a Vec cannot be a compile-time constant; build it at run time"), span))
+    }
+
+    // Replaces the expression at `index` with the literal of `value`.
+    fun replace_with(mut self, index: u64, value: u64, span: ast::Span) -> Result<bool, String> {
+        node := self.literal_node(value, span)?
+        self.exprs.set(index, node)
+        return Result::Ok(true)
+    }
+
+    // The children of an expression, in the order the bootstrap visits them.
+    fun children(self, index: u64) -> Vec<u64> {
+        return choose self.exprs[index] {
+            ast::ExprTree::CallE(name, type_arguments, arguments, span) => arguments,
+            ast::ExprTree::EnumE(enum_name, variant, arguments, span) => arguments,
+            ast::ExprTree::MethodCallE(value, name, type_arguments, arguments, span) => ct_prefixed(value, arguments),
+            ast::ExprTree::StructLit(name, inits, span) => self.init_values(inits),
+            ast::ExprTree::FieldE(value, name, name_span, span) => ct_single(value),
+            ast::ExprTree::NegateE(inner, span) => ct_single(inner),
+            ast::ExprTree::NotE(inner, span) => ct_single(inner),
+            ast::ExprTree::BitNotE(inner, span) => ct_single(inner),
+            ast::ExprTree::DerefE(inner, span) => ct_single(inner),
+            ast::ExprTree::CastE(inner, ty, span) => ct_single(inner),
+            ast::ExprTree::PropagateE(inner, span) => ct_single(inner),
+            ast::ExprTree::AddressOfE(mutable, raw, inner, span) => ct_single(inner),
+            ast::ExprTree::RepeatE(value, length, span) => ct_single(value),
+            ast::ExprTree::RangeE(start, end, inclusive, span) => ct_pair(start, end),
+            ast::ExprTree::IfE(condition, then_value, else_value, span) => ct_prefixed(condition, ct_pair(then_value, else_value)),
+            ast::ExprTree::BinaryE(op, left, right, span) => ct_pair(left, right),
+            ast::ExprTree::TupleE(values, span) => values,
+            ast::ExprTree::ArrayE(values, span) => values,
+            ast::ExprTree::IndexE(value, position, span) => ct_pair(value, position),
+            ast::ExprTree::ChooseE(value, arms, span) => ct_prefixed(value, self.arm_bodies(arms)),
+            ast::ExprTree::PipeE(left, right, span) => ct_pair(left, right),
+            ast::ExprTree::CoalesceE(left, right, span) => ct_pair(left, right),
+            ast::ExprTree::OptionalFieldE(value, name, name_span, span) => ct_single(value),
+            _ => Vec(),
+        }
+    }
+
+    fun init_values(self, inits: Vec<u64>) -> Vec<u64> {
+        mut values: Vec<u64> = Vec()
+        for init in inits {
+            values.push(self.inits[init].value)
+        }
+        return values
+    }
+
+    fun arm_bodies(self, arms: Vec<u64>) -> Vec<u64> {
+        mut bodies: Vec<u64> = Vec()
+        for arm in arms {
+            bodies.push(self.program.arms[arm].body)
+        }
+        return bodies
+    }
+
+    // The expressions a statement holds directly, in visiting order, and its bodies.
+    fun statement_expressions(self, index: u64) -> Vec<u64> {
+        return choose self.stmts[index] {
+            ast::Stmt::LetS(name, mutable, annotation, value, span) => ct_single(value),
+            ast::Stmt::AssignS(name, value, span) => ct_single(value),
+            ast::Stmt::CompoundS(name, op, value, span) => ct_single(value),
+            ast::Stmt::FieldAssignS(object, names, spans, op, value, span) => ct_single(value),
+            ast::Stmt::PrintS(value, span) => ct_single(value),
+            ast::Stmt::IndexAssignS(name, position, value, span) => ct_pair(position, value),
+            ast::Stmt::DerefAssignS(pointer, value, span) => ct_pair(pointer, value),
+            ast::Stmt::TemplateS(parts, span) => self.part_values(parts),
+            ast::Stmt::CallS(name, type_arguments, arguments, span) => arguments,
+            ast::Stmt::MethodCallS(value, name, arguments, span) => ct_prefixed(value, arguments),
+            ast::Stmt::IfS(condition, then_body, else_body, span) => ct_single(condition),
+            ast::Stmt::WhileS(condition, body, span) => ct_single(condition),
+            ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => ct_pair(start, end),
+            ast::Stmt::ForEachS(name, name_span, iterable, body, span) => ct_single(iterable),
+            ast::Stmt::ReturnS(value, span) => ct_optional(value),
+            _ => Vec(),
+        }
+    }
+
+    // The number of statement lists inside a statement, and the list at a position, in visiting order.
+    fun body_count(self, index: u64) -> u64 {
+        return choose self.stmts[index] {
+            ast::Stmt::IfS(condition, then_body, else_body, span) => 2,
+            ast::Stmt::WhileS(condition, body, span) => 1,
+            ast::Stmt::DeferS(body, span) => 1,
+            ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => 1,
+            ast::Stmt::ForEachS(name, name_span, iterable, body, span) => 1,
+            _ => 0,
+        }
+    }
+
+    fun body_at(self, index: u64, position: u64) -> Vec<u64> {
+        return choose self.stmts[index] {
+            ast::Stmt::IfS(condition, then_body, else_body, span) => ct_pick(position, then_body, else_body),
+            ast::Stmt::WhileS(condition, body, span) => body,
+            ast::Stmt::DeferS(body, span) => body,
+            ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => body,
+            ast::Stmt::ForEachS(name, name_span, iterable, body, span) => body,
+            _ => Vec(),
+        }
+    }
+
+    // The same statement with the list at `position` replaced.
+    fun with_body(self, index: u64, position: u64, list: Vec<u64>) -> ast::Stmt {
+        return choose self.stmts[index] {
+            ast::Stmt::IfS(condition, then_body, else_body, span) => ct_if_with(condition, then_body, else_body, span, position, list),
+            ast::Stmt::WhileS(condition, body, span) => ast::Stmt::WhileS(condition, list, span),
+            ast::Stmt::DeferS(body, span) => ast::Stmt::DeferS(list, span),
+            ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => ast::Stmt::ForS(name, name_span, start, end, inclusive, list, span),
+            ast::Stmt::ForEachS(name, name_span, iterable, body, span) => ast::Stmt::ForEachS(name, name_span, iterable, list, span),
+            _ => self.stmts[index],
+        }
+    }
+
+    fun part_value(self, part: u64) -> Option<u64> {
+        return choose self.program.parts[part] {
+            ast::TemplatePart::ValuePart(value) => Option::Some(value),
+            _ => Option::None,
+        }
+    }
+
+    fun part_values(self, parts: Vec<u64>) -> Vec<u64> {
+        mut values: Vec<u64> = Vec()
+        for part in parts {
+            value := self.part_value(part)
+            when value.is_some() {
+                values.push(value.unwrap())
+            }
+        }
+        return values
+    }
+}
+
+fun ct_pick(position: u64, first: Vec<u64>, second: Vec<u64>) -> Vec<u64> {
+    when position == 0 {
+        return first
+    }
+    return second
+}
+
+fun ct_if_with(condition: u64, then_body: Vec<u64>, else_body: Vec<u64>, span: ast::Span, position: u64, list: Vec<u64>) -> ast::Stmt {
+    when position == 0 {
+        return ast::Stmt::IfS(condition, list, else_body, span)
+    }
+    return ast::Stmt::IfS(condition, then_body, list, span)
+}
+
+fun ct_single(value: u64) -> Vec<u64> {
+    mut items: Vec<u64> = Vec()
+    items.push(value)
+    return items
+}
+
+fun ct_optional(value: Option<u64>) -> Vec<u64> {
+    mut items: Vec<u64> = Vec()
+    when value.is_some() {
+        items.push(value.unwrap())
+    }
+    return items
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The pass
+
+extend Comptime {
+    fun function_is_constant(self, position: u64) -> bool {
+        return self.is_constant(self.functions[position])
+    }
+
+    fun evaluate(mut self) -> Result<bool, String> {
+        mut has_work := false
+        mut position: u64 = 0
+        while position < self.functions.len() && !has_work {
+            index := self.functions[position]
+            when self.is_constant(index) || self.mentions_comptime(index) {
+                has_work = true
+            }
+            position += 1
+        }
+        when !has_work {
+            return Result::Ok(false)
+        }
+        self.setup()
+        // Every constant is evaluated even when nothing uses it, so mistakes surface.
+        position = 0
+        while position < self.functions.len() {
+            index := self.functions[position]
+            when self.is_constant(index) {
+                span := self.function_defs[index].span
+                value := self.constant(index, span)?
+                self.literal_check(value, span)?
+            }
+            position += 1
+        }
+        position = 0
+        while position < self.functions.len() {
+            index := self.functions[position]
+            when !self.is_constant(index) {
+                self.evaluate_function(index)?
+            }
+            position += 1
+        }
+        mut kept: Vec<u64> = Vec()
+        for index in self.functions.clone() {
+            when !self.is_constant(index) {
+                kept.push(index)
+            }
+        }
+        self.functions = kept
+        return Result::Ok(true)
+    }
+
+    fun evaluate_function(mut self, index: u64) -> Result<bool, String> {
+        function := self.function_defs[index]
+        mut names: Vec<String> = Vec()
+        for parameter in function.parameters.clone() {
+            names.push(self.program.parameters[parameter].name.clone())
+        }
+        names = self.declared_names(function.body.clone(), names)
+        names = self.choose_bindings_list(function.body.clone(), names)
+        when function.return_value.is_some() {
+            names = self.choose_bindings_expr(function.return_value.unwrap(), names)
+        }
+        self.module = function.module_path.clone()
+        self.base = self.local_names.len()
+        self.reject_assignments(function.body.clone(), names.clone())?
+        body := self.check_assertions(function.body.clone(), names.clone())?
+        mut updated := self.function_defs[index]
+        updated.body = body.clone()
+        self.function_defs.set(index, updated)
+        // The expression form `when c { a } else { b }` is folded the same way; children fold before their parents.
+        self.fold_list(body.clone(), names.clone())?
+        when function.return_value.is_some() {
+            self.fold_expr(function.return_value.unwrap(), names.clone())?
+        }
+        self.rewrite_list(body, names.clone())?
+        when function.return_value.is_some() {
+            self.rewrite_expr(function.return_value.unwrap(), names)?
+        }
+        return Result::Ok(true)
+    }
+
+    // The names that the statements of a body declare: `let` names and loop variables, at any depth.
+    fun declared_names(self, body: Vec<u64>, names: Vec<String>) -> Vec<String> {
+        mut found := names
+        for index in body {
+            found = self.declared_statement(index, found)
+        }
+        return found
+    }
+
+    fun declared_statement(self, index: u64, names: Vec<String>) -> Vec<String> {
+        return choose self.stmts[index] {
+            ast::Stmt::LetS(name, mutable, annotation, value, span) => ct_with_name(names, name),
+            ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => self.declared_names(body, ct_with_name(names, name)),
+            ast::Stmt::ForEachS(name, name_span, iterable, body, span) => self.declared_names(body, ct_with_name(names, name)),
+            ast::Stmt::IfS(condition, then_body, else_body, span) => self.declared_names(else_body, self.declared_names(then_body, names)),
+            ast::Stmt::WhileS(condition, body, span) => self.declared_names(body, names),
+            ast::Stmt::DeferS(body, span) => self.declared_names(body, names),
+            _ => names,
+        }
+    }
+
+    // The names that `choose` arms bind anywhere in a body.
+    fun choose_bindings_list(self, body: Vec<u64>, names: Vec<String>) -> Vec<String> {
+        mut found := names
+        for index in body {
+            for expression in self.statement_expressions(index) {
+                found = self.choose_bindings_expr(expression, found)
+            }
+            mut position: u64 = 0
+            count := self.body_count(index)
+            while position < count {
+                found = self.choose_bindings_list(self.body_at(index, position), found)
+                position += 1
+            }
+        }
+        return found
+    }
+
+    fun choose_bindings_expr(self, index: u64, names: Vec<String>) -> Vec<String> {
+        mut found := names
+        for child in self.children(index) {
+            found = self.choose_bindings_expr(child, found)
+        }
+        arms := self.choose_arms(index)
+        for arm in arms {
+            for binding in self.program.arms[arm].bindings.clone() {
+                found.push(binding)
+            }
+        }
+        return found
+    }
+
+    fun choose_arms(self, index: u64) -> Vec<u64> {
+        return choose self.exprs[index] {
+            ast::ExprTree::ChooseE(value, arms, span) => arms,
+            _ => Vec(),
+        }
+    }
+
+    // `R0467`: an assignment to a constant, unless a local or parameter of the same name takes precedence.
+    fun reject_assignments(mut self, body: Vec<u64>, names: Vec<String>) -> Result<bool, String> {
+        for index in body {
+            target := self.assignment_target(index)
+            when target.is_some() {
+                name := target.unwrap()
+                span := self.statement_span(index)
+                when !ct_has_name(names.clone(), name.clone()) {
+                    resolved := self.resolve_constant(name.clone(), self.module.clone(), span)?
+                    when resolved.is_some() {
+                        mut message := String("cannot assign to the constant `")
+                        message.append(name)
+                        message.append("`")
+                        return Result::Err(ct_error_help("R0467", message, span, "constants are fixed at compile time; copy it into a `mut` local first"))
+                    }
+                }
+            }
+            mut position: u64 = 0
+            count := self.body_count(index)
+            while position < count {
+                // A `defer` body is visited too, as the bootstrap does; an `if` visits both branches.
+                self.reject_assignments(self.body_at(index, position), names.clone())?
+                position += 1
+            }
+        }
+        return Result::Ok(true)
+    }
+
+    fun assignment_target(self, index: u64) -> Option<String> {
+        return choose self.stmts[index] {
+            ast::Stmt::AssignS(name, value, span) => Option::Some(name),
+            ast::Stmt::IndexAssignS(name, position, value, span) => Option::Some(name),
+            ast::Stmt::CompoundS(name, op, value, span) => Option::Some(name),
+            ast::Stmt::FieldAssignS(object, names, spans, op, value, span) => Option::Some(object),
+            _ => Option::None,
+        }
+    }
+
+    fun statement_span(self, index: u64) -> ast::Span {
+        return choose self.stmts[index] {
+            ast::Stmt::LetS(name, mutable, annotation, value, span) => span,
+            ast::Stmt::AssignS(name, value, span) => span,
+            ast::Stmt::IndexAssignS(name, position, value, span) => span,
+            ast::Stmt::DerefAssignS(pointer, value, span) => span,
+            ast::Stmt::FieldAssignS(object, names, spans, op, value, span) => span,
+            ast::Stmt::CompoundS(name, op, value, span) => span,
+            ast::Stmt::PrintS(value, span) => span,
+            ast::Stmt::TemplateS(parts, span) => span,
+            ast::Stmt::CallS(name, type_arguments, arguments, span) => span,
+            ast::Stmt::MethodCallS(value, name, arguments, span) => span,
+            ast::Stmt::IfS(condition, then_body, else_body, span) => span,
+            ast::Stmt::WhileS(condition, body, span) => span,
+            ast::Stmt::DeferS(body, span) => span,
+            ast::Stmt::ForS(name, name_span, start, end, inclusive, body, span) => span,
+            ast::Stmt::ForEachS(name, name_span, iterable, body, span) => span,
+            ast::Stmt::BreakS(span) => span,
+            ast::Stmt::ContinueS(span) => span,
+            ast::Stmt::ReturnS(value, span) => span,
+        }
+    }
+
+    // Whether a condition names a constant (and no local of the same name) or calls `comptime`.
+    fun mentions_constant(self, index: u64, names: Vec<String>) -> bool {
+        flags := self.mention_flags(index, names)
+        return (flags & 1) == 1 && (flags & 2) == 0
+    }
+
+    fun mention_flags(self, index: u64, names: Vec<String>) -> u64 {
+        mut flags: u64 = choose self.exprs[index] {
+            ast::ExprTree::NameRef(name, span) => self.name_flag(name, span, names.clone()),
+            ast::ExprTree::CallE(name, type_arguments, arguments, span) => ct_comptime_flag(name),
+            _ => 0,
+        }
+        for child in self.children(index) {
+            flags = flags | self.mention_flags(child, names.clone())
+        }
+        return flags
+    }
+
+    fun name_flag(self, name: String, span: ast::Span, names: Vec<String>) -> u64 {
+        when ct_has_name(names, name.clone()) {
+            return 2
+        }
+        resolved := self.resolve_constant(name, self.module.clone(), span)
+        when resolved.is_ok() && resolved.unwrap().is_some() {
+            return 1
+        }
+        return 0
+    }
+
+    // Removes and checks the `static_assert` statements of a list; a `when` on a compile-time condition keeps only the
+    // branch that is taken, so the other branch is never analyzed (conditional compilation).
+    fun check_assertions(mut self, body: Vec<u64>, names: Vec<String>) -> Result<Vec<u64>, String> {
+        mut kept: Vec<u64> = Vec()
+        for index in body {
+            assertion := self.assertion_call(index)
+            when assertion.is_some() {
+                self.static_assert(index)?
+            } else {
+                self.check_nested(index, names.clone())?
+                kept.push(index)
+            }
+        }
+        return Result::Ok(kept)
+    }
+
+    fun assertion_call(self, index: u64) -> Option<bool> {
+        return choose self.stmts[index] {
+            ast::Stmt::CallS(name, type_arguments, arguments, span) => ct_when_assert(name),
+            _ => Option::None,
+        }
+    }
+
+    fun static_assert(mut self, index: u64) -> Result<bool, String> {
+        arguments := self.call_arguments(index)
+        span := self.statement_span(index)
+        mut message: Option<String> = Option::None
+        mut valid := arguments.len() == 1
+        when arguments.len() == 2 {
+            text := self.string_literal(arguments[1])
+            when text.is_some() {
+                message = text
+                valid = true
+            }
+        }
+        when !valid {
+            return Result::Err(ct_error("R0461", String("`static_assert` takes a condition and an optional message literal"), span))
+        }
+        value := self.expression(arguments[0])?
+        record := self.vals[value]
+        when record.kind == 3 {
+            when record.flag {
+                return Result::Ok(true)
+            }
+            mut text := String("static assertion failed")
+            when message.is_some() {
+                text.append(": ")
+                text.append(message.unwrap())
+            }
+            return Result::Err(ct_error_help("R0460", text, span, "the condition was evaluated at compile time and is false"))
+        }
+        mut text := String("`static_assert` needs a bool, found ")
+        text.append(ct_describe(record.kind))
+        return Result::Err(ct_error("R0464", text, span))
+    }
+
+    fun call_arguments(self, index: u64) -> Vec<u64> {
+        return choose self.stmts[index] {
+            ast::Stmt::CallS(name, type_arguments, arguments, span) => arguments,
+            _ => Vec(),
+        }
+    }
+
+    fun if_parts(self, index: u64) -> Option<u64> {
+        return choose self.stmts[index] {
+            ast::Stmt::IfS(condition, then_body, else_body, span) => Option::Some(condition),
+            _ => Option::None,
+        }
+    }
+
+    // The nested lists of a kept statement.
+    fun check_nested(mut self, index: u64, names: Vec<String>) -> Result<bool, String> {
+        condition := self.if_parts(index)
+        when condition.is_some() {
+            cond := condition.unwrap()
+            when self.mentions_constant(cond, names.clone()) {
+                outcome := self.expression(cond)
+                when outcome.is_ok() {
+                    record := self.vals[outcome.unwrap()]
+                    when record.kind == 3 {
+                        mut taken := self.body_at(index, 1)
+                        when record.flag {
+                            taken = self.body_at(index, 0)
+                        }
+                        branch := self.check_assertions(taken, names)?
+                        cond_span := self.span_of(cond)
+                        self.exprs.set(cond, ast::ExprTree::BoolLit(true, cond_span))
+                        span := self.statement_span(index)
+                        self.stmts.set(index, ast::Stmt::IfS(cond, branch, Vec(), span))
+                        return Result::Ok(true)
+                    }
+                }
+            }
+        }
+        count := self.body_count(index)
+        mut position: u64 = 0
+        while position < count {
+            list := self.check_assertions(self.body_at(index, position), names.clone())?
+            updated := self.with_body(index, position, list)
+            self.stmts.set(index, updated)
+            position += 1
+        }
+        return Result::Ok(true)
+    }
+
+    // Folds `when` expressions on compile-time conditions, children first.
+    fun fold_list(mut self, body: Vec<u64>, names: Vec<String>) -> Result<bool, String> {
+        for index in body {
+            for expression in self.statement_expressions(index) {
+                self.fold_expr(expression, names.clone())?
+            }
+            count := self.body_count(index)
+            mut position: u64 = 0
+            while position < count {
+                self.fold_list(self.body_at(index, position), names.clone())?
+                position += 1
+            }
+        }
+        return Result::Ok(true)
+    }
+
+    fun fold_expr(mut self, index: u64, names: Vec<String>) -> Result<bool, String> {
+        for child in self.children(index) {
+            self.fold_expr(child, names.clone())?
+        }
+        parts := self.if_expression_parts(index)
+        when parts.len() == 3 && self.mentions_constant(parts[0], names) {
+            outcome := self.expression(parts[0])
+            when outcome.is_ok() {
+                record := self.vals[outcome.unwrap()]
+                when record.kind == 3 {
+                    mut chosen := parts[2]
+                    when record.flag {
+                        chosen = parts[1]
+                    }
+                    self.exprs.set(index, self.exprs[chosen])
+                }
+            }
+        }
+        return Result::Ok(true)
+    }
+
+    fun if_expression_parts(self, index: u64) -> Vec<u64> {
+        return choose self.exprs[index] {
+            ast::ExprTree::IfE(condition, then_value, else_value, span) => ct_prefixed(condition, ct_pair(then_value, else_value)),
+            _ => Vec(),
+        }
+    }
+
+    // Replaces constants, `comptime(...)` and metadata calls with their values, children first.
+    fun rewrite_list(mut self, body: Vec<u64>, names: Vec<String>) -> Result<bool, String> {
+        for index in body {
+            for expression in self.statement_expressions(index) {
+                self.rewrite_expr(expression, names.clone())?
+            }
+            count := self.body_count(index)
+            mut position: u64 = 0
+            while position < count {
+                self.rewrite_list(self.body_at(index, position), names.clone())?
+                position += 1
+            }
+        }
+        return Result::Ok(true)
+    }
+
+    fun rewrite_expr(mut self, index: u64, names: Vec<String>) -> Result<bool, String> {
+        for child in self.children(index) {
+            self.rewrite_expr(child, names.clone())?
+        }
+        span := self.span_of(index)
+        replacement := choose self.exprs[index] {
+            ast::ExprTree::NameRef(name, name_span) => self.rewrite_name(name, span, names),
+            ast::ExprTree::EnumE(enum_name, variant, arguments, enum_span) => self.rewrite_enum(enum_name, variant, arguments, span),
+            ast::ExprTree::CallE(name, type_arguments, arguments, call_span) => self.rewrite_call(name, type_arguments, arguments, span),
+            _ => Result::Ok(Option::None),
+        }
+        value := replacement?
+        when value.is_some() {
+            self.replace_with(index, value.unwrap(), span)?
+        }
+        return Result::Ok(true)
+    }
+
+    fun rewrite_name(mut self, name: String, span: ast::Span, names: Vec<String>) -> Result<Option<u64>, String> {
+        when ct_has_name(names, name.clone()) {
+            return Result::Ok(Option::None)
+        }
+        resolved := self.resolve_constant(name, self.module.clone(), span)?
+        when resolved.is_none() {
+            return Result::Ok(Option::None)
+        }
+        return Result::Ok(Option::Some(self.constant(resolved.unwrap(), span)?))
+    }
+
+    fun rewrite_enum(mut self, enum_name: String, variant: String, arguments: Vec<u64>, span: ast::Span) -> Result<Option<u64>, String> {
+        when !arguments.is_empty() {
+            return Result::Ok(Option::None)
+        }
+        mut qualified := enum_name
+        qualified.append("::")
+        qualified.append(variant)
+        resolved := self.resolve_constant(qualified, self.module.clone(), span)?
+        when resolved.is_none() {
+            return Result::Ok(Option::None)
+        }
+        return Result::Ok(Option::Some(self.constant(resolved.unwrap(), span)?))
+    }
+
+    fun rewrite_call(mut self, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: ast::Span) -> Result<Option<u64>, String> {
+        when !((name == "comptime" && arguments.len() == 1) || ct_is_metadata(name.clone())) {
+            return Result::Ok(Option::None)
+        }
+        // The call is evaluated in a fresh frame of the function's module.
+        saved_base := self.base
+        self.base = self.local_names.len()
+        outcome := self.call(name, type_arguments, arguments, span)
+        self.truncate_locals(self.base)
+        self.base = saved_base
+        return Result::Ok(Option::Some(outcome?))
+    }
+
+    // Whether a function has compile-time work: a `static_assert` statement, or a `comptime` or metadata call anywhere.
+    fun mentions_comptime(self, index: u64) -> bool {
+        function := self.function_defs[index]
+        when self.list_mentions(function.body.clone()) {
+            return true
+        }
+        when function.return_value.is_some() {
+            return self.expr_mentions(function.return_value.unwrap())
+        }
+        return false
+    }
+
+    fun list_mentions(self, body: Vec<u64>) -> bool {
+        for index in body {
+            when self.assertion_call(index).is_some() {
+                return true
+            }
+            for expression in self.statement_expressions(index) {
+                when self.expr_mentions(expression) {
+                    return true
+                }
+            }
+            count := self.body_count(index)
+            mut position: u64 = 0
+            while position < count {
+                when self.list_mentions(self.body_at(index, position)) {
+                    return true
+                }
+                position += 1
+            }
+        }
+        return false
+    }
+
+    fun expr_mentions(self, index: u64) -> bool {
+        mentioned := choose self.exprs[index] {
+            ast::ExprTree::CallE(name, type_arguments, arguments, span) => name == "comptime" || ct_is_metadata(name),
+            _ => false,
+        }
+        when mentioned {
+            return true
+        }
+        for child in self.children(index) {
+            when self.expr_mentions(child) {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+fun ct_with_name(names: Vec<String>, name: String) -> Vec<String> {
+    mut found := names
+    found.push(name)
+    return found
+}
+
+fun ct_comptime_flag(name: String) -> u64 {
+    when name == "comptime" {
+        return 1
+    }
+    return 0
+}
+
+fun ct_when_assert(name: String) -> Option<bool> {
+    when name == "static_assert" {
+        return Option::Some(true)
+    }
+    return Option::None
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Derived defaults
+
+extend Comptime {
+    // Synthesizes `Type::default()` for `#[derive(Default)]` structures.
+    fun derive_defaults(mut self) -> Result<bool, String> {
+        mut generated: Vec<u64> = Vec()
+        for structure in self.program.structs.clone() {
+            definition := self.program.struct_defs[structure]
+            when ct_has_name(definition.derives.clone(), String("Default")) {
+                mut name := definition.name.clone()
+                name.append("::default")
+                mut exists := false
+                for function in self.functions.clone() {
+                    when self.function_defs[function].name == name {
+                        exists = true
+                    }
+                }
+                when !exists {
+                    zero := ast::Span { start: 0, end: 0 }
+                    mut inits: Vec<u64> = Vec()
+                    for field in definition.fields.clone() {
+                        declared := self.program.struct_fields[field]
+                        value := self.default_value(declared.ty, declared.span)?
+                        init := self.inits.len()
+                        self.inits.push(ast::FieldInit { name: declared.name.clone(), value: value, span: declared.span })
+                        inits.push(init)
+                    }
+                    literal := self.push_expr(ast::ExprTree::StructLit(definition.name.clone(), inits, zero))
+                    result_type := self.push_type(ast::TypeTree::NamedTy(definition.name.clone(), zero))
+                    index := self.function_defs.len()
+                    self.function_defs.push(ast::Function {
+                        name: name,
+                        extern_c: false,
+                        external_symbol: Option::None,
+                        type_parameters: Vec(),
+                        type_parameter_bounds: Vec(),
+                        public: true,
+                        module_path: definition.module_path.clone(),
+                        parameters: Vec(),
+                        return_type: Option::Some(result_type),
+                        body: Vec(),
+                        return_value: Option::Some(literal),
+                        span: definition.span,
+                    })
+                    generated.push(index)
+                }
+            }
+        }
+        for index in generated {
+            self.functions.push(index)
+        }
+        return Result::Ok(true)
+    }
+
+    fun derives_default(self, name: String) -> bool {
+        for structure in self.program.structs.clone() {
+            definition := self.program.struct_defs[structure]
+            when definition.name == name && ct_has_name(definition.derives, String("Default")) {
+                return true
+            }
+        }
+        return false
+    }
+
+    // The default value expression of a field type.
+    fun default_value(mut self, ty: u64, span: ast::Span) -> Result<u64, String> {
+        word := self.simple_word(ty)
+        when ct_int_code(word.clone()) != 0 {
+            zero := self.push_expr(ast::ExprTree::IntLit(0, span))
+            return Result::Ok(self.push_expr(ast::ExprTree::CastE(zero, ty, span)))
+        }
+        when word == "f32" || word == "f64" {
+            zero := self.push_expr(ast::ExprTree::FloatLit(String("0"), span))
+            return Result::Ok(self.push_expr(ast::ExprTree::CastE(zero, ty, span)))
+        }
+        when word == "bool" {
+            return Result::Ok(self.push_expr(ast::ExprTree::BoolLit(false, span)))
+        }
+        when word == "char" {
+            return Result::Ok(self.push_expr(ast::ExprTree::CharLit(0, span)))
+        }
+        when word == "String" {
+            text := self.push_expr(ast::ExprTree::StrLit(String(""), span))
+            return Result::Ok(self.push_expr(ast::ExprTree::CallE(String("String"), Vec(), ct_single(text), span)))
+        }
+        when word == "str" {
+            return Result::Ok(self.push_expr(ast::ExprTree::StrLit(String(""), span)))
+        }
+        node := self.types[ty]
+        made := choose node {
+            ast::TypeTree::VecTy(element, type_span) => Option::Some(ast::ExprTree::VecNewE(element, span)),
+            ast::TypeTree::MapTy(key, value, type_span) => Option::Some(ast::ExprTree::MapNewE(key, value, span)),
+            ast::TypeTree::SetTy(element, type_span) => Option::Some(ast::ExprTree::SetNewE(element, span)),
+            _ => Option::None,
+        }
+        when made.is_some() {
+            return Result::Ok(self.push_expr(made.unwrap()))
+        }
+        array := self.array_parts(ty)
+        when array.len() == 2 {
+            element := self.default_value(array[0], span)?
+            return Result::Ok(self.push_expr(ast::ExprTree::RepeatE(element, array[1], span)))
+        }
+        named := self.named_type(ty)
+        when named.is_some() {
+            type_name := named.unwrap()
+            when self.derives_default(type_name.clone()) {
+                return Result::Ok(self.push_expr(ast::ExprTree::EnumE(type_name, String("default"), Vec(), span)))
+            }
+        }
+        mut message := String("`#[derive(Default)]` cannot build a default for a field of type `")
+        message.append(self.type_label(ty))
+        message.append("`")
+        return Result::Err(ct_error("R0466", message, span))
+    }
+
+    fun array_parts(self, ty: u64) -> Vec<u64> {
+        return choose self.types[ty] {
+            ast::TypeTree::ArrayTy(element, length, span) => ct_pair(element, length),
+            _ => Vec(),
+        }
+    }
+}

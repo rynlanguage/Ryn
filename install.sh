@@ -80,8 +80,11 @@ printf '%s  %s\n' "$expected_hash" "$archive_path" | sha256sum --check --status 
 
 version="${tag#v}"
 member="ryn-$version-linux-x86_64/ryn"
-tar -tzf "$archive_path" | grep -Fxq "$member" || fail 'the release archive does not contain the Ryn executable.'
-tar -xOzf "$archive_path" "$member" > "$work_dir/ryn"
+# The listing is read in full before it is searched: `grep -q` exits at the first match and
+# would close the pipe early, so `pipefail` would report the killed `tar` instead of the match.
+archive_listing="$(tar -tzf "$archive_path")" || fail 'the downloaded archive is not readable.'
+grep -Fxq -- "$member" <<<"$archive_listing" || fail 'the release archive does not contain the Ryn executable.'
+tar -xOzf "$archive_path" "$member" > "$work_dir/ryn" || fail 'the Ryn executable could not be extracted from the archive.'
 chmod 0755 "$work_dir/ryn"
 [[ "$("$work_dir/ryn" --version)" == "ryn $version" ]] || fail 'the downloaded executable reported an unexpected version.'
 

@@ -1,0 +1,35 @@
+// test: run
+// out: 7
+// exit: 0
+// A slice parameter takes two slots, so a `mut self` receiver declared after it must still find its own slot.
+struct Counter {
+    value: i32,
+}
+
+extend Counter {
+    pub fun bump(mut self) -> i32 {
+        self.value += 2
+        return self.value
+    }
+}
+
+fun total(values: &[i32]) -> i32 {
+    mut sum: i32 = 0
+    for value in values {
+        sum += value
+    }
+    return sum
+}
+
+fun tally(values: &[i32]) -> i32 {
+    mut counter := Counter { value: 0 }
+    counter.bump()
+    return counter.bump() + total(values)
+}
+
+fun main() {
+    mut numbers: Vec<i32> = Vec()
+    numbers.push(1)
+    numbers.push(2)
+    echo tally(numbers.as_slice())
+}

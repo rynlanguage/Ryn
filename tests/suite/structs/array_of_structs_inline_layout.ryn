@@ -1,0 +1,97 @@
+// test: run
+// out: 1
+// out: 7
+// out: 120
+// out: 7
+// out: 1
+// out: 1000
+// out: true
+// out: 10
+// out: 2
+// out: 2000
+// out: false
+// out: 20
+// out: 3
+// out: 3000
+// out: true
+// out: 30
+// out: 9000
+// out: 90
+// out: 4
+// out: 3
+// out: true
+// out: 1
+// out: 2
+// out: 40
+// out: 3
+// out: 2
+// An array of plain structures is stored inline: element i is the structure's own cells, so reads, writes, copies and
+// whole-array moves see the same fields in the same order as the bootstrap backend.
+struct Point {
+    x: i32
+    y: i32
+}
+
+struct Mixed {
+    small: u8
+    wide: i64
+    flag: bool
+    count: i32
+}
+
+fun translate(points: [Point; 2], delta: i32) -> [Point; 2] {
+    [
+        Point { x: points[0].x + delta, y: points[0].y },
+        Point { x: points[1].x, y: points[1].y + delta },
+    ]
+}
+
+fun pick(items: [Mixed; 3], at: u64) -> Mixed {
+    return items[at]
+}
+
+fun main() {
+    mut points: [Point; 2] = [Point { x: 1, y: 2 }, Point { x: 10, y: 20 }]
+    points[0] = Point { x: points[0].x, y: 7 }
+    echo points[0].x
+    echo points[0].y
+    moved := translate(points, 100)
+    echo moved[1].y
+    copied := points[0]
+    echo copied.y
+
+    mut items: [Mixed; 3] = [
+        Mixed { small: 1, wide: 1000, flag: true, count: 10 },
+        Mixed { small: 2, wide: 2000, flag: false, count: 20 },
+        Mixed { small: 3, wide: 3000, flag: true, count: 30 },
+    ]
+    mut at: u64 = 0
+    while at < 3 {
+        echo items[at].small
+        echo items[at].wide
+        echo items[at].flag
+        echo items[at].count
+        at += 1
+    }
+    items[1] = Mixed { small: 9, wide: 9000, flag: true, count: 90 }
+    chosen := pick(items, 1)
+    echo chosen.wide
+    echo chosen.count
+    filled: [Mixed; 2] = [Mixed { small: 4, wide: 4, flag: false, count: 4 }; 2]
+    echo filled[1].count
+    tail := items[2]
+    echo tail.small
+    echo tail.flag
+
+    mut slots: [Point; 3] = [Point { x: 1, y: 2 }, Point { x: 3, y: 4 }, Point { x: 5, y: 6 }]
+    mut index: u64 = 2
+    slots[index] = slots[0]
+    echo slots[2].x
+    slots = [slots[2], slots[1], slots[0]]
+    echo slots[0].y
+    index = 0
+    slots[index] = Point { x: 40, y: 50 }
+    echo slots[0].x
+    echo slots[1].x
+    echo slots[2].y
+}

@@ -1,0 +1,16 @@
+// test: run
+// out: 0
+// out: 3
+// out: 2
+// out: 1
+// Elements of an array with destructors are dropped last first, as the scope drops its other values.
+#[drop(release)]
+struct Resource { handle: *i32 }
+fun release(resource: Resource) { echo *resource.handle }
+fun main() {
+    mut a: i32 = 1
+    mut b: i32 = 2
+    mut c: i32 = 3
+    items: [Resource; 3] = [Resource { handle: &raw mut a }, Resource { handle: &raw mut b }, Resource { handle: &raw mut c }]
+    echo 0
+}

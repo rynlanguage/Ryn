@@ -1,0 +1,47 @@
+// test: run
+// out: 6000
+// out: 0
+// Vector and nested map values are cloned on get, copy and values(), and freed on replace, remove and clear: a thousand
+// rounds leave no live allocation (the native runtime counts them).
+extern "C" fun ryn_native_live_allocations() -> u64;
+fun round(seed: i32) -> i64 {
+    mut groups := Map<i32, Vec<String>>()
+    mut first: Vec<String> = Vec<String>()
+    first.push(String("ryn"))
+    groups.insert(1, first)
+    mut second: Vec<String> = Vec<String>()
+    second.push(String("language"))
+    second.push(String("compiler"))
+    groups.insert(1, second)
+    mut nested := Map<i32, Map<i32, String>>()
+    mut inner := Map<i32, String>()
+    inner.insert(seed, String("deep"))
+    nested.insert(7, inner)
+    mut copies := groups.clone()
+    mut total: i64 = 0
+    when groups.get(1).is_some() {
+        total += groups.get(1).unwrap().len() as i64
+    }
+    for names in copies.values() {
+        total += names.len() as i64
+    }
+    when nested.get(7).is_some() {
+        total += 1
+    }
+    when groups.remove(1) {
+        total += 1
+    }
+    groups.clear()
+    return total
+}
+fun main() {
+    before := ryn_native_live_allocations()
+    mut i: i32 = 0
+    mut total: i64 = 0
+    while i < 1000 {
+        total += round(i)
+        i += 1
+    }
+    echo total
+    echo ryn_native_live_allocations() - before
+}

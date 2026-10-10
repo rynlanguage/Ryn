@@ -1,0 +1,31 @@
+// test: run
+// out: 7
+// out: 12
+// out: 13
+// exit: 0
+// A function in a namespace names the structure and the alias of its namespace without the qualifier, in its signature.
+namespace math::integer;
+
+pub struct Point {
+    x: i32,
+    y: i32
+}
+
+type Score = i32
+
+pub fun sum(point: Point) -> i32 {
+    return point.x + point.y
+}
+
+pub fun alias_score(value: Score) -> Score {
+    return value
+}
+
+namespace;
+
+fun main() {
+    point := math::integer::Point { x: 3, y: 4 }
+    echo math::integer::sum(point)
+    echo math::integer::alias_score(12)
+    echo math::integer::alias_score(13)
+}

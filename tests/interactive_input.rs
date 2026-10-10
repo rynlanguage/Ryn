@@ -593,7 +593,29 @@ fn tcp_client_connects_writes_and_reads_on_loopback() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener binds");
     let address = listener.local_addr().unwrap();
     let peer = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("client connects");
+        // A client that never connects fails this test instead of blocking the run.
+        listener
+            .set_nonblocking(true)
+            .expect("loopback listener is non-blocking");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("client connects: {error}"),
+            }
+        };
+        stream
+            .set_nonblocking(false)
+            .expect("accepted stream is blocking");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("accepted stream read timeout is set");
         let mut request = [0_u8; 7];
         stream
             .read_exact(&mut request)
@@ -634,6 +656,10 @@ fn tcp_listener_accepts_and_reads_a_loopback_client_and_dns_resolves_localhost()
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let mut stream = connected.expect("Ryn listener accepts client");
+        // A listener that never answers fails this test instead of blocking the run.
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("peer read timeout is set");
         stream.write_all(b"from-peer").expect("peer request writes");
         stream
             .shutdown(Shutdown::Write)
@@ -661,6 +687,10 @@ fn tcp_listener_accepts_and_reads_a_loopback_client_and_dns_resolves_localhost()
 fn udp_socket_sends_and_receives_loopback_datagrams() {
     let server = UdpSocket::bind("127.0.0.1:0").expect("loopback UDP socket binds");
     let address = server.local_addr().unwrap();
+    // A program that never sends fails this test instead of blocking the run.
+    server
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .expect("UDP read timeout is set");
     let peer = std::thread::spawn(move || {
         let mut request = [0_u8; 32];
         let (length, client) = server.recv_from(&mut request).expect("UDP request arrives");
@@ -837,6 +867,155 @@ fn standard_filesystem_and_path_modules_operate_on_paths() {
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
         "static-data\none.txt\ntxt\nfirst\nsecond\nthird\n\n"
+    );
+}
+
+/// Runs a project whose source works inside `files/`, which holds `files/bad.txt` with bytes that are not UTF-8 and
+/// the `extra` fixtures.
+fn run_file_handle_project(
+    source_text: &str,
+    source_name: &str,
+    extra: &[(&str, &[u8])],
+) -> std::process::Output {
+    let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+    let directory =
+        std::env::temp_dir().join(format!("ryn-file-handle-{}-{id}", std::process::id()));
+    fs::create_dir_all(directory.join("src")).expect("temporary project source directory");
+    fs::write(
+        directory.join("ryn.yaml"),
+        format!("name: {source_name}\nversion: 0.1.0\nowner: guest\ndependencies:\n"),
+    )
+    .expect("temporary project manifest is written");
+    fs::write(directory.join("src/main.ryn"), source_text).expect("temporary source is written");
+    fs::create_dir_all(directory.join("files")).expect("temporary work directory is created");
+    fs::write(
+        directory.join("files/bad.txt"),
+        b"\xffab\nok line\n\xc3\xa9\n",
+    )
+    .expect("invalid UTF-8 fixture is written");
+    for (name, bytes) in extra {
+        fs::write(directory.join(name), bytes).expect("fixture is written");
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_ryn"))
+        .arg("run")
+        .arg(&directory)
+        .current_dir(&directory)
+        .output()
+        .expect("Ryn project process completes");
+    let _ = fs::remove_dir_all(directory);
+    output
+}
+
+// Read and write a file handle, including invalid UTF-8 and CRLF line endings, as the Rust runtime does.
+#[test]
+fn standard_file_handles_read_write_and_close_like_buffered_files() {
+    let source = concat!(
+        "use std::fs\n",
+        "fun main() {\n",
+        "    assert(fs::create_dir_all(\"files\"))\n",
+        "    mut writer := fs::File::create(\"files/a.txt\")\n",
+        "    assert(writer.write(\"line one\\r\\nline two\\n\"))\n",
+        "    assert(writer.write(\"tail\"))\n",
+        "    assert(writer.flush())\n",
+        "    assert(writer.close())\n",
+        "    echo writer.write(\"after close\")\n",
+        "    echo writer.flush()\n",
+        "    echo writer.close()\n",
+        "    mut reader := fs::File::open(\"files/a.txt\")\n",
+        "    echo reader.read_line()\n",
+        "    echo reader.read_line()\n",
+        "    echo reader.read_line()\n",
+        "    echo reader.read_line().len()\n",
+        "    echo reader.write(\"x\")\n",
+        "    echo reader.read().len()\n",
+        "    assert(reader.close())\n",
+        "    mut again := fs::File::open(\"files/a.txt\")\n",
+        "    echo again.read().len()\n",
+        "    echo again.read().len()\n",
+        "    assert(again.close())\n",
+        "    mut bad := fs::File::open(\"files/bad.txt\")\n",
+        "    echo bad.read_line().len()\n",
+        "    echo bad.read_line()\n",
+        "    echo bad.read_line().len()\n",
+        "    echo bad.read_line()\n",
+        "    assert(bad.close())\n",
+        "    mut bytes := fs::File::open(\"files/bad.txt\")\n",
+        "    echo bytes.read().len()\n",
+        "    assert(bytes.close())\n",
+        "    mut stream := fs::File::create(\"files/line.txt\")\n",
+        "    assert(stream.write(\"x\"))\n",
+        "    assert(stream.close())\n",
+        "    mut single := fs::File::open(\"files/line.txt\")\n",
+        "    echo single.read_line().len()\n",
+        "    echo single.read_line().len()\n",
+        "    assert(single.close())\n",
+        "    assert(fs::remove_file(\"files/a.txt\"))\n",
+        "    assert(fs::remove_file(\"files/bad.txt\"))\n",
+        "    assert(fs::remove_file(\"files/line.txt\"))\n",
+        "    assert(fs::remove_dir(\"files\"))\n",
+        "    echo \"done\"\n",
+        "}\n",
+    );
+    let output = run_file_handle_project(source, "file-handle-test", &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "false\nfalse\nfalse\nline one\nline two\ntail\n0\nfalse\n0\n23\n0\n0\nok line\n2\n\n0\n1\n0\ndone\n"
+    );
+}
+
+// `read_file_result` and `try_read_file` report the text of a file, or the code of the failure.
+#[test]
+fn standard_read_file_results_report_text_and_failure_codes() {
+    let big = "é".repeat(5000);
+    let output = run_file_handle_project(
+        concat!(
+            "fun main() {\n",
+            "    echo read_file_result(\"files/small.txt\").unwrap().len()\n",
+            "    echo read_file_result(\"files/empty.txt\").unwrap().len()\n",
+            "    echo read_file_result(\"files/big.txt\").unwrap().len()\n",
+            "    echo read_file_result(\"files/bad.txt\").unwrap_err()\n",
+            "    echo try_read_file(\"files/bad.txt\").is_none()\n",
+            "    echo try_read_file(\"files/big.txt\").unwrap().len()\n",
+            "}\n",
+        ),
+        "read-file-results-test",
+        &[
+            ("files/small.txt", b"ok text\n"),
+            ("files/empty.txt", b""),
+            ("files/big.txt", big.as_bytes()),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "8\n0\n10000\n3\ntrue\n10000\n"
+    );
+}
+
+#[test]
+fn standard_file_open_of_a_missing_file_stops_with_the_operating_system_error() {
+    let output = run_file_handle_project(
+        "use std::fs\nfun main() {\n    mut missing := fs::File::open(\"missing.txt\")\n    echo \"unreachable\"\n}\n",
+        "file-open-test",
+        &[],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            "Ryn runtime error: could not open `missing.txt`: No such file or directory (os error 2)"
+        ),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

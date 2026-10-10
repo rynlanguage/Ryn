@@ -1,0 +1,388 @@
+// Diagnostics of the native compiler: the encoded forms the compiler stages write, and the text a person reads.
+//
+// The parser and the generic specializer write ` Error <code> <message> <start> <end> +/- [<help>]` (and the recovering
+// parser ` Errors <count> ...`), with length-prefixed strings; the lowering and the compile-time passes write
+// `diagnostic <code> <start> <end> <message> <help>`. Both are read into `Diagnostic` and rendered exactly as the bootstrap
+// compiler's `Diagnostic::render` does:
+//
+//     error[R0203]: unknown variable `missing`
+//       --> src/main.ryn:2:10
+//       |
+//     2 |     echo(missing)
+//       |          ^~~~~~~
+//       help: ...
+//
+// Columns count display width: tabs advance to the next multiple of four, wide East Asian characters take two columns and
+// combining marks none.
+
+pub struct Diagnostic {
+    pub code: String,
+    pub message: String,
+    pub start: u64,
+    pub end: u64,
+    pub has_help: bool,
+    pub help: String,
+}
+
+// Reads encoded diagnostics. `at` is the position in `text`.
+struct Reader {
+    text: String,
+    at: u64,
+}
+
+extend Reader {
+    fun skip_spaces(mut self) {
+        while self.at < self.text.len() && rp_space(self.text.byte_at(self.at) as u64) {
+            self.at += 1
+        }
+    }
+
+    fun word(mut self) -> String {
+        self.skip_spaces()
+        start := self.at
+        while self.at < self.text.len() && !rp_space(self.text.byte_at(self.at) as u64) {
+            self.at += 1
+        }
+        return self.text.slice(start, self.at)
+    }
+
+    fun number(mut self) -> Option<u64> {
+        token := self.word()
+        when token.is_empty() {
+            return Option::None
+        }
+        mut value: u64 = 0
+        mut at: u64 = 0
+        while at < token.len() {
+            byte := token.byte_at(at) as u64
+            when byte < 48 || byte > 57 {
+                return Option::None
+            }
+            value = value * 10 + (byte - 48)
+            at += 1
+        }
+        return Option::Some(value)
+    }
+
+    // A length-prefixed string: `<byte length>:<bytes>`.
+    fun string(mut self) -> Option<String> {
+        self.skip_spaces()
+        mut length: u64 = 0
+        mut digits := false
+        while self.at < self.text.len() && (self.text.byte_at(self.at) as u64) >= 48 && (self.text.byte_at(self.at) as u64) <= 57 {
+            length = length * 10 + ((self.text.byte_at(self.at) as u64) - 48)
+            self.at += 1
+            digits = true
+        }
+        when !digits || self.at >= self.text.len() || (self.text.byte_at(self.at) as u64) != 58 {
+            return Option::None
+        }
+        self.at += 1
+        end := self.at + length
+        when end > self.text.len() {
+            return Option::None
+        }
+        value := self.text.slice(self.at, end)
+        self.at = end
+        return Option::Some(value)
+    }
+
+    // The fields of one diagnostic of the frontend form: code, message, span, optional help.
+    fun frontend_fields(mut self) -> Option<Diagnostic> {
+        code := self.string()
+        message := self.string()
+        start := self.number()
+        end := self.number()
+        when code.is_none() || message.is_none() || start.is_none() || end.is_none() {
+            return Option::None
+        }
+        marker := self.word()
+        mut has_help := false
+        mut help := String("")
+        when marker == "+" {
+            text := self.string()
+            when text.is_none() {
+                return Option::None
+            }
+            has_help = true
+            help = text.unwrap()
+        } else when marker != "-" {
+            return Option::None
+        }
+        return Option::Some(Diagnostic { code: code.unwrap(), message: message.unwrap(), start: start.unwrap(), end: end.unwrap(), has_help: has_help, help: help })
+    }
+}
+
+fun rp_space(byte: u64) -> bool {
+    return byte == 32 || byte == 9 || byte == 10 || byte == 12 || byte == 13
+}
+
+// The diagnostics of a frontend result that is not ` Ok`: one for ` Error`, all of them for ` Errors`.
+pub fun frontend_diagnostics(text: String) -> Vec<Diagnostic> {
+    mut reader := Reader { text: text, at: 0 }
+    mut found: Vec<Diagnostic> = Vec()
+    tag := reader.word()
+    when tag == "Error" {
+        one := reader.frontend_fields()
+        when one.is_some() {
+            found.push(one.unwrap())
+        }
+        return found
+    }
+    when tag == "Errors" {
+        count := reader.number()
+        when count.is_none() {
+            return found
+        }
+        mut index: u64 = 0
+        while index < count.unwrap() {
+            one := reader.frontend_fields()
+            when one.is_none() {
+                return found
+            }
+            found.push(one.unwrap())
+            index += 1
+        }
+    }
+    return found
+}
+
+// A diagnostic of the form `diagnostic <code> <start> <end> <message> <help>`; an empty help is no help.
+pub fun lowered_diagnostic(text: String) -> Option<Diagnostic> {
+    mut reader := Reader { text: text, at: 0 }
+    when reader.word() != "diagnostic" {
+        return Option::None
+    }
+    code := reader.word()
+    start := reader.number()
+    end := reader.number()
+    message := reader.string()
+    help := reader.string()
+    when code.is_empty() || start.is_none() || end.is_none() || message.is_none() || help.is_none() {
+        return Option::None
+    }
+    help_text := help.unwrap()
+    return Option::Some(Diagnostic { code: code, message: message.unwrap(), start: start.unwrap(), end: end.unwrap(), has_help: !help_text.is_empty(), help: help_text })
+}
+
+// A diagnostic with no place in a source, rendered as `error[CODE]: message`.
+pub fun plain(code: str, message: String) -> String {
+    mut out := String("error[")
+    out.append(code)
+    out.append("]: ")
+    out.append(message)
+    return out
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Rendering
+
+// The scalar value of the UTF-8 character that starts at `at`, and its length in bytes.
+fun rp_char_at(text: String, at: u64) -> u64 {
+    lead := text.byte_at(at) as u64
+    mut length: u64 = 1
+    mut code := lead
+    when lead >= 240 {
+        length = 4
+        code = lead & 7
+    } else when lead >= 224 {
+        length = 3
+        code = lead & 15
+    } else when lead >= 192 {
+        length = 2
+        code = lead & 31
+    }
+    mut follow: u64 = 1
+    while follow < length && at + follow < text.len() {
+        code = (code << (6 as u32)) | ((text.byte_at(at + follow) as u64) & 63)
+        follow += 1
+    }
+    return code
+}
+
+fun rp_char_length(text: String, at: u64) -> u64 {
+    lead := text.byte_at(at) as u64
+    when lead >= 240 {
+        return 4
+    }
+    when lead >= 224 {
+        return 3
+    }
+    when lead >= 192 {
+        return 2
+    }
+    return 1
+}
+
+// The display width of a character, as the `unicode-width` crate gives it for the common ranges.
+fun rp_char_width(code: u64) -> u64 {
+    when code == 0 {
+        return 0
+    }
+    when code < 32 || (code >= 127 && code < 160) {
+        return 0
+    }
+    // Combining marks and zero-width characters.
+    when (code >= 768 && code <= 879) || (code >= 1155 && code <= 1161) || (code >= 1425 && code <= 1469) || (code >= 1552 && code <= 1562) || (code >= 1611 && code <= 1631) || (code >= 6832 && code <= 6911) || (code >= 7616 && code <= 7679) || (code >= 8203 && code <= 8207) || (code >= 8232 && code <= 8238) || (code >= 8288 && code <= 8292) || (code >= 8400 && code <= 8447) || (code >= 65024 && code <= 65039) || (code >= 65056 && code <= 65071) || code == 65279 {
+        return 0
+    }
+    // Wide and fullwidth characters.
+    when (code >= 4352 && code <= 4447) || (code >= 11904 && code <= 12350) || (code >= 12353 && code <= 13311) || (code >= 13312 && code <= 19903) || (code >= 19968 && code <= 42191) || (code >= 43360 && code <= 43391) || (code >= 44032 && code <= 55203) || (code >= 63744 && code <= 64255) || (code >= 65040 && code <= 65049) || (code >= 65072 && code <= 65135) || (code >= 65280 && code <= 65376) || (code >= 65504 && code <= 65510) || (code >= 127744 && code <= 128591) || (code >= 128640 && code <= 128767) || (code >= 129280 && code <= 129535) || (code >= 131072 && code <= 262141) {
+        return 2
+    }
+    return 1
+}
+
+// The display width of `text[start..end]` when it starts at column `initial` (0-based): tabs advance to multiples of four.
+fun rp_width(text: String, start: u64, end: u64, initial: u64) -> u64 {
+    mut column := initial
+    mut at := start
+    while at < end {
+        byte := text.byte_at(at) as u64
+        when byte == 9 {
+            column = column + (4 - column % 4)
+            at += 1
+        } else {
+            column = column + rp_char_width(rp_char_at(text.clone(), at))
+            at = at + rp_char_length(text.clone(), at)
+        }
+    }
+    return column - initial
+}
+
+// The line with its tabs expanded to the next multiple of four.
+fun rp_expand_tabs(text: String) -> String {
+    mut out := String("")
+    mut column: u64 = 0
+    mut start: u64 = 0
+    mut at: u64 = 0
+    while at < text.len() {
+        byte := text.byte_at(at) as u64
+        when byte == 9 {
+            out.append(text.slice(start, at))
+            column = column + rp_width(text.clone(), start, at, 0)
+            spaces := 4 - column % 4
+            mut space: u64 = 0
+            while space < spaces {
+                out.push(' ')
+                space += 1
+            }
+            column += spaces
+            at += 1
+            start = at
+        } else {
+            at += 1
+        }
+    }
+    out.append(text.slice(start, text.len()))
+    return out
+}
+
+fun rp_boundary(text: String, offset: u64) -> u64 {
+    mut at := offset
+    when at > text.len() {
+        at = text.len()
+    }
+    while at > 0 && at < text.len() && (text.byte_at(at) as u64) >= 128 && (text.byte_at(at) as u64) < 192 {
+        at -= 1
+    }
+    return at
+}
+
+fun rp_repeat(piece: str, count: u64) -> String {
+    mut out := String("")
+    mut at: u64 = 0
+    while at < count {
+        out.append(piece)
+        at += 1
+    }
+    return out
+}
+
+// Renders a diagnostic against the source text of the file at `path`; the span is a byte range of `text`.
+pub fun render(diagnostic: Diagnostic, path: String, text: String) -> String {
+    start := rp_boundary(text.clone(), diagnostic.start)
+    // The line starts: after `\n`, after `\r` not followed by `\n`, and after `\r\n`.
+    mut line: u64 = 1
+    mut line_start: u64 = 0
+    mut at: u64 = 0
+    while at < start {
+        byte := text.byte_at(at) as u64
+        when byte == 13 {
+            at += 1
+            when at < text.len() && (text.byte_at(at) as u64) == 10 {
+                at += 1
+            }
+            when at <= start {
+                line += 1
+                line_start = at
+            }
+        } else when byte == 10 {
+            at += 1
+            line += 1
+            line_start = at
+        } else {
+            at += 1
+        }
+    }
+    column := rp_width(text.clone(), line_start, start, 0) + 1
+    mut line_end := start
+    while line_end < text.len() && (text.byte_at(line_end) as u64) != 10 && (text.byte_at(line_end) as u64) != 13 {
+        line_end += 1
+    }
+    source_line := rp_expand_tabs(text.slice(line_start, line_end))
+    mut end := diagnostic.end
+    when end < start {
+        end = start
+    }
+    when end > line_end {
+        end = line_end
+    }
+    end = rp_boundary(text.clone(), end)
+    mut marker_width := rp_width(text.clone(), start, end, column - 1)
+    when marker_width == 0 {
+        marker_width = 1
+    }
+    line_text := String(line)
+    gutter := rp_repeat(" ", line_text.len())
+    mut out := String("error[")
+    out.append(diagnostic.code.clone())
+    out.append("]: ")
+    out.append(diagnostic.message.clone())
+    out.append("\n  --> ")
+    out.append(path)
+    out.append(":")
+    out.append(line_text.clone())
+    out.append(":")
+    out.append(String(column))
+    out.append("\n")
+    out.append(gutter.clone())
+    out.append(" |\n")
+    out.append(line_text)
+    out.append(" | ")
+    out.append(source_line)
+    out.append("\n")
+    out.append(gutter)
+    out.append(" | ")
+    out.append(rp_repeat(" ", column - 1))
+    out.append("^")
+    out.append(rp_repeat("~", marker_width - 1))
+    when diagnostic.has_help {
+        out.append("\n  help: ")
+        out.append(diagnostic.help.clone())
+    }
+    return out
+}
+
+// A diagnostic without a source: `error[CODE]: message` and its help on the next line.
+pub fun render_plain(diagnostic: Diagnostic) -> String {
+    mut out := String("error[")
+    out.append(diagnostic.code.clone())
+    out.append("]: ")
+    out.append(diagnostic.message.clone())
+    when diagnostic.has_help {
+        out.append("\nhelp: ")
+        out.append(diagnostic.help.clone())
+    }
+    return out
+}

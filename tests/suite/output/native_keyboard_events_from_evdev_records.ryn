@@ -1,0 +1,230 @@
+// test: run
+// out: W press
+// out: true
+// out: true
+// out: false
+// out: W release
+// out: false
+// out: true
+// out: true
+// out: digit 1 press
+// out: true
+// out: true
+// out: false
+// out: left shift press shift
+// out: true
+// out: true
+// out: false
+// out: left shift press side
+// out: true
+// out: true
+// out: false
+// out: space press then repeat
+// out: true
+// out: true
+// out: false
+// out: relative event ignored
+// out: false
+// out: true
+// out: true
+// out: zero key code 11
+// out: true
+// out: true
+// out: false
+// out: unmapped code 4 changes nothing
+// exit: 0
+// The keyboard reads evdev `input_event` records (type 1 key events, 24 bytes) from a device; this feeds them through a pipe
+// that is set up the way the runtime opens devices (non-blocking), and checks the down, pressed and released flags.
+// The functions below are copies of the keyboard section of std::native, which the probe needs in order to run alone.
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(pointer: *u8);
+extern "C" fun realloc(pointer: *u8, size: u64) -> *u8;
+extern "C" fun read(descriptor: i32, buffer: *u8, size: u64) -> i64;
+extern "C" fun write(descriptor: i32, buffer: *u8, size: u64) -> i64;
+extern "C" fun pipe(descriptors: *u8) -> i32;
+extern "C" fun fcntl(descriptor: i32, command: i32, argument: i32) -> i32;
+
+fun word64_of(pointer: *u8, offset: u64) -> i64 {
+    cell := ((pointer as u64) + offset) as *i64
+    return *cell
+}
+fun set_word64(pointer: *u8, offset: u64, value: i64) {
+    slot2 := ((pointer as u64) + offset) as *i64
+    *slot2 = value
+}
+fun byte_of(pointer: *u8, offset: u64) -> u8 {
+    cell := ((pointer as u64) + offset) as *u8
+    return *cell
+}
+fun word32_of(pointer: *u8, offset: u64) -> u32 {
+    cell := ((pointer as u64) + offset) as *u32
+    return *cell
+}
+fun set_byte(pointer: *u8, offset: u64, value: u8) {
+    slot := ((pointer as u64) + offset) as *u8
+    *slot = value
+}
+fun list_new() -> *u8 {
+    record := malloc(24)
+    set_word64(record, 0, 0)
+    set_word64(record, 8, 0)
+    set_word64(record, 16, 0)
+    return record
+}
+fun list_push(list: *u8, item: *u8) {
+    count := word64_of(list, 8) as u64
+    mut capacity := word64_of(list, 16) as u64
+    mut items := word64_of(list, 0) as u64 as *u8
+    when count == capacity {
+        capacity = 2 * capacity + 4
+        items = realloc(items, 8 * capacity)
+        set_word64(list, 0, items as u64 as i64)
+        set_word64(list, 16, capacity as i64)
+    }
+    set_word64(items, 8 * count, item as u64 as i64)
+    set_word64(list, 8, (count + 1) as i64)
+}
+fun list_count(list: *u8) -> u64 {
+    return word64_of(list, 8) as u64
+}
+fun list_item(list: *u8, index: u64) -> *u8 {
+    items := word64_of(list, 0) as u64 as *u8
+    return word64_of(items, 8 * index) as u64 as *u8
+}
+fun list_free(list: *u8) {
+    mut index: u64 = 0
+    while index < list_count(list) {
+        free(list_item(list, index))
+        index += 1
+    }
+    free(word64_of(list, 0) as u64 as *u8)
+    free(list)
+}
+fun linux_key_ids(code: u64) -> Vec<u32> {
+    mut keys: Vec<u32> = Vec()
+    when code == 16 { keys.push(17) } else when code == 17 { keys.push(23) } else when code == 18 { keys.push(5) } else when code == 19 { keys.push(18) } else when code == 20 { keys.push(20) } else when code == 21 { keys.push(25) } else when code == 22 { keys.push(21) } else when code == 23 { keys.push(9) } else when code == 24 { keys.push(15) } else when code == 25 { keys.push(16) } else when code == 30 { keys.push(1) } else when code == 31 { keys.push(19) } else when code == 32 { keys.push(4) } else when code == 33 { keys.push(6) } else when code == 34 { keys.push(7) } else when code == 35 { keys.push(8) } else when code == 36 { keys.push(10) } else when code == 37 { keys.push(11) } else when code == 38 { keys.push(12) } else when code == 44 { keys.push(26) } else when code == 45 { keys.push(24) } else when code == 46 { keys.push(3) } else when code == 47 { keys.push(22) } else when code == 48 { keys.push(2) } else when code == 49 { keys.push(14) } else when code == 50 { keys.push(13) }
+    when code >= 2 && code <= 11 {
+        keys.push(27 + ((code - 2 + 1) % 10) as u32)
+    }
+    when code == 57 { keys.push(37) } else when code == 28 || code == 96 { keys.push(38) } else when code == 1 { keys.push(39) } else when code == 15 { keys.push(40) } else when code == 14 { keys.push(41) } else when code == 111 { keys.push(42) } else when code == 110 { keys.push(43) } else when code == 102 { keys.push(44) } else when code == 107 { keys.push(45) } else when code == 104 { keys.push(46) } else when code == 109 { keys.push(47) } else when code == 103 { keys.push(48) } else when code == 108 { keys.push(49) } else when code == 105 { keys.push(50) } else when code == 106 { keys.push(51) }
+    when code == 42 { keys.push(52)
+        keys.push(53) } else when code == 54 { keys.push(52)
+        keys.push(54) } else when code == 29 { keys.push(55)
+        keys.push(56) } else when code == 97 { keys.push(55)
+        keys.push(57) } else when code == 56 { keys.push(58)
+        keys.push(59) } else when code == 100 { keys.push(58)
+        keys.push(60) } else when code == 58 { keys.push(61) } else when code == 69 { keys.push(62) } else when code == 70 { keys.push(63) }
+    when code >= 59 && code <= 68 {
+        keys.push(64 + ((code - 59) as u32))
+    }
+    when code == 87 { keys.push(74) } else when code == 88 { keys.push(75) } else when code == 41 { keys.push(76) } else when code == 12 { keys.push(77) } else when code == 13 { keys.push(78) } else when code == 26 { keys.push(79) } else when code == 27 { keys.push(80) } else when code == 43 { keys.push(81) } else when code == 39 { keys.push(82) } else when code == 40 { keys.push(83) } else when code == 51 { keys.push(84) } else when code == 52 { keys.push(85) } else when code == 53 { keys.push(86) } else when code == 82 { keys.push(87) } else when code == 79 { keys.push(88) } else when code == 80 { keys.push(89) } else when code == 81 { keys.push(90) } else when code == 75 { keys.push(91) } else when code == 76 { keys.push(92) } else when code == 77 { keys.push(93) } else when code == 71 { keys.push(94) } else when code == 72 { keys.push(95) } else when code == 73 { keys.push(96) } else when code == 78 { keys.push(97) } else when code == 74 { keys.push(98) } else when code == 55 { keys.push(99) } else when code == 98 { keys.push(100) } else when code == 83 { keys.push(101) } else when code == 99 { keys.push(103) } else when code == 119 { keys.push(104) } else when code == 127 { keys.push(105) } else when code == 125 { keys.push(106) } else when code == 126 { keys.push(107) }
+    return keys
+}
+fun keyboard_sample(state: *u8, key: u32, pressed: bool) {
+    index := key as u64
+    when index == 0 || index >= 108 {
+        return
+    }
+    was_down := byte_of(state, 32 + index) != 0
+    when pressed && !was_down {
+        set_byte(state, 140 + index, 1)
+    } else when !pressed && was_down {
+        set_byte(state, 248 + index, 1)
+    }
+    mut value: u8 = 0
+    when pressed {
+        value = 1
+    }
+    set_byte(state, 32 + index, value)
+}
+fun keyboard_poll(state: *u8) {
+    devices := word64_of(state, 16) as u64 as *u8
+    event := malloc(24)
+    mut index: u64 = 0
+    while index < list_count(devices) {
+        descriptor := list_item(devices, index) as u64 as i32
+        index += 1
+        while true {
+            count := read(descriptor, event, 24)
+            when count != 24 {
+                break
+            }
+            // A `struct input_event` is 24 bytes: the type at 16, the code at 18 and the value at 20, all little-endian.
+            kind := (byte_of(event, 16) as u64) + 256 * (byte_of(event, 17) as u64)
+            code := (byte_of(event, 18) as u64) + 256 * (byte_of(event, 19) as u64)
+            value := word32_of(event, 20) as i32
+            when kind == 1 && (value == 0 || value == 1) {
+                for key in linux_key_ids(code) {
+                    keyboard_sample(state, key, value == 1)
+                }
+            }
+        }
+    }
+    free(event)
+}
+
+fun send(descriptor: i32, kind: u64, code: u64, value: u64) {
+    event := malloc(24)
+    mut at: u64 = 0
+    while at < 24 {
+        set_byte(event, at, 0)
+        at += 1
+    }
+    set_byte(event, 16, (kind % 256) as u8)
+    set_byte(event, 17, (kind / 256) as u8)
+    set_byte(event, 18, (code % 256) as u8)
+    set_byte(event, 19, (code / 256) as u8)
+    set_byte(event, 20, (value % 256) as u8)
+    set_byte(event, 21, ((value / 256) % 256) as u8)
+    write(descriptor, event, 24)
+    free(event)
+}
+
+fun report(label: str, state: *u8, key: u64) {
+    echo label
+    echo byte_of(state, 32 + key) != 0
+    echo byte_of(state, 140 + key) != 0
+    echo byte_of(state, 248 + key) != 0
+}
+
+fun main() {
+    fds := malloc(8)
+    pipe(fds)
+    read_end := word32_of(fds, 0) as i32
+    write_end := word32_of(fds, 4) as i32
+    fcntl(read_end, 4, 2048)
+    state := malloc(384)
+    mut at: u64 = 0
+    while at < 384 {
+        set_byte(state, at, 0)
+        at += 1
+    }
+    set_word64(state, 16, list_new() as u64 as i64)
+    list_push(word64_of(state, 16) as u64 as *u8, read_end as u64 as *u8)
+    send(write_end, 1, 17, 1)
+    keyboard_poll(state)
+    report("W press", state, 23)
+    send(write_end, 1, 17, 0)
+    keyboard_poll(state)
+    report("W release", state, 23)
+    send(write_end, 1, 2, 1)
+    keyboard_poll(state)
+    report("digit 1 press", state, 28)
+    send(write_end, 1, 42, 1)
+    keyboard_poll(state)
+    report("left shift press shift", state, 52)
+    report("left shift press side", state, 53)
+    send(write_end, 1, 57, 1)
+    send(write_end, 1, 57, 2)
+    keyboard_poll(state)
+    report("space press then repeat", state, 37)
+    send(write_end, 2, 17, 1)
+    keyboard_poll(state)
+    report("relative event ignored", state, 23)
+    send(write_end, 1, 11, 1)
+    keyboard_poll(state)
+    report("zero key code 11", state, 27)
+    send(write_end, 1, 4, 1)
+    keyboard_poll(state)
+    echo "unmapped code 4 changes nothing"
+}

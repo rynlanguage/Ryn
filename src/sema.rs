@@ -2733,7 +2733,6 @@ impl<'a> Analyzer<'a> {
     }
 
     fn allocate_scalar(&mut self, ty: Type) {
-        self.addressed_slot_types.push(None);
         match ty {
             Type::I8 | Type::U8 => {
                 self.local_types.push(LocalType::I8);
@@ -2806,6 +2805,9 @@ impl<'a> Analyzer<'a> {
             Type::Struct(_) => unreachable!("structure storage is allocated field by field"),
             Type::Array(_) => unreachable!("array storage is allocated element by element"),
         }
+        // A string or a slice takes two cells, and every cell needs its own addressed entry.
+        self.addressed_slot_types
+            .resize(self.local_types.len(), None);
     }
 
     fn enter_loop(&mut self) {
@@ -7415,6 +7417,9 @@ impl<'a> Analyzer<'a> {
                 span,
             ));
         }
+        if receiver_ty == Type::Str && matches!(name.as_str(), "len" | "byte_at") {
+            return self.lower_str_method(receiver, name, arguments, span);
+        }
         if receiver_ty != Type::OwnedString {
             return Err(diag(
                 "R0234",
@@ -7423,6 +7428,53 @@ impl<'a> Analyzer<'a> {
             ));
         }
         self.lower_string_method_receiver(receiver, name, arguments, span, mutable)
+    }
+
+    /// `len()` and `byte_at(index)` of a `str` view: its length in bytes, and one byte, checked against the length.
+    fn lower_str_method(
+        &mut self,
+        receiver: IrExpression,
+        name: String,
+        arguments: Vec<Expression>,
+        span: Span,
+    ) -> Result<(IrCallTarget, Vec<IrExpression>, Option<Type>), Diagnostic> {
+        let expected = if name == "len" { 0 } else { 1 };
+        if arguments.len() != expected {
+            return Err(diag(
+                "R0211",
+                format!(
+                    "method `{name}` expects {expected} argument{} but got {}",
+                    if expected == 1 { "" } else { "s" },
+                    arguments.len()
+                ),
+                span,
+            ));
+        }
+        if name == "len" {
+            return Ok((
+                IrCallTarget::String(StringOp::StrLen),
+                vec![receiver],
+                Some(Type::U64),
+            ));
+        }
+        let index_span = arguments[0].span();
+        let (index, actual) =
+            self.expression(arguments.into_iter().next().unwrap(), Some(Type::U64))?;
+        if actual != Type::U64 {
+            return Err(diag(
+                "R0212",
+                format!(
+                    "method argument has type `{}` but `u64` is required",
+                    type_name(actual)
+                ),
+                index_span,
+            ));
+        }
+        Ok((
+            IrCallTarget::String(StringOp::StrByteAt),
+            vec![receiver, index],
+            Some(Type::U8),
+        ))
     }
 
     fn lower_string_method_receiver(
@@ -7690,8 +7742,14 @@ impl<'a> Analyzer<'a> {
                     );
                 }
                 if pointer_target(target) == Type::OwnedString {
+                    // Load the handle through the reference, as `lower_method` does: the runtime takes the String
+                    // handle, not the address of the reference's home.
+                    let dereferenced = IrExpression::Dereference {
+                        pointer: Box::new(receiver),
+                        ty: Type::OwnedString,
+                    };
                     return self.lower_string_method_receiver(
-                        receiver,
+                        dereferenced,
                         name,
                         arguments,
                         span,
@@ -9773,7 +9831,30 @@ impl<'a> Analyzer<'a> {
                 self.expression(argument, Some(expected))
             };
             match analyzed {
-                Ok((value, actual)) if actual == expected => lowered.push(value),
+                Ok((value, actual)) if actual == expected => {
+                    // A vector that a builtin borrows is passed as a clone, the same lowering the Ryn analysis uses: the
+                    // native runtime function takes the vector it is given. `RunProcessArgs` moves its list instead.
+                    match expected {
+                        Type::Vec(elem_id)
+                            if matches!(
+                                target,
+                                IrCallTarget::Filesystem(_)
+                                    | IrCallTarget::String(_)
+                                    | IrCallTarget::System(_)
+                            ) && !matches!(
+                                target,
+                                IrCallTarget::System(SystemOp::RunProcessArgs)
+                            ) =>
+                        {
+                            lowered.push(IrExpression::Call {
+                                target: IrCallTarget::Vec(VecOp::Clone, elem_id),
+                                arguments: vec![value],
+                                return_type: expected,
+                            });
+                        }
+                        _ => lowered.push(value),
+                    }
+                }
                 Ok((value, Type::OwnedString)) if accepts_owned_path => {
                     lowered.push(IrExpression::StringAsStr(Box::new(value)));
                 }

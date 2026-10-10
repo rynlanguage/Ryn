@@ -1,0 +1,34 @@
+// test: run
+// out: 1
+// out: 3
+// out: 1
+// out: 2
+// out: 2
+// out: 9
+// exit: 0
+// A vector of destructor values: `set` drops the element it replaces, a `take` that nothing names drops the taken value at
+// the end of its statement, and a `for` over the vector drops each item at the end of its iteration.
+#[drop(release)]
+struct Resource {
+    handle: *i32,
+}
+
+fun release(resource: Resource) {
+    echo *resource.handle
+}
+
+fun main() {
+    mut a: i32 = 1
+    mut b: i32 = 2
+    mut c: i32 = 3
+    mut items := Vec<Resource>()
+    items.push(Resource { handle: &raw mut a })
+    items.push(Resource { handle: &raw mut b })
+    items.set(0, Resource { handle: &raw mut c })
+    items.take(0)
+    echo items.len()
+    for item in items {
+        echo *item.handle
+    }
+    echo 9
+}

@@ -1,0 +1,29 @@
+// test: run
+// out: 3
+// out: 2
+// out: 1
+// out: 7
+// out: 0
+// out: 3
+// out: 2
+// out: 1
+// out: 8
+// An early return drops the array's elements last first too, before the function's other values.
+#[drop(release)]
+struct Resource { handle: *i32 }
+fun release(resource: Resource) { echo *resource.handle }
+fun run(flag: bool) -> i32 {
+    mut a: i32 = 1
+    mut b: i32 = 2
+    mut c: i32 = 3
+    items: [Resource; 3] = [Resource { handle: &raw mut a }, Resource { handle: &raw mut b }, Resource { handle: &raw mut c }]
+    when flag {
+        return 7
+    }
+    echo 0
+    return 8
+}
+fun main() {
+    echo run(true)
+    echo run(false)
+}

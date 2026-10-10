@@ -11,6 +11,9 @@ fn main() {
     if let Err(error) = set_compiler_build_fingerprint() {
         panic!("could not fingerprint the Ryn compiler sources: {error}");
     }
+    if let Err(error) = embed_native_sources() {
+        panic!("could not list the native compiler sources: {error}");
+    }
     if let Err(error) = build_runtime_shim() {
         panic!("could not build the native runtime shim: {error}");
     }
@@ -55,6 +58,57 @@ fn set_compiler_build_fingerprint() -> Result<(), String> {
         hasher.finish()
     );
     Ok(())
+}
+
+/// Lists the Ryn sources of the native compiler (`selfhost/src`) and of the standard library (`stdlib/std/src`) in
+/// `native_sources.rs`, as `(relative path, text)` pairs the compiler embeds, so it can write them out and build `rync`.
+fn embed_native_sources() -> Result<(), String> {
+    fn collect(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+        println!("cargo:rerun-if-changed={}", directory.display());
+        let entries = fs::read_dir(directory)
+            .map_err(|error| format!("cannot read {}: {error}", directory.display()))?;
+        for entry in entries {
+            let path = entry
+                .map_err(|error| {
+                    format!("cannot read an entry in {}: {error}", directory.display())
+                })?
+                .path();
+            if path.is_dir() {
+                collect(root, &path, files)?;
+            } else if path.extension().is_some_and(|extension| extension == "ryn") {
+                println!("cargo:rerun-if-changed={}", path.display());
+                files.push(
+                    path.strip_prefix(root)
+                        .map_err(|error| error.to_string())?
+                        .to_path_buf(),
+                );
+            }
+        }
+        Ok(())
+    }
+    let manifest =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or("CARGO_MANIFEST_DIR is not set")?);
+    let mut output = String::new();
+    for (constant, relative) in [
+        ("NATIVE_COMPILER_SOURCES", "selfhost/src"),
+        ("NATIVE_STDLIB_SOURCES", "stdlib/std/src"),
+    ] {
+        let root = manifest.join(relative);
+        let mut files = Vec::new();
+        collect(&root, &root, &mut files)?;
+        files.sort();
+        output.push_str(&format!("pub const {constant}: &[(&str, &str)] = &[\n"));
+        for file in files {
+            let name = file.to_string_lossy().replace('\\', "/");
+            output.push_str(&format!(
+                "    ({name:?}, include_str!({:?})),\n",
+                root.join(&file).to_string_lossy()
+            ));
+        }
+        output.push_str("];\n");
+    }
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR is not set")?);
+    fs::write(out_dir.join("native_sources.rs"), output).map_err(|error| error.to_string())
 }
 
 fn configure_windows_stack() {

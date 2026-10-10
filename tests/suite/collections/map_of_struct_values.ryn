@@ -1,0 +1,47 @@
+// test: run
+// out: 100
+// out: 30
+// out: -1
+// out: 55
+// out: true
+// out: 1
+// out: 0
+// A map whose values are structures keeps each value in a box of its own: insert, replace, get, `?`, remove and clear.
+struct Mixed {
+    small: u8
+    wide: i64
+    flag: bool
+    count: i32
+}
+fun total(values: Map<i32, Mixed>) -> Option<i64> {
+    item := values.get(2)?
+    return Option::Some(item.wide + item.count as i64)
+}
+fun main() {
+    mut table := Map<i32, Mixed>()
+    table.insert(1, Mixed { small: 1, wide: 100, flag: true, count: 10 })
+    table.insert(2, Mixed { small: 2, wide: 200, flag: false, count: 20 })
+    table.insert(2, Mixed { small: 3, wide: 300, flag: true, count: 30 })
+    echo choose table.get(1) {
+        Option::Some(item) => item.wide,
+        Option::None => -1
+    }
+    echo choose table.get(2) {
+        Option::Some(item) => item.count as i64,
+        Option::None => -1
+    }
+    echo choose table.get(9) {
+        Option::Some(item) => item.wide,
+        Option::None => -1
+    }
+    mut other := Map<i32, Mixed>()
+    other.insert(2, Mixed { small: 5, wide: 50, flag: false, count: 5 })
+    echo choose total(other) {
+        Option::Some(sum) => sum,
+        Option::None => -1
+    }
+    echo table.remove(1)
+    echo table.len()
+    table.clear()
+    echo table.len()
+}

@@ -1,0 +1,33 @@
+// test: run
+// out: 7
+// out: 7
+// out: 2
+// exit: 0
+// A `mut self` method writes a repr(C) local through its address, and the local reads the write back after the call.
+#[repr(C)]
+struct Wide {
+    c0: f32,
+    c1: f32,
+    c2: f32,
+    c3: f32,
+    c4: f32,
+    c5: f32,
+}
+
+extend Wide {
+    fun diag(self) -> f32 {
+        return self.c0 * 2.0 + self.c5
+    }
+
+    fun set_tail(mut self, value: f32) {
+        self.c5 = value
+    }
+}
+
+fun main() {
+    mut wide := Wide { c0: 2.0, c1: 10.0, c2: 20.0, c3: 30.0, c4: 40.0, c5: 3.0 }
+    echo wide.diag()
+    wide.set_tail(7.0)
+    echo wide.c5
+    echo wide.c0
+}

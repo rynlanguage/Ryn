@@ -1,0 +1,25 @@
+// test: run
+// out: 2000
+// out: 0
+// Owning array elements are cloned on each read and freed on overwrite, scope exit and move: a thousand rounds leave no
+// live allocation behind (the native runtime counts them).
+extern "C" fun ryn_native_live_allocations() -> u64;
+fun take(values: [String; 2]) -> u64 {
+    return 1
+}
+fun main() {
+    before := ryn_native_live_allocations()
+    mut i: u64 = 0
+    mut total: u64 = 0
+    while i < 1000 {
+        mut labels: [String; 2] = [String("a"), String("bb")]
+        copy := labels[0]
+        labels[1] = String("ccc")
+        labels[0] = labels[0]
+        total += copy.len()
+        total += take(labels)
+        i += 1
+    }
+    echo total
+    echo ryn_native_live_allocations() - before
+}

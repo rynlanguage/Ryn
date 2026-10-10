@@ -78,6 +78,16 @@ fn project_roots(project: &Path) -> Result<(PathBuf, PathBuf, HashMap<String, Pa
     Ok((root, source_root, dependency_roots))
 }
 
+pub(crate) fn dependency_roots(project: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    let (_, _, roots) = project_roots(project)?;
+    let mut packages: Vec<(String, PathBuf)> = roots
+        .into_iter()
+        .filter(|(name, _)| name != "std")
+        .collect();
+    packages.sort();
+    Ok(packages)
+}
+
 /// Checks a single source file that imports modules: `std::...` resolves to
 /// the embedded standard library, and other imports to `.ryn` files next to it.
 pub(crate) fn check_file(

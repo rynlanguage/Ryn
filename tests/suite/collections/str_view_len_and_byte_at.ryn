@@ -1,0 +1,24 @@
+// test: run
+// out: 10
+// out: 10
+// out: 90
+// out: 197
+// out: 188
+// out: 90
+// out: 135
+fun first_byte(text: str) -> u8 {
+    return text.byte_at(0)
+}
+
+fun main() {
+    // "Zażółć" is six scalar values but ten UTF-8 bytes: `len` and `byte_at` count bytes.
+    literal := "Zażółć"
+    echo literal.len()
+    owned := String("Zażółć")
+    echo owned.len()
+    echo literal.byte_at(0)
+    echo literal.byte_at(2)
+    echo literal.byte_at(3)
+    echo first_byte(literal)
+    echo literal.byte_at(literal.len() - 1)
+}

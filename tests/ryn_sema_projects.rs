@@ -40,6 +40,17 @@ fn analyze_with_ryn(tool: &Path, syntax_tree: &str, name: &str) -> Result<String
 
 #[test]
 fn ryn_semantic_analysis_matches_the_bootstrap_for_the_compilers_own_projects() {
+    // The bootstrap analysis of the whole compiler recurses deeply in a debug build, deeper than the 2 MiB default of a
+    // test thread. The comparison is the same; only the thread that runs it gets a larger stack.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(compare_compiler_projects)
+        .expect("the comparison thread starts")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+fn compare_compiler_projects() {
     let tool = build_tool();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for project in ["selfhost/ir", "selfhost"] {

@@ -1,0 +1,10 @@
+// test: run
+// out: 3
+// err: str byte index is out of bounds
+// exit: 1
+fun main() {
+    word := "abc"
+    echo word.len()
+    index: u64 = 3
+    echo word.byte_at(index)
+}

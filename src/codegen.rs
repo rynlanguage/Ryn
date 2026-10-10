@@ -2212,7 +2212,7 @@ fn bind_parameter_value(
 
 #[derive(Clone, Copy)]
 struct PrintFunctionIds {
-    owned_strings: [FuncId; 65],
+    owned_strings: [FuncId; 67],
     filesystem: [FuncId; 29],
     system: [FuncId; 95],
     owned_vecs: [FuncId; 19],
@@ -2258,7 +2258,7 @@ struct FunctionCodegenEnv<'a> {
 
 #[derive(Clone, Copy)]
 struct PrintFunctions {
-    owned_strings: [FuncRef; 65],
+    owned_strings: [FuncRef; 67],
     filesystem: [FuncRef; 29],
     system: [FuncRef; 95],
     owned_vecs: [FuncRef; 19],
@@ -2434,6 +2434,76 @@ fn drop_discarded_destructor(
     let Some(&handle) = arguments.first() else {
         return;
     };
+    invoke_discarded_destructor(b, env, drop_function, handle, &arguments, seal_state);
+}
+
+/// A discarded structure that owns something: each owner it holds is dropped at the end of its statement, the last first,
+/// as the owners of a named structure are at the end of their scope. A structure with a destructor in a field runs that
+/// destructor on its own cells, and a String, vector, map, set or enum is freed.
+fn drop_discarded_structure(
+    b: &mut FunctionBuilder<'_>,
+    env: &ExprEnv<'_>,
+    ty: Type,
+    value: CompiledValue,
+    seal_state: &mut BlockSealState,
+) {
+    let cells = flatten_value(value);
+    let mut owners = crate::guard::owned_slots(ty, 0, env.structs);
+    owners.reverse();
+    for (offset, owner) in owners {
+        match owner {
+            Type::Struct(struct_id) if env.structs[struct_id].drop_function.is_some() => {
+                let drop_function = env.structs[struct_id].drop_function.unwrap();
+                let mut arguments = Vec::new();
+                for field in &env.structs[struct_id].fields {
+                    for component in 0..crate::sema::storage_slot_width(field.ty, env.structs) {
+                        arguments.push(cells[offset + field.slot_offset + component]);
+                    }
+                }
+                invoke_discarded_destructor(
+                    b,
+                    env,
+                    drop_function,
+                    cells[offset],
+                    &arguments,
+                    seal_state,
+                );
+            }
+            Type::Vec(_) => {
+                b.ins().call(
+                    env.print_functions.owned_vecs[VecOp::Drop as usize],
+                    &[cells[offset]],
+                );
+            }
+            Type::Map(_) | Type::Set(_) => {
+                b.ins().call(
+                    env.print_functions.maps[MapOp::Drop as usize],
+                    &[cells[offset]],
+                );
+            }
+            Type::Enum(_) => {
+                b.ins()
+                    .call(env.print_functions.enum_drop, &[cells[offset]]);
+            }
+            _ => {
+                b.ins().call(
+                    env.print_functions.owned_strings[StringOp::Drop as usize],
+                    &[cells[offset]],
+                );
+            }
+        }
+    }
+}
+
+/// The destructor of a discarded value runs on its arguments unless the handle, the value's first cell, is null.
+fn invoke_discarded_destructor(
+    b: &mut FunctionBuilder<'_>,
+    env: &ExprEnv<'_>,
+    drop_function: usize,
+    handle: Value,
+    arguments: &[Value],
+    seal_state: &mut BlockSealState,
+) {
     let is_null = b.ins().icmp_imm_s(IntCC::Equal, handle, 0);
     let skip = b.create_block();
     let invoke = b.create_block();
@@ -2442,7 +2512,7 @@ fn drop_discarded_destructor(
     b.ins().brif(is_null, skip, &[], invoke, &[]);
     seal_ready(b, from, seal_state);
     b.switch_to_block(invoke);
-    b.ins().call(env.calls[drop_function], &arguments);
+    b.ins().call(env.calls[drop_function], arguments);
     b.ins().jump(merge, &[]);
     seal_ready(b, invoke, seal_state);
     b.switch_to_block(skip);
@@ -2876,6 +2946,11 @@ fn emit_statements(
                                     result,
                                     seal_state,
                                 );
+                            }
+                            Type::Struct(_)
+                                if !crate::guard::owned_slots(ty, 0, env.structs).is_empty() =>
+                            {
+                                drop_discarded_structure(b, env, ty, result, seal_state);
                             }
                             _ => drop_temporary(b, env.print_functions, result),
                         }

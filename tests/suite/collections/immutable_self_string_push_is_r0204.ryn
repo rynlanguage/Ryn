@@ -1,0 +1,15 @@
+// test: fail
+// code: R0204
+// msg: requires a mutable String
+// A mutating String method needs a mutable receiver: a `self` method cannot push, and `ryn build` rejects it as `ryn check` does.
+extend String {
+    fun bad(self) {
+        self.push('x')
+    }
+}
+
+fun main() {
+    mut text := String("hey")
+    text.bad()
+    echo text
+}

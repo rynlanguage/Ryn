@@ -1,0 +1,15 @@
+// test: run
+// out: 3
+// out: 2
+// out: 1
+// out: 4
+// An element of a nested array is read where it lies: `outer[i][j]` is the element j of the inner array i.
+fun main() {
+    nested: [[i32; 2]; 2] = [[1, 2], [3, 4]]
+    echo nested[1][0]
+    echo nested[0][1]
+    grid := [[1; 2]; 2]
+    echo grid[1][0]
+    mut index: u64 = 1
+    echo nested[index][index]
+}

@@ -1,0 +1,40 @@
+// test: run
+// out: 518500
+// out: 0
+// A map of structures that own a String: insert, replace, get, clone, values, remove and clear over a thousand rounds leave
+// no live allocation (the native runtime counts them).
+extern "C" fun ryn_native_live_allocations() -> u64;
+struct Label {
+    text: String,
+    score: i32
+}
+fun round(seed: i32) -> i64 {
+    mut labels := Map<i32, Label>()
+    labels.insert(1, Label { text: String("original"), score: seed })
+    labels.insert(1, Label { text: String("replacement"), score: seed + 1 })
+    labels.insert(2, Label { text: String("second"), score: seed + 2 })
+    mut copies := labels.clone()
+    mut total: i64 = 0
+    when labels.get(1).is_some() {
+        total += labels.get(1).unwrap().score as i64
+    }
+    for item in copies.values() {
+        total += item.text.len() as i64
+    }
+    when labels.remove(2) {
+        total += 1
+    }
+    labels.clear()
+    return total
+}
+fun main() {
+    before := ryn_native_live_allocations()
+    mut i: i32 = 0
+    mut total: i64 = 0
+    while i < 1000 {
+        total += round(i)
+        i += 1
+    }
+    echo total
+    echo ryn_native_live_allocations() - before
+}

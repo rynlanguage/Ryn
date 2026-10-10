@@ -1,0 +1,53 @@
+// test: run
+// out: 2
+// out: 1
+// out: 2
+// out: 1
+// out: 2
+// out: 2
+// out: 1
+// out: true
+// out: 2
+// out: 9
+// exit: 0
+// A structure whose destructor sits in a field is an element of a vector and a value of a map: its destructors run where
+// the element is replaced, taken, iterated and cleared, the way a direct destructor value's do.
+#[drop(release)]
+struct Resource {
+    handle: *i32,
+}
+
+fun release(resource: Resource) {
+    echo *resource.handle
+}
+
+struct Bundle {
+    resource: Resource,
+    label: String,
+}
+
+struct Envelope {
+    bundle: Bundle,
+    note: String,
+}
+
+fun main() {
+    mut a: i32 = 1
+    mut b: i32 = 2
+    mut items := Vec<Envelope>()
+    items.push(Envelope { bundle: Bundle { resource: Resource { handle: &raw mut a }, label: String("first") }, note: String("n1") })
+    items.push(Envelope { bundle: Bundle { resource: Resource { handle: &raw mut b }, label: String("second") }, note: String("n2") })
+    echo items.len()
+    items.set(0, Envelope { bundle: Bundle { resource: Resource { handle: &raw mut b }, label: String("third") }, note: String("n3") })
+    items.take(1)
+    echo items.len()
+    for item in items {
+        echo *item.bundle.resource.handle
+    }
+    mut values := Map<i32, Envelope>()
+    values.insert(1, Envelope { bundle: Bundle { resource: Resource { handle: &raw mut a }, label: String("x") }, note: String("y") })
+    values.insert(1, Envelope { bundle: Bundle { resource: Resource { handle: &raw mut b }, label: String("z") }, note: String("w") })
+    echo values.contains_key(1)
+    values.clear()
+    echo 9
+}

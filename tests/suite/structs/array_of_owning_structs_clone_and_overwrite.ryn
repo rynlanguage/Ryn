@@ -1,0 +1,29 @@
+// test: run
+// out: 3
+// out: z
+// out: y
+// out: 2
+// out: y
+// out: z
+// out: 2
+// A structure element that owns a String is cloned when read by value, dropped when overwritten, and its field is a copy.
+struct Named {
+    id: i32
+    label: String
+}
+fun first_label(items: [Named; 2]) -> i32 {
+    echo items[0].label
+    return items[1].id
+}
+fun main() {
+    mut items: [Named; 2] = [Named { id: 1, label: String("x") }, Named { id: 2, label: String("y") }]
+    items[0] = Named { id: 3, label: String("z") }
+    echo items[0].id
+    echo items[0].label
+    copy := items[1]
+    echo copy.label
+    echo copy.id
+    items[1] = copy
+    echo items[1].label
+    echo first_label(items)
+}

@@ -635,8 +635,11 @@ fn failed_linker_removes_its_temporary_build_directory() {
     )
     .expect("source is written");
 
+    // The Cranelift backend links with an external driver; the native backend writes the executable itself.
     let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
         .arg("build")
+        .arg("--backend")
+        .arg("cranelift")
         .arg("fixture.ryn")
         .current_dir(&directory)
         .env("RUSTC", env!("CARGO_BIN_EXE_ryn"))
@@ -664,6 +667,55 @@ fn failed_linker_removes_its_temporary_build_directory() {
     assert!(
         leaked_build_dirs.is_empty(),
         "temporary build directories leaked: {leaked_build_dirs:?}"
+    );
+}
+
+// The native equivalent of a failed link: the executable cannot be written, so the build fails with its diagnostic,
+// leaves the output path as it was and creates no build directory.
+#[test]
+fn failed_native_write_reports_r0301_and_leaves_no_build_directory() {
+    let directory = temp_dir("failed-native-write");
+    fs::write(
+        directory.join("fixture.ryn"),
+        "fun main() { echo(\"built\") }",
+    )
+    .expect("source is written");
+    // An existing directory cannot be opened for writing as the executable.
+    fs::create_dir(directory.join("occupied")).expect("output directory is created");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_ryn"))
+        .arg("build")
+        .arg("--backend")
+        .arg("native")
+        .arg("fixture.ryn")
+        .arg("-o")
+        .arg("occupied")
+        .current_dir(&directory)
+        .env("TEMP", &directory)
+        .env("TMP", &directory)
+        .env("TMPDIR", &directory)
+        .output()
+        .expect("ryn process starts");
+    let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+    let entries: Vec<_> = fs::read_dir(&directory)
+        .expect("temporary workspace remains readable")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    let occupied_is_still_a_directory = directory.join("occupied").is_dir();
+    let _ = fs::remove_dir_all(&directory);
+
+    assert!(!result.status.success());
+    assert!(
+        stderr.contains("error[R0301]: cannot write the executable occupied"),
+        "{stderr}"
+    );
+    assert!(occupied_is_still_a_directory);
+    let mut entries = entries;
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec!["fixture.ryn".to_owned(), "occupied".to_owned()]
     );
 }
 

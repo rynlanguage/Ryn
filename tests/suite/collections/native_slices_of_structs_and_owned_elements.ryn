@@ -1,0 +1,45 @@
+// test: run
+// out: 11
+// out: 33
+// out: b
+// out: 30
+// out: 1
+// out: 99
+// exit: 0
+// A slice of structures reads whole elements, and a slice of owners clones the element it reads, as the array and vector do.
+struct Point {
+    x: i32,
+    label: String,
+    y: i64,
+}
+
+fun pick(items: &[Point], index: u64) -> i64 {
+    chosen := items[index]
+    return chosen.y + (chosen.x as i64)
+}
+
+fun find(names: &[String], wanted: String) -> u64 {
+    for slot in 0 as u64..names.len() {
+        when names[slot] == wanted {
+            return slot
+        }
+    }
+    return 99
+}
+
+fun main() {
+    mut values: Vec<Point> = Vec()
+    values.push(Point { x: 1, label: String("a"), y: 10 })
+    values.push(Point { x: 2, label: String("b"), y: 20 })
+    values.push(Point { x: 3, label: String("c"), y: 30 })
+    echo pick(values.as_slice(), 0)
+    echo pick(values.as_slice(), 2)
+    echo values.as_slice()[1].label
+    echo values.as_slice()[2].y
+    mut words: Vec<String> = Vec()
+    words.push(String("alpha"))
+    words.push(String("beta"))
+    words.push(String("gamma"))
+    echo find(words.as_slice(), String("beta"))
+    echo find(words.as_slice(), String("delta"))
+}

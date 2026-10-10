@@ -1,0 +1,38 @@
+// test: run
+// out: 2200
+// out: 0
+// exit: 0
+// Looking up, removing and cloning struct keys frees the text each one builds: two hundred rounds leave no live allocation.
+extern "C" fun ryn_native_live_allocations() -> u64;
+#[derive(Clone, Eq, Hash)]
+struct Cell {
+    row: i64,
+    col: i32,
+    live: bool,
+}
+
+fun main() {
+    before := ryn_native_live_allocations()
+    mut found: u64 = 0
+    mut round: u64 = 0
+    while round < 200 {
+        mut board := Map<Cell, i32>()
+        mut i: i64 = 0
+        while i < 5 {
+            board.insert(Cell { row: i, col: 1, live: true }, 7)
+            i += 1
+        }
+        board.insert(Cell { row: 0, col: 1, live: true }, 8)
+        copy := board.clone()
+        ks := board.keys()
+        found += ks.len() as u64
+        when board.contains_key(Cell { row: 2, col: 1, live: true }) {
+            found += 1
+        }
+        board.remove(Cell { row: 2, col: 1, live: true })
+        found += copy.len() as u64
+        round += 1
+    }
+    echo found
+    echo ryn_native_live_allocations() - before
+}

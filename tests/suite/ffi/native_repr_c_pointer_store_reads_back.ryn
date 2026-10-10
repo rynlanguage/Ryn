@@ -1,0 +1,24 @@
+// test: run
+// out: 5
+// out: 5
+// exit: 0
+// A store through a raw pointer to a repr(C) local is seen by the local, which reads its copy back after the store.
+type Words = [u16; 4]
+
+#[repr(C)]
+struct NativeBuffer {
+    words: Words,
+    marker: u32,
+}
+
+fun main() -> i32 {
+    mut buffer := NativeBuffer {
+        words: [11, 22, 33, 44],
+        marker: 99,
+    }
+    pointer := &raw mut buffer
+    pointer.marker = 5
+    echo buffer.marker
+    echo pointer.marker
+    return 0
+}

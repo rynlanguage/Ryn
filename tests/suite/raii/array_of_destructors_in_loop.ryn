@@ -1,0 +1,24 @@
+// test: run
+// out: 0
+// out: 3
+// out: 2
+// out: 1
+// out: 1
+// out: 3
+// out: 2
+// out: 1
+// An array of destructors declared in a loop is dropped at the end of each iteration, last element first.
+#[drop(release)]
+struct Resource { handle: *i32 }
+fun release(resource: Resource) { echo *resource.handle }
+fun main() {
+    mut a: i32 = 1
+    mut b: i32 = 2
+    mut c: i32 = 3
+    mut round: i32 = 0
+    while round < 2 {
+        items: [Resource; 3] = [Resource { handle: &raw mut a }, Resource { handle: &raw mut b }, Resource { handle: &raw mut c }]
+        echo round
+        round += 1
+    }
+}

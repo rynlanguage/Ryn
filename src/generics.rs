@@ -323,6 +323,8 @@ fn specialize_program(mut program: Program) -> Result<Program, Diagnostic> {
         .drain(..)
         .filter(|function| function.type_parameters.is_empty())
         .collect::<Vec<_>>();
+    // The limit bounds the specializations that monomorphization creates, not the ordinary functions of the program.
+    let ordinary_functions = concrete_functions.len();
     let mut known_functions = concrete_functions
         .iter()
         .map(|function| (function.name.clone(), function.clone()))
@@ -388,7 +390,7 @@ fn specialize_program(mut program: Program) -> Result<Program, Diagnostic> {
         }
         known_functions.insert(function.name.clone(), function.clone());
         concrete_functions.push(function);
-        if concrete_functions.len() > MAX_SPECIALIZATIONS {
+        if concrete_functions.len() - ordinary_functions > MAX_SPECIALIZATIONS {
             return Err(Diagnostic {
                 code: "R0261",
                 message: "generic specialization limit exceeded".into(),

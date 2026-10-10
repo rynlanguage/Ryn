@@ -1,0 +1,7 @@
+// test: fail
+// code: R0230
+// msg: unknown type `Strng`
+fun main() {
+    value: Strng = "text"
+    echo value
+}

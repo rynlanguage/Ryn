@@ -1,0 +1,11 @@
+// test: fail
+// code: R0205
+// msg: range end has type `i64` but the start has type `i32`
+fun main() {
+    low: i32 = 1
+    high: i64 = 9
+    span := low..high
+    for value in span {
+        echo value
+    }
+}

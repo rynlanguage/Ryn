@@ -1,0 +1,266 @@
+// The parts of a project manifest (`ryn.yaml`) the native compiler reads: the package name and its path dependencies.
+//
+// The manifest is YAML; this reader takes the subset `ryn new` writes and the documentation shows:
+//
+//     name: app
+//     dependencies:
+//       mathlib:
+//         path: ./vendor/mathlib
+//       tools: { path: ../tools }
+//
+// A dependency without a `path` (a registry version or a git source) is resolved by the `ryn` command, which passes the
+// source directory of each resolved package with `--package name=directory`.
+
+pub struct Manifest {
+    pub name: String,
+    pub dependency_names: Vec<String>,
+    pub dependency_paths: Vec<String>,
+    // The dependencies that are not paths, which this reader cannot resolve.
+    pub other_dependencies: Vec<String>,
+    pub error: String,
+}
+
+fun mf_indent(line: String) -> u64 {
+    mut at: u64 = 0
+    while at < line.len() && (line.byte_at(at) as u64) == 32 {
+        at += 1
+    }
+    return at
+}
+
+// The line without a comment: `#` starts one outside quotes.
+fun mf_strip_comment(line: String) -> String {
+    mut quote: u64 = 0
+    mut at: u64 = 0
+    while at < line.len() {
+        byte := line.byte_at(at) as u64
+        when quote == 0 && (byte == 34 || byte == 39) {
+            quote = byte
+        } else when quote != 0 && byte == quote {
+            quote = 0
+        } else when quote == 0 && byte == 35 {
+            when at == 0 || (line.byte_at(at - 1) as u64) == 32 {
+                return line.slice(0, at)
+            }
+        }
+        at += 1
+    }
+    return line
+}
+
+// A scalar value without its quotes and surrounding spaces.
+pub fun scalar(text: String) -> String {
+    trimmed := text.trim()
+    when trimmed.len() >= 2 {
+        first := trimmed.byte_at(0) as u64
+        last := trimmed.byte_at(trimmed.len() - 1) as u64
+        when (first == 34 && last == 34) || (first == 39 && last == 39) {
+            return trimmed.slice(1, trimmed.len() - 1)
+        }
+    }
+    return trimmed
+}
+
+// The key of a `key: value` line and its value; nothing when the line has no `:`.
+fun mf_colon(text: String) -> Option<u64> {
+    mut quote: u64 = 0
+    mut at: u64 = 0
+    while at < text.len() {
+        byte := text.byte_at(at) as u64
+        when quote == 0 && (byte == 34 || byte == 39) {
+            quote = byte
+        } else when quote != 0 && byte == quote {
+            quote = 0
+        } else when quote == 0 && byte == 58 {
+            when at + 1 == text.len() || (text.byte_at(at + 1) as u64) == 32 {
+                return Option::Some(at)
+            }
+        }
+        at += 1
+    }
+    return Option::None
+}
+
+// The `path` entry of a flow mapping such as `{ path: ../x }`, if any.
+fun mf_flow_path(value: String) -> Option<String> {
+    trimmed := value.trim()
+    when !trimmed.starts_with("{") || !trimmed.ends_with("}") {
+        return Option::None
+    }
+    inner := trimmed.slice(1, trimmed.len() - 1)
+    for part in mf_split(inner, 44) {
+        colon := mf_colon(part.clone())
+        when colon.is_some() {
+            key := scalar(part.slice(0, colon.unwrap()))
+            when key == "path" {
+                return Option::Some(scalar(part.slice(colon.unwrap() + 1, part.len())))
+            }
+        }
+    }
+    return Option::None
+}
+
+// The lines of a text, without their line endings.
+fun mf_lines(text: String) -> Vec<String> {
+    mut lines: Vec<String> = Vec()
+    mut start: u64 = 0
+    mut at: u64 = 0
+    while at < text.len() {
+        when (text.byte_at(at) as u64) == 10 {
+            mut end := at
+            when end > start && (text.byte_at(end - 1) as u64) == 13 {
+                end -= 1
+            }
+            lines.push(text.slice(start, end))
+            start = at + 1
+        }
+        at += 1
+    }
+    when start < text.len() {
+        lines.push(text.slice(start, text.len()))
+    }
+    return lines
+}
+
+// The parts of a text between the bytes `separator`.
+fun mf_split(text: String, separator: u64) -> Vec<String> {
+    mut parts: Vec<String> = Vec()
+    mut start: u64 = 0
+    mut at: u64 = 0
+    while at < text.len() {
+        when (text.byte_at(at) as u64) == separator {
+            parts.push(text.slice(start, at))
+            start = at + 1
+        }
+        at += 1
+    }
+    parts.push(text.slice(start, text.len()))
+    return parts
+}
+
+pub fun read_manifest(text: String) -> Manifest {
+    mut manifest := Manifest { name: String(""), dependency_names: Vec(), dependency_paths: Vec(), other_dependencies: Vec(), error: String("") }
+    mut in_dependencies := false
+    mut dependency_indent: u64 = 0
+    mut current := String("")
+    mut current_has_path := false
+    for raw in mf_lines(text) {
+        line := mf_strip_comment(raw)
+        when line.trim().is_empty() {
+            continue
+        }
+        indent := mf_indent(line.clone())
+        content := line.trim()
+        colon := mf_colon(content.clone())
+        when indent == 0 {
+            when !current.is_empty() && !current_has_path {
+                manifest.other_dependencies.push(current.clone())
+            }
+            current = String("")
+            current_has_path = false
+            in_dependencies = false
+            when colon.is_some() {
+                key := scalar(content.slice(0, colon.unwrap()))
+                value := content.slice(colon.unwrap() + 1, content.len())
+                when key == "name" {
+                    manifest.name = scalar(value)
+                }
+                when key == "dependencies" {
+                    in_dependencies = true
+                    dependency_indent = 0
+                }
+            }
+        } else when in_dependencies && colon.is_some() {
+            key := scalar(content.slice(0, colon.unwrap()))
+            value := content.slice(colon.unwrap() + 1, content.len())
+            when dependency_indent == 0 || indent <= dependency_indent {
+                // A new dependency.
+                when !current.is_empty() && !current_has_path {
+                    manifest.other_dependencies.push(current.clone())
+                }
+                dependency_indent = indent
+                current = key.clone()
+                current_has_path = false
+                flow := mf_flow_path(value.clone())
+                when flow.is_some() {
+                    manifest.dependency_names.push(key)
+                    manifest.dependency_paths.push(flow.unwrap())
+                    current_has_path = true
+                }
+            } else when key == "path" && !current.is_empty() && !current_has_path {
+                manifest.dependency_names.push(current.clone())
+                manifest.dependency_paths.push(scalar(value))
+                current_has_path = true
+            }
+        }
+    }
+    when !current.is_empty() && !current_has_path {
+        manifest.other_dependencies.push(current)
+    }
+    return manifest
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Paths
+
+// The directory part of a path, without the final slash ("" when there is none).
+pub fun directory_of(path: String) -> String {
+    mut at: u64 = path.len()
+    while at > 0 {
+        at -= 1
+        when (path.byte_at(at) as u64) == 47 {
+            when at == 0 {
+                return String("/")
+            }
+            return path.slice(0, at)
+        }
+    }
+    return String("")
+}
+
+// `base/relative`, with `.` and `..` components resolved by their text. An absolute `relative` replaces `base`.
+pub fun join_path(base: String, relative: String) -> String {
+    mut combined := String("")
+    when relative.starts_with("/") || base.is_empty() {
+        combined = relative
+    } else {
+        combined = base
+        combined.append("/")
+        combined.append(relative)
+    }
+    return normalize(combined)
+}
+
+pub fun normalize(path: String) -> String {
+    absolute := path.starts_with("/")
+    mut parts: Vec<String> = Vec()
+    for part in mf_split(path, 47) {
+        when part.is_empty() || part == "." {
+            continue
+        }
+        when part == ".." && !parts.is_empty() && parts[parts.len() - 1] != ".." {
+            parts.pop()
+            continue
+        }
+        when part == ".." && absolute {
+            continue
+        }
+        parts.push(part)
+    }
+    mut out := String("")
+    when absolute {
+        out.append("/")
+    }
+    mut at: u64 = 0
+    while at < parts.len() {
+        when at > 0 {
+            out.append("/")
+        }
+        out.append(parts[at].clone())
+        at += 1
+    }
+    when out.is_empty() {
+        return String(".")
+    }
+    return out
+}

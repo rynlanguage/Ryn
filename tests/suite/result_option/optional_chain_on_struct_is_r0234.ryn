@@ -1,0 +1,12 @@
+// test: fail
+// code: R0234
+// msg: `choose` requires an enum value
+// `?.` desugars to a `choose`, and a structure is not an enum: the native compiler reports the same code.
+struct Point {
+    x: i32
+}
+
+fun main() {
+    point := Point { x: 3 }
+    echo point?.x
+}

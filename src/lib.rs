@@ -18,6 +18,7 @@ pub mod lockfile;
 pub mod manifest;
 pub mod map_ops;
 mod modules;
+pub mod native;
 pub mod parser;
 pub mod patterns;
 pub mod pe_linker;
@@ -91,6 +92,19 @@ pub fn check_project_with_frontend(
     frontend: &frontend::Frontend,
 ) -> Result<sema::RynIr, String> {
     modules::check_project(project.as_ref(), frontend).map(|(ir, _)| ir)
+}
+
+/// The source directories of a project's dependency packages (path, git and registry dependencies, resolved through
+/// `ryn.lock`), by package name, without the standard library.
+pub fn project_dependency_roots(
+    project: impl AsRef<Path>,
+) -> Result<Vec<(String, PathBuf)>, String> {
+    modules::dependency_roots(project.as_ref())
+}
+
+/// Whether writing `output` would overwrite the source file `input`, including through a filesystem alias.
+pub fn output_overwrites_source(input: &Path, output: &Path) -> bool {
+    paths_refer_to_same_file(input, output)
 }
 
 /// Loads a project's modules into one specialized program, as semantic analysis receives it.

@@ -1,0 +1,61 @@
+// test: run
+// out: 8
+// out: 4
+// out: 9
+// out: false
+// out: 1
+// out: 3
+// out: true
+// out: 0
+// out: 1
+// out: false
+// out: -1
+// out: -1
+// out: true
+// out: 2
+// out: 5
+// out: false
+// out: -2
+// out: -3
+// out: false
+// out: -3
+// out: -5
+// out: true
+// out: 3
+// out: 7
+// out: true
+// out: 8
+// out: 8
+// out: Some(999)
+// out: false
+// out: 0
+// out: 8
+// exit: 0
+// Struct keys hash and compare by their fields: keys() follows the hash order, and clone, remove and clear keep the entries apart.
+#[derive(Clone, Eq, Hash)]
+struct Cell { row: i64, col: i32, live: bool }
+fun main() {
+    mut board := Map<Cell, i32>()
+    mut i: i64 = 0
+    while i < 8 {
+        board.insert(Cell { row: i - 3, col: (i * 2) as i32 - 5, live: i % 2 == 0 }, (i * 10) as i32)
+        i += 1
+    }
+    board.insert(Cell { row: -3, col: -5, live: true }, 999)
+    echo board.len()
+    keys := board.keys()
+    for key in keys {
+        echo key.row
+        echo key.col
+        echo key.live
+    }
+    copy := board.clone()
+    board.remove(Cell { row: 1, col: -1, live: false })
+    echo board.len()
+    echo copy.len()
+    echo copy.get(Cell { row: -3, col: -5, live: true })
+    echo copy.contains_key(Cell { row: 1, col: -1, live: false })
+    board.clear()
+    echo board.len()
+    echo copy.len()
+}

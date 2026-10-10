@@ -1,0 +1,2641 @@
+// The runtime of the native compiler, written in Ryn.
+//
+// `rync` loads this module with every program. A builtin of the language whose operation it implements here
+// (`__rt_<group>_<operation>`, after the builtin's IR target such as `Filesystem CreateDir`) is compiled as a call of the
+// function, with the builtin's parameter and result types; only the functions a program reaches are generated. They call
+// the system's C library, so a program that uses one is linked dynamically with `libc.so.6`. The behaviour follows the
+// bootstrap compiler's runtime (`src/runtime/*.rs`): failures that it reports as `Ryn runtime error: ...` and exit status 1
+// are reported the same way, and an operating-system error reads `<description> (os error <number>)`.
+//
+// The bootstrap compiler does not load this module.
+
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(pointer: *u8);
+extern "C" fun strlen(text: *u8) -> u64;
+extern "C" fun __errno_location() -> *i32;
+extern "C" fun strerror(code: i32) -> *u8;
+extern "C" fun mkdir(path: *u8, mode: u32) -> i32;
+extern "C" fun rmdir(path: *u8) -> i32;
+extern "C" fun unlink(path: *u8) -> i32;
+extern "C" fun stat(path: *u8, buffer: *u8) -> i32;
+extern "C" fun lstat(path: *u8, buffer: *u8) -> i32;
+extern "C" fun opendir(path: *u8) -> *u8;
+extern "C" fun readdir(directory: *u8) -> *u8;
+extern "C" fun closedir(directory: *u8) -> i32;
+extern "C" fun realpath(path: *u8, resolved: *u8) -> *u8;
+extern "C" fun getcwd(buffer: *u8, size: u64) -> *u8;
+extern "C" fun chdir(path: *u8) -> i32;
+extern "C" fun getenv(name: *u8) -> *u8;
+extern "C" fun setenv(name: *u8, value: *u8, overwrite: i32) -> i32;
+extern "C" fun unsetenv(name: *u8) -> i32;
+extern "C" fun readlink(path: *u8, buffer: *u8, size: u64) -> i64;
+extern "C" fun sysconf(name: i32) -> i64;
+extern "C" fun clock_gettime(clock: i32, time: *u8) -> i32;
+extern "C" fun nanosleep(requested: *u8, remaining: *u8) -> i32;
+extern "C" fun sched_yield() -> i32;
+extern "C" fun read(descriptor: i32, buffer: *u8, size: u64) -> i64;
+extern "C" fun write(descriptor: i32, buffer: *u8, size: u64) -> i64;
+extern "C" fun open(path: *u8, flags: i32, mode: u32) -> i32;
+extern "C" fun close(descriptor: i32) -> i32;
+extern "C" fun getpid() -> i32;
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Memory and C text
+
+fun c_text(text: String) -> *u8 {
+    length := text.len()
+    buffer := malloc(length + 1)
+    base := buffer as u64
+    mut at: u64 = 0
+    while at < length {
+        slot1 := (base + at) as *u8
+        *slot1 = text.byte_at(at)
+        at += 1
+    }
+    end := (base + length) as *u8
+    *end = 0 as u8
+    return buffer
+}
+
+fun from_c(pointer: *u8) -> String {
+    when (pointer as u64) == 0 {
+        return String("")
+    }
+    return __native_string_from_raw(pointer, strlen(pointer))
+}
+
+fun byte_of(pointer: *u8, offset: u64) -> u8 {
+    cell := ((pointer as u64) + offset) as *u8
+    return *cell
+}
+
+fun word32_of(pointer: *u8, offset: u64) -> u32 {
+    cell := ((pointer as u64) + offset) as *u32
+    return *cell
+}
+
+fun word64_of(pointer: *u8, offset: u64) -> i64 {
+    cell := ((pointer as u64) + offset) as *i64
+    return *cell
+}
+
+fun set_word64(pointer: *u8, offset: u64, value: i64) {
+    slot2 := ((pointer as u64) + offset) as *i64
+    *slot2 = value
+}
+
+fun errno_value() -> i32 {
+    location := __errno_location()
+    return *location
+}
+
+// The text of the last operating-system error, as Rust's `io::Error` displays it.
+fun os_error_text() -> String {
+    code := errno_value()
+    mut text := from_c(strerror(code))
+    text.append(" (os error ")
+    text.append(String(code))
+    text.append(")")
+    return text
+}
+
+fun runtime_failure(message: String) {
+    eprint("Ryn runtime error: {}", message)
+    exit(1)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Files and directories
+
+// The `st_mode` of a path (following symbolic links with `follow`), or nothing when it does not exist.
+fun mode_of(path: String, follow: bool) -> Option<u32> {
+    name := c_text(path.clone())
+    buffer := malloc(256)
+    mut status: i32 = 0
+    when follow {
+        status = stat(name, buffer)
+    } else {
+        status = lstat(name, buffer)
+    }
+    mode := word32_of(buffer, 24)
+    free(buffer)
+    free(name)
+    when status != 0 {
+        return Option::None
+    }
+    return Option::Some(mode)
+}
+
+fun is_directory_mode(mode: u32) -> bool {
+    return (mode & (61440 as u32)) == (16384 as u32)
+}
+
+fun is_regular_mode(mode: u32) -> bool {
+    return (mode & (61440 as u32)) == (32768 as u32)
+}
+
+pub fun __rt_filesystem_is_directory(path_given: str) -> bool {
+    path := String(path_given)
+    mode := mode_of(path.clone(), true)
+    when mode.is_none() {
+        return false
+    }
+    return is_directory_mode(mode.unwrap())
+}
+
+pub fun __rt_filesystem_create_dir(path_given: str) -> bool {
+    path := String(path_given)
+    name := c_text(path.clone())
+    status := mkdir(name, 511 as u32)
+    free(name)
+    return status == 0
+}
+
+pub fun __rt_filesystem_create_dir_all(path_given: str) -> bool {
+    path := String(path_given)
+    when path.len() == 0 {
+        return false
+    }
+    when __rt_filesystem_is_directory(path.clone()) {
+        return true
+    }
+    parent := path_parent_text(path.clone())
+    when parent.len() > 0 && !__rt_filesystem_is_directory(parent.clone()) {
+        when !__rt_filesystem_create_dir_all(parent.clone()) {
+            return false
+        }
+    }
+    name := c_text(path.clone())
+    status := mkdir(name, 511 as u32)
+    free(name)
+    return status == 0 || __rt_filesystem_is_directory(path.clone())
+}
+
+pub fun __rt_filesystem_delete_dir(path_given: str) -> bool {
+    path := String(path_given)
+    name := c_text(path.clone())
+    status := rmdir(name)
+    free(name)
+    return status == 0
+}
+
+// As the bootstrap runtime's `fs::remove_file`: a directory is not removed, so it gives false.
+pub fun __rt_filesystem_delete_file(path_given: str) -> bool {
+    path := String(path_given)
+    name := c_text(path.clone())
+    status := unlink(name)
+    free(name)
+    return status == 0
+}
+
+// The names in a directory, without `.` and `..`, or nothing when it cannot be opened.
+fun directory_names(path: String) -> Option<Vec<String>> {
+    name := c_text(path.clone())
+    directory := opendir(name)
+    free(name)
+    when (directory as u64) == 0 {
+        return Option::None
+    }
+    mut names: Vec<String> = Vec()
+    while true {
+        entry := readdir(directory)
+        when (entry as u64) == 0 {
+            break
+        }
+        // `struct dirent` on Linux x86-64: the name starts at byte 19.
+        entry_name := from_c(((entry as u64) + 19) as *u8)
+        when entry_name != "." && entry_name != ".." {
+            names.push(entry_name)
+        }
+    }
+    closedir(directory)
+    return Option::Some(names)
+}
+
+pub fun __rt_filesystem_delete_dir_all(path_given: str) -> bool {
+    path := String(path_given)
+    mode := mode_of(path.clone(), false)
+    when mode.is_none() {
+        return false
+    }
+    when !is_directory_mode(mode.unwrap()) {
+        name := c_text(path.clone())
+        status := unlink(name)
+        free(name)
+        return status == 0
+    }
+    names := directory_names(path.clone())
+    when names.is_none() {
+        return false
+    }
+    for entry in names.unwrap() {
+        child := path_join_text(path.clone(), entry)
+        when !__rt_filesystem_delete_dir_all(child.clone()) {
+            return false
+        }
+    }
+    return __rt_filesystem_delete_dir(path.clone())
+}
+
+// The bytes order of two texts, as Rust orders `String` values.
+fun text_less(left: String, right: String) -> bool {
+    mut at: u64 = 0
+    while at < left.len() && at < right.len() {
+        a := left.byte_at(at)
+        b := right.byte_at(at)
+        when a != b {
+            return a < b
+        }
+        at += 1
+    }
+    return left.len() < right.len()
+}
+
+pub fun __rt_filesystem_read_dir(path_given: str) -> Vec<String> {
+    path := String(path_given)
+    names := directory_names(path.clone())
+    when names.is_none() {
+        mut message := String("could not read directory `")
+        message.append(path)
+        message.append("`: ")
+        message.append(os_error_text())
+        runtime_failure(message)
+        return Vec()
+    }
+    mut entries: Vec<String> = Vec()
+    for entry in names.unwrap() {
+        entries.push(path_join_text(path.clone(), entry))
+    }
+    // An insertion sort gives the order of the bootstrap runtime (sorted paths).
+    mut at: u64 = 1
+    while at < entries.len() {
+        mut position := at
+        while position > 0 && text_less(entries[position].clone(), entries[position - 1].clone()) {
+            earlier := entries[position - 1].clone()
+            later := entries[position].clone()
+            entries.set(position - 1, later)
+            entries.set(position, earlier)
+            position -= 1
+        }
+        at += 1
+    }
+    return entries
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Paths, as Rust's `Path` reads them on Unix
+
+fun trimmed_end(path: String) -> u64 {
+    mut end := path.len()
+    while end > 1 && (path.byte_at(end - 1) as u64) == 47 {
+        end -= 1
+    }
+    return end
+}
+
+pub fun __rt_filesystem_path_join(base_given: str, child_given: str) -> String {
+    return path_join_text(String(base_given), String(child_given))
+}
+
+// The join for owned texts. The runtime's own callers hold `String` values, and a `str` parameter takes only `str`.
+fun path_join_text(base: String, child: String) -> String {
+    when child.len() > 0 && (child.byte_at(0) as u64) == 47 {
+        return child
+    }
+    mut joined := base
+    when joined.len() > 0 && !joined.ends_with("/") {
+        joined.append("/")
+    }
+    joined.append(child)
+    return joined
+}
+
+// The text of a path without its last component ("" when it has none).
+fun path_parent_text(path: String) -> String {
+    end := trimmed_end(path.clone())
+    when end == 0 || (end == 1 && (path.byte_at(0) as u64) == 47) {
+        return String("")
+    }
+    mut at := end
+    while at > 0 && (path.byte_at(at - 1) as u64) != 47 {
+        at -= 1
+    }
+    when at == 0 {
+        // A relative path of one component has the empty parent.
+        return String("")
+    }
+    mut cut := at - 1
+    while cut > 0 && (path.byte_at(cut - 1) as u64) == 47 {
+        cut -= 1
+    }
+    when cut == 0 {
+        return String("/")
+    }
+    text := path.clone()
+    return text.slice(0, cut)
+}
+
+pub fun __rt_filesystem_path_parent(path_given: str) -> String {
+    path := String(path_given)
+    return path_parent_text(path.clone())
+}
+
+fun file_name_text(path: String) -> String {
+    end := trimmed_end(path.clone())
+    mut start := end
+    while start > 0 && (path.byte_at(start - 1) as u64) != 47 {
+        start -= 1
+    }
+    text := path.clone()
+    name := text.slice(start, end)
+    when name == ".." || name == "." || name == "/" {
+        return String("")
+    }
+    return name
+}
+
+pub fun __rt_filesystem_path_file_name(path_given: str) -> String {
+    path := String(path_given)
+    return file_name_text(path.clone())
+}
+
+pub fun __rt_filesystem_path_extension(path_given: str) -> String {
+    path := String(path_given)
+    name := file_name_text(path.clone())
+    mut at := name.len()
+    while at > 0 {
+        at -= 1
+        when (name.byte_at(at) as u64) == 46 {
+            when at == 0 {
+                return String("")
+            }
+            return name.slice(at + 1, name.len())
+        }
+    }
+    return String("")
+}
+
+pub fun __rt_filesystem_path_is_absolute(path_given: str) -> bool {
+    path := String(path_given)
+    return path.len() > 0 && (path.byte_at(0) as u64) == 47
+}
+
+pub fun __rt_filesystem_path_absolute(path_given: str) -> String {
+    path := String(path_given)
+    when __rt_filesystem_path_is_absolute(path.clone()) {
+        return path
+    }
+    return path_join_text(__rt_system_current_dir(), path)
+}
+
+// The resolved path is written into a buffer of PATH_MAX bytes: `realpath` with no buffer fails with EINVAL in
+// binaries built by the native backend, although the same call succeeds with a buffer.
+pub fun __rt_filesystem_path_canonical(path_given: str) -> String {
+    path := String(path_given)
+    name := c_text(path.clone())
+    buffer := malloc(4096)
+    resolved := realpath(name, buffer)
+    free(name)
+    when (resolved as u64) == 0 {
+        free(buffer)
+        return String("")
+    }
+    text := from_c(buffer)
+    free(buffer)
+    return text
+}
+
+// An open file is a record: its descriptor (-1 once closed) at 0, its read buffer at 8, the number of bytes the buffer
+// holds at 16 and the read position in it at 24.
+fun open_handle(path_given: str, flags: i32, action: str) -> *u8 {
+    path := String(path_given)
+    name := c_text(path.clone())
+    descriptor := open(name, flags, 438)
+    when descriptor < 0 {
+        reason := os_error_text()
+        free(name)
+        mut message := String(action)
+        message.append(" `")
+        message.append(path)
+        message.append("`: ")
+        message.append(reason)
+        runtime_failure(message)
+    }
+    free(name)
+    buffer := malloc(8192)
+    handle := malloc(32)
+    set_word64(handle, 0, descriptor as i64)
+    set_word64(handle, 8, buffer as u64 as i64)
+    set_word64(handle, 16, 0)
+    set_word64(handle, 24, 0)
+    return handle
+}
+
+pub fun __rt_filesystem_file_open(path_given: str) -> *u8 {
+    return open_handle(path_given, 0, "could not open")
+}
+
+// O_RDWR | O_CREAT | O_TRUNC, with the mode 0o666 that the process umask then narrows.
+pub fun __rt_filesystem_file_create(path_given: str) -> *u8 {
+    return open_handle(path_given, 578, "could not create")
+}
+
+// The descriptor of an open file, or -1 when there is no file or it is closed.
+fun open_descriptor(handle: *u8) -> i64 {
+    when (handle as u64) == 0 {
+        return -1
+    }
+    return word64_of(handle, 0)
+}
+
+// Makes the buffer of a file hold unread bytes: their count, zero at the end of the file, below zero after a read error.
+fun buffered(handle: *u8) -> i64 {
+    when word64_of(handle, 24) < word64_of(handle, 16) {
+        return word64_of(handle, 16) - word64_of(handle, 24)
+    }
+    buffer := word64_of(handle, 8) as u64 as *u8
+    count := read(word64_of(handle, 0) as i32, buffer, 8192)
+    when count <= 0 {
+        set_word64(handle, 16, 0)
+        set_word64(handle, 24, 0)
+        return count
+    }
+    set_word64(handle, 16, count)
+    set_word64(handle, 24, 0)
+    return count
+}
+
+// A growing buffer of bytes, as `buffer_append` keeps it, for the bytes that a file read collects.
+fun byte_buffer_new() -> *u8 {
+    record := malloc(24)
+    set_word64(record, 0, 0)
+    set_word64(record, 8, 0)
+    set_word64(record, 16, 0)
+    return record
+}
+
+fun byte_buffer_free(record: *u8) {
+    free(word64_of(record, 0) as u64 as *u8)
+    free(record)
+}
+
+// Appends the rest of a file to a byte buffer; false after a read error.
+fun read_rest_into(handle: *u8, collected: *u8) -> bool {
+    mut ok := true
+    while true {
+        available := buffered(handle)
+        when available < 0 {
+            ok = false
+            break
+        }
+        when available == 0 {
+            break
+        }
+        buffer := word64_of(handle, 8) as u64 as *u8
+        start := word64_of(handle, 24) as u64
+        buffer_append(collected, ((buffer as u64) + start) as *u8, available as u64)
+        set_word64(handle, 24, word64_of(handle, 16))
+    }
+    return ok
+}
+
+// Appends one line of a file to a byte buffer, its line ending included; false after a read error.
+fun read_line_into(handle: *u8, line: *u8) -> bool {
+    mut ok := true
+    while true {
+        available := buffered(handle)
+        when available < 0 {
+            ok = false
+            break
+        }
+        when available == 0 {
+            break
+        }
+        buffer := word64_of(handle, 8) as u64 as *u8
+        start := word64_of(handle, 24) as u64
+        stop := word64_of(handle, 16) as u64
+        mut end := start
+        mut found := false
+        while end < stop {
+            end += 1
+            when (byte_of(buffer, end - 1) as u64) == 10 {
+                found = true
+                break
+            }
+        }
+        buffer_append(line, ((buffer as u64) + start) as *u8, end - start)
+        set_word64(handle, 24, end as i64)
+        when found {
+            break
+        }
+    }
+    return ok
+}
+
+// Whether the bytes are well-formed UTF-8, which Rust's `read_to_string` and `read_line` require.
+fun utf8_valid(data: *u8, count: u64) -> bool {
+    mut at: u64 = 0
+    while at < count {
+        lead := byte_of(data, at) as u32
+        mut extra: u64 = 0
+        mut low: u32 = 128
+        mut high: u32 = 191
+        when lead < 128 {
+            extra = 0
+        } else when lead >= 194 && lead <= 223 {
+            extra = 1
+        } else when lead == 224 {
+            low = 160
+            extra = 2
+        } else when (lead >= 225 && lead <= 236) || lead == 238 || lead == 239 {
+            extra = 2
+        } else when lead == 237 {
+            high = 159
+            extra = 2
+        } else when lead == 240 {
+            low = 144
+            extra = 3
+        } else when lead >= 241 && lead <= 243 {
+            extra = 3
+        } else when lead == 244 {
+            high = 143
+            extra = 3
+        } else {
+            return false
+        }
+        when at + extra >= count {
+            return false
+        }
+        mut index: u64 = 1
+        while index <= extra {
+            value := byte_of(data, at + index) as u32
+            when value < low || value > high {
+                return false
+            }
+            low = 128
+            high = 191
+            index += 1
+        }
+        at += extra + 1
+    }
+    return true
+}
+
+fun text_of(data: *u8, count: u64) -> String {
+    when count == 0 {
+        return String("")
+    }
+    return __native_string_from_raw(data, count)
+}
+
+pub fun __rt_filesystem_file_read(handle: *u8) -> String {
+    when open_descriptor(handle) < 0 {
+        return String("")
+    }
+    collected := byte_buffer_new()
+    mut text := String("")
+    when read_rest_into(handle, collected) {
+        length := word64_of(collected, 8) as u64
+        data := word64_of(collected, 0) as u64 as *u8
+        when utf8_valid(data, length) {
+            text = text_of(data, length)
+        }
+    }
+    byte_buffer_free(collected)
+    return text
+}
+
+pub fun __rt_filesystem_file_read_line(handle: *u8) -> String {
+    when open_descriptor(handle) < 0 {
+        return String("")
+    }
+    line := byte_buffer_new()
+    mut text := String("")
+    when read_line_into(handle, line) {
+        mut length := word64_of(line, 8) as u64
+        data := word64_of(line, 0) as u64 as *u8
+        when utf8_valid(data, length) {
+            when length > 0 && (byte_of(data, length - 1) as u64) == 10 {
+                length -= 1
+                when length > 0 && (byte_of(data, length - 1) as u64) == 13 {
+                    length -= 1
+                }
+            }
+            text = text_of(data, length)
+        }
+    }
+    byte_buffer_free(line)
+    return text
+}
+
+pub fun __rt_filesystem_file_write(handle: *u8, data_given: str) -> bool {
+    when open_descriptor(handle) < 0 {
+        return false
+    }
+    text := String(data_given)
+    when text.len() == 0 {
+        return true
+    }
+    buffer := c_text(text.clone())
+    descriptor := word64_of(handle, 0) as i32
+    mut written: u64 = 0
+    mut ok := true
+    while written < text.len() {
+        count := write(descriptor, ((buffer as u64) + written) as *u8, text.len() - written)
+        when count <= 0 {
+            ok = false
+            break
+        }
+        written += count as u64
+    }
+    free(buffer)
+    return ok
+}
+
+// Files are not buffered on the way out, so flushing only confirms that the file is still open.
+pub fun __rt_filesystem_file_flush(handle: *u8) -> bool {
+    return open_descriptor(handle) >= 0
+}
+
+pub fun __rt_filesystem_file_close(handle: *u8) -> bool {
+    when open_descriptor(handle) < 0 {
+        return false
+    }
+    close(word64_of(handle, 0) as i32)
+    set_word64(handle, 0, -1)
+    return true
+}
+
+// Called by the destructor of `File`, once for each owner: closes the descriptor if it is still open.
+pub fun __rt_filesystem_file_drop(handle: *u8) -> bool {
+    when (handle as u64) == 0 {
+        return false
+    }
+    when open_descriptor(handle) >= 0 {
+        close(word64_of(handle, 0) as i32)
+    }
+    free(word64_of(handle, 8) as u64 as *u8)
+    free(handle)
+    return true
+}
+
+// The code of a failed file read, as `read_file_result` reports it: 1 not found, 2 permission denied, 3 invalid UTF-8,
+// 4 invalid input, 5 any other input or output failure.
+fun read_failure_code(error: i32) -> i32 {
+    when error == 2 {
+        return 1
+    }
+    when error == 1 || error == 13 {
+        return 2
+    }
+    when error == 22 {
+        return 4
+    }
+    return 5
+}
+
+// A whole file read as UTF-8 text, or the code of the failure.
+fun read_text_file(path_given: str) -> Result<String, i32> {
+    path := String(path_given)
+    name := c_text(path.clone())
+    descriptor := open(name, 0, 0)
+    free(name)
+    when descriptor < 0 {
+        return Result::Err(read_failure_code(errno_value()))
+    }
+    buffer := malloc(8192)
+    collected := byte_buffer_new()
+    mut failure: i32 = 0
+    while true {
+        count := read(descriptor, buffer, 8192)
+        when count < 0 {
+            failure = read_failure_code(errno_value())
+            break
+        }
+        when count == 0 {
+            break
+        }
+        buffer_append(collected, buffer, count as u64)
+    }
+    close(descriptor)
+    free(buffer)
+    when failure != 0 {
+        byte_buffer_free(collected)
+        return Result::Err(failure)
+    }
+    length := word64_of(collected, 8) as u64
+    data := word64_of(collected, 0) as u64 as *u8
+    when !utf8_valid(data, length) {
+        byte_buffer_free(collected)
+        return Result::Err(3)
+    }
+    text := text_of(data, length)
+    byte_buffer_free(collected)
+    return Result::Ok(text)
+}
+
+pub fun __rt_filesystem_read_file_result(path_given: str) -> Result<String, i32> {
+    return read_text_file(path_given)
+}
+
+pub fun __rt_filesystem_try_read_file(path_given: str) -> Option<String> {
+    result := read_text_file(path_given)
+    when result.is_err() {
+        return Option::None
+    }
+    return Option::Some(result.unwrap())
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The keyboard, from the Linux event devices
+
+// The keyboard state, kept behind the runtime cell and made on the first query: the list of the open event devices
+// at 16, and for each of the 108 key ids a down flag at 32, a pressed edge at 140 and a released edge at 248.
+fun keyboard_state() -> *u8 {
+    cell := __runtime_cell()
+    existing := word64_of(cell, 0)
+    when existing != 0 {
+        return existing as u64 as *u8
+    }
+    state := malloc(384)
+    mut at: u64 = 0
+    while at < 384 {
+        set_byte(state, at, 0)
+        at += 1
+    }
+    set_word64(state, 16, list_new() as u64 as i64)
+    keyboard_open_devices(state)
+    set_word64(cell, 0, state as u64 as i64)
+    return state
+}
+
+fun set_byte(pointer: *u8, offset: u64, value: u8) {
+    slot := ((pointer as u64) + offset) as *u8
+    *slot = value
+}
+
+// Opens each `event*` device of /dev/input without blocking, as the runtime did; a device that cannot be opened is skipped.
+fun keyboard_open_devices(state: *u8) {
+    listing := directory_names(String("/dev/input"))
+    when listing.is_none() {
+        return
+    }
+    devices := word64_of(state, 16) as u64 as *u8
+    for name in listing.unwrap() {
+        when name.starts_with("event") {
+            mut path := String("/dev/input/")
+            path.append(name)
+            c_path := c_text(path)
+            descriptor := open(c_path, 526336, 0)
+            free(c_path)
+            when descriptor >= 0 {
+                list_push(devices, descriptor as u64 as *u8)
+            }
+        }
+    }
+}
+
+// The key ids of an evdev key code, as the runtime maps them: a code can name two keys (a modifier and its side).
+fun linux_key_ids(code: u64) -> Vec<u32> {
+    mut keys: Vec<u32> = Vec()
+    when code == 16 { keys.push(17) } else when code == 17 { keys.push(23) } else when code == 18 { keys.push(5) } else when code == 19 { keys.push(18) } else when code == 20 { keys.push(20) } else when code == 21 { keys.push(25) } else when code == 22 { keys.push(21) } else when code == 23 { keys.push(9) } else when code == 24 { keys.push(15) } else when code == 25 { keys.push(16) } else when code == 30 { keys.push(1) } else when code == 31 { keys.push(19) } else when code == 32 { keys.push(4) } else when code == 33 { keys.push(6) } else when code == 34 { keys.push(7) } else when code == 35 { keys.push(8) } else when code == 36 { keys.push(10) } else when code == 37 { keys.push(11) } else when code == 38 { keys.push(12) } else when code == 44 { keys.push(26) } else when code == 45 { keys.push(24) } else when code == 46 { keys.push(3) } else when code == 47 { keys.push(22) } else when code == 48 { keys.push(2) } else when code == 49 { keys.push(14) } else when code == 50 { keys.push(13) }
+    when code >= 2 && code <= 11 {
+        keys.push(27 + ((code - 2 + 1) % 10) as u32)
+    }
+    when code == 57 { keys.push(37) } else when code == 28 || code == 96 { keys.push(38) } else when code == 1 { keys.push(39) } else when code == 15 { keys.push(40) } else when code == 14 { keys.push(41) } else when code == 111 { keys.push(42) } else when code == 110 { keys.push(43) } else when code == 102 { keys.push(44) } else when code == 107 { keys.push(45) } else when code == 104 { keys.push(46) } else when code == 109 { keys.push(47) } else when code == 103 { keys.push(48) } else when code == 108 { keys.push(49) } else when code == 105 { keys.push(50) } else when code == 106 { keys.push(51) }
+    when code == 42 { keys.push(52)
+        keys.push(53) } else when code == 54 { keys.push(52)
+        keys.push(54) } else when code == 29 { keys.push(55)
+        keys.push(56) } else when code == 97 { keys.push(55)
+        keys.push(57) } else when code == 56 { keys.push(58)
+        keys.push(59) } else when code == 100 { keys.push(58)
+        keys.push(60) } else when code == 58 { keys.push(61) } else when code == 69 { keys.push(62) } else when code == 70 { keys.push(63) }
+    when code >= 59 && code <= 68 {
+        keys.push(64 + ((code - 59) as u32))
+    }
+    when code == 87 { keys.push(74) } else when code == 88 { keys.push(75) } else when code == 41 { keys.push(76) } else when code == 12 { keys.push(77) } else when code == 13 { keys.push(78) } else when code == 26 { keys.push(79) } else when code == 27 { keys.push(80) } else when code == 43 { keys.push(81) } else when code == 39 { keys.push(82) } else when code == 40 { keys.push(83) } else when code == 51 { keys.push(84) } else when code == 52 { keys.push(85) } else when code == 53 { keys.push(86) } else when code == 82 { keys.push(87) } else when code == 79 { keys.push(88) } else when code == 80 { keys.push(89) } else when code == 81 { keys.push(90) } else when code == 75 { keys.push(91) } else when code == 76 { keys.push(92) } else when code == 77 { keys.push(93) } else when code == 71 { keys.push(94) } else when code == 72 { keys.push(95) } else when code == 73 { keys.push(96) } else when code == 78 { keys.push(97) } else when code == 74 { keys.push(98) } else when code == 55 { keys.push(99) } else when code == 98 { keys.push(100) } else when code == 83 { keys.push(101) } else when code == 99 { keys.push(103) } else when code == 119 { keys.push(104) } else when code == 127 { keys.push(105) } else when code == 125 { keys.push(106) } else when code == 126 { keys.push(107) }
+    return keys
+}
+
+// The rules of the runtime's `apply_samples`: a key that goes down is pressed, one that goes up is released, and key 0 is
+// ignored, as are ids the table does not have.
+fun keyboard_sample(state: *u8, key: u32, pressed: bool) {
+    index := key as u64
+    when index == 0 || index >= 108 {
+        return
+    }
+    was_down := byte_of(state, 32 + index) != 0
+    when pressed && !was_down {
+        set_byte(state, 140 + index, 1)
+    } else when !pressed && was_down {
+        set_byte(state, 248 + index, 1)
+    }
+    mut value: u8 = 0
+    when pressed {
+        value = 1
+    }
+    set_byte(state, 32 + index, value)
+}
+
+// Reads every event waiting on each open device, without blocking, and applies the key presses and releases.
+fun keyboard_poll(state: *u8) {
+    devices := word64_of(state, 16) as u64 as *u8
+    event := malloc(24)
+    mut index: u64 = 0
+    while index < list_count(devices) {
+        descriptor := list_item(devices, index) as u64 as i32
+        index += 1
+        while true {
+            count := read(descriptor, event, 24)
+            when count != 24 {
+                break
+            }
+            // A `struct input_event` is 24 bytes: the type at 16, the code at 18 and the value at 20, all little-endian.
+            kind := (byte_of(event, 16) as u64) + 256 * (byte_of(event, 17) as u64)
+            code := (byte_of(event, 18) as u64) + 256 * (byte_of(event, 19) as u64)
+            value := word32_of(event, 20) as i32
+            when kind == 1 && (value == 0 || value == 1) {
+                for key in linux_key_ids(code) {
+                    keyboard_sample(state, key, value == 1)
+                }
+            }
+        }
+    }
+    free(event)
+}
+
+pub fun __rt_system_key_down(key_given: u32) -> bool {
+    when key_given >= 108 {
+        return false
+    }
+    state := keyboard_state()
+    keyboard_poll(state)
+    return byte_of(state, 32 + (key_given as u64)) != 0
+}
+
+// The pressed or released edge of a key since the last query, which the query clears.
+fun keyboard_edge(key: u32, flags: u64) -> bool {
+    when key >= 108 {
+        return false
+    }
+    state := keyboard_state()
+    keyboard_poll(state)
+    index := key as u64
+    was := byte_of(state, flags + index) != 0
+    set_byte(state, flags + index, 0)
+    return was
+}
+
+pub fun __rt_system_key_pressed(key_given: u32) -> bool {
+    return keyboard_edge(key_given, 140)
+}
+
+pub fun __rt_system_key_released(key_given: u32) -> bool {
+    return keyboard_edge(key_given, 248)
+}
+
+// The first key pressed since the last query, from key 1 upward; it waits in 4 ms steps until one is pressed.
+pub fun __rt_system_read_key() -> u32 {
+    state := keyboard_state()
+    when list_count(word64_of(state, 16) as u64 as *u8) == 0 {
+        runtime_failure(String("Linux realtime keyboard input requires read access to /dev/input/event*"))
+    }
+    while true {
+        keyboard_poll(state)
+        mut key: u64 = 1
+        while key < 108 {
+            when byte_of(state, 140 + key) != 0 {
+                set_byte(state, 140 + key, 0)
+                return key as u32
+            }
+            key += 1
+        }
+        __rt_system_sleep(4)
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The environment and the system
+
+fun valid_environment_key(key: String) -> bool {
+    when key.len() == 0 {
+        return false
+    }
+    mut at: u64 = 0
+    while at < key.len() {
+        byte := key.byte_at(at) as u64
+        when byte == 61 || byte == 0 {
+            return false
+        }
+        at += 1
+    }
+    return true
+}
+
+fun has_zero_byte(text: String) -> bool {
+    mut at: u64 = 0
+    while at < text.len() {
+        when (text.byte_at(at) as u64) == 0 {
+            return true
+        }
+        at += 1
+    }
+    return false
+}
+
+fun environment_value(key: String) -> Option<String> {
+    when !valid_environment_key(key.clone()) {
+        return Option::None
+    }
+    name := c_text(key.clone())
+    value := getenv(name)
+    free(name)
+    when (value as u64) == 0 {
+        return Option::None
+    }
+    return Option::Some(from_c(value))
+}
+
+pub fun __rt_system_env_get(key_given: str) -> String {
+    key := String(key_given)
+    value := environment_value(key.clone())
+    when value.is_none() {
+        return String("")
+    }
+    return value.unwrap()
+}
+
+pub fun __rt_system_env_exists(key_given: str) -> bool {
+    key := String(key_given)
+    return environment_value(key.clone()).is_some()
+}
+
+pub fun __rt_system_env_or(key_given: str, fallback_given: str) -> String {
+    key := String(key_given)
+    fallback := String(fallback_given)
+    value := environment_value(key.clone())
+    when value.is_none() {
+        return fallback
+    }
+    return value.unwrap()
+}
+
+pub fun __rt_system_set_env(key_given: str, value_given: str) -> bool {
+    key := String(key_given)
+    value := String(value_given)
+    when !valid_environment_key(key.clone()) || has_zero_byte(value.clone()) {
+        return false
+    }
+    name := c_text(key.clone())
+    text := c_text(value.clone())
+    status := setenv(name, text, 1)
+    free(text)
+    free(name)
+    return status == 0
+}
+
+pub fun __rt_system_remove_env(key_given: str) -> bool {
+    key := String(key_given)
+    when !valid_environment_key(key.clone()) {
+        return false
+    }
+    name := c_text(key.clone())
+    unsetenv(name)
+    free(name)
+    return true
+}
+
+pub fun __rt_system_current_dir() -> String {
+    buffer := getcwd(0 as *u8, 0)
+    when (buffer as u64) == 0 {
+        return String("")
+    }
+    text := from_c(buffer)
+    free(buffer)
+    return text
+}
+
+pub fun __rt_system_set_current_dir(path_given: str) -> bool {
+    path := String(path_given)
+    name := c_text(path.clone())
+    status := chdir(name)
+    free(name)
+    return status == 0
+}
+
+pub fun __rt_system_home_dir() -> String {
+    return __rt_system_env_get("HOME")
+}
+
+pub fun __rt_system_temp_dir() -> String {
+    value := environment_value(String("TMPDIR"))
+    when value.is_some() {
+        return value.unwrap()
+    }
+    return String("/tmp")
+}
+
+pub fun __rt_system_executable_path() -> String {
+    buffer := malloc(4097)
+    name := c_text(String("/proc/self/exe"))
+    length := readlink(name, buffer, 4096)
+    free(name)
+    when length <= 0 {
+        free(buffer)
+        return String("")
+    }
+    text := __native_string_from_raw(buffer, length as u64)
+    free(buffer)
+    return text
+}
+
+pub fun __rt_system_os() -> String {
+    return String("linux")
+}
+
+pub fun __rt_system_arch() -> String {
+    return String("x86_64")
+}
+
+pub fun __rt_system_cpu_count() -> u32 {
+    // `_SC_NPROCESSORS_ONLN` is 84 on Linux.
+    count := sysconf(84)
+    when count < 1 {
+        return 1 as u32
+    }
+    return count as u32
+}
+
+pub fun __rt_system_hostname() -> String {
+    return __rt_system_env_get("HOSTNAME")
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Time
+
+// The seconds of a clock (0 the wall clock, 1 the monotonic one).
+fun clock_seconds(clock: i32) -> f64 {
+    time := malloc(16)
+    clock_gettime(clock, time)
+    seconds := word64_of(time, 0)
+    nanoseconds := word64_of(time, 8)
+    free(time)
+    return (seconds as f64) + (nanoseconds as f64) / 1000000000.0
+}
+
+pub fun __rt_system_time_unix() -> f64 {
+    return clock_seconds(0)
+}
+
+pub fun __rt_system_time_monotonic() -> f64 {
+    return clock_seconds(1)
+}
+
+pub fun __rt_system_time_elapsed(started: f64) -> f64 {
+    elapsed := clock_seconds(1) - started
+    when elapsed < 0.0 {
+        return 0.0
+    }
+    return elapsed
+}
+
+pub fun __rt_system_sleep(milliseconds: u64) {
+    time := malloc(16)
+    set_word64(time, 0, (milliseconds / 1000) as i64)
+    set_word64(time, 8, ((milliseconds % 1000) * 1000000) as i64)
+    nanosleep(time, time)
+    free(time)
+}
+
+pub fun __rt_system_yield_thread() {
+    sched_yield()
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Standard input and output
+
+// Reads standard input to its end.
+pub fun __rt_system_read_stdin() -> String {
+    chunk: u64 = 65536
+    buffer := malloc(chunk)
+    mut text := String("")
+    while true {
+        count := read(0, buffer, chunk)
+        when count < 0 {
+            free(buffer)
+            mut message := String("could not read stdin: ")
+            message.append(os_error_text())
+            runtime_failure(message)
+            return String("")
+        }
+        when count == 0 {
+            break
+        }
+        piece := __native_string_from_raw(buffer, count as u64)
+        text.append(piece)
+    }
+    free(buffer)
+    return text
+}
+
+// Reads one line of standard input, a byte at a time so that nothing after it is consumed, without its line ending.
+pub fun __rt_system_read_stdin_line() -> String {
+    buffer := malloc(1)
+    mut collected := malloc(256)
+    mut capacity: u64 = 256
+    mut length: u64 = 0
+    while true {
+        count := read(0, buffer, 1)
+        when count < 0 {
+            mut message := String("could not read stdin line: ")
+            message.append(os_error_text())
+            runtime_failure(message)
+            return String("")
+        }
+        when count == 0 {
+            break
+        }
+        byte := byte_of(buffer, 0)
+        when length == capacity {
+            larger := malloc(capacity * 2)
+            mut at: u64 = 0
+            while at < length {
+                slot3 := ((larger as u64) + at) as *u8
+                *slot3 = byte_of(collected, at)
+                at += 1
+            }
+            free(collected)
+            collected = larger
+            capacity = capacity * 2
+        }
+        slot4 := ((collected as u64) + length) as *u8
+        *slot4 = byte
+        length += 1
+        when (byte as u64) == 10 {
+            break
+        }
+    }
+    free(buffer)
+    when length > 0 && (byte_of(collected, length - 1) as u64) == 10 {
+        length -= 1
+        when length > 0 && (byte_of(collected, length - 1) as u64) == 13 {
+            length -= 1
+        }
+    }
+    text := __native_string_from_raw(collected, length)
+    free(collected)
+    return text
+}
+
+fun write_all(descriptor: i32, text: String) {
+    buffer := c_text(text.clone())
+    mut written: u64 = 0
+    while written < text.len() {
+        count := write(descriptor, ((buffer as u64) + written) as *u8, text.len() - written)
+        when count <= 0 {
+            break
+        }
+        written += count as u64
+    }
+    free(buffer)
+}
+
+pub fun __rt_system_ask(prompt_given: str) -> String {
+    prompt := String(prompt_given)
+    write_all(1, prompt)
+    return __rt_system_read_stdin_line()
+}
+
+pub fun __rt_system_write_stdout(text_given: str) {
+    text := String(text_given)
+    write_all(1, text)
+}
+
+pub fun __rt_system_write_stderr(text_given: str) {
+    text := String(text_given)
+    write_all(2, text)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Dynamic libraries: `dlopen` with RTLD_NOW, as the bootstrap runtime opens them. A failure gives a null pointer.
+
+extern "C" fun dlopen(path: *u8, flags: i32) -> *u8;
+extern "C" fun dlsym(library: *u8, name: *u8) -> *u8;
+extern "C" fun dlclose(library: *u8) -> i32;
+
+pub fun __rt_system_load_library(path_given: str) -> *u8 {
+    path := String(path_given)
+    when has_zero_byte(path.clone()) {
+        return 0 as *u8
+    }
+    name := c_text(path)
+    library := dlopen(name, 2)
+    free(name)
+    return library
+}
+
+pub fun __rt_system_load_symbol(library: *u8, name_given: str) -> *u8 {
+    when (library as u64) == 0 {
+        return 0 as *u8
+    }
+    name := String(name_given)
+    when has_zero_byte(name.clone()) {
+        return 0 as *u8
+    }
+    text := c_text(name)
+    symbol := dlsym(library, text)
+    free(text)
+    return symbol
+}
+
+pub fun __rt_system_unload_library(library: *u8) -> bool {
+    when (library as u64) == 0 {
+        return false
+    }
+    return dlclose(library) == 0
+}
+
+type CFunctionI32 = extern "C" fun(i32) -> i32
+
+// Calls the C function `function(i32) -> i32`; a null pointer gives the minimum integer, as the bootstrap runtime does.
+pub fun __rt_system_call_c_i32_one(function: *u8, argument: i32) -> i32 {
+    when (function as u64) == 0 {
+        return -2147483647 - 1
+    }
+    typed: CFunctionI32 = function as CFunctionI32
+    return typed(argument)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Child processes, run to their end with the standard streams inherited. A program that cannot be started gives -1, as
+// `std::process::Command::status` fails: the child reports the failed `execvp` through a pipe that closes on a successful one.
+
+extern "C" fun fork() -> i32;
+extern "C" fun execvp(file: *u8, arguments: *u8) -> i32;
+extern "C" fun waitpid(process: i32, status: *u8, options: i32) -> i32;
+extern "C" fun pipe(descriptors: *u8) -> i32;
+extern "C" fun fcntl(descriptor: i32, command: i32, argument: i32) -> i32;
+extern "C" fun _exit(status: i32);
+
+fun set_word32(pointer: *u8, offset: u64, value: i32) {
+    slot5 := ((pointer as u64) + offset) as *i32
+    *slot5 = value
+}
+
+// The exit status of a process as `wait` reports it, or -1 when it ended by a signal.
+fun exit_status_of(status: i32) -> i32 {
+    when (status & 127) == 0 {
+        return (status >> 8) & 255
+    }
+    return -1
+}
+
+fun run_program(program: String, arguments: Vec<String>) -> i32 {
+    count := arguments.len()
+    // The argument vector: the program, its arguments, and a null pointer.
+    vector := malloc(8 * (count + 2))
+    set_word64(vector, 0, c_text(program.clone()) as u64 as i64)
+    mut position: u64 = 0
+    while position < count {
+        set_word64(vector, 8 * (position + 1), c_text(arguments[position].clone()) as u64 as i64)
+        position += 1
+    }
+    set_word64(vector, 8 * (count + 1), 0)
+    file := word64_of(vector, 0) as *u8
+    // The pipe carries the child's `errno` when it could not be executed.
+    ends := malloc(8)
+    when pipe(ends) != 0 {
+        free(ends)
+        return -1
+    }
+    reading := word32_of(ends, 0) as i32
+    writing := word32_of(ends, 4) as i32
+    child := fork()
+    when child == 0 {
+        close(reading)
+        fcntl(writing, 2, 1)
+        execvp(file, vector)
+        report := malloc(4)
+        set_word32(report, 0, errno_value())
+        write(writing, report, 4)
+        _exit(127)
+    }
+    close(writing)
+    report := malloc(4)
+    received := read(reading, report, 4)
+    close(reading)
+    status := malloc(4)
+    waitpid(child, status, 0)
+    mut code := exit_status_of(word32_of(status, 0) as i32)
+    when child < 0 || received == 4 {
+        code = -1
+    }
+    free(status)
+    free(report)
+    free(ends)
+    position = 0
+    while position < count + 1 {
+        free(word64_of(vector, 8 * position) as *u8)
+        position += 1
+    }
+    free(vector)
+    return code
+}
+
+pub fun __rt_system_run_process(program_given: str) -> i32 {
+    program := String(program_given)
+    arguments: Vec<String> = Vec()
+    return run_program(program, arguments)
+}
+
+pub fun __rt_system_run_process_args(program_given: str, arguments: Vec<String>) -> i32 {
+    program := String(program_given)
+    return run_program(program, arguments)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The process builder and captured runs. A builder is a record of its program, its arguments and environment (two lists of
+// C strings), its working directory, and the identifier of its child (zero when there is none). A child that cannot be
+// started is reported through a pipe, as `run_process` reports it.
+
+extern "C" fun kill(process: i32, signal: i32) -> i32;
+extern "C" fun dup2(from: i32, to: i32) -> i32;
+extern "C" fun realloc(pointer: *u8, size: u64) -> *u8;
+
+// A list of C strings: its items, its count and its capacity.
+fun list_new() -> *u8 {
+    record := malloc(24)
+    set_word64(record, 0, 0)
+    set_word64(record, 8, 0)
+    set_word64(record, 16, 0)
+    return record
+}
+
+fun list_push(list: *u8, item: *u8) {
+    count := word64_of(list, 8) as u64
+    mut capacity := word64_of(list, 16) as u64
+    mut items := word64_of(list, 0) as u64 as *u8
+    when count == capacity {
+        capacity = 2 * capacity + 4
+        items = realloc(items, 8 * capacity)
+        set_word64(list, 0, items as u64 as i64)
+        set_word64(list, 16, capacity as i64)
+    }
+    set_word64(items, 8 * count, item as u64 as i64)
+    set_word64(list, 8, (count + 1) as i64)
+}
+
+fun list_count(list: *u8) -> u64 {
+    return word64_of(list, 8) as u64
+}
+
+fun list_item(list: *u8, index: u64) -> *u8 {
+    items := word64_of(list, 0) as u64 as *u8
+    return word64_of(items, 8 * index) as u64 as *u8
+}
+
+fun list_free(list: *u8) {
+    mut index: u64 = 0
+    while index < list_count(list) {
+        free(list_item(list, index))
+        index += 1
+    }
+    free(word64_of(list, 0) as u64 as *u8)
+    free(list)
+}
+
+// Whether a C string holds the text (its bytes, then the terminating zero).
+fun c_text_is(item: *u8, text: String) -> bool {
+    mut at: u64 = 0
+    while at < text.len() {
+        when byte_of(item, at) != text.byte_at(at) {
+            return false
+        }
+        at += 1
+    }
+    return byte_of(item, text.len()) == 0
+}
+
+// An argument vector for `execvp`: the program, its arguments, and a null pointer.
+fun argument_vector(program: *u8, arguments: *u8) -> *u8 {
+    count := list_count(arguments)
+    vector := malloc(8 * (count + 2))
+    set_word64(vector, 0, program as u64 as i64)
+    mut position: u64 = 0
+    while position < count {
+        set_word64(vector, 8 * (position + 1), list_item(arguments, position) as u64 as i64)
+        position += 1
+    }
+    set_word64(vector, 8 * (count + 1), 0)
+    return vector
+}
+
+// The record of a process builder: program, arguments, environment keys and values, working directory, and child.
+pub fun __rt_system_process_new(program_given: str) -> *u8 {
+    record := malloc(48)
+    set_word64(record, 0, c_text(String(program_given)) as u64 as i64)
+    set_word64(record, 8, list_new() as u64 as i64)
+    set_word64(record, 16, list_new() as u64 as i64)
+    set_word64(record, 24, list_new() as u64 as i64)
+    set_word64(record, 32, 0)
+    set_word64(record, 40, 0)
+    return record
+}
+
+pub fun __rt_system_process_arg(handle: *u8, value_given: str) -> bool {
+    when (handle as u64) == 0 || word64_of(handle, 40) != 0 {
+        return false
+    }
+    list_push(word64_of(handle, 8) as u64 as *u8, c_text(String(value_given)))
+    return true
+}
+
+pub fun __rt_system_process_args(handle: *u8, values: Vec<String>) -> bool {
+    when (handle as u64) == 0 || word64_of(handle, 40) != 0 {
+        return false
+    }
+    for value in values {
+        list_push(word64_of(handle, 8) as u64 as *u8, c_text(value))
+    }
+    return true
+}
+
+pub fun __rt_system_process_env(handle: *u8, key_given: str, value_given: str) -> bool {
+    when (handle as u64) == 0 || word64_of(handle, 40) != 0 {
+        return false
+    }
+    key := String(key_given)
+    keys := word64_of(handle, 16) as u64 as *u8
+    values := word64_of(handle, 24) as u64 as *u8
+    mut position: u64 = 0
+    while position < list_count(keys) {
+        when c_text_is(list_item(keys, position), key.clone()) {
+            free(list_item(values, position))
+            set_word64(word64_of(values, 0) as u64 as *u8, 8 * position, c_text(String(value_given)) as u64 as i64)
+            return true
+        }
+        position += 1
+    }
+    list_push(keys, c_text(key))
+    list_push(values, c_text(String(value_given)))
+    return true
+}
+
+pub fun __rt_system_process_cwd(handle: *u8, path_given: str) -> bool {
+    when (handle as u64) == 0 || word64_of(handle, 40) != 0 {
+        return false
+    }
+    previous := word64_of(handle, 32) as u64 as *u8
+    when (previous as u64) != 0 {
+        free(previous)
+    }
+    set_word64(handle, 32, c_text(String(path_given)) as u64 as i64)
+    return true
+}
+
+// Starts the child with the builder's arguments, environment and working directory. A child that cannot be started gives
+// false, and no child is kept.
+pub fun __rt_system_process_spawn(handle: *u8) -> bool {
+    when (handle as u64) == 0 || word64_of(handle, 40) != 0 {
+        return false
+    }
+    program := word64_of(handle, 0) as u64 as *u8
+    arguments := word64_of(handle, 8) as u64 as *u8
+    keys := word64_of(handle, 16) as u64 as *u8
+    values := word64_of(handle, 24) as u64 as *u8
+    directory := word64_of(handle, 32) as u64 as *u8
+    vector := argument_vector(program, arguments)
+    ends := malloc(8)
+    when pipe(ends) != 0 {
+        free(ends)
+        free(vector)
+        return false
+    }
+    reading := word32_of(ends, 0) as i32
+    writing := word32_of(ends, 4) as i32
+    report := malloc(4)
+    child := fork()
+    when child == 0 {
+        close(reading)
+        fcntl(writing, 2, 1)
+        mut position: u64 = 0
+        while position < list_count(keys) {
+            setenv(list_item(keys, position), list_item(values, position), 1)
+            position += 1
+        }
+        when (directory as u64) != 0 && chdir(directory) != 0 {
+            set_word32(report, 0, errno_value())
+            write(writing, report, 4)
+            _exit(127)
+        }
+        execvp(program, vector)
+        set_word32(report, 0, errno_value())
+        write(writing, report, 4)
+        _exit(127)
+    }
+    close(writing)
+    received := read(reading, report, 4)
+    close(reading)
+    free(report)
+    free(ends)
+    free(vector)
+    when child <= 0 || received == 4 {
+        when child > 0 {
+            waitpid(child, malloc(4), 0)
+        }
+        return false
+    }
+    set_word64(handle, 40, child as i64)
+    return true
+}
+
+// Waits for the child: its exit status, or -1 when there is no child, or it ended by a signal. The child is no longer kept.
+pub fun __rt_system_process_wait(handle: *u8) -> i32 {
+    when (handle as u64) == 0 || word64_of(handle, 40) == 0 {
+        return -1
+    }
+    child := word64_of(handle, 40) as i32
+    set_word64(handle, 40, 0)
+    status := malloc(4)
+    waited := waitpid(child, status, 0)
+    code := exit_status_of(word32_of(status, 0) as i32)
+    free(status)
+    when waited < 0 {
+        return -1
+    }
+    return code
+}
+
+pub fun __rt_system_process_kill(handle: *u8) -> bool {
+    when (handle as u64) == 0 || word64_of(handle, 40) == 0 {
+        return false
+    }
+    return kill(word64_of(handle, 40) as i32, 9) == 0
+}
+
+// Frees a builder. A child that was started is not waited for, as dropping a `std::process::Child` does not wait.
+pub fun __rt_system_process_drop(handle: *u8) {
+    when (handle as u64) == 0 {
+        return
+    }
+    free(word64_of(handle, 0) as u64 as *u8)
+    list_free(word64_of(handle, 8) as u64 as *u8)
+    list_free(word64_of(handle, 16) as u64 as *u8)
+    list_free(word64_of(handle, 24) as u64 as *u8)
+    when word64_of(handle, 32) != 0 {
+        free(word64_of(handle, 32) as u64 as *u8)
+    }
+    free(handle)
+}
+
+// A growing buffer of bytes: its data, its length and its capacity.
+fun buffer_append(buffer: *u8, source: *u8, count: u64) {
+    length := word64_of(buffer, 8) as u64
+    mut capacity := word64_of(buffer, 16) as u64
+    mut data := word64_of(buffer, 0) as u64 as *u8
+    when length + count > capacity {
+        capacity = 2 * (length + count) + 64
+        data = realloc(data, capacity)
+        set_word64(buffer, 0, data as u64 as i64)
+        set_word64(buffer, 16, capacity as i64)
+    }
+    mut at: u64 = 0
+    while at < count {
+        slot6 := ((data as u64) + length + at) as *u8
+        *slot6 = byte_of(source, at)
+        at += 1
+    }
+    set_word64(buffer, 8, (length + count) as i64)
+}
+
+// Reads both pipes until both reach their ends, so that neither child output blocks the other.
+fun drain_pipes(first: i32, second: i32, first_buffer: *u8, second_buffer: *u8) {
+    polls := malloc(16)
+    chunk := malloc(4096)
+    mut open_first := first
+    mut open_second := second
+    while open_first >= 0 || open_second >= 0 {
+        set_word32(polls, 0, open_first as u32 as i32)
+        set_word32(polls, 4, 0)
+        set_word32(polls, 8, open_second as u32 as i32)
+        set_word32(polls, 12, 0)
+        // POLLIN is 1 for each open pipe.
+        cell_first := ((polls as u64) + 4) as *i16
+        cell_second := ((polls as u64) + 12) as *i16
+        *cell_first = 1
+        *cell_second = 1
+        poll(polls, 2, -1)
+        when open_first >= 0 && *((((polls as u64) + 6) as *i16)) != 0 {
+            count := read(open_first, chunk, 4096)
+            when count <= 0 {
+                close(open_first)
+                open_first = -1
+            } else {
+                buffer_append(first_buffer, chunk, count as u64)
+            }
+        }
+        when open_second >= 0 && *((((polls as u64) + 14) as *i16)) != 0 {
+            count := read(open_second, chunk, 4096)
+            when count <= 0 {
+                close(open_second)
+                open_second = -1
+            } else {
+                buffer_append(second_buffer, chunk, count as u64)
+            }
+        }
+    }
+    free(chunk)
+    free(polls)
+}
+
+extern "C" fun poll(descriptors: *u8, count: u64, timeout: i32) -> i32;
+
+// Runs a program to its end with its output captured. A program that cannot be started gives -1 and no output.
+// The record: exit code, then the pointer and length of the standard output and of the standard error.
+fun capture_program(program: String, arguments: *u8) -> *u8 {
+    record := malloc(40)
+    set_word64(record, 0, -1)
+    set_word64(record, 8, 0)
+    set_word64(record, 16, 0)
+    set_word64(record, 24, 0)
+    set_word64(record, 32, 0)
+    file := c_text(program)
+    vector := argument_vector(file, arguments)
+    outs := malloc(8)
+    errs := malloc(8)
+    report := malloc(4)
+    when pipe(outs) != 0 || pipe(errs) != 0 {
+        free(outs)
+        free(errs)
+        free(report)
+        free(vector)
+        return record
+    }
+    out_reading := word32_of(outs, 0) as i32
+    out_writing := word32_of(outs, 4) as i32
+    err_reading := word32_of(errs, 0) as i32
+    err_writing := word32_of(errs, 4) as i32
+    rep_ends := malloc(8)
+    pipe(rep_ends)
+    rep_reading := word32_of(rep_ends, 0) as i32
+    rep_writing := word32_of(rep_ends, 4) as i32
+    child := fork()
+    when child == 0 {
+        close(out_reading)
+        close(err_reading)
+        close(rep_reading)
+        fcntl(rep_writing, 2, 1)
+        dup2(out_writing, 1)
+        dup2(err_writing, 2)
+        close(out_writing)
+        close(err_writing)
+        input := open(c_text(String("/dev/null")), 0, 0 as u32)
+        dup2(input, 0)
+        execvp(file, vector)
+        set_word32(report, 0, errno_value())
+        write(rep_writing, report, 4)
+        _exit(127)
+    }
+    close(out_writing)
+    close(err_writing)
+    close(rep_writing)
+    received := read(rep_reading, report, 4)
+    close(rep_reading)
+    free(rep_ends)
+    free(report)
+    free(vector)
+    free(file)
+    stdout_buffer := malloc(24)
+    stderr_buffer := malloc(24)
+    set_word64(stdout_buffer, 0, 0)
+    set_word64(stdout_buffer, 8, 0)
+    set_word64(stdout_buffer, 16, 0)
+    set_word64(stderr_buffer, 0, 0)
+    set_word64(stderr_buffer, 8, 0)
+    set_word64(stderr_buffer, 16, 0)
+    when child <= 0 || received == 4 {
+        close(out_reading)
+        close(err_reading)
+        when child > 0 {
+            waitpid(child, malloc(4), 0)
+        }
+    } else {
+        drain_pipes(out_reading, err_reading, stdout_buffer, stderr_buffer)
+        status := malloc(4)
+        waitpid(child, status, 0)
+        set_word64(record, 0, exit_status_of(word32_of(status, 0) as i32) as i64)
+        free(status)
+    }
+    set_word64(record, 8, word64_of(stdout_buffer, 0))
+    set_word64(record, 16, word64_of(stdout_buffer, 8))
+    set_word64(record, 24, word64_of(stderr_buffer, 0))
+    set_word64(record, 32, word64_of(stderr_buffer, 8))
+    free(stdout_buffer)
+    free(stderr_buffer)
+    free(outs)
+    free(errs)
+    return record
+}
+
+pub fun __rt_system_process_capture(program_given: str, arguments: Vec<String>) -> *u8 {
+    list := list_new()
+    for value in arguments {
+        list_push(list, c_text(value))
+    }
+    record := capture_program(String(program_given), list)
+    list_free(list)
+    return record
+}
+
+pub fun __rt_system_process_capture_exit_code(capture: *u8) -> i32 {
+    when (capture as u64) == 0 {
+        return -1
+    }
+    return word64_of(capture, 0) as i32
+}
+
+pub fun __rt_system_process_capture_stdout(capture: *u8) -> String {
+    when (capture as u64) == 0 || word64_of(capture, 16) == 0 {
+        return String("")
+    }
+    return __native_string_from_raw(word64_of(capture, 8) as u64 as *u8, word64_of(capture, 16) as u64)
+}
+
+pub fun __rt_system_process_capture_stderr(capture: *u8) -> String {
+    when (capture as u64) == 0 || word64_of(capture, 32) == 0 {
+        return String("")
+    }
+    return __native_string_from_raw(word64_of(capture, 24) as u64 as *u8, word64_of(capture, 32) as u64)
+}
+
+pub fun __rt_system_process_capture_drop(capture: *u8) {
+    when (capture as u64) == 0 {
+        return
+    }
+    when word64_of(capture, 8) != 0 {
+        free(word64_of(capture, 8) as u64 as *u8)
+    }
+    when word64_of(capture, 24) != 0 {
+        free(word64_of(capture, 24) as u64 as *u8)
+    }
+    free(capture)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Threads. A thread is a record of three cells: the `pthread` identifier, the identifier Ryn reports (the same value, which
+// is unique among the live threads, where the bootstrap runtime counts its threads from 1), and whether it was joined.
+
+extern "C" fun pthread_create(thread: *u8, attributes: *u8, routine: *u8, argument: *u8) -> i32;
+extern "C" fun pthread_join(thread: u64, result: *u8) -> i32;
+extern "C" fun pthread_detach(thread: u64) -> i32;
+
+pub fun __rt_system_thread_spawn(worker: extern "C" fun()) -> *u8 {
+    record := malloc(24)
+    when pthread_create(record, 0 as *u8, worker as *u8, 0 as *u8) != 0 {
+        free(record)
+        return 0 as *u8
+    }
+    identifier := word64_of(record, 0)
+    set_word64(record, 8, identifier)
+    set_word64(record, 16, 0)
+    return record
+}
+
+pub fun __rt_system_thread_join(handle: *u8) -> bool {
+    when (handle as u64) == 0 {
+        return false
+    }
+    when word64_of(handle, 16) != 0 {
+        return false
+    }
+    set_word64(handle, 16, 1)
+    return pthread_join(word64_of(handle, 0) as u64, 0 as *u8) == 0
+}
+
+pub fun __rt_system_thread_id(handle: *u8) -> u64 {
+    when (handle as u64) == 0 {
+        return 0
+    }
+    return word64_of(handle, 8) as u64
+}
+
+// A thread that is dropped without being joined is detached, and its record is freed.
+pub fun __rt_system_thread_drop(handle: *u8) {
+    when (handle as u64) == 0 {
+        return
+    }
+    when word64_of(handle, 16) == 0 {
+        pthread_detach(word64_of(handle, 0) as u64)
+    }
+    free(handle)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Parsing integers, as `str::parse` reads the whole text: an optional sign, then digits, and nothing else.
+
+// The magnitude of the digits after the sign, or None when there are no digits or one of them is not a digit or the value
+// does not fit in 64 bits.
+fun invalid_number(label: str) {
+    mut message := String("String is not a valid ")
+    message.append(label)
+    runtime_failure(message)
+}
+
+fun integer_magnitude(text: String) -> Option<u64> {
+    mut at: u64 = 0
+    when text.len() > 0 && (text.byte_at(0) == 43 || text.byte_at(0) == 45) {
+        at = 1
+    }
+    when at == text.len() {
+        return Option::None
+    }
+    mut value: u64 = 0
+    while at < text.len() {
+        byte := text.byte_at(at)
+        when byte < 48 || byte > 57 {
+            return Option::None
+        }
+        digit := (byte - 48) as u64
+        when value > (((0 as u64) - 1) - digit) / 10 {
+            return Option::None
+        }
+        value = value * 10 + digit
+        at += 1
+    }
+    return Option::Some(value)
+}
+
+fun is_negative_text(text: String) -> bool {
+    return text.len() > 0 && text.byte_at(0) == 45
+}
+
+// The value of a signed integer of `bits` bits with this sign and magnitude, or None outside its range.
+fun signed_value(negative: bool, magnitude: u64, bits: u64) -> Option<i64> {
+    limit: u64 = (1 as u64) << ((bits - 1) as u32)
+    when negative {
+        when magnitude > limit {
+            return Option::None
+        }
+        when magnitude == 0 {
+            return Option::Some(0)
+        }
+        inner := (magnitude - 1) as i64
+        return Option::Some((0 as i64) - inner - 1)
+    }
+    when magnitude >= limit {
+        return Option::None
+    }
+    return Option::Some(magnitude as i64)
+}
+
+fun parse_signed(text_given: str, bits: u64, label: str) -> i64 {
+    text := String(text_given)
+    magnitude := integer_magnitude(text.clone())
+    when magnitude.is_none() {
+        invalid_number(label)
+        return 0
+    }
+    value := signed_value(is_negative_text(text), magnitude.unwrap(), bits)
+    when value.is_none() {
+        invalid_number(label)
+        return 0
+    }
+    return value.unwrap()
+}
+
+fun parse_unsigned(text_given: str, bits: u64, label: str) -> u64 {
+    text := String(text_given)
+    magnitude := integer_magnitude(text.clone())
+    when magnitude.is_none() || is_negative_text(text.clone()) {
+        invalid_number(label)
+        return 0
+    }
+    value := magnitude.unwrap()
+    when bits < 64 && value > ((1 as u64) << (bits as u32)) - 1 {
+        invalid_number(label)
+        return 0
+    }
+    return value
+}
+
+pub fun __rt_string_to_i8(text_given: str) -> i8 {
+    return parse_signed(text_given, 8, "i8 value") as i8
+}
+
+pub fun __rt_string_to_i16(text_given: str) -> i16 {
+    return parse_signed(text_given, 16, "i16 value") as i16
+}
+
+pub fun __rt_string_to_i32(text_given: str) -> i32 {
+    return parse_signed(text_given, 32, "i32 value") as i32
+}
+
+pub fun __rt_string_to_i64(text_given: str) -> i64 {
+    return parse_signed(text_given, 64, "i64 value")
+}
+
+pub fun __rt_string_to_u8(text_given: str) -> u8 {
+    return parse_unsigned(text_given, 8, "u8 value") as u8
+}
+
+pub fun __rt_string_to_u16(text_given: str) -> u16 {
+    return parse_unsigned(text_given, 16, "u16 value") as u16
+}
+
+pub fun __rt_string_to_u32(text_given: str) -> u32 {
+    return parse_unsigned(text_given, 32, "u32 value") as u32
+}
+
+pub fun __rt_string_to_u64(text_given: str) -> u64 {
+    return parse_unsigned(text_given, 64, "u64 value")
+}
+
+// Parsing floating-point numbers as `str::parse` reads them: an optional sign, then digits with an optional point and an
+// optional exponent, or `inf`, `infinity` and `nan` in any case. The C library converts the checked text, correctly rounded.
+
+extern "C" fun strtod(text: *u8, end: *u8) -> f64;
+extern "C" fun strtof(text: *u8, end: *u8) -> f32;
+
+fun lower_byte(byte: u8) -> u8 {
+    when byte >= 65 && byte <= 90 {
+        return byte + 32
+    }
+    return byte
+}
+
+fun word_is(text: String, from: u64, word: str) -> bool {
+    when text.len() - from != word.len() {
+        return false
+    }
+    mut at: u64 = 0
+    while at < word.len() {
+        when lower_byte(text.byte_at(from + at)) != lower_byte(word.byte_at(at)) {
+            return false
+        }
+        at += 1
+    }
+    return true
+}
+
+fun is_float_text(text: String) -> bool {
+    mut at: u64 = 0
+    when text.len() > 0 && (text.byte_at(0) == 43 || text.byte_at(0) == 45) {
+        at = 1
+    }
+    when word_is(text.clone(), at, "inf") || word_is(text.clone(), at, "infinity") || word_is(text.clone(), at, "nan") {
+        return true
+    }
+    mut digits: u64 = 0
+    while at < text.len() && text.byte_at(at) >= 48 && text.byte_at(at) <= 57 {
+        digits += 1
+        at += 1
+    }
+    when at < text.len() && text.byte_at(at) == 46 {
+        at += 1
+        while at < text.len() && text.byte_at(at) >= 48 && text.byte_at(at) <= 57 {
+            digits += 1
+            at += 1
+        }
+    }
+    when digits == 0 {
+        return false
+    }
+    when at < text.len() && (text.byte_at(at) == 101 || text.byte_at(at) == 69) {
+        at += 1
+        when at < text.len() && (text.byte_at(at) == 43 || text.byte_at(at) == 45) {
+            at += 1
+        }
+        mut exponent: u64 = 0
+        while at < text.len() && text.byte_at(at) >= 48 && text.byte_at(at) <= 57 {
+            exponent += 1
+            at += 1
+        }
+        when exponent == 0 {
+            return false
+        }
+    }
+    return at == text.len()
+}
+
+pub fun __rt_string_to_f64(text_given: str) -> f64 {
+    text := String(text_given)
+    when !is_float_text(text.clone()) {
+        invalid_number("f64 value")
+        return 0.0
+    }
+    converted := c_text(text)
+    value := strtod(converted, 0 as *u8)
+    free(converted)
+    return value
+}
+
+pub fun __rt_string_to_f32(text_given: str) -> f32 {
+    text := String(text_given)
+    when !is_float_text(text.clone()) {
+        invalid_number("f32 value")
+        return 0.0
+    }
+    converted := c_text(text)
+    value := strtof(converted, 0 as *u8)
+    free(converted)
+    return value
+}
+
+// The bytes of a text as `str::bytes` gives them.
+pub fun __rt_string_bytes(text_given: str) -> Vec<u8> {
+    text := String(text_given)
+    mut bytes: Vec<u8> = Vec()
+    mut at: u64 = 0
+    while at < text.len() {
+        bytes.push(text.byte_at(at))
+        at += 1
+    }
+    return bytes
+}
+
+// The characters of a text as `str::chars` gives them: each is the Unicode scalar value its UTF-8 bytes encode.
+pub fun __rt_string_chars(text_given: str) -> Vec<char> {
+    text := String(text_given)
+    mut characters: Vec<char> = Vec()
+    mut at: u64 = 0
+    while at < text.len() {
+        lead := text.byte_at(at) as u32
+        mut width: u64 = 1
+        mut value: u32 = lead
+        when lead >= 240 {
+            width = 4
+            value = lead & 7
+        } else when lead >= 224 {
+            width = 3
+            value = lead & 15
+        } else when lead >= 192 {
+            width = 2
+            value = lead & 31
+        }
+        mut part: u64 = 1
+        while part < width {
+            value = (value << (6 as u32)) | ((text.byte_at(at + part) as u32) & 63)
+            part += 1
+        }
+        characters.push(char_from_u32(value))
+        at += width
+    }
+    return characters
+}
+
+// The text repeated `count` times. A repeated text that would not fit in the address space fails, as the runtime does.
+pub fun __rt_string_repeat(text_given: str, count: u64) -> String {
+    text := String(text_given)
+    length := text.len()
+    when length > 0 && count > 18446744073709551615 / length {
+        runtime_failure(String("repeated String is too large"))
+    }
+    mut repeated := String("")
+    mut at: u64 = 0
+    while at < count {
+        repeated.append(text.clone())
+        at += 1
+    }
+    return repeated
+}
+
+// The lines of a text as `str::lines` gives them: each ends at a line feed, which a carriage return before it is removed
+// with, and a last line without a line feed is kept as it is. A text without characters has no lines.
+pub fun __rt_string_lines(text_given: str) -> Vec<String> {
+    text := String(text_given)
+    mut lines: Vec<String> = Vec()
+    mut start: u64 = 0
+    mut at: u64 = 0
+    while at < text.len() {
+        when text.byte_at(at) == 10 {
+            mut end := at
+            when end > start && text.byte_at(end - 1) == 13 {
+                end -= 1
+            }
+            lines.push(text.slice(start, end))
+            start = at + 1
+        }
+        at += 1
+    }
+    when start < text.len() {
+        lines.push(text.slice(start, text.len()))
+    }
+    return lines
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Copying, renaming and appending files, as the bootstrap runtime does them with `std::fs`.
+
+extern "C" fun rename(from: *u8, to: *u8) -> i32;
+
+// Writes `count` bytes of `data` to the file descriptor; false when a write fails.
+fun write_bytes(descriptor: i32, data: *u8, count: u64) -> bool {
+    mut written: u64 = 0
+    while written < count {
+        sent := write(descriptor, ((data as u64) + written) as *u8, count - written)
+        when sent <= 0 {
+            return false
+        }
+        written += sent as u64
+    }
+    return true
+}
+
+pub fun __rt_filesystem_copy_file(from_given: str, to_given: str) -> bool {
+    from := c_text(String(from_given))
+    source := open(from, 0, 0 as u32)
+    free(from)
+    when source < 0 {
+        return false
+    }
+    to := c_text(String(to_given))
+    // O_WRONLY | O_CREAT | O_TRUNC, with mode 0644.
+    target := open(to, 577, 420 as u32)
+    free(to)
+    when target < 0 {
+        close(source)
+        return false
+    }
+    chunk := malloc(65536)
+    mut ok := true
+    while true {
+        count := read(source, chunk, 65536)
+        when count == 0 {
+            break
+        }
+        when count < 0 || !write_bytes(target, chunk, count as u64) {
+            ok = false
+            break
+        }
+    }
+    free(chunk)
+    close(source)
+    close(target)
+    return ok
+}
+
+pub fun __rt_filesystem_rename(from_given: str, to_given: str) -> bool {
+    from := c_text(String(from_given))
+    to := c_text(String(to_given))
+    status := rename(from, to)
+    free(from)
+    free(to)
+    return status == 0
+}
+
+pub fun __rt_filesystem_append_file(path_given: str, data_given: str) -> bool {
+    path := c_text(String(path_given))
+    // O_WRONLY | O_CREAT | O_APPEND, with mode 0644.
+    target := open(path, 1089, 420 as u32)
+    free(path)
+    when target < 0 {
+        return false
+    }
+    data := String(data_given)
+    text := c_text(data.clone())
+    ok := write_bytes(target, text, data.len())
+    free(text)
+    close(target)
+    return ok
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// TCP and UDP sockets, over the C library's sockets. A socket is a record of its descriptor (-1 when there is none, as a
+// failed `connect` or `bind` leaves none in the bootstrap runtime). Addresses are `ip:port`, IPv6 in brackets; `connect`
+// also takes host names, through the first address the resolver gives.
+
+extern "C" fun socket(domain: i32, kind: i32, protocol: i32) -> i32;
+extern "C" fun bind(descriptor: i32, address: *u8, length: u32) -> i32;
+extern "C" fun listen(descriptor: i32, backlog: i32) -> i32;
+extern "C" fun accept(descriptor: i32, address: *u8, length: *u8) -> i32;
+extern "C" fun connect(descriptor: i32, address: *u8, length: u32) -> i32;
+extern "C" fun setsockopt(descriptor: i32, level: i32, name: i32, value: *u8, length: u32) -> i32;
+extern "C" fun send(descriptor: i32, buffer: *u8, length: u64, flags: i32) -> i64;
+extern "C" fun recv(descriptor: i32, buffer: *u8, length: u64, flags: i32) -> i64;
+extern "C" fun getaddrinfo(node: *u8, service: *u8, hints: *u8, result: *u8) -> i32;
+extern "C" fun freeaddrinfo(info: *u8);
+extern "C" fun inet_pton(family: i32, text: *u8, address: *u8) -> i32;
+extern "C" fun inet_ntop(family: i32, address: *u8, text: *u8, size: u32) -> *u8;
+extern "C" fun htons(value: u16) -> u16;
+
+// The socket record: the descriptor, held as a 64-bit cell.
+fun socket_descriptor(handle: *u8) -> i32 {
+    return word64_of(handle, 0) as i32
+}
+
+fun close_socket(handle: *u8) -> bool {
+    when socket_descriptor(handle) < 0 {
+        return false
+    }
+    close(socket_descriptor(handle))
+    set_word64(handle, 0, -1)
+    return true
+}
+
+// The position of the last colon of a text, or -1.
+fun last_colon(text: String) -> i64 {
+    mut at: u64 = text.len()
+    while at > 0 {
+        at -= 1
+        when text.byte_at(at) == 58 {
+            return at as i64
+        }
+    }
+    return -1
+}
+
+// A port number: decimal digits of at most five places that give at most 65535.
+fun parse_port(text: String) -> Option<u64> {
+    when text.len() == 0 || text.len() > 5 {
+        return Option::None
+    }
+    mut value: u64 = 0
+    mut at: u64 = 0
+    while at < text.len() {
+        byte := text.byte_at(at)
+        when byte < 48 || byte > 57 {
+            return Option::None
+        }
+        value = value * 10 + ((byte - 48) as u64)
+        at += 1
+    }
+    when value > 65535 {
+        return Option::None
+    }
+    return Option::Some(value)
+}
+
+// Writes the socket address `text` names as a literal, `ip:port`, into `storage`, and gives its length (0 when it is not one).
+fun literal_address(text: String, storage: *u8) -> u32 {
+    colon := last_colon(text.clone())
+    when colon < 0 {
+        return 0
+    }
+    port := parse_port(text.slice(colon as u64 + 1, text.len()))
+    when port.is_none() {
+        return 0
+    }
+    host := text.slice(0, colon as u64)
+    mut inner := host.clone()
+    mut family: i32 = 2
+    when host.len() >= 2 && host.byte_at(0) == 91 && host.byte_at(host.len() - 1) == 93 {
+        inner = host.slice(1, host.len() - 1)
+        family = 10
+    }
+    converted := c_text(inner)
+    mut length: u32 = 16
+    when family == 10 {
+        length = 28
+    }
+    set_word64(storage, 0, 0)
+    set_word64(storage, 8, 0)
+    set_word64(storage, 16, 0)
+    set_word64(storage, 24, 0)
+    address_cell := ((storage as u64) + (if_family_offset(family))) as *u8
+    matched := inet_pton(family, converted, address_cell)
+    free(converted)
+    when matched != 1 {
+        return 0
+    }
+    slot7 := (storage as u64) as *u8
+    *slot7 = family as u8
+    slot8 := ((storage as u64) + 1) as *u8
+    *slot8 = 0
+    slot9 := ((storage as u64) + 2) as *u16
+    *slot9 = htons(port.unwrap() as u16)
+    return length
+}
+
+fun if_family_offset(family: i32) -> u64 {
+    when family == 10 {
+        return 8
+    }
+    return 4
+}
+
+// The first address a host and port give, as `to_socket_addrs().next()` does: a literal first, then the resolver.
+fun resolve_first(text: String, storage: *u8) -> u32 {
+    literal := literal_address(text.clone(), storage)
+    when literal > 0 {
+        return literal
+    }
+    colon := last_colon(text.clone())
+    when colon < 0 {
+        return 0
+    }
+    host := c_text(text.slice(0, colon as u64))
+    service := c_text(text.slice(colon as u64 + 1, text.len()))
+    hints := malloc(48)
+    mut at: u64 = 0
+    while at < 48 {
+        slot10 := ((hints as u64) + at) as *u8
+        *slot10 = 0
+        at += 1
+    }
+    set_word32(hints, 8, 1)
+    result := malloc(8)
+    set_word64(result, 0, 0)
+    status := getaddrinfo(host, service, hints, result)
+    free(host)
+    free(service)
+    free(hints)
+    when status != 0 || word64_of(result, 0) == 0 {
+        free(result)
+        return 0
+    }
+    info := word64_of(result, 0) as u64 as *u8
+    address := word64_of(info, 24) as u64 as *u8
+    length := word64_of(info, 16) as u64
+    mut copy: u64 = 0
+    while copy < length && copy < 32 {
+        slot11 := ((storage as u64) + copy) as *u8
+        *slot11 = byte_of(address, copy)
+        copy += 1
+    }
+    freeaddrinfo(info)
+    free(result)
+    return length as u32
+}
+
+fun new_socket_record(descriptor: i32) -> *u8 {
+    record := malloc(8)
+    set_word64(record, 0, descriptor as i64)
+    return record
+}
+
+// `bind` and `listen` for an address literal, as `TcpListener::bind` does (with SO_REUSEADDR).
+fun listening_descriptor(text: String) -> i32 {
+    storage := malloc(32)
+    length := literal_address(text, storage)
+    when length == 0 {
+        free(storage)
+        return -1
+    }
+    family := byte_of(storage, 0) as i32
+    descriptor := socket(family, 1, 0)
+    mut one: u32 = 1
+    setsockopt(descriptor, 1, 2, (&raw mut one) as *u8, 4)
+    when descriptor < 0 || bind(descriptor, storage, length) != 0 || listen(descriptor, 128) != 0 {
+        when descriptor >= 0 {
+            close(descriptor)
+        }
+        free(storage)
+        return -1
+    }
+    free(storage)
+    return descriptor
+}
+
+pub fun __rt_system_tcp_connect(address_given: str) -> *u8 {
+    storage := malloc(32)
+    length := resolve_first(String(address_given), storage)
+    when length == 0 {
+        free(storage)
+        return 0 as *u8
+    }
+    mut descriptor := socket(byte_of(storage, 0) as i32, 1, 0)
+    when descriptor >= 0 && connect(descriptor, storage, length) != 0 {
+        close(descriptor)
+        descriptor = -1
+    }
+    free(storage)
+    return new_socket_record(descriptor)
+}
+
+pub fun __rt_system_tcp_read(handle: *u8) -> String {
+    when (handle as u64) == 0 || socket_descriptor(handle) < 0 {
+        return String("")
+    }
+    buffer := malloc(24)
+    set_word64(buffer, 0, 0)
+    set_word64(buffer, 8, 0)
+    set_word64(buffer, 16, 0)
+    chunk := malloc(4096)
+    while true {
+        count := recv(socket_descriptor(handle), chunk, 4096, 0)
+        when count <= 0 {
+            break
+        }
+        buffer_append(buffer, chunk, count as u64)
+    }
+    free(chunk)
+    length := word64_of(buffer, 8) as u64
+    mut text := String("")
+    when length > 0 {
+        text = __native_string_from_raw(word64_of(buffer, 0) as u64 as *u8, length)
+    }
+    when word64_of(buffer, 0) != 0 {
+        free(word64_of(buffer, 0) as u64 as *u8)
+    }
+    free(buffer)
+    return text
+}
+
+pub fun __rt_system_tcp_write(handle: *u8, data_given: str) -> bool {
+    when (handle as u64) == 0 || socket_descriptor(handle) < 0 {
+        return false
+    }
+    data := String(data_given)
+    text := c_text(data.clone())
+    ok := write_bytes(socket_descriptor(handle), text, data.len())
+    free(text)
+    return ok
+}
+
+pub fun __rt_system_tcp_close(handle: *u8) -> bool {
+    when (handle as u64) == 0 {
+        return false
+    }
+    return close_socket(handle)
+}
+
+pub fun __rt_system_tcp_drop(handle: *u8) {
+    when (handle as u64) == 0 {
+        return
+    }
+    close_socket(handle)
+    free(handle)
+}
+
+pub fun __rt_system_tcp_listener_bind(address_given: str) -> *u8 {
+    return new_socket_record(listening_descriptor(String(address_given)))
+}
+
+pub fun __rt_system_tcp_accept(listener: *u8) -> *u8 {
+    when (listener as u64) == 0 {
+        return 0 as *u8
+    }
+    descriptor := socket_descriptor(listener)
+    mut accepted: i32 = -1
+    when descriptor >= 0 {
+        accepted = accept(descriptor, 0 as *u8, 0 as *u8)
+    }
+    return new_socket_record(accepted)
+}
+
+pub fun __rt_system_tcp_listener_close(listener: *u8) -> bool {
+    when (listener as u64) == 0 {
+        return false
+    }
+    return close_socket(listener)
+}
+
+pub fun __rt_system_tcp_listener_drop(listener: *u8) {
+    when (listener as u64) == 0 {
+        return
+    }
+    close_socket(listener)
+    free(listener)
+}
+
+pub fun __rt_system_udp_bind(address_given: str) -> *u8 {
+    storage := malloc(32)
+    length := literal_address(String(address_given), storage)
+    mut descriptor: i32 = -1
+    when length > 0 {
+        descriptor = socket(byte_of(storage, 0) as i32, 2, 0)
+        when descriptor >= 0 && bind(descriptor, storage, length) != 0 {
+            close(descriptor)
+            descriptor = -1
+        }
+    }
+    free(storage)
+    return new_socket_record(descriptor)
+}
+
+pub fun __rt_system_udp_connect(handle: *u8, address_given: str) -> bool {
+    when (handle as u64) == 0 || socket_descriptor(handle) < 0 {
+        return false
+    }
+    storage := malloc(32)
+    length := resolve_first(String(address_given), storage)
+    mut ok := false
+    when length > 0 {
+        ok = connect(socket_descriptor(handle), storage, length) == 0
+    }
+    free(storage)
+    return ok
+}
+
+pub fun __rt_system_udp_read(handle: *u8) -> String {
+    when (handle as u64) == 0 || socket_descriptor(handle) < 0 {
+        return String("")
+    }
+    chunk := malloc(65535)
+    count := recv(socket_descriptor(handle), chunk, 65535, 0)
+    when count < 0 {
+        free(chunk)
+        return String("")
+    }
+    text := __native_string_from_raw(chunk, count as u64)
+    free(chunk)
+    return text
+}
+
+pub fun __rt_system_udp_write(handle: *u8, data_given: str) -> bool {
+    when (handle as u64) == 0 || socket_descriptor(handle) < 0 {
+        return false
+    }
+    data := String(data_given)
+    text := c_text(data.clone())
+    sent := send(socket_descriptor(handle), text, data.len(), 0)
+    free(text)
+    return sent == data.len() as i64
+}
+
+pub fun __rt_system_udp_close(handle: *u8) -> bool {
+    when (handle as u64) == 0 {
+        return false
+    }
+    return close_socket(handle)
+}
+
+pub fun __rt_system_udp_drop(handle: *u8) {
+    when (handle as u64) == 0 {
+        return
+    }
+    close_socket(handle)
+    free(handle)
+}
+
+// The IP addresses a host name resolves to, each once, in the order the resolver gives them.
+pub fun __rt_system_dns_resolve(host_given: str) -> Vec<String> {
+    mut addresses: Vec<String> = Vec()
+    host := c_text(String(host_given))
+    service := c_text(String("0"))
+    hints := malloc(48)
+    mut at: u64 = 0
+    while at < 48 {
+        slot12 := ((hints as u64) + at) as *u8
+        *slot12 = 0
+        at += 1
+    }
+    set_word32(hints, 8, 1)
+    result := malloc(8)
+    set_word64(result, 0, 0)
+    status := getaddrinfo(host, service, hints, result)
+    free(host)
+    free(service)
+    free(hints)
+    when status != 0 {
+        free(result)
+        return addresses
+    }
+    text := malloc(64)
+    mut info := word64_of(result, 0) as u64 as *u8
+    while (info as u64) != 0 {
+        family := word32_of(info, 4) as i32
+        address := word64_of(info, 24) as u64 as *u8
+        when family == 2 {
+            inet_ntop(2, ((address as u64) + 4) as *u8, text, 64)
+        } else when family == 10 {
+            inet_ntop(10, ((address as u64) + 8) as *u8, text, 64)
+        } else {
+            info = word64_of(info, 40) as u64 as *u8
+            continue
+        }
+        mut value := __native_string_from_raw(text, strlen(text))
+        mut seen := false
+        mut index: u64 = 0
+        while index < addresses.len() {
+            when addresses[index] == value {
+                seen = true
+            }
+            index += 1
+        }
+        when !seen {
+            addresses.push(value)
+        }
+        info = word64_of(info, 40) as u64 as *u8
+    }
+    free(text)
+    freeaddrinfo(word64_of(result, 0) as u64 as *u8)
+    free(result)
+    return addresses
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Random numbers: 53 random bits from the kernel for each value
+
+extern "C" fun getrandom(buffer: *u8, size: u64, flags: u32) -> i64;
+
+fun random_bits() -> u64 {
+    buffer := malloc(8)
+    set_word64(buffer, 0, 0)
+    getrandom(buffer, 8, 0 as u32)
+    value := word64_of(buffer, 0) as u64
+    free(buffer)
+    return value
+}
+
+pub fun __rt_system_random() -> f64 {
+    return ((random_bits() >> (11 as u32)) as f64) / 9007199254740992.0
+}
+
+pub fun __rt_system_random_range(low: f64, high: f64) -> f64 {
+    when low >= high {
+        return low
+    }
+    return low + __rt_system_random() * (high - low)
+}
