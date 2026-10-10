@@ -37,6 +37,20 @@ address-space limit, and the script requires byte-identical stage2/stage3.
 No Rust compiler, Cargo, C library or external linker is used in this bootstrap.
 The output directory must not already contain bootstrap outputs.
 
+The repository commits its starting point as `bootstrap/rync-seed`, with its digest in
+`bootstrap/rync-seed.sha256`. A checkout therefore builds the compiler without Cargo or
+rustc (the release archive contains the same file as `rync`):
+
+```sh
+env -i PATH=/usr/bin:/bin HOME="$HOME" ./tools/bootstrap-native.sh "$PWD/bootstrap/rync-seed" /var/tmp/ryn-bootstrap
+```
+
+On the machine where this seed was made, stage2 and stage3 were byte-identical and equal to
+the seed itself: 8,994,816 bytes, sha256 `bba0d86b…`. The seed reproduces itself, so it
+is a fixed point of the current sources. To replace it, build a new stage2 with the
+current seed, check that stage2 and stage3 are byte-identical, then copy stage2 to
+`bootstrap/rync-seed` and update the digest in the same change.
+
 ## Float text and runtime ownership
 
 The native backend embeds typed IR generated from the same Ryn big-integer
@@ -71,16 +85,16 @@ That development step is unnecessary for end users or native compiler bootstrap.
 
 ## Compatibility
 
-Successful native compiler bootstrap does not imply complete language-corpus
-parity. A direct-source sweep currently passes 303 of 424 programs; outstanding
-cases include compile-time evaluation (46), compile-time function calls (12),
-C library imports a freestanding executable cannot satisfy (19), metaprogramming
-reflection (10), pattern forms (4), generic specialization (3) and module path
-dependency lookup (3). The native code generator passes all 424 cases when fed
-the existing typed-IR pipeline, including all 17 formerly declined float cases.
-`tools/test-native-sources.py` tests executable output and status directly through
-`rync`, without using Rust-generated IR. Tests are retained for unsupported
-features.
+A successful bootstrap does not by itself show parity with the language corpus, so the
+corpus is run through the compiler as well. `tools/test-native-sources.py` compiles each
+entry of `tests/suite` directly with `rync`, without the Rust frontend or Rust-generated
+IR, and checks the executable's stdout, stderr and status, or the rejection's status and
+diagnostic. The suite has 628 entries: 471 that must run and 157 that must be rejected.
+41 of the entries are project directories rather than single files. With the shipped `rync` and
+`PATH=/usr/bin:/bin`, all 628 entries pass.
+
+Programs that declare C functions are linked against the system's shared C library at
+run time, so running them depends on that library being present.
 
 ## Benchmarks (0.1.6 working tree)
 

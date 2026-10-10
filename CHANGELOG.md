@@ -65,6 +65,9 @@ no release archive and no commit for 0.1.6 yet. Items marked "not verified" were
 ### Build and tooling
 
 - The crate version is 0.1.6 (`Cargo.toml`, `Cargo.lock`).
+- `bootstrap/rync-seed` (digest in `bootstrap/rync-seed.sha256`) is the native compiler that `tools/bootstrap-native.sh`
+  starts from, so the bootstrap needs no Cargo or rustc. The seed reproduces itself from the sources. The release archive
+  ships it as `rync`. How to replace it is in `docs/native-compiler.md`.
 - `build.rs` lists the Ryn sources of the native compiler and the standard library in `native_sources.rs`, so the compiler
   can write them out and build `rync`, and it compiles the runtime shim object for the build target.
 - `install.sh` reads the release archive listing in full before searching it, so a `pipefail` shell no longer reports a
@@ -93,19 +96,30 @@ no release archive and no commit for 0.1.6 yet. Items marked "not verified" were
   Rust code. Removing it needs the self-hosted analysis to produce the messages the Rust analysis produces. For example,
   the Rust analysis has 50 `R0234` diagnostic sites and the self-hosted analysis has 16; the Map diagnostics for
   destructor values exist only in Rust.
+- Two fixed points: the Rust-seeded `ryn bootstrap --native` gave a stage 2 of 8,953,856 bytes, and the committed seed gives
+  8,994,816 bytes. Both reproduce themselves, but why the sources have two fixed points was not investigated.
 - Windows float records were not re-run in this work; the shims are now compiled for all x86_64 targets.
 - Native declines: `Map.get`, `Map.values` and `Map.clone` of destructor values are rejected by the frontends, so programs
   that reach the native backend never use them.
 
 ### Verification in this work
 
-Run from the working tree in this session; nothing was committed, tagged or published.
+Run in this work. The work is committed locally on `release/v0.1.6-native-first`; nothing is pushed, tagged or published.
 
 - `cargo test` (full suite, all test targets) exits 0.
-- `ryn bootstrap --native`: stage 2 and stage 3 byte-identical.
-- Examples: native and Cranelift outputs (stdout, stderr, exit status) compared for every `examples/*.ryn`; the result is
-  in the release notes of this work, not repeated here.
-- Example project directories (ten with `src/main.ryn`) compared the same way.
+- `ryn bootstrap --native`: stage 2 and stage 3 byte-identical (8,953,856 bytes, from the Rust-built compiler).
+- Cargo-free bootstrap: `tools/bootstrap-native.sh` with the committed `bootstrap/rync-seed` and `PATH=/usr/bin:/bin`
+  completes; stage 2 and stage 3 are byte-identical and equal to the seed (8,994,816 bytes).
+- Examples: all 97 entries of `examples/` (87 files and 10 project directories) build with the native default and with
+  `--backend cranelift`. The two runs agree on stdout, stderr and exit status for every entry. `network_smoke` and
+  `realtime_input` time out with stdin closed on both backends, so for those two the agreement shows only that both
+  behave the same, not that the output is correct.
+- Distribution without cargo: the release archive built from the seed was extracted into an empty directory. Its `rync`,
+  run with `PATH=/usr/bin:/bin`, compiled and ran all 628 entries of `tests/suite` through `tools/test-native-sources.py`
+  (471 that must run, 157 that must be rejected); all 628 pass. Its build of `examples/vec.ryn` prints the same output as
+  `ryn run`. The archive's own `tools/bootstrap-native.sh`, run from the extracted directory with the same `PATH`, gives
+  stage 2 and stage 3 byte-identical to the seed. The sweep used the repository's copy of the standard library, which is
+  byte-identical to the archive's.
 - Runtime leak tests: file handles, processes, threads and sockets keep the open descriptor count unchanged over 100 to
   200 rounds. The descriptor count is read from `/proc/self/fd`.
 - `ryn check`, `ryn build` and `ryn run` work with an empty `PATH`, so the standard path does not call `rustc`, `cc` or
