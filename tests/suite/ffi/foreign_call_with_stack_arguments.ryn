@@ -1,4 +1,5 @@
 // test: run
+// target: linux
 // out: 42
 // out: 3
 // Past the sixth integer register a C argument goes to the stack: `syscall(SYS_getpid-like)` takes the call number and

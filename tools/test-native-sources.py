@@ -9,6 +9,7 @@ compiled through its directory. The header comments state the expectation, as in
     // test: run    the program compiles, and its stdout (`// out:` lines), stderr (`// err:` texts) and exit
                     status (`// exit:`) match
     // test: fail   the compiler rejects the program with status 1 and the diagnostic `// code:` and `// msg:` texts
+    // target: linux   the program uses Linux-only C functions; it is skipped when RYN_TEST_TARGET=windows
 
 No Rust frontend, IR dump, system linker or C library is used to compile; programs that declare C functions are
 linked against the system's shared C library at run time. Every process runs under a 1 GiB address-space limit.
@@ -38,7 +39,7 @@ def limit():
 
 
 def header(source):
-    case = {"kind": None, "out": [], "err": [], "exit": 0, "code": None, "msg": []}
+    case = {"target": None, "kind": None, "out": [], "err": [], "exit": 0, "code": None, "msg": []}
     for line in source.read_text().splitlines():
         if not line.startswith("//"):
             break
@@ -53,6 +54,8 @@ def header(source):
             case[key].append(value)
         elif key == "exit":
             case["exit"] = int(value.strip())
+        elif key == "target":
+            case["target"] = value.strip()
         elif key == "code":
             case["code"] = value.strip()
     return case
@@ -69,6 +72,8 @@ def run(path):
         if given.name == "main.ryn" and (given.parent.parent / "ryn.yaml").is_file():
             target = given.parent.parent
     case = header(source)
+    if WINDOWS and case["target"] == "linux":
+        return "skip", path, "Linux-only program (`// target: linux`)"
     if case["kind"] not in ("run", "fail"):
         return "skip", path, "no `// test:` header"
     with tempfile.TemporaryDirectory(prefix="ryn-native-source-") as directory:
