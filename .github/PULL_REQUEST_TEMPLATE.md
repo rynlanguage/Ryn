@@ -21,8 +21,8 @@ Fixes #
 - [ ] `python3 tools/run-tests.py <ryn>`
 - [ ] New or updated tests in `tests/suite/` or the relevant integration test, covering both the
       accepted and the rejected program
-- [ ] Backends verified: [ ] native [ ] cranelift — or the change is backend-independent
-- [ ] `ryn bootstrap --native` still reaches a byte-identical fixpoint (native-compiler changes)
+- [ ] Targets verified: [ ] Linux x86-64 [ ] Windows x86-64 — or the change is target-independent
+- [ ] `tools/bootstrap-native.sh` still reaches a byte-identical fixpoint (native-compiler changes)
 
 **Compatibility**
 

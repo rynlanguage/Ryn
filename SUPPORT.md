@@ -20,8 +20,7 @@
 5. Search existing issues, open and closed, for the same report.
 
 A good report for a wrong-exit-code, wrong-output, or crash bug includes the command, the program,
-the full output, and the backend (`native` or `cranelift`, usually visible from whether the host is
-Linux x86-64). A good report for a diagnostic problem quotes the diagnostic code (for example `R0234`)
+the full output, and the target (Linux x86-64 or the experimental Windows x86-64). A good report for a diagnostic problem quotes the diagnostic code (for example `R0234`)
 and the program line.
 
 ## Response expectations

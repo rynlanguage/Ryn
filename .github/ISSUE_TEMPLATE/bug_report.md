@@ -33,7 +33,7 @@ What happened instead: full stdout/stderr and the exit code.
 
 - OS and architecture:
 - `ryn --version`:
-- Backend (`native` on Linux x86-64, otherwise `cranelift`), if you passed `--backend`:
+- Target (Linux x86-64 or Windows x86-64):
 - How you built the compiler (release archive, `tools/bootstrap-native.sh`, or a commit):
 
 **Additional context**

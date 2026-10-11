@@ -1,5 +1,9 @@
 # Ryn 0.2 language work
 
+> **Historical document.** This was written while the Rust implementation and the Cranelift backend still existed. Both were
+> removed in 0.1.6; the `cargo` commands and Rust-side statements below describe that earlier state and cannot be run on
+> this tree (the last tree that builds with Cargo is the branch `rust-reference-0.1.6`).
+
 This document records what the 0.2 work added, how it is tested, and what is still missing. It
 complements `docs/audit-0.0.2.md` (the feature audit) and `docs/self-hosting-plan.md`.
 

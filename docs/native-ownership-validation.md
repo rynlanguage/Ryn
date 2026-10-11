@@ -1,5 +1,9 @@
 # Native ownership validation — 2026-10-09
 
+> **Historical document.** This was written while the Rust implementation and the Cranelift backend still existed. Both were
+> removed in 0.1.6; the `cargo` commands and Rust-side statements below describe that earlier state and cannot be run on
+> this tree (the last tree that builds with Cargo is the branch `rust-reference-0.1.6`).
+
 The selected option is deterministic ownership and moves. No garbage collector is implemented. All reported compiler
 and stress runs used a 1,073,741,824-byte `RLIMIT_AS`; this limit was never raised. RSS is measured with a small C
 `fork`/`wait4` launcher, so it does not include a Python interpreter before `exec`.

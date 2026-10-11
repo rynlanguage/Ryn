@@ -1,5 +1,9 @@
 # Native float validation — 2026-10-09
 
+> **Historical document.** This was written while the Rust implementation and the Cranelift backend still existed. Both were
+> removed in 0.1.6; the `cargo` commands and Rust-side statements below describe that earlier state and cannot be run on
+> this tree (the last tree that builds with Cargo is the branch `rust-reference-0.1.6`).
+
 The 17 known freestanding float-text declines from `docs/native-ownership-validation.md` are
 resolved. Every case below ran without a C library: the native backend links a freestanding
 executable containing neither libc nor a startup file, and the object carries no `_start` from

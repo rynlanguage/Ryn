@@ -23,7 +23,7 @@ Other ways to reach the same goal, and why they are worse.
 
 - Affects: [ ] language syntax [ ] compiler/CLI [ ] code generation [ ] runtime [ ] standard library
 - Breaking change: [ ] yes [ ] no [ ] not sure
-- Backends: [ ] native (`rync`) [ ] cranelift [ ] both
+- Targets: [ ] Linux x86-64 [ ] Windows x86-64 [ ] both
 
 **Additional context**
 Prior art from other languages, links, or an issue this unblocks.
