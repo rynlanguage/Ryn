@@ -769,7 +769,7 @@ fun main() -> i32 {
     while position < arg_count() {
         word := String(arg(position))
         when word == "--version" || word == "-V" {
-            echo "rync 0.1.7"
+            echo "rync 0.1.8"
             return 0
         }
         when word == "--help" || word == "-h" {

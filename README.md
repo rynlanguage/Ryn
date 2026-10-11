@@ -13,7 +13,7 @@ own sources, and the tree contains no Rust.
 
 ## Status
 
-The latest release is [0.1.7](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.7) ("Native Power & Benchmarks"); [0.1.6](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.6) was "Native First".
+The latest release is [0.1.8](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.8); [0.1.7](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.7) was "Native Power & Benchmarks" and [0.1.6](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.6) was "Native First".
 
 - The whole toolchain is written in Ryn: the `ryn` command, the native compiler `rync` (lexer, parser,
   analysis, code generator, ELF and PE writers) and the runtime. There is no Rust code in the tree and no Cargo

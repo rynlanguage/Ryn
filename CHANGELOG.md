@@ -4,6 +4,15 @@ All notable changes to Ryn are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses a `0.x` version
 sequence: minor releases may change language details while the compiler is pre-1.0.
 
+## [0.1.8] — 2026-10-11
+
+Maintenance release. The version strings say 0.1.8; the compiler and the language are unchanged from 0.1.7.
+
+- Issue and pull request templates and `SUPPORT.md` no longer ask for a `cranelift` backend or `ryn bootstrap --native`
+  (both were removed in 0.1.6); they ask for the target and point at `tools/bootstrap-native.sh`.
+- `docs/native-ownership-validation.md`, `docs/native-float-validation.md` and `docs/language-0.2.md` are marked as
+  historical: they describe the Rust and Cargo era.
+
 ## [0.1.7] — 2026-10-11
 
 "Native Power & Benchmarks". The version strings (`VERSION`, `ryn --version`, `rync --version`, the registry header, the CI
