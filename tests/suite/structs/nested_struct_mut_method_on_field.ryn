@@ -1,0 +1,29 @@
+// test: run
+// out: 4
+// out: 15
+// out: 101
+// out: 232
+// out: s
+// A `mut self` method is called on a structure nested in another one, through a local, through `self` and through a reference.
+pub struct P { pub x: i64, pub y: i64 }
+pub struct L { pub a: P, pub b: P, pub s: String }
+extend P {
+    pub fun sum(self) -> i64 { return self.x + self.y }
+    pub fun shift(mut self, d: i64) { self.x += d self.y += d }
+}
+extend L {
+    pub fun move_b(mut self, d: i64) { self.b.shift(d) }
+    pub fun total(self) -> i64 { return self.a.sum() + self.b.sum() }
+}
+fun go(l: &mut L) { l.a.shift(100) }
+fun main() {
+    mut l := L { a: P { x: 1, y: 2 }, b: P { x: 3, y: 4 }, s: String("s") }
+    l.b.shift(1)
+    echo l.b.x
+    l.move_b(10)
+    echo l.b.y
+    go(&mut l)
+    echo l.a.x
+    echo l.total()
+    echo l.s
+}

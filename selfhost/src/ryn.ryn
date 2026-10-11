@@ -5,26 +5,30 @@
 //     ryn check <file.ryn|project-dir>
 //     ryn build <file.ryn|project-dir> [--release] [-o|--output <path>]
 //     ryn run <file.ryn|project-dir> [--release] [-o|--output <path>] [-- <program-args...>]
+//     ryn bench <file.ryn|project-dir> [--iterations N] [--warmup N] [--compile-runs N] [--json]
+//               [--baseline <file>] [--save-baseline <file>] [--threshold PERCENT] [-- <program-args...>]
 //     ryn clean <project-dir>
 //
 // The standard library is found at `<directory of ryn>/stdlib/std/src`, or at `RYN_STDLIB`. Status 0 means success, 1 an
 // error (diagnostics go to standard error), and `run` returns the program's own status.
 
+use driver::bench
 use driver::manifest
 use driver::pkg
 use std::fs
 use std::env
 use std::time
+use std::process
 use std::system
 
 fun ryn_usage() -> String {
-    return String("usage:\n  ryn new <path>\n  ryn check <file.ryn|project-dir>\n  ryn build <file.ryn|project-dir> [--release] [-o|--output <path>]\n  ryn run <file.ryn|project-dir> [--release] [-o|--output <path>] [-- <program-args...>]\n  ryn clean <project-dir>\n  ryn lock <project-dir>\n  ryn login <token>\n  ryn publish [project-dir]")
+    return String("usage:\n  ryn new <path>\n  ryn check <file.ryn|project-dir>\n  ryn build <file.ryn|project-dir> [--release] [-o|--output <path>]\n  ryn run <file.ryn|project-dir> [--release] [-o|--output <path>] [-- <program-args...>]\n  ryn bench <file.ryn|project-dir> [--iterations N] [--warmup N] [--compile-runs N] [--json] [--baseline <file>] [--save-baseline <file>] [--threshold PERCENT] [-- <program-args...>]\n  ryn clean <project-dir>\n  ryn lock <project-dir>\n  ryn login <token>\n  ryn publish [project-dir]")
 }
 
 fun ryn_help() -> String {
     mut text := String("Ryn — Reliable. Fast. Native.\n\n")
     text.append(ryn_usage())
-    text.append("\n\nCommands:\n  new <path>        Create a project with a native Hello World example\n  check <source>    Check a .ryn file or project directory\n  build <source>    Compile a .ryn file or project directory\n  run <source>      Compile and run a .ryn file or project directory\n  lock <project>     Resolve and write ryn.lock for supported dependencies\n  login <token>     Save a pods registry token for publishing\n  publish [project] Check, pack and upload the project to the pods registry\n  clean <project>   Remove the project's build directory\n\nA project directory uses src/main.ryn as its entry point.\nProject outputs go under build/debug or build/release; build/cache is reserved for compiler caches.\nAn i32 result from main becomes the process exit code for run.\nPass program arguments to run after --.\nclean removes only the direct build directory and refuses symbolic links.\n\nOptions:\n  --release            Use the project's release output directory\n  -o, --output <path>  Set the executable path for build or run\n  -h, --help           Show this help\n  -V, --version        Show compiler version\n")
+    text.append("\n\nCommands:\n  new <path>        Create a project with a native Hello World example\n  check <source>    Check a .ryn file or project directory\n  build <source>    Compile a .ryn file or project directory\n  run <source>      Compile and run a .ryn file or project directory\n  bench <source>    Compile, then time the program: warmup, median, baseline comparison, JSON\n  lock <project>     Resolve and write ryn.lock for supported dependencies\n  login <token>     Save a pods registry token for publishing\n  publish [project] Check, pack and upload the project to the pods registry\n  clean <project>   Remove the project's build directory\n\nA project directory uses src/main.ryn as its entry point.\nProject outputs go under build/debug or build/release; build/cache is reserved for compiler caches.\nAn i32 result from main becomes the process exit code for run.\nPass program arguments to run after --.\nclean removes only the direct build directory and refuses symbolic links.\n\nBench options:\n  --iterations N       Timed runs of the program (default 10)\n  --warmup N           Runs before timing starts, not counted (default 2)\n  --compile-runs N     Times the compiler is timed (default 1)\n  --json               Print the report as JSON only\n  --baseline <file>    Compare medians with a saved report; exit 1 on a regression\n  --save-baseline <f>  Write the report as JSON to a file\n  --threshold PERCENT  Slowdown that counts as a regression (default 10)\n  A project directory with a benches/ directory times every .ryn file in it.\n\nOptions:\n  --release            Use the project's release output directory\n  -o, --output <path>  Set the executable path for build or run\n  -h, --help           Show this help\n  -V, --version        Show compiler version\n")
     return text
 }
 
@@ -202,13 +206,12 @@ fun ryn_dependencies(project: String) -> Vec<String> {
     return resolved.unwrap()
 }
 
-fun ryn_compiler(command: str, input: String, output: String, packages: Vec<String>) -> i32 {
-    compiler := manifest::join_path(ryn_home(), ryn_executable(String("rync")))
-    when !fs::exists(compiler.clone()) {
-        mut message := String("error[R0301]: the compiler is not installed at ")
-        message.append(compiler)
-        return ryn_fail(message)
-    }
+fun ryn_compiler_path() -> String {
+    return manifest::join_path(ryn_home(), ryn_executable(String("rync")))
+}
+
+// The arguments of one start of the compiler.
+fun ryn_compiler_arguments(command: str, input: String, output: String, packages: Vec<String>) -> Vec<String> {
     mut arguments: Vec<String> = Vec()
     arguments.push(String(command))
     arguments.push(String("--stdlib"))
@@ -227,7 +230,340 @@ fun ryn_compiler(command: str, input: String, output: String, packages: Vec<Stri
         at += 2
     }
     arguments.push(input)
-    return run_process_args(compiler, arguments)
+    return arguments
+}
+
+fun ryn_compiler(command: str, input: String, output: String, packages: Vec<String>) -> i32 {
+    compiler := ryn_compiler_path()
+    when !fs::exists(compiler.clone()) {
+        mut message := String("error[R0301]: the compiler is not installed at ")
+        message.append(compiler)
+        return ryn_fail(message)
+    }
+    return run_process_args(compiler, ryn_compiler_arguments(command, input, output, packages))
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// ryn bench
+
+fun ryn_now_ns() -> u64 {
+    return (time::monotonic() * 1000000000.0) as u64
+}
+
+// Whether `left` sorts after `right`, byte by byte.
+fun ryn_text_after(left: String, right: String) -> bool {
+    mut at: u64 = 0
+    while at < left.len() && at < right.len() {
+        a := left.byte_at(at) as u64
+        b := right.byte_at(at) as u64
+        when a != b {
+            return a > b
+        }
+        at += 1
+    }
+    return left.len() > right.len()
+}
+
+// The `.ryn` files directly in `directory`, by name.
+fun ryn_bench_sources(directory: String) -> Vec<String> {
+    mut names: Vec<String> = Vec()
+    for name in fs::read_dir(directory.clone()) {
+        when name.ends_with(".ryn") {
+            names.push(name)
+        }
+    }
+    mut at: u64 = 1
+    while at < names.len() {
+        value := names[at].clone()
+        mut before := at
+        while before > 0 && ryn_text_after(names[before - 1].clone(), value.clone()) {
+            names.set(before, names[before - 1].clone())
+            before -= 1
+        }
+        names.set(before, value)
+        at += 1
+    }
+    mut paths: Vec<String> = Vec()
+    for name in names {
+        paths.push(manifest::join_path(directory.clone(), name))
+    }
+    return paths
+}
+
+fun ryn_bench_options_error(message: str) -> i32 {
+    mut text := String("error[R0908]: ")
+    text.append(message)
+    return ryn_fail(text)
+}
+
+fun ryn_bench() -> i32 {
+    mut input := String("")
+    mut iterations: u64 = 10
+    mut warmup: u64 = 2
+    mut compile_runs: u64 = 1
+    mut threshold: u64 = 10
+    mut baseline_path := String("")
+    mut save_path := String("")
+    mut json := false
+    mut program_args: Vec<String> = Vec()
+    mut position: u32 = 1
+    while position < arg_count() {
+        word := String(arg(position))
+        when word == "--" {
+            position += 1
+            while position < arg_count() {
+                program_args.push(String(arg(position)))
+                position += 1
+            }
+        } else when (word == "--iterations" || word == "--warmup" || word == "--compile-runs" || word == "--threshold") && position + 1 < arg_count() {
+            parsed := bench::bench_parse_u64(String(arg(position + 1)))
+            when parsed.is_none() {
+                mut message := String("`")
+                message.append(word)
+                message.append("` takes a whole number")
+                return ryn_bench_options_error(message.slice(0, message.len()))
+            }
+            when word == "--iterations" {
+                iterations = parsed.unwrap()
+            } else when word == "--warmup" {
+                warmup = parsed.unwrap()
+            } else when word == "--compile-runs" {
+                compile_runs = parsed.unwrap()
+            } else {
+                threshold = parsed.unwrap()
+            }
+            position += 2
+        } else when word == "--baseline" && position + 1 < arg_count() && baseline_path.is_empty() {
+            baseline_path = String(arg(position + 1))
+            position += 2
+        } else when word == "--save-baseline" && position + 1 < arg_count() && save_path.is_empty() {
+            save_path = String(arg(position + 1))
+            position += 2
+        } else when word == "--json" && !json {
+            json = true
+            position += 1
+        } else when word == "--release" {
+            position += 1
+        } else when input.is_empty() && !word.starts_with("-") {
+            input = word
+            position += 1
+        } else {
+            return ryn_fail(ryn_usage())
+        }
+    }
+    when input.is_empty() {
+        return ryn_fail(ryn_usage())
+    }
+    when iterations == 0 {
+        return ryn_bench_options_error("`--iterations` must be at least 1")
+    }
+    when compile_runs == 0 {
+        return ryn_bench_options_error("`--compile-runs` must be at least 1")
+    }
+    when !fs::exists(input.clone()) {
+        mut message := String("error[R0300]: no such file or directory: ")
+        message.append(input)
+        return ryn_fail(message)
+    }
+    compiler := ryn_compiler_path()
+    when !fs::exists(compiler.clone()) {
+        mut message := String("error[R0301]: the compiler is not installed at ")
+        message.append(compiler)
+        return ryn_fail(message)
+    }
+    baseline_text := String("")
+    mut baseline_text_value := baseline_text
+    when !baseline_path.is_empty() {
+        when !fs::is_file(baseline_path.clone()) {
+            mut message := String("error[R0300]: no such baseline file: ")
+            message.append(baseline_path)
+            return ryn_fail(message)
+        }
+        baseline_text_value = fs::read(baseline_path.clone())
+    }
+    // The programs to time: every file in the `benches` directory of a project, or the given file or project itself.
+    mut targets: Vec<String> = Vec()
+    project := fs::is_dir(input.clone())
+    mut packages := ryn_dependencies(input.clone())
+    when packages.len() == 1 {
+        return 1
+    }
+    when project {
+        benches := manifest::join_path(input.clone(), String("benches"))
+        when fs::is_dir(benches.clone()) {
+            targets = ryn_bench_sources(benches)
+        }
+    }
+    when targets.is_empty() {
+        targets.push(input.clone())
+    }
+    scratch := env::temp_dir()
+    mut work := scratch
+    work.append("/ryn-bench-")
+    work.append((time::monotonic() * 1000000.0).to_string())
+    when !fs::create_dir_all(work.clone()) {
+        return ryn_fail(String("error[R0401]: cannot create a scratch directory"))
+    }
+    mut entries: Vec<String> = Vec()
+    mut regressions: u64 = 0
+    mut failed := false
+    mut report := String("")
+    mut index: u64 = 0
+    while index < targets.len() && !failed {
+        target := targets[index].clone()
+        mut shown := target.clone()
+        when project && targets.len() == 1 && targets[0] == input {
+            shown = manifest::join_path(input.clone(), String("src/main.ryn"))
+        }
+        mut executable := work.clone()
+        executable.append("/bench")
+        executable.append(index.to_string())
+        executable = ryn_executable(executable)
+        mut compile_samples: Vec<u64> = Vec()
+        mut compile_peak: u64 = 0
+        mut run_peak: u64 = 0
+        mut run_count: u64 = 0
+        while run_count < compile_runs && !failed {
+            started := ryn_now_ns()
+            built := process::run_capture_args(compiler.clone(), ryn_compiler_arguments("build", target.clone(), executable.clone(), packages.clone()))
+            compile_samples.push(ryn_now_ns() - started)
+            when built.peak_memory_kb > compile_peak {
+                compile_peak = built.peak_memory_kb
+            }
+            when built.exit_code != 0 {
+                eprint("{}", built.stderr)
+                failed = true
+            }
+            run_count += 1
+        }
+        mut run_samples: Vec<u64> = Vec()
+        mut total_runs: u64 = 0
+        while total_runs < warmup + iterations && !failed {
+            started := ryn_now_ns()
+            result := process::run_capture_args(executable.clone(), program_args.clone())
+            elapsed := ryn_now_ns() - started
+            when result.exit_code != 0 {
+                mut message := String("error[R0909]: the benchmark exited with status ")
+                message.append(result.exit_code.to_string())
+                message.append(": ")
+                message.append(shown.clone())
+                eprint("{}", message)
+                failed = true
+            }
+            when total_runs >= warmup {
+                run_samples.push(elapsed)
+                when result.peak_memory_kb > run_peak {
+                    run_peak = result.peak_memory_kb
+                }
+            }
+            total_runs += 1
+        }
+        when !failed {
+            compile := bench::bench_stats(compile_samples.clone())
+            run := bench::bench_stats(run_samples.clone())
+            entries.push(bench::bench_json_entry(shown.clone(), compile_samples, run_samples, warmup, compile_peak, run_peak))
+            mut text := String("")
+            text.append(shown.clone())
+            text.append("\n  compile  median ")
+            text.append(bench::bench_format(compile.median_ns))
+            text.append("  min ")
+            text.append(bench::bench_format(compile.min_ns))
+            text.append("  max ")
+            text.append(bench::bench_format(compile.max_ns))
+            text.append("  peak memory ")
+            text.append(bench::bench_format_kb(compile_peak))
+            text.append("  (")
+            text.append(compile.count.to_string())
+            text.append(" runs)\n  run      median ")
+            text.append(bench::bench_format(run.median_ns))
+            text.append("  min ")
+            text.append(bench::bench_format(run.min_ns))
+            text.append("  mean ")
+            text.append(bench::bench_format(run.mean_ns))
+            text.append("  max ")
+            text.append(bench::bench_format(run.max_ns))
+            text.append("  +/- ")
+            text.append(bench::bench_format(run.stddev_ns))
+            text.append("  peak memory ")
+            text.append(bench::bench_format_kb(run_peak))
+            text.append("  (")
+            text.append(run.count.to_string())
+            text.append(" runs after ")
+            text.append(warmup.to_string())
+            text.append(" warmup)\n")
+            when !baseline_path.is_empty() {
+                before := bench::bench_baseline_median(baseline_text_value.clone(), shown.clone())
+                when before.is_none() {
+                    text.append("  baseline none for this program\n")
+                } else {
+                    change := bench::bench_change(before.unwrap(), run.median_ns, threshold)
+                    text.append("  baseline median ")
+                    text.append(bench::bench_format(before.unwrap()))
+                    text.append("  now ")
+                    text.append(bench::bench_percent(change.tenths))
+                    when change.regression {
+                        text.append("  REGRESSION (more than ")
+                        text.append(threshold.to_string())
+                        text.append("%)\n")
+                        regressions += 1
+                    } else {
+                        text.append("  ok\n")
+                    }
+                }
+                // The peak memory is compared with the same threshold when both reports have it.
+                memory_before := bench::bench_baseline_peak(baseline_text_value.clone(), shown.clone())
+                when memory_before.is_some() && memory_before.unwrap() > 0 && run_peak > 0 {
+                    memory_change := bench::bench_change(memory_before.unwrap(), run_peak, threshold)
+                    text.append("  baseline memory ")
+                    text.append(bench::bench_format_kb(memory_before.unwrap()))
+                    text.append("  now ")
+                    text.append(bench::bench_percent(memory_change.tenths))
+                    when memory_change.regression {
+                        text.append("  REGRESSION (more than ")
+                        text.append(threshold.to_string())
+                        text.append("%)\n")
+                        regressions += 1
+                    } else {
+                        text.append("  ok\n")
+                    }
+                }
+            }
+            report.append(text)
+        }
+        index += 1
+    }
+    removed := fs::remove_dir_all(work)
+    when failed {
+        return 1
+    }
+    json_text := bench::bench_json_report(String("0.1.7"), entries)
+    when !save_path.is_empty() {
+        parent := manifest::directory_of(save_path.clone())
+        when !parent.is_empty() {
+            made := fs::create_dir_all(parent)
+        }
+        mut file_text := json_text.clone()
+        file_text.append("\n")
+        when !fs::write(save_path.clone(), file_text) {
+            mut message := String("error[R0401]: cannot write ")
+            message.append(save_path)
+            return ryn_fail(message)
+        }
+    }
+    when json {
+        echo "{json_text}"
+    } else {
+        echo "{report}"
+        when regressions > 0 {
+            mut summary := regressions.to_string()
+            summary.append(" benchmark(s) regressed")
+            echo "{summary}"
+        }
+    }
+    when regressions > 0 {
+        return 1
+    }
+    return 0
 }
 
 fun main() -> i32 {
@@ -241,8 +577,11 @@ fun main() -> i32 {
         return 0
     }
     when command == "-V" || command == "--version" || command == "version" {
-        echo "ryn 0.1.6"
+        echo "ryn 0.1.7"
         return 0
+    }
+    when command == "bench" {
+        return ryn_bench()
     }
     when command == "new" || command == "clean" {
         when arg_count() != 2 {

@@ -1,0 +1,13 @@
+// test: run
+// out: 42
+// out: 3
+// Past the sixth integer register a C argument goes to the stack: `syscall(SYS_getpid-like)` takes the call number and
+// up to six more, so seven and eight arguments are passed.
+extern "C" fun syscall(number: i64, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64;
+fun main() {
+    // SYS_umask (95) answers the previous mask and takes one argument; the extra ones are ignored.
+    old := syscall(95, 18, 1, 2, 3, 4, 5)
+    again := syscall(95, old, 7, 8, 9, 10, 11)
+    when again == 18 { echo 42 } else { echo 0 }
+    when old >= 0 { echo 3 } else { echo 0 }
+}

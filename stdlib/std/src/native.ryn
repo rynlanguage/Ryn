@@ -1655,9 +1655,13 @@ fun drain_pipes(first: i32, second: i32, first_buffer: *u8, second_buffer: *u8) 
 extern "C" fun poll(descriptors: *u8, count: u64, timeout: i32) -> i32;
 
 // Runs a program to its end with its output captured. A program that cannot be started gives -1 and no output.
-// The record: exit code, then the pointer and length of the standard output and of the standard error.
+// The record: exit code, then the pointer and length of the standard output and of the standard error, then the peak
+// resident memory of the child in kilobytes.
+extern "C" fun wait4(process: i32, status: *u8, options: i32, usage: *u8) -> i32;
+
 fun capture_program(program: String, arguments: *u8) -> *u8 {
-    record := malloc(40)
+    record := malloc(48)
+    set_word64(record, 40, 0)
     set_word64(record, 0, -1)
     set_word64(record, 8, 0)
     set_word64(record, 16, 0)
@@ -1726,8 +1730,17 @@ fun capture_program(program: String, arguments: *u8) -> *u8 {
     } else {
         drain_pipes(out_reading, err_reading, stdout_buffer, stderr_buffer)
         status := malloc(4)
-        waitpid(child, status, 0)
+        usage := malloc(144)
+        mut cleared: u64 = 0
+        while cleared < 144 {
+            set_byte(usage, cleared, 0)
+            cleared += 1
+        }
+        wait4(child, status, 0, usage)
         set_word64(record, 0, exit_status_of(word32_of(status, 0) as i32) as i64)
+        // `ru_maxrss` follows the two `timeval`s of the resource usage.
+        set_word64(record, 40, word64_of(usage, 32))
+        free(usage)
         free(status)
     }
     set_word64(record, 8, word64_of(stdout_buffer, 0))
@@ -1770,6 +1783,13 @@ pub fun __rt_system_process_capture_stderr(capture: *u8) -> String {
         return String("")
     }
     return __native_string_from_raw(word64_of(capture, 24) as u64 as *u8, word64_of(capture, 32) as u64)
+}
+
+pub fun __rt_system_process_capture_peak_kb(capture: *u8) -> u64 {
+    when (capture as u64) == 0 {
+        return 0
+    }
+    return word64_of(capture, 40) as u64
 }
 
 pub fun __rt_system_process_capture_drop(capture: *u8) {

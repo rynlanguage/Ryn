@@ -4133,22 +4133,73 @@ extend Lowering {
         // A reference and a raw pointer are both stores through an address: the pointer's pointee is the structure.
         pointee := self.pointee_of(local.ty.clone())?
         id := struct_id_of(pointee.clone())
-        when id.is_none() || names.len() != 1 {
+        when id.is_none() || names.len() == 0 {
             return Result::Err(unsupported("assignment through this reference"))
         }
-        field := self.field_index(id.unwrap(), names[0].clone())?
+        // A path of fields (`reference.inner.field = value`) stores into a structure nested in the referenced one: the
+        // place of the enclosing structure is reached field by field, and its address is the pointer of the store.
+        mut holder := pointee.clone()
+        mut holder_id: u64 = id.unwrap()
+        mut place_text := join(words5(String("Local"), num(local.slot), local.ty.clone(), num(span.start), num(span.start + object.len())))
+        mut place_type := local.ty.clone()
+        mut walked: u64 = object.len()
+        mut step: u64 = 0
+        while step + 1 < names.len() {
+            step_field := self.field_index(holder_id, names[step].clone())?
+            step_private := self.private_field_of(holder.clone(), names[step].clone(), spans[step * 2], spans[step * 2 + 1])
+            when step_private.is_some() {
+                return Result::Err(step_private.unwrap())
+            }
+            step_type := self.structs[holder_id].field_types[step_field].clone()
+            next_id := struct_id_of(step_type.clone())
+            when next_id.is_none() {
+                return Result::Err(unsupported("field of a value that is not a structure"))
+            }
+            walked += 1 + names[step].len()
+            mut step_tokens: Vec<String> = Vec()
+            when step == 0 {
+                step_tokens.push(String("ReferenceField"))
+            } else {
+                step_tokens.push(String("Field"))
+            }
+            step_tokens.push(place_text.clone())
+            step_tokens.push(num(holder_id))
+            step_tokens.push(num(step_field))
+            step_tokens.push(step_type.clone())
+            step_tokens.push(num(span.start))
+            step_tokens.push(num(span.start + walked))
+            when step == 0 {
+                step_tokens.push(String("0"))
+            }
+            place_text = join(step_tokens)
+            holder = step_type
+            holder_id = next_id.unwrap()
+            step += 1
+        }
+        last := names.len() - 1
+        field := self.field_index(holder_id, names[last].clone())?
         // `R0426`: a field of a structure from another module is assigned through a reference only when it is `pub`.
-        private := self.private_field_of(pointee.clone(), names[0].clone(), spans[0], spans[1])
+        private := self.private_field_of(holder.clone(), names[last].clone(), spans[last * 2], spans[last * 2 + 1])
         when private.is_some() {
             return Result::Err(private.unwrap())
         }
         // `R0255`: the resource handle, the first field of a structure with a destructor, is not overwritten through a borrow.
-        when reference_inner(local.ty.clone()).is_some() && field == 0 && !self.structs[id.unwrap()].drop_name.is_empty() {
+        when reference_inner(local.ty.clone()).is_some() && field == 0 && !self.structs[holder_id].drop_name.is_empty() {
             return Result::Err(diagnostic("R0255", span.start, span.end, String("cannot overwrite the resource handle through a borrowed value"), String("")))
         }
-        field_ty := self.structs[id.unwrap()].field_types[field].clone()
-        object_end := span.start + object.len()
-        pointer := join(words5(String("Local"), num(local.slot), local.ty.clone(), num(span.start), num(object_end)))
+        field_ty := self.structs[holder_id].field_types[field].clone()
+        object_end := span.start + walked
+        mut pointer := join(words5(String("Local"), num(local.slot), local.ty.clone(), num(span.start), num(span.start + object.len())))
+        when names.len() > 1 {
+            mut address: Vec<String> = Vec()
+            address.push(String("PlaceAddress"))
+            address.push(place_text.clone())
+            mut address_type := String("Reference ")
+            address_type.append(holder.clone())
+            address_type.append(" 1")
+            address.push(address_type)
+            pointer = join(address)
+        }
         mut stored := String("")
         when op.is_none() {
             lowered := self.moved_expression(value, field_ty.clone())?
@@ -4161,11 +4212,11 @@ extend Lowering {
             when !is_numeric_word(field_ty.clone()) {
                 return Result::Err(unsupported("arithmetic on this type"))
             }
-            end := object_end + 1 + names[0].len()
+            end := object_end + 1 + names[last].len()
             mut read: Vec<String> = Vec()
             read.push(String("ReferenceField"))
             read.push(pointer.clone())
-            read.push(num(id.unwrap()))
+            read.push(num(holder_id))
             read.push(num(field))
             read.push(field_ty.clone())
             read.push(num(span.start))
@@ -4182,7 +4233,7 @@ extend Lowering {
         mut tokens: Vec<String> = Vec()
         tokens.push(String("ReferenceFieldAssign"))
         tokens.push(pointer)
-        tokens.push(num(id.unwrap()))
+        tokens.push(num(holder_id))
         tokens.push(num(field))
         tokens.push(field_ty)
         tokens.push(stored)
@@ -6097,6 +6148,20 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
             return Result::Err(located)
         }
         returned := lowered.unwrap()
+        when !self.setup.is_empty() && self.is_let_statement(index) {
+            // A `let` binds a name that outlives the statement, so its setup is not a scope of its own: the temporaries the
+            // setup declared stay visible and are dropped with the enclosing block, after the name.
+            mut flat := self.setup.clone()
+            self.setup = Vec()
+            for item in self.statements_since(start) {
+                flat.push(item)
+            }
+            for item in flat {
+                self.statements.push(item)
+            }
+            self.setup = outer
+            return Result::Ok(returned)
+        }
         when !self.setup.is_empty() {
             // The setup comes first in a block with the statement, as the bootstrap's `with_setup` makes it. The block is a
             // scope of its own, which the guard ends with a drop unless the statement returns (the block does not fall through).
@@ -6109,6 +6174,8 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
                 items.push(self.owned_drop(visible_before))
             }
             self.statements.push(join(block_of(items)))
+            // The block dropped the temporaries that the setup declared, so they are no longer visible.
+            self.visible = visible_before
         }
         self.setup = outer
         return Result::Ok(returned)
@@ -7818,8 +7885,19 @@ extend Lowering {
     }
 
     fun method_target_unchecked(mut self, receiver: u64, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: ast::Span) -> Result<Lowered, String> {
-        recv := self.receiver(receiver)?
+        mut recv := self.receiver(receiver)?
         ty := recv.ty.clone()
+        // A `String` field of a temporary (`make().label.len()`) is moved into a hidden local, which ends the statement's
+        // borrow and drops the string with the enclosing block; reading its bytes in place would use freed memory.
+        when ty == "OwnedString" && self.is_field_of_temporary(receiver) {
+            hidden := self.allocate(ty.clone())?
+            mut hidden_name := String(" temporary")
+            hidden_name.append(hidden.to_string())
+            self.declare(Local { name: hidden_name, slot: hidden, ty: ty.clone(), mutable: false })
+            receiver_span := self.expr_span_of(receiver)
+            self.setup.push(join(words6(String("Let"), num(hidden), ty.clone(), recv.text.clone(), num(receiver_span.start), num(receiver_span.end))))
+            recv = Lowered { text: join(words5(String("Local"), num(hidden), ty.clone(), num(receiver_span.start), num(receiver_span.end))), ty: ty.clone() }
+        }
         when ty == "OwnedString" && (name == "append" || name == "push" || name == "clear") && self.immutable_local_receiver(receiver) {
             return Result::Err(mutable_string_error(name.clone(), span.start, span.end))
         }
@@ -8219,7 +8297,41 @@ extend Lowering {
         when borrowed.is_none() && reference_is_mutable(params[0].clone()) && self.immutable_local_receiver(receiver) {
             return Result::Err(mutable_receiver_error(name.clone(), span.start, span.end))
         }
-        when borrowed.is_none() {
+        root := self.field_place_root(receiver)
+        when borrowed.is_none() && root.is_some() && self.structs[id].repr_c == 0 {
+            // A structure nested in another (`outer.inner.method()`) is lent in place: its address is the address of the
+            // field of the enclosing structure, not that of a copy.
+            mutable_method := reference_is_mutable(params[0].clone())
+            root_name := root.unwrap()
+            root_local := self.locals[self.find(root_name.clone())?]
+            when mutable_method {
+                when reference_inner(root_local.ty.clone()).is_some() {
+                    when !reference_is_mutable(root_local.ty.clone()) {
+                        return Result::Err(mutable_receiver_error(name.clone(), span.start, span.end))
+                    }
+                } else when root_local.ty.starts_with("RawPointer ") {
+                    // A raw pointer's pointee is not checked for mutability.
+                } else when self.local_is_immutable(root_name) {
+                    return Result::Err(mutable_receiver_error(name.clone(), span.start, span.end))
+                }
+            }
+            place := self.field_tree(receiver)?
+            mut address: Vec<String> = Vec()
+            address.push(String("PlaceAddress"))
+            address.push(place.text)
+            mut address_type := String("Reference ")
+            address_type.append(recv.ty.clone())
+            when mutable_method {
+                address_type.append(" 1")
+            } else {
+                address_type.append(" 0")
+            }
+            address.push(address_type)
+            when reference_inner(root_local.ty.clone()).is_none() && !root_local.ty.starts_with("RawPointer ") {
+                self.addressed_types.set(root_local.slot, root_local.ty.clone())
+            }
+            lent = join(address)
+        } else when borrowed.is_none() {
             slot := self.receiver_local(receiver, recv.clone(), reference_is_mutable(params[0].clone()), span)?
             mut pointer := String("Reference ")
             pointer.append(recv.ty.clone())
@@ -8265,6 +8377,40 @@ extend Lowering {
         slot := self.allocate(recv.ty.clone())?
         self.setup.push(join(words6(String("Let"), num(slot), recv.ty.clone(), recv.text, num(span.start), num(span.end))))
         return Result::Ok(slot)
+    }
+
+    // Whether an expression is a field (at any depth) of the result of a call of a function. A method call is left out: its
+    // result may be read where an earlier operand decides whether it runs (`x.is_some() && x.unwrap().name.len() > 0`), and the
+    // hidden local's setup runs before the whole statement.
+    fun is_field_of_temporary(self, index: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::FieldE(value, name, name_span, span) => self.field_base_is_temporary(value),
+            _ => false,
+        }
+    }
+
+    fun field_base_is_temporary(self, index: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::FieldE(value, name, name_span, span) => self.field_base_is_temporary(value),
+            ast::ExprTree::CallE(callee, type_arguments, arguments, span) => true,
+            _ => false,
+        }
+    }
+
+    // The name of the local at the root of a chain of fields (`name.a.b`); nothing for any other expression.
+    fun field_place_root(self, index: u64) -> Option<String> {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::FieldE(value, name, name_span, span) => self.field_place_base(value),
+            _ => Option::None,
+        }
+    }
+
+    fun field_place_base(self, index: u64) -> Option<String> {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::NameRef(name, span) => Option::Some(name),
+            ast::ExprTree::FieldE(value, name, name_span, span) => self.field_place_base(value),
+            _ => Option::None,
+        }
     }
 
     // Whether a receiver expression is a name, which is a local.

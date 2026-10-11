@@ -1,0 +1,29 @@
+// test: run
+// out: 51
+// out: 99
+// out: 77
+// out: 4
+// out: 9
+// out: s
+// A path of fields (`self.q.p.y = value`) is stored into a structure nested in the one a reference points at.
+pub struct P { pub x: i64, pub y: i64 }
+pub struct Q { pub p: P, pub k: i64 }
+pub struct L { pub a: P, pub b: P, pub q: Q, pub s: String }
+extend L {
+    pub fun bump(mut self) { self.a.x = self.a.x + 1 self.b.y += 2 self.q.p.y = 40 self.q.p.x += 3 }
+    pub fun get(self) -> i64 { return self.a.x + self.b.y + self.q.p.y + self.q.p.x }
+    pub fun set_a(mut self, p: P) { self.a = p }
+}
+fun poke(l: &mut L) { l.b.x = 77 l.q.p.x += 1 }
+fun main() {
+    mut l := L { a: P { x: 1, y: 2 }, b: P { x: 3, y: 4 }, q: Q { p: P { x: 0, y: 0 }, k: 9 }, s: String("s") }
+    l.bump()
+    echo l.get()
+    l.set_a(P { x: 50, y: 0 })
+    echo l.get()
+    poke(&mut l)
+    echo l.b.x
+    echo l.q.p.x
+    echo l.q.k
+    echo l.s
+}

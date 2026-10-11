@@ -1,0 +1,436 @@
+// The measurements and reports of `ryn bench`: the statistics of a series of timings, the JSON the command writes and
+// reads back as a baseline, and the comparison of a run with its baseline.
+//
+// All times are whole nanoseconds. A series is summarised by its minimum, median, mean, maximum and population standard
+// deviation; the median is the middle sample, or the mean of the two middle ones when the count is even.
+//
+// The baseline file is the JSON `ryn bench --json` prints:
+//
+//     {"ryn":"0.1.7","benchmarks":[{"name":"path/to/program.ryn","compile":{...},"run":{...}}]}
+//
+// Only `"name"` and, inside `"run"`, `"median_ns"` are read back, so a baseline stays readable when more fields are added.
+
+pub struct Stats {
+    pub count: u64,
+    pub min_ns: u64,
+    pub median_ns: u64,
+    pub mean_ns: u64,
+    pub max_ns: u64,
+    pub stddev_ns: u64,
+}
+
+// The samples in ascending order.
+pub fun bench_sorted(samples: Vec<u64>) -> Vec<u64> {
+    mut sorted: Vec<u64> = Vec()
+    for sample in samples {
+        sorted.push(sample)
+    }
+    mut at: u64 = 1
+    while at < sorted.len() {
+        value := sorted[at]
+        mut before := at
+        while before > 0 && sorted[before - 1] > value {
+            sorted.set(before, sorted[before - 1])
+            before -= 1
+        }
+        sorted.set(before, value)
+        at += 1
+    }
+    return sorted
+}
+
+fun bench_isqrt(value: u64) -> u64 {
+    when value < 2 {
+        return value
+    }
+    mut low: u64 = 1
+    mut high: u64 = value
+    when high > 4294967296 {
+        high = 4294967296
+    }
+    while low < high {
+        middle := low + (high - low + 1) / 2
+        when middle <= value / middle {
+            low = middle
+        } else {
+            high = middle - 1
+        }
+    }
+    return low
+}
+
+pub fun bench_stats(samples: Vec<u64>) -> Stats {
+    sorted := bench_sorted(samples)
+    count := sorted.len()
+    when count == 0 {
+        return Stats { count: 0, min_ns: 0, median_ns: 0, mean_ns: 0, max_ns: 0, stddev_ns: 0 }
+    }
+    mut total: u64 = 0
+    for sample in sorted.clone() {
+        total += sample
+    }
+    mean := total / count
+    mut squares: u64 = 0
+    for sample in sorted.clone() {
+        mut distance: u64 = mean - sample
+        when sample > mean {
+            distance = sample - mean
+        }
+        // Distances are scaled down to microseconds before they are squared, so a long series of slow runs cannot overflow.
+        scaled := distance / 1000
+        squares += scaled * scaled
+    }
+    deviation := bench_isqrt(squares / count) * 1000
+    mut median := sorted[count / 2]
+    when count % 2 == 0 {
+        median = (sorted[count / 2 - 1] + sorted[count / 2]) / 2
+    }
+    return Stats { count: count, min_ns: sorted[0], median_ns: median, mean_ns: mean, max_ns: sorted[count - 1], stddev_ns: deviation }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Text
+
+fun bench_pad3(value: u64) -> String {
+    mut text := String("")
+    when value < 100 {
+        text.append("0")
+    }
+    when value < 10 {
+        text.append("0")
+    }
+    text.append(value.to_string())
+    return text
+}
+
+// A duration for people: `850 ns`, `12.500 us`, `3.250 ms`, `1.500 s`.
+pub fun bench_format(ns: u64) -> String {
+    mut text := String("")
+    when ns < 1000 {
+        text.append(ns.to_string())
+        text.append(" ns")
+        return text
+    }
+    mut unit: u64 = 1000
+    mut name := String(" us")
+    when ns >= 1000000000 {
+        unit = 1000000000
+        name = String(" s")
+    } else when ns >= 1000000 {
+        unit = 1000000
+        name = String(" ms")
+    }
+    text.append((ns / unit).to_string())
+    text.append(".")
+    text.append(bench_pad3((ns % unit) * 1000 / unit))
+    text.append(name)
+    return text
+}
+
+fun bench_json_text(value: String) -> String {
+    mut out := String("\"")
+    mut at: u64 = 0
+    while at < value.len() {
+        byte := value.byte_at(at) as u64
+        when byte == 34 || byte == 92 {
+            out.append("\\")
+            out.append(value.slice(at, at + 1))
+        } else when byte == 10 {
+            out.append("\\n")
+        } else when byte >= 32 {
+            out.append(value.slice(at, at + 1))
+        }
+        at += 1
+    }
+    out.append("\"")
+    return out
+}
+
+fun bench_json_stats(stats: Stats, samples: Vec<u64>, extra: String) -> String {
+    mut out := String("{")
+    out.append(extra)
+    out.append("\"runs\":")
+    out.append(stats.count.to_string())
+    out.append(",\"min_ns\":")
+    out.append(stats.min_ns.to_string())
+    out.append(",\"median_ns\":")
+    out.append(stats.median_ns.to_string())
+    out.append(",\"mean_ns\":")
+    out.append(stats.mean_ns.to_string())
+    out.append(",\"max_ns\":")
+    out.append(stats.max_ns.to_string())
+    out.append(",\"stddev_ns\":")
+    out.append(stats.stddev_ns.to_string())
+    out.append(",\"samples_ns\":[")
+    mut at: u64 = 0
+    while at < samples.len() {
+        when at > 0 {
+            out.append(",")
+        }
+        out.append(samples[at].to_string())
+        at += 1
+    }
+    out.append("]}")
+    return out
+}
+
+// The JSON object of one benchmark: its name, the compile timings and the run timings, each with the peak resident memory
+// of the slowest-to-grow process in kilobytes (0 where the system does not report it).
+pub fun bench_json_entry(name: String, compile_samples: Vec<u64>, run_samples: Vec<u64>, warmup: u64, compile_peak_kb: u64, run_peak_kb: u64) -> String {
+    mut out := String("{\"name\":")
+    out.append(bench_json_text(name))
+    out.append(",\"compile\":")
+    mut compile_extra := String("\"peak_memory_kb\":")
+    compile_extra.append(compile_peak_kb.to_string())
+    compile_extra.append(",")
+    out.append(bench_json_stats(bench_stats(compile_samples.clone()), compile_samples, compile_extra))
+    out.append(",\"run\":")
+    mut extra := String("\"warmup\":")
+    extra.append(warmup.to_string())
+    extra.append(",\"peak_memory_kb\":")
+    extra.append(run_peak_kb.to_string())
+    extra.append(",")
+    out.append(bench_json_stats(bench_stats(run_samples.clone()), run_samples, extra))
+    out.append("}")
+    return out
+}
+
+// A memory size for people: `850 KB`, `12.5 MB`, `1.2 GB`; `unknown` for 0.
+pub fun bench_format_kb(kb: u64) -> String {
+    mut text := String("")
+    when kb == 0 {
+        return String("unknown")
+    }
+    when kb < 1024 {
+        text.append(kb.to_string())
+        text.append(" KB")
+        return text
+    }
+    mut unit: u64 = 1024
+    mut name := String(" MB")
+    when kb >= 1048576 {
+        unit = 1048576
+        name = String(" GB")
+    }
+    text.append((kb / unit).to_string())
+    text.append(".")
+    text.append(((kb % unit) * 10 / unit).to_string())
+    text.append(name)
+    return text
+}
+
+pub fun bench_json_report(version: String, entries: Vec<String>) -> String {
+    mut out := String("{\"ryn\":")
+    out.append(bench_json_text(version))
+    out.append(",\"benchmarks\":[")
+    mut at: u64 = 0
+    while at < entries.len() {
+        when at > 0 {
+            out.append(",")
+        }
+        out.append(entries[at].clone())
+        at += 1
+    }
+    out.append("]}")
+    return out
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Baselines
+
+// The position just after the first `needle` at or after `from`; nothing when it does not occur.
+fun bench_find_after(text: String, needle: String, from: u64) -> Option<u64> {
+    when needle.is_empty() || text.len() < needle.len() {
+        return Option::None
+    }
+    mut at := from
+    while at + needle.len() <= text.len() {
+        mut matches := true
+        mut offset: u64 = 0
+        while offset < needle.len() {
+            when text.byte_at(at + offset) != needle.byte_at(offset) {
+                matches = false
+                offset = needle.len()
+            } else {
+                offset += 1
+            }
+        }
+        when matches {
+            return Option::Some(at + needle.len())
+        }
+        at += 1
+    }
+    return Option::None
+}
+
+fun bench_skip_spaces(text: String, at: u64) -> u64 {
+    mut position := at
+    while position < text.len() {
+        byte := text.byte_at(position) as u64
+        when byte != 32 && byte != 9 && byte != 10 && byte != 13 {
+            break
+        }
+        position += 1
+    }
+    return position
+}
+
+// The position of the value of the first `"key":` at or after `from`, after the colon and any white space; nothing when the
+// key does not occur. The file may be formatted any way a JSON writer likes.
+fun bench_value_of(text: String, key: String, from: u64) -> Option<u64> {
+    mut quoted := String("\"")
+    quoted.append(key)
+    quoted.append("\"")
+    mut search := from
+    while true {
+        found := bench_find_after(text.clone(), quoted.clone(), search)
+        when found.is_none() {
+            return Option::None
+        }
+        colon := bench_skip_spaces(text.clone(), found.unwrap())
+        when colon < text.len() && (text.byte_at(colon) as u64) == 58 {
+            return Option::Some(bench_skip_spaces(text.clone(), colon + 1))
+        }
+        search = found.unwrap()
+    }
+    return Option::None
+}
+
+// The unsigned number that starts at `at`.
+fun bench_number_at(text: String, at: u64) -> Option<u64> {
+    mut position := at
+    mut value: u64 = 0
+    mut digits: u64 = 0
+    while position < text.len() {
+        byte := text.byte_at(position) as u64
+        when byte < 48 || byte > 57 {
+            break
+        }
+        value = value * 10 + (byte - 48)
+        digits += 1
+        position += 1
+    }
+    when digits == 0 {
+        return Option::None
+    }
+    return Option::Some(value)
+}
+
+// The position after the quoted `name` that is the value of a `"name"` key at or after `from`.
+fun bench_find_name(text: String, name: String, from: u64) -> Option<u64> {
+    quoted := bench_json_text(name)
+    mut search := from
+    while true {
+        value := bench_value_of(text.clone(), String("name"), search)
+        when value.is_none() {
+            return Option::None
+        }
+        at := value.unwrap()
+        when at + quoted.len() <= text.len() && text.slice(at, at + quoted.len()) == quoted {
+            return Option::Some(at + quoted.len())
+        }
+        search = at
+    }
+    return Option::None
+}
+
+// The median run time of the benchmark `name` in a baseline file's text; nothing when the file has no such benchmark.
+pub fun bench_baseline_median(text: String, name: String) -> Option<u64> {
+    start := bench_find_name(text.clone(), name, 0)
+    when start.is_none() {
+        return Option::None
+    }
+    // The entry ends where the next one starts.
+    next := bench_value_of(text.clone(), String("name"), start.unwrap())
+    mut end := text.len()
+    when next.is_some() {
+        end = next.unwrap()
+    }
+    entry := text.slice(start.unwrap(), end)
+    run := bench_value_of(entry.clone(), String("run"), 0)
+    when run.is_none() {
+        return Option::None
+    }
+    median := bench_value_of(entry.clone(), String("median_ns"), run.unwrap())
+    when median.is_none() {
+        return Option::None
+    }
+    return bench_number_at(entry, median.unwrap())
+}
+
+// The peak memory in kilobytes of the run of the benchmark `name` in a baseline file; nothing when it has none.
+pub fun bench_baseline_peak(text: String, name: String) -> Option<u64> {
+    start := bench_find_name(text.clone(), name, 0)
+    when start.is_none() {
+        return Option::None
+    }
+    next := bench_value_of(text.clone(), String("name"), start.unwrap())
+    mut end := text.len()
+    when next.is_some() {
+        end = next.unwrap()
+    }
+    entry := text.slice(start.unwrap(), end)
+    run := bench_value_of(entry.clone(), String("run"), 0)
+    when run.is_none() {
+        return Option::None
+    }
+    peak := bench_value_of(entry.clone(), String("peak_memory_kb"), run.unwrap())
+    when peak.is_none() {
+        return Option::None
+    }
+    return bench_number_at(entry, peak.unwrap())
+}
+
+// The change from the baseline to the current median, in tenths of a percent (negative when it got faster) and whether it
+// is a regression past `threshold` percent.
+pub struct Change {
+    pub tenths: i64,
+    pub regression: bool,
+}
+
+pub fun bench_change(baseline: u64, current: u64, threshold: u64) -> Change {
+    when baseline == 0 {
+        return Change { tenths: 0, regression: false }
+    }
+    mut tenths: i64 = 0
+    when current >= baseline {
+        tenths = ((current - baseline) * 1000 / baseline) as i64
+    } else {
+        tenths = (0 as i64) - (((baseline - current) * 1000 / baseline) as i64)
+    }
+    return Change { tenths: tenths, regression: tenths > (threshold * 10) as i64 }
+}
+
+pub fun bench_percent(tenths: i64) -> String {
+    mut text := String("")
+    mut magnitude: u64 = 0
+    when tenths < 0 {
+        text.append("-")
+        magnitude = ((0 as i64) - tenths) as u64
+    } else {
+        text.append("+")
+        magnitude = tenths as u64
+    }
+    text.append((magnitude / 10).to_string())
+    text.append(".")
+    text.append((magnitude % 10).to_string())
+    text.append("%")
+    return text
+}
+
+pub fun bench_parse_u64(text: String) -> Option<u64> {
+    when text.is_empty() {
+        return Option::None
+    }
+    mut value: u64 = 0
+    mut at: u64 = 0
+    while at < text.len() {
+        byte := text.byte_at(at) as u64
+        when byte < 48 || byte > 57 || value > 1844674407370955160 {
+            return Option::None
+        }
+        value = value * 10 + (byte - 48)
+        at += 1
+    }
+    return Option::Some(value)
+}

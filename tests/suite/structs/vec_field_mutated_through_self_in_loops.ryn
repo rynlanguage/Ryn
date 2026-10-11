@@ -1,0 +1,28 @@
+// test: run
+// out: 1
+// out: 0
+// out: 1
+// A collection field of a structure is changed through `self` inside nested loops and conditions.
+pub struct Grid { pub seen: Vec<i64>, pub x: f64, pub z: f64, pub note: str }
+extend Grid {
+    fun near(self, a: f64) -> bool { return a > 1.0 }
+    pub fun explore(mut self, px: f64, pz: f64) {
+        cx := px as i64
+        cz := pz as i64
+        for z in cz-1..cz+2 { for x in cx-1..cx+2 {
+            when x >= 0 && z >= 0 && x < 3 && z < 3 {
+                when self.near(px) || (x == cx && z == cz) { self.seen.set((z*3+x) as u64, 1) }
+            }
+        } }
+    }
+}
+fun main() {
+    mut seen := Vec<i64>()
+    for i in 0..9 { seen.push(0) }
+    mut grid := Grid { seen: seen, x: 0.0, z: 0.0, note: "" }
+    grid.explore(0.0, 0.0)
+    echo grid.seen.index(0)
+    echo grid.seen.index(8)
+    grid.explore(2.0, 2.0)
+    echo grid.seen.index(8)
+}

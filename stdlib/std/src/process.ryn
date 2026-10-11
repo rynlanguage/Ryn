@@ -7,6 +7,8 @@ pub struct ProcessResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+    // The peak resident memory of the program in kilobytes; 0 where the system does not report it.
+    pub peak_memory_kb: u64,
 }
 
 fun release_process(process: Process) {
@@ -62,6 +64,7 @@ pub fun run_capture_args(program: str, arguments: Vec<String>) -> ProcessResult 
         exit_code: __process_capture_exit_code(capture),
         stdout: __process_capture_stdout(capture),
         stderr: __process_capture_stderr(capture),
+        peak_memory_kb: __process_capture_peak_kb(capture),
     }
     __process_capture_drop(capture)
     return result
