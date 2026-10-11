@@ -120,6 +120,8 @@ class BenchTests(unittest.TestCase):
             self.assertNotIn("REGRESSION", generous.stdout)
 
             data["benchmarks"][0]["run"]["median_ns"] = 1
+            # The peak memory of two runs differs by a few percent, so the baseline allows far more: only the time regresses.
+            data["benchmarks"][0]["run"]["peak_memory_kb"] = 10**9
             saved.write_text(json.dumps(data), encoding="utf-8")
             slower = run_ryn("bench", source, "--iterations", "3", "--baseline", saved)
             self.assertEqual(slower.code, 1)
