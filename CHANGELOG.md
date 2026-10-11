@@ -4,6 +4,44 @@ All notable changes to Ryn are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses a `0.x` version
 sequence: minor releases may change language details while the compiler is pre-1.0.
 
+## [0.1.7] — 2026-10-11
+
+"Native Power & Benchmarks". The version strings (`VERSION`, `ryn --version`, `rync --version`, the registry header, the CI
+archive names) say 0.1.7.
+
+### Nested structures
+
+- A path of fields is stored through a reference: `self.q.p.y = 1` and `l.a.x += 1` in a `mut self` method or through a
+  `&mut` parameter (the native backend declined these as "assignment through this reference"). The store goes to the
+  address of the nested field (`PlaceAddress` in the IR), so the old value is dropped and the new one moved in once.
+- A `mut self` method is called on a structure nested in another one (`self.b.shift(1)`, `l.b.shift(1)`), in place, with the
+  mutability of the root checked (`R0204` on an immutable local). It was `R0235` ("method receivers must be a local
+  variable").
+- A field of a structure nested in the result of a call is read (`make().q.p.x`), and the rest of the result is dropped.
+- A method is called on a `String` field of a call result (`make().label.len()`, `make().q.p.name.clone()`): the string moves
+  into a hidden local that lives as long as the enclosing block, so nothing leaks or is freed twice (it was R0905). A `let`
+  whose statement needed such a temporary no longer drops the bound name at the end of the statement.
+- A structure stored through a pointer as a whole (`self.seen = ...` of a `Vec`, a `String` or a nested structure) works
+  for the native backend; it was declined as "a structure field of a structure type". This is what stopped programs with
+  a collection field changed through `self` inside loops from compiling.
+- C calls with more than six integer arguments pass the rest on the stack, for named functions and for calls through a
+  function pointer (scalar arguments only; records and the freestanding and Windows targets still decline).
+- The help of `R0905` no longer points at the removed `--backend cranelift`.
+- Tests: `tests/suite/structs/nested_struct_*`, `vec_field_mutated_through_self_in_loops`,
+  `raii/nested_destructor_runs_once_per_resource`, `ffi/foreign_call_with_stack_arguments`.
+
+### `ryn bench`
+
+- `ryn bench <file.ryn|project-dir>` compiles the program, times the compiler (`--compile-runs N`), runs the program
+  `--warmup N` times without counting and then `--iterations N` times with its output captured, and prints the minimum,
+  median, mean, maximum and standard deviation. `--json` prints the report as JSON, `--save-baseline FILE` writes it,
+  `--baseline FILE --threshold PERCENT` compares medians (default 10%) and exits 1 on a regression. A project with a
+  `benches/` directory times every `.ryn` file in it by name. Written in Ryn (`selfhost/src/driver/bench.ryn`).
+- The peak resident memory of the compiler and of the program is reported and written to the JSON (`peak_memory_kb`), and a
+  baseline that has it makes memory growth past the threshold a regression too. `std::process::ProcessResult` has a new
+  field `peak_memory_kb` (the child's `ru_maxrss` from `wait4`; 0 on Windows, where it is not measured).
+- Tests: `tools/tests/test_bench.py`.
+
 ## [0.1.6] — 2026-10-11
 
 "Native First". The `ryn` command, the native compiler and the runtime are written in Ryn, and the Rust implementation and

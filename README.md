@@ -13,7 +13,7 @@ own sources, and the tree contains no Rust.
 
 ## Status
 
-The latest release is [0.1.6](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.6) ("Native First").
+The latest release is [0.1.7](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.7) ("Native Power & Benchmarks"); [0.1.6](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.6) was "Native First".
 
 - The whole toolchain is written in Ryn: the `ryn` command, the native compiler `rync` (lexer, parser,
   analysis, code generator, ELF and PE writers) and the runtime. There is no Rust code in the tree and no Cargo
@@ -97,6 +97,7 @@ ryn check .                # analyse
 ryn build .                # compile to build/debug/<name>
 ryn run .                  # compile and run
 ryn run app.ryn -- arg     # pass arguments after --
+ryn bench app.ryn          # time the compiler and the program: warmup, median, JSON, baseline
 ryn clean .                # remove build artifacts
 ryn lock .                 # resolve dependencies and write ryn.lock
 ryn login <token>          # save a pods registry token
@@ -105,6 +106,11 @@ ryn publish .              # check, pack and upload the package
 
 A single file works too: `ryn check main.ryn`, `ryn build main.ryn -o main`, `ryn run main.ryn`.
 `main` returning `i32` becomes the process exit code.
+
+`ryn bench` compiles a file or project and times it: `--iterations N` timed runs after `--warmup N` untimed ones
+(the program's output is captured), `--compile-runs N` timings of the compiler, `--json` for a machine-readable report,
+`--save-baseline FILE` to keep a report and `--baseline FILE [--threshold PERCENT]` to compare medians with it (status 1
+on a regression). A project with a `benches/` directory times every `.ryn` file in it.
 
 Useful options: `--release` (outputs go to `build/release`), `-o/--output <path>`. On Windows the program is
 `ryn.exe` and the executables get `.exe`; Windows support is experimental (see Status).

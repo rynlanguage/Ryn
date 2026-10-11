@@ -393,7 +393,7 @@ extend Compilation {
             when found.code == "R0905" {
                 mut message := String("the native compiler cannot compile this program: ")
                 message.append(found.message.clone())
-                placed := report::Diagnostic { code: found.code.clone(), message: message, start: found.start, end: found.end, has_help: true, help: String("compile with `--backend cranelift` until the native backend handles it") }
+                placed := report::Diagnostic { code: found.code.clone(), message: message, start: found.start, end: found.end, has_help: true, help: String("this construct is not supported by the native backend yet; simplify it or report it as a compiler limitation") }
                 return Failure { text: self.render(placed), status: 3 }
             }
             return Failure { text: self.render(found), status: 1 }
@@ -769,7 +769,7 @@ fun main() -> i32 {
     while position < arg_count() {
         word := String(arg(position))
         when word == "--version" || word == "-V" {
-            echo "rync 0.1.6"
+            echo "rync 0.1.7"
             return 0
         }
         when word == "--help" || word == "-h" {

@@ -1035,7 +1035,7 @@ pub fun publish(project: String) -> Result<String, String> {
     authorization.append(secret.unwrap())
     headers.push(authorization)
     headers.push(String("Content-Type: application/gzip"))
-    headers.push(String("X-Ryn-Version: 0.1.6"))
+    headers.push(String("X-Ryn-Version: 0.1.7"))
     mut url := registry.clone()
     url.append("/api/v1/packages/new")
     body_path := temp_path("http-body", 5)

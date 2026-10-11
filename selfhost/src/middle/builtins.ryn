@@ -107,6 +107,7 @@ fun builtin_rows() -> Vec<String> {
     rows.push(String("__process_capture_exit_code;System ProcessCaptureExitCode;RawPointer U8;I32"))
     rows.push(String("__process_capture_stdout;System ProcessCaptureStdout;RawPointer U8;OwnedString"))
     rows.push(String("__process_capture_stderr;System ProcessCaptureStderr;RawPointer U8;OwnedString"))
+    rows.push(String("__process_capture_peak_kb;System ProcessCapturePeakKb;RawPointer U8;U64"))
     rows.push(String("__process_capture_drop;System ProcessCaptureDrop;RawPointer U8;"))
     rows.push(String("__tcp_connect;System TcpConnect;Str;RawPointer U8"))
     rows.push(String("__tcp_read;System TcpRead;RawPointer U8;OwnedString"))

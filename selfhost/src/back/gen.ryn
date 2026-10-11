@@ -207,6 +207,8 @@ pub struct Gen {
     dynamic_imports: bool,
     // Whether a freestanding build met a call it can only make through the C library.
     wants_libc: bool,
+    // The arguments of the last C call that do not fit the six integer registers, by position: they go to the stack.
+    c_overflow: Vec<u64>,
     // The source span of the statement or expression being generated, and the one where generation failed: a construct
     // the backend lacks is reported at its place in the program.
     span_start: u64,
@@ -400,6 +402,7 @@ fun build(input: ir::IrProgram, executable: bool, libc: bool, windows: bool) -> 
         win_symbols: Vec(),
         dynamic_imports: false,
         wants_libc: false,
+        c_overflow: Vec(),
         helper_names: Vec(),
         helper_labels: Vec(),
         span_start: 0,
@@ -692,6 +695,7 @@ extend Gen {
             ir::IrExpr::SliceElementAddress(slice, index, ty, span) => String("the address of a slice element"),
             ir::IrExpr::AddressOf(slot, ty, pointer, span) => String("the address of a local"),
             ir::IrExpr::Dereference(pointer, ty) => String("a dereference"),
+            ir::IrExpr::PlaceAddress(place, ty) => String("the address of a nested field"),
             ir::IrExpr::StringFindOption(value, id) => String("a find result"),
             ir::IrExpr::StringAsStr(value) => String("a String as str"),
             ir::IrExpr::Binary(op, left, right, ty) => String("an arithmetic expression"),
@@ -3311,7 +3315,7 @@ extend Gen {
         when !self.load_cell(asm, ty, x64::Reg::RSP, self.pushed_field_disp(id, field)) {
             return false
         }
-        self.drop_field_remainder(asm, id, field, ty)
+        self.drop_field_remainder(asm, id, self.pushed_field_disp(id, field), ty)
         asm.alu_ri(0, x64::Reg::RSP, (8 * count) as i64)
         return true
     }
@@ -9253,10 +9257,41 @@ extend Gen {
             // A freestanding program cannot make this call: it is built again against the C library.
             self.wants_libc = true
             asm.trap()
+        } else when self.c_overflow.len() > 0 {
+            when !self.stack_argument_call(asm, name.clone(), arguments.len()) {
+                return false
+            }
         } else {
             self.aligned_call(asm, name)
         }
         return self.finish_c_call(asm, result)
+    }
+
+    // A call of a C function some of whose arguments (`self.c_overflow`, by position) go to the stack, of the `count`
+    // arguments that are pushed in order: the stack is aligned, the stack arguments are pushed last one first, and
+    // all the pushed cells are dropped after the call.
+    fun stack_argument_call(mut self, asm: &mut x64::Asm, name: String, count: u64) -> bool {
+        when self.freestanding || self.windows {
+            return self.fail("a foreign call with this many arguments")
+        }
+        spilled := self.c_overflow.clone()
+        asm.push(x64::Reg::RBX)
+        asm.mov_rr(x64::Reg::RBX, x64::Reg::RSP)
+        asm.alu_ri(4, x64::Reg::RSP, (0 as i64) - 16)
+        when spilled.len() % 2 == 1 {
+            asm.alu_ri(5, x64::Reg::RSP, 8)
+        }
+        mut at: u64 = spilled.len()
+        while at > 0 {
+            at -= 1
+            asm.load(8, false, x64::Reg::RAX, x64::Reg::RBX, (8 + 8 * (count - 1 - spilled[at])) as i64)
+            asm.push(x64::Reg::RAX)
+        }
+        asm.call_symbol(self.foreign_symbol(name))
+        asm.mov_rr(x64::Reg::RSP, x64::Reg::RBX)
+        asm.pop(x64::Reg::RBX)
+        asm.alu_ri(0, x64::Reg::RSP, (8 * count) as i64)
+        return true
     }
 
     // A call of a Windows function with the arguments `types` on the stack (the first pushed first): the first four go to
@@ -10319,6 +10354,7 @@ extend Gen {
         mut firsts: Vec<u64> = Vec()
         mut integers: u64 = 0
         mut floats: u64 = 0
+        mut overflow: Vec<u64> = Vec()
         for ty in types.clone() {
             firsts.push(registers.len())
             classes := self.c_classes(ty)
@@ -10351,15 +10387,49 @@ extend Gen {
                     registers.push(floats)
                     sse.push(true)
                     floats += 1
+                } else when integers >= 6 {
+                    // Past the sixth integer register a scalar goes to the stack.
+                    overflow.push(firsts.len() - 1)
+                    registers.push(0)
+                    sse.push(false)
                 } else {
-                    when integers >= 6 {
-                        return self.fail("a foreign call with this many arguments")
-                    }
                     registers.push(arg_register(integers))
                     sse.push(false)
                     integers += 1
                 }
             }
+        }
+        self.c_overflow = overflow.clone()
+        when overflow.len() > 0 {
+            // The pushed cells stay where they are for the call to copy the overflowing ones; the register arguments are
+            // read from them in place. Only scalars are mixed with stack arguments.
+            count := types.len()
+            mut at: u64 = 0
+            while at < count {
+                when self.c_classes(types[at]).len() > 0 {
+                    return self.fail("a foreign call with this many arguments")
+                }
+                at += 1
+            }
+            mut position: u64 = 0
+            while position < count {
+                mut spilled := false
+                for given in overflow.clone() {
+                    when given == position {
+                        spilled = true
+                    }
+                }
+                when !spilled {
+                    asm.load(8, false, x64::Reg::RAX, x64::Reg::RSP, (8 * (count - 1 - position)) as i64)
+                    when sse[position] {
+                        asm.movq_to_xmm(self.word(types[position]) == "F64", registers[position], x64::Reg::RAX)
+                    } else {
+                        asm.mov_rr(registers[position], x64::Reg::RAX)
+                    }
+                }
+                position += 1
+            }
+            return true
         }
         mut index: u64 = types.len()
         while index > 0 {
@@ -10482,6 +10552,30 @@ extend Gen {
         }
         when !self.load_c_arguments(asm, parameters) {
             return false
+        }
+        when self.c_overflow.len() > 0 {
+            // The function pointer is the lowest pushed cell; the arguments above it that do not fit the registers go to
+            // the stack, as for a call of a named function.
+            count := arguments.len() - 1
+            spilled := self.c_overflow.clone()
+            asm.load(8, false, x64::Reg::R11, x64::Reg::RSP, (8 * count) as i64)
+            asm.push(x64::Reg::RBX)
+            asm.mov_rr(x64::Reg::RBX, x64::Reg::RSP)
+            asm.alu_ri(4, x64::Reg::RSP, (0 as i64) - 16)
+            when spilled.len() % 2 == 1 {
+                asm.alu_ri(5, x64::Reg::RSP, 8)
+            }
+            mut at: u64 = spilled.len()
+            while at > 0 {
+                at -= 1
+                asm.load(8, false, x64::Reg::RAX, x64::Reg::RBX, (8 + 8 * (count - 1 - spilled[at])) as i64)
+                asm.push(x64::Reg::RAX)
+            }
+            asm.call_reg(x64::Reg::R11)
+            asm.mov_rr(x64::Reg::RSP, x64::Reg::RBX)
+            asm.pop(x64::Reg::RBX)
+            asm.alu_ri(0, x64::Reg::RSP, (8 * (count + 1)) as i64)
+            return self.finish_c_call(asm, self.pointer_result(id))
         }
         asm.pop(x64::Reg::R11)
         asm.push(x64::Reg::RBX)
@@ -10616,6 +10710,7 @@ extend Gen {
             ir::IrExpr::AddressOf(slot, ty, pointer, span) => self.address_of(asm, slot, ty),
             ir::IrExpr::ValueAddress(value, ty, pointer, span) => self.value_address(asm, value, ty),
             ir::IrExpr::Dereference(pointer, ty) => self.load_through(asm, pointer, 0, ty),
+            ir::IrExpr::PlaceAddress(place, ty) => self.memory_address(asm, place),
             ir::IrExpr::MoveRef(slot, ty) => self.move_local(asm, slot, ty),
             ir::IrExpr::FloatLit(bits, ty) => self.float_literal(asm, bits, ty),
             ir::IrExpr::FunctionAddress(function, ty) => self.function_address(asm, function),
@@ -10989,6 +11084,72 @@ extend Gen {
         }
     }
 
+    // A field of a structure that is itself a field (at any depth) of the result of a call, `call().a.b`: the result of the
+    // call is the root. Answers the call expression, the root's structure and the cell offset of `value` inside it; an
+    // empty list for any other value.
+    fun nested_call_root(self, value: u64) -> Vec<u64> {
+        mut none: Vec<u64> = Vec()
+        return choose self.program.exprs[value] {
+            ir::IrExpr::FieldRead(inner, iid, ifield, ity, span) => self.nested_call_step(inner, iid, ifield),
+            _ => none,
+        }
+    }
+
+    fun nested_call_step(self, inner: u64, id: u64, field: u64) -> Vec<u64> {
+        mut none: Vec<u64> = Vec()
+        offset := self.program.structs[id].fields[field].slot_offset
+        return choose self.program.exprs[inner] {
+            ir::IrExpr::CallExpr(target, arguments, cty) => self.nested_call_found(inner, id, offset),
+            ir::IrExpr::FieldRead(deeper, did, dfield, dty, span) => self.nested_call_deeper(deeper, did, dfield, offset),
+            _ => none,
+        }
+    }
+
+    fun nested_call_found(self, call: u64, id: u64, offset: u64) -> Vec<u64> {
+        mut found: Vec<u64> = Vec()
+        found.push(call)
+        found.push(id)
+        found.push(offset)
+        return found
+    }
+
+    fun nested_call_deeper(self, inner: u64, id: u64, field: u64, offset: u64) -> Vec<u64> {
+        found := self.nested_call_step(inner, id, field)
+        when found.len() == 0 {
+            return found
+        }
+        mut shifted: Vec<u64> = Vec()
+        shifted.push(found[0])
+        shifted.push(found[1])
+        shifted.push(found[2] + offset)
+        return shifted
+    }
+
+    // The cell of a field read from a structure nested in the result of a call: the result is pushed, the cell loaded, and
+    // the rest of the result dropped.
+    fun nested_call_field(mut self, asm: &mut x64::Asm, nested: Vec<u64>, id: u64, field: u64, ty: u64) -> bool {
+        root := nested[1]
+        when self.program.structs[root].drop_function.is_some() {
+            return self.fail("a field of a temporary destructor")
+        }
+        pushed := choose self.program.exprs[nested[0]] {
+            ir::IrExpr::CallExpr(target, arguments, cty) => self.call_expression(asm, target, arguments),
+            _ => self.fail("a field of a value that is not a local"),
+        }
+        when !pushed {
+            return false
+        }
+        count := self.program.structs[root].slot_count
+        offset := nested[2] + self.program.structs[id].fields[field].slot_offset
+        disp := (8 * (count - 1 - offset)) as i64
+        when !self.load_cell(asm, ty, x64::Reg::RSP, disp) {
+            return false
+        }
+        self.drop_field_remainder(asm, root, disp, ty)
+        asm.alu_ri(0, x64::Reg::RSP, (8 * count) as i64)
+        return true
+    }
+
     fun field_of_value(mut self, asm: &mut x64::Asm, value: u64, id: u64, field: u64, ty: u64) -> bool {
         base := self.place_of(value)
         when base.is_some() {
@@ -11000,6 +11161,10 @@ extend Gen {
         when self.program.structs[id].drop_function.is_some() {
             return self.fail("a field of a temporary destructor")
         }
+        nested := self.nested_call_root(value)
+        when nested.len() > 0 {
+            return self.nested_call_field(asm, nested, id, field, ty)
+        }
         when !self.is_pure(value) && !self.is_propagation(value) && !self.is_struct_literal(value) {
             return self.fail("a field of a value that is not a local")
         }
@@ -11010,7 +11175,7 @@ extend Gen {
         when !self.load_cell(asm, ty, x64::Reg::RSP, self.pushed_field_disp(id, field)) {
             return false
         }
-        self.drop_field_remainder(asm, id, field, ty)
+        self.drop_field_remainder(asm, id, self.pushed_field_disp(id, field), ty)
         asm.alu_ri(0, x64::Reg::RSP, (8 * count) as i64)
         return true
     }
@@ -11028,6 +11193,7 @@ extend Gen {
             ir::IrExpr::FieldRead(inner, id, field, ty, span) => self.is_pure(inner),
             ir::IrExpr::ReferenceFieldRead(inner, id, field, ty, span, borrowed) => self.is_pure(inner),
             ir::IrExpr::Dereference(inner, ty) => self.is_pure(inner),
+            ir::IrExpr::PlaceAddress(inner, ty) => self.is_pure(inner),
             ir::IrExpr::Binary(op, left, right, ty) => self.is_pure(left) && self.is_pure(right),
             ir::IrExpr::CallExpr(target, arguments, ty) => self.is_pure_call(target, arguments),
             _ => false,
@@ -11109,6 +11275,7 @@ extend Gen {
             ir::IrExpr::ReferenceFieldRead(pointer, id, field, ty, span, borrowed) => self.reference_field_address(asm, pointer, id, field),
             ir::IrExpr::FieldRead(value, id, field, ty, span) => self.value_field_address(asm, value, id, field),
             ir::IrExpr::Dereference(pointer, ty) => self.expr(asm, pointer),
+            ir::IrExpr::LocalRef(slot, ty, span) => self.address_of(asm, slot, ty),
             ir::IrExpr::ArrayIndex(array, index, ty, length) => self.array_element_address(asm, array, index, ty, length),
             ir::IrExpr::SliceIndex(slice, index, ty) => self.slice_element_address(asm, slice, index, ty),
             _ => self.fail("a structure in memory that is not reached through a reference"),
@@ -11271,12 +11438,12 @@ extend Gen {
     }
 
     // A field taken from a temporary leaves its owner alive and drops the other fields.
-    fun drop_field_remainder(mut self, asm: &mut x64::Asm, id: u64, field: u64, ty: u64) {
+    fun drop_field_remainder(mut self, asm: &mut x64::Asm, id: u64, disp: i64, ty: u64) {
         count := self.program.structs[id].slot_count
         asm.push(x64::Reg::RAX)
         when self.has_owners(ty) {
             asm.mov_ri(x64::Reg::RCX, 0)
-            asm.store(8, x64::Reg::RCX, x64::Reg::RSP, 8 + self.pushed_field_disp(id, field))
+            asm.store(8, x64::Reg::RCX, x64::Reg::RSP, 8 + disp)
         }
         asm.lea(x64::Reg::RDI, x64::Reg::RSP, (8 * count) as i64)
         asm.call_label(self.value_drop_routine(asm, self.struct_type(id), false))
@@ -11317,11 +11484,54 @@ extend Gen {
         return true
     }
 
+    // A structure field stored through a pointer: its cells go to the lowest cell of the field on. A field of a `repr(C)`
+    // structure keeps the C layout.
+    fun store_field_cells_through(mut self, asm: &mut x64::Asm, value: u64, pointer: u64, id: u64, field: u64, ty: u64) -> bool {
+        displacement := self.sub_displacement(id, field)
+        when self.program.structs[id].repr_c {
+            return self.store_through(asm, value, pointer, displacement, ty)
+        }
+        when self.cells_of(ty) == 0 {
+            return self.fail("an assignment of a structure through a pointer")
+        }
+        return self.store_cells_through(asm, value, pointer, displacement, ty)
+    }
+
     fun store_field_through(mut self, asm: &mut x64::Asm, value: u64, pointer: u64, id: u64, field: u64, ty: u64) -> bool {
+        // A field that is itself a structure (a `Vec`, a `String`, a nested structure) is stored as its cells, from the
+        // lowest cell of the field on.
         when !self.is_cell(ty) {
-            return self.fail("a structure field of a structure type")
+            return self.store_field_cells_through(asm, value, pointer, id, field, ty)
         }
         return self.store_through(asm, value, pointer, self.field_displacement(id, field), ty)
+    }
+
+    // A structure stored through a pointer as its cells, the first cell at the highest offset, as a field read through
+    // the pointer reads it; `displacement` is the offset of its lowest cell.
+    fun store_cells_through(mut self, asm: &mut x64::Asm, value: u64, pointer: u64, displacement: i64, ty: u64) -> bool {
+        // A structure is pushed as its cells, the pointer is evaluated, and each cell is stored through it, the
+        // first cell at the highest offset, as a field read through the pointer reads it.
+        count := self.cells_of(ty)
+        when !self.push_value(asm, value, ty) {
+            return false
+        }
+        when !self.expr(asm, pointer) {
+            return false
+        }
+        when self.has_owners(ty) {
+            asm.push(x64::Reg::RAX)
+            asm.lea(x64::Reg::RDI, x64::Reg::RAX, displacement + (8 * (count - 1)) as i64)
+            asm.call_label(self.value_drop_routine(asm, ty, false))
+            asm.pop(x64::Reg::RAX)
+        }
+        mut cell: u64 = 0
+        while cell < count {
+            asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, (8 * (count - 1 - cell)) as i64)
+            asm.store(8, x64::Reg::RCX, x64::Reg::RAX, displacement + (8 * (count - 1 - cell)) as i64)
+            cell += 1
+        }
+        asm.alu_ri(0, x64::Reg::RSP, (8 * count) as i64)
+        return true
     }
 
     // Stores a scalar through a pointer, at `displacement` from the address the pointer holds.
@@ -11331,29 +11541,7 @@ extend Gen {
                 return self.store_c_struct_through(asm, value, pointer, displacement, ty)
             }
             when self.cells_of(ty) > 0 && !self.is_str(ty) && self.c_size_of(ty) == 8 * self.cells_of(ty) {
-                // A structure is pushed as its cells, the pointer is evaluated, and each cell is stored through it, the
-                // first cell at the highest offset, as a field read through the pointer reads it.
-                count := self.cells_of(ty)
-                when !self.push_value(asm, value, ty) {
-                    return false
-                }
-                when !self.expr(asm, pointer) {
-                    return false
-                }
-                when self.has_owners(ty) {
-                    asm.push(x64::Reg::RAX)
-                    asm.lea(x64::Reg::RDI, x64::Reg::RAX, displacement + (8 * (count - 1)) as i64)
-                    asm.call_label(self.value_drop_routine(asm, ty, false))
-                    asm.pop(x64::Reg::RAX)
-                }
-                mut cell: u64 = 0
-                while cell < count {
-                    asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, (8 * (count - 1 - cell)) as i64)
-                    asm.store(8, x64::Reg::RCX, x64::Reg::RAX, displacement + (8 * (count - 1 - cell)) as i64)
-                    cell += 1
-                }
-                asm.alu_ri(0, x64::Reg::RSP, (8 * count) as i64)
-                return true
+                return self.store_cells_through(asm, value, pointer, displacement, ty)
             }
             return self.fail("an assignment of a structure through a pointer")
         }

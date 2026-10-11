@@ -1,0 +1,24 @@
+// test: run
+// out: none
+// out: 3
+// A method called on a field of a method result is evaluated where the expression is reached, not before the statement:
+// `maybe.is_some() && !maybe.unwrap().name.is_empty()` must not unwrap an empty option.
+pub struct Named { pub name: String }
+fun find(present: bool) -> Option<Named> {
+    when present {
+        return Option::Some(Named { name: String("abc") })
+    }
+    return Option::None
+}
+fun main() {
+    empty := find(false)
+    when empty.is_some() && !empty.unwrap().name.is_empty() {
+        echo "some"
+    } else {
+        echo "none"
+    }
+    full := find(true)
+    when full.is_some() && !full.unwrap().name.is_empty() {
+        echo 3
+    }
+}

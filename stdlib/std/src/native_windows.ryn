@@ -313,6 +313,11 @@ pub fun __rt_system_process_capture(program_given: str, arguments: Vec<String>) 
     return capture_program(String(program_given), arguments)
 }
 
+// The peak memory of a captured child is not measured on Windows.
+pub fun __rt_system_process_capture_peak_kb(capture: *u8) -> u64 {
+    return 0
+}
+
 // ---------------------------------------------------------------------------------------------------------------------
 // Directories, paths and time
 

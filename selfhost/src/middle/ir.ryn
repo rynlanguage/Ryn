@@ -73,6 +73,7 @@ pub enum IrExpr {
     SliceElementAddress(u64, u64, u64, IrSpan),
     AddressOf(u64, u64, u64, IrSpan),
     Dereference(u64, u64),
+    PlaceAddress(u64, u64),
     StringFindOption(u64, u64),
     StringAsStr(u64),
     Binary(String, u64, u64, u64),
@@ -1002,6 +1003,11 @@ extend IrDecoder {
             span := self.span()?
             return Result::Ok(self.push_expr(IrExpr::AddressOf(slot, ty, pointer_type, span)))
         }
+        when word == "PlaceAddress" {
+            place := self.expression()?
+            ty := self.ty()?
+            return Result::Ok(self.push_expr(IrExpr::PlaceAddress(place, ty)))
+        }
         when word == "Dereference" {
             pointer := self.expression()?
             ty := self.ty()?
@@ -1381,6 +1387,7 @@ extend IrWriter {
             IrExpr::SliceElementAddress(slice, index, ty, span) => self.emit_expr_slice_element_address(slice, index, ty, span),
             IrExpr::AddressOf(slot, ty, pointer_type, span) => self.emit_expr_address_of(slot, ty, pointer_type, span),
             IrExpr::Dereference(pointer, ty) => self.emit_expr_dereference(pointer, ty),
+            IrExpr::PlaceAddress(place, ty) => self.emit_expr_place_address(place, ty),
             IrExpr::StringFindOption(value, enum_id) => self.emit_expr_string_find_option(value, enum_id),
             IrExpr::StringAsStr(value) => self.emit_expr_string_as_str(value),
             IrExpr::Binary(op, left, right, ty) => self.emit_expr_binary(op, left, right, ty),
@@ -1940,6 +1947,13 @@ extend IrWriter {
         self.ty(ty)
         self.ty(pointer_type)
         self.span(span)
+        return true
+    }
+
+    fun emit_expr_place_address(mut self, place: u64, ty: u64) -> bool {
+        self.word("PlaceAddress")
+        self.expression(place)
+        self.ty(ty)
         return true
     }
 

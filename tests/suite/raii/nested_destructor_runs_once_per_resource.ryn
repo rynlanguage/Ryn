@@ -1,0 +1,31 @@
+// test: run
+// out: 1
+// out: 2
+// out: 2
+// out: 2
+// out: 4
+// Resources nested two levels deep are released once each when the owner ends, also after a nested part was moved out.
+#[drop(release_res)]
+pub struct Res { pub h: *i32 }
+fun release_res(r: Res) { *r.h = *r.h + 1 }
+pub struct Holder { pub r: Res, pub k: i64 }
+pub struct Top { pub h: Holder, pub z: Res }
+pub struct Inner { pub name: String, pub tags: Vec<String> }
+pub struct Outer { pub id: i64, pub inner: Inner }
+fun main() {
+    mut hits: i32 = 0
+    mut o := Outer { id: 1, inner: Inner { name: String("in"), tags: Vec() } }
+    o.inner.tags.push(String("a"))
+    echo o.inner.tags.len()
+    when true {
+        t := Top { h: Holder { r: Res { h: &raw mut hits }, k: 2 }, z: Res { h: &raw mut hits } }
+        echo t.h.k
+    }
+    echo hits
+    when true {
+        t := Top { h: Holder { r: Res { h: &raw mut hits }, k: 2 }, z: Res { h: &raw mut hits } }
+        moved := t.h
+        echo moved.k
+    }
+    echo hits
+}

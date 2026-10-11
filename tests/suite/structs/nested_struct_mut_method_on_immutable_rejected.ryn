@@ -1,0 +1,11 @@
+// test: fail
+// code: R0204
+// msg: requires a mutable receiver
+pub struct P { pub x: i64 }
+pub struct L { pub a: P }
+extend P { pub fun shift(mut self) { self.x += 1 } }
+fun main() {
+    l := L { a: P { x: 1 } }
+    l.a.shift()
+    echo l.a.x
+}
