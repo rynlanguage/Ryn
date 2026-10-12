@@ -31,6 +31,9 @@ sequence: minor releases may change language details while the compiler is pre-1
   Verified by encoding checks against llvm-mc and by running the suite's accepted programs under the Unicorn emulator:
   70 of 538 run programs are accepted, all match. See `docs/arm64-backend.md`.
 - `RYN_DUMP_IR=<path>` writes the IR text of a program (a debugging aid for the code generators).
+- Unknown types and enums: a path such as `Missing::make()`, `Missing::A` or a `choose` arm that names a variant of
+  another enum is reported as `R0230` (`unknown type or enum`) or `R0233` (no such variant) at the statement, with the
+  name and the help. Before, these showed the generic `unsupported: unknown enum` (R0905) without a name.
 
 ## [0.1.12] — released in 0.1.13 — Sugar Rush and GameDev Essentials
 

@@ -618,10 +618,30 @@ fun operator_mismatch(op: String, left: String, right: String, left_span: ast::S
 
 // `R0230` for a path whose first part names no enum, at the expression's span.
 fun unknown_enum_error(name: String, start: u64, end: u64) -> String {
-    mut message := String("unknown enum `")
+    mut message := String("unknown type or enum `")
+    message.append(name.clone())
+    message.append("`")
+    mut help := String("declare `")
+    help.append(name)
+    help.append("` before using it, or import the module that declares it (for example `use std::simd`)")
+    return diagnostic("R0230", start, end, message, help)
+}
+
+// The unsupported error of a name that no enum, module or type declares. The statement that holds it turns it into a
+// located `R0230` (see `unknown_enum_statement`).
+fun unknown_enum_text(name: String) -> String {
+    mut message := String("unsupported: unknown enum `")
     message.append(name)
     message.append("`")
-    return diagnostic("R0230", start, end, message, String("declare the enum before constructing it"))
+    return message
+}
+
+// The `R0230` of an unknown enum name that reached a statement, at that statement's span.
+fun unknown_enum_statement(message: String, start: u64, end: u64) -> String {
+    prefix := "unsupported: unknown enum `".len()
+    close := last_index_of(message.clone(), String("`")).unwrap()
+    name := message.slice(prefix, close)
+    return unknown_enum_error(name, start, end)
 }
 
 // `R0230` for a path into a module whose module does not declare the item, at the expression's span.
@@ -3549,6 +3569,26 @@ extend Lowering {
         self.pending_moves = pending
     }
 
+    // The `R0233` of an unsupported `Enum::Variant` message that reached a statement: the enum exists but has no such variant
+    // (for example a `choose` arm that names a variant of another enum). The variants are listed as help, as they are for
+    // an expression; an enum that cannot be found is reported as an unknown enum.
+    fun unknown_variant_statement(self, message: String, start: u64, end: u64) -> String {
+        prefix := "unsupported: unknown variant `".len()
+        close := last_index_of(message.clone(), String("`")).unwrap()
+        body := message.slice(prefix, close)
+        cut := last_index_of(body.clone(), String("::")).unwrap()
+        enum_name := body.slice(0, cut)
+        variant := body.slice(cut + 2, body.len())
+        mut index: u64 = 0
+        while index < self.enums.len() {
+            when self.enums[index].name == enum_name {
+                return unknown_variant_error(enum_name, variant, self.enums[index].variant_names.clone(), start, end)
+            }
+            index += 1
+        }
+        return unknown_enum_error(enum_name, start, end)
+    }
+
     fun enum_index(self, name: String) -> Result<u64, String> {
         mut id: u64 = 0
         while id < self.enums.len() {
@@ -3559,13 +3599,13 @@ extend Lowering {
         }
         aliased := self.named_word(name.clone())
         when aliased.is_ok() && enum_id_of(aliased.unwrap()).is_some() {
-            return Result::Ok(enum_id_of(self.named_word(name)?).unwrap())
+            return Result::Ok(enum_id_of(self.named_word(name.clone())?).unwrap())
         }
-        qualified := qualified_in(self.scope_path.clone(), name)
+        qualified := qualified_in(self.scope_path.clone(), name.clone())
         when !qualified.is_empty() {
             return self.enum_index(qualified)
         }
-        return Result::Err(unsupported("unknown enum"))
+        return Result::Err(unknown_enum_text(name.clone()))
     }
 
     fun enum_type(self, name: String) -> Result<String, String> {
@@ -3581,7 +3621,12 @@ extend Lowering {
             }
             variant += 1
         }
-        return Result::Err(unsupported("unknown variant"))
+        mut message := String("unsupported: unknown variant `")
+        message.append(self.enums[id].name.clone())
+        message.append("::")
+        message.append(name)
+        message.append("`")
+        return Result::Err(message)
     }
 
     // The index of a variant's first field among all the enum's fields.
@@ -3788,15 +3833,16 @@ extend Lowering {
                 ret := self.signatures[function.unwrap()].ret.clone()
                 return Result::Ok(Lowered { text: join(words5(String("Call"), String("Function"), num(function.unwrap()), String("0"), ret.clone())), ty: ret })
             }
-            // `R0230` for a name that is neither an enum nor a constant, at the expression's span. A lowercase
-            // name, or one with functions or structures under it, is a module.
-            when located && expression && name != "Option" && name != "Result" {
+            // `R0230` for a name that is neither an enum nor a constant, at the expression's span, whether the path is
+            // written as an expression or as a call. A lowercase name, or one with functions or structures under it, is a
+            // module.
+            when located && name != "Option" && name != "Result" {
                 when self.names_module(name.clone()) {
                     return Result::Err(unknown_module_item_error(name, variant_name, span.start, span.end))
                 }
                 return Result::Err(unknown_enum_error(name, span.start, span.end))
             }
-            return Result::Err(unsupported("unknown enum"))
+            return Result::Err(unknown_enum_text(name.clone()))
         }
         id := found.unwrap()
         variant_found := self.variant_index(id, variant_name.clone())
@@ -6841,6 +6887,14 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
             }
             when message.contains(" @ ") || message.starts_with("diagnostic ") {
                 return Result::Err(message)
+            }
+            when message.starts_with("unsupported: unknown enum `") {
+                span := stmt_span(self.program.stmts[index])
+                return Result::Err(unknown_enum_statement(message, span.start, span.end))
+            }
+            when message.starts_with("unsupported: unknown variant `") {
+                span := stmt_span(self.program.stmts[index])
+                return Result::Err(self.unknown_variant_statement(message, span.start, span.end))
             }
             mut located := message
             located.append(" @ ")
