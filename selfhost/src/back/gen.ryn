@@ -285,6 +285,7 @@ pub struct Gen {
     handler_label: u64,
     division_error_label: u64,
     index_error_label: u64,
+    set_error_label: u64,
     index_literal: u64,
     overflow_literal: u64,
     invalid_literal: u64,
@@ -465,6 +466,24 @@ pub struct Gen {
     def_seen: Vec<bool>,
     def_noreg: Vec<bool>,
     scan_depth: u64,
+    // Per slot, the first and last position (a count of the statements and uses the scan has passed) at which the function uses
+    // it, widened over the loops it lives across; two locals whose ranges do not meet can share a register.
+    live_first: Vec<u64>,
+    live_last: Vec<u64>,
+    loop_starts: Vec<u64>,
+    loop_ends: Vec<u64>,
+    scan_pos: u64,
+    scan_whole: bool,
+    // Bounds-check elimination: pairs (vector local, index local) whose index is below the vector's length in the loop being
+    // generated; `bce_cut` is the statement after which the index may have changed, `bce_on` whether the pair holds now.
+    // Scalar replacement: per cell, the base slot plus one of the structure local whose field it is (0 for none), and the
+    // bases of the structure locals the scan has found.
+    sroa_base: Vec<u64>,
+    sroa_list: Vec<u64>,
+    bce_vec: Vec<u64>,
+    bce_idx: Vec<u64>,
+    bce_cut: Vec<u64>,
+    bce_on: Vec<bool>,
     // The locals kept in callee-saved registers: `slot_reg[slot]` is the register, or 0. The function saves each register
     // it uses in a frame cell on entry and restores it on every return (`saved_regs`, `saved_cells`).
     slot_reg: Vec<u64>,
@@ -496,6 +515,40 @@ fun true_literal() -> u64 {
 
 fun false_literal() -> u64 {
     return 2
+}
+
+// The name of an MMX instruction by its opcode (the `MmxBin` operations of std::mmx).
+fun mmx_name(opcode: u64) -> String {
+    when opcode == 254 {
+        return String("paddd")
+    } else when opcode == 250 {
+        return String("psubd")
+    } else when opcode == 219 {
+        return String("pand")
+    } else when opcode == 235 {
+        return String("por")
+    } else when opcode == 239 {
+        return String("pxor")
+    } else when opcode == 212 {
+        return String("paddq")
+    } else when opcode == 251 {
+        return String("psubq")
+    } else when opcode == 253 {
+        return String("paddw")
+    } else when opcode == 249 {
+        return String("psubw")
+    } else when opcode == 252 {
+        return String("paddb")
+    } else when opcode == 248 {
+        return String("psubb")
+    } else when opcode == 213 {
+        return String("pmullw")
+    } else when opcode == 118 {
+        return String("pcmpeqd")
+    } else when opcode == 102 {
+        return String("pcmpgtd")
+    }
+    return String("mmx")
 }
 
 // Generates the object of a program, or the reason it is not handled.
@@ -657,6 +710,7 @@ fun build_listing(input: ir::IrProgram, executable: bool, libc: bool, windows: b
         handler_label: 0,
         division_error_label: 0,
         index_error_label: 0,
+        set_error_label: 0,
         index_literal: 0,
         overflow_literal: 0,
         invalid_literal: 0,
@@ -779,6 +833,18 @@ fun build_listing(input: ir::IrProgram, executable: bool, libc: bool, windows: b
         def_seen: Vec(),
         def_noreg: Vec(),
         scan_depth: 0,
+        live_first: Vec(),
+        live_last: Vec(),
+        loop_starts: Vec(),
+        loop_ends: Vec(),
+        scan_pos: 0,
+        scan_whole: false,
+        sroa_base: Vec(),
+        sroa_list: Vec(),
+        bce_vec: Vec(),
+        bce_idx: Vec(),
+        bce_cut: Vec(),
+        bce_on: Vec(),
         slot_reg: Vec(),
         saved_regs: Vec(),
         saved_cells: Vec(),
@@ -856,6 +922,7 @@ fun build_listing(input: ir::IrProgram, executable: bool, libc: bool, windows: b
     gen.handler_label = asm.new_label()
     gen.division_error_label = asm.new_label()
     gen.index_error_label = asm.new_label()
+    gen.set_error_label = asm.new_label()
     gen.write_label = asm.new_label()
     gen.map_hash_scalar = asm.new_label()
     gen.struct_key_drop = asm.new_label()
@@ -1558,6 +1625,21 @@ extend Gen {
             asm.syscall()
         }
 
+        // `Vec::set` past the end: the same, with the message of that operation.
+        when asm.is_pending(self.set_error_label) {
+            set_literal := self.literal(String("Ryn runtime error: Vec index is out of bounds\n"))
+            asm.bind(self.set_error_label)
+            self.flush_stdout(asm)
+            asm.lea_symbol(x64::Reg::RSI, self.literal_symbols[set_literal])
+            asm.mov_ri(x64::Reg::RDX, self.literal_lengths[set_literal])
+            asm.mov_ri(x64::Reg::RDI, 2)
+            asm.mov_ri(x64::Reg::RAX, 1)
+            asm.syscall()
+            asm.mov_ri(x64::Reg::RDI, 1)
+            asm.mov_ri(x64::Reg::RAX, 231)
+            asm.syscall()
+        }
+
         // A division by zero: the message to standard error, and exit with status 1.
         when asm.is_pending(self.division_error_label) {
             self.division_literal = self.literal(String("Ryn runtime error: integer division or remainder by zero\n"))
@@ -1639,6 +1721,168 @@ extend Gen {
         return name
     }
 
+    // A function that starts with `when p <op> constant { return p or a constant }`, of scalar parameters that arrive in registers
+    // (`fib`, `gcd`, `max` of a base case): the test and the return are written before the frame, so that the base case of a
+    // recursion takes four instructions, not twelve. The rest of the function tests again.
+    fun early_return(mut self, asm: &mut x64::Asm, index: u64) -> bool {
+        definition := self.program.functions[index]
+        when self.no_opt || self.profiling || definition.statements.len() == 0 || !self.reg_args(index) || definition.return_type.is_none() {
+            return false
+        }
+        returned := definition.return_type.unwrap()
+        when !self.plain_word(returned) || self.value_width(returned) != 8 {
+            return false
+        }
+        mut pair: u64 = 0
+        while pair < definition.parameters.len() / 2 {
+            ty := definition.parameters[pair * 2 + 1]
+            when !self.plain_word(ty) || self.value_width(ty) > 8 || self.is_float(ty) {
+                return false
+            }
+            pair += 1
+        }
+        guard := choose self.program.stmts[definition.statements[0]] {
+            ir::IrStmt::IfStmt(condition, then_body, else_body) => if_text_id(then_body.len() == 1 && self.is_noop_body(else_body), condition),
+            _ => 0,
+        }
+        when guard == 0 {
+            return false
+        }
+        condition := guard - 1
+        then_body := choose self.program.stmts[definition.statements[0]] {
+            ir::IrStmt::IfStmt(c, then_body, else_body) => then_body,
+            _ => Vec(),
+        }
+        value := choose self.program.stmts[then_body[0]] {
+            ir::IrStmt::ReturnStmt(value) => value,
+            _ => Option::None,
+        }
+        when value.is_none() {
+            return false
+        }
+        op := choose self.program.exprs[condition] {
+            ir::IrExpr::Binary(op, left, right, ty) => op,
+            _ => String(""),
+        }
+        left := choose self.program.exprs[condition] {
+            ir::IrExpr::Binary(op, left, right, ty) => left,
+            _ => 0,
+        }
+        right := choose self.program.exprs[condition] {
+            ir::IrExpr::Binary(op, left, right, ty) => right,
+            _ => 0,
+        }
+        compared := choose self.program.exprs[condition] {
+            ir::IrExpr::Binary(op, left, right, ty) => ty,
+            _ => 0,
+        }
+        when op != "Eq" && op != "Ne" && op != "Lt" && op != "Le" && op != "Gt" && op != "Ge" {
+            return false
+        }
+        left_pair := self.parameter_pair(definition.parameters.clone(), left)
+        when left_pair == 0 || !self.plain_word(compared) {
+            return false
+        }
+        immediate := self.immediate_operand(op.clone(), right)
+        when immediate.is_none() {
+            return false
+        }
+        // Where the value comes from: a parameter, or a constant.
+        value_pair := self.parameter_pair(definition.parameters.clone(), value.unwrap())
+        constant := self.const_value(value.unwrap())
+        when value_pair == 0 && constant.is_none() {
+            return false
+        }
+        mut opposite: String = String("Ge")
+        when op == "Eq" {
+            opposite = String("Ne")
+        } else when op == "Ne" {
+            opposite = String("Eq")
+        } else when op == "Le" {
+            opposite = String("Gt")
+        } else when op == "Gt" {
+            opposite = String("Le")
+        } else when op == "Ge" {
+            opposite = String("Lt")
+        }
+        rest := asm.new_label()
+        asm.alu_ri(7, arg_register(left_pair - 1), immediate.unwrap() as i64)
+        asm.jcc(comparison_condition(opposite, is_signed_word(self.word(compared))), rest)
+        when value_pair != 0 {
+            asm.mov_rr(x64::Reg::RAX, arg_register(value_pair - 1))
+        } else {
+            asm.mov_ri(x64::Reg::RAX, constant.unwrap())
+        }
+        asm.ret()
+        asm.bind(rest)
+        return true
+    }
+
+    // Whether a statement list has `return f(...)` with `f` the function `index` (a call that may become a jump to the start).
+    fun returns_own_call(self, statements: Vec<u64>, index: u64) -> bool {
+        for statement in statements {
+            found := choose self.program.stmts[statement] {
+                ir::IrStmt::ReturnStmt(value) => self.is_call_of(value, index),
+                ir::IrStmt::BlockStmt(inner) => self.returns_own_call(inner, index),
+                ir::IrStmt::IfStmt(condition, then_body, else_body) => self.returns_own_call(then_body, index) || self.returns_own_call(else_body, index),
+                ir::IrStmt::WhileStmt(setup, condition, body) => self.returns_own_call(body, index),
+                ir::IrStmt::ForStmt(slot, end_slot, ty, start, end, inclusive, body) => self.returns_own_call(body, index),
+                _ => false,
+            }
+            when found {
+                return true
+            }
+        }
+        return false
+    }
+
+    fun is_call_of(self, value: Option<u64>, index: u64) -> bool {
+        when value.is_none() {
+            return false
+        }
+        return choose self.program.exprs[value.unwrap()] {
+            ir::IrExpr::CallExpr(target, arguments, ty) => choose target {
+                ir::CallTarget::Func(callee) => callee == index,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    // Whether a list of statements does nothing: it is empty or holds only blocks without statements and drops of nothing.
+    fun is_noop_body(self, statements: Vec<u64>) -> bool {
+        for statement in statements {
+            ok := choose self.program.stmts[statement] {
+                ir::IrStmt::BlockStmt(inner) => self.is_noop_body(inner),
+                ir::IrStmt::DropStmt(slots, types) => slots.len() == 0,
+                _ => false,
+            }
+            when !ok {
+                return false
+            }
+        }
+        return true
+    }
+
+    // The position (plus one) of the parameter that expression `index` reads, or 0.
+    fun parameter_pair(self, parameters: Vec<u64>, index: u64) -> u64 {
+        slot := choose self.program.exprs[index] {
+            ir::IrExpr::LocalRef(slot, ty, span) => slot + 1,
+            _ => 0,
+        }
+        when slot == 0 {
+            return 0
+        }
+        mut pair: u64 = 0
+        while pair < parameters.len() / 2 {
+            when parameters[pair * 2] + 1 == slot {
+                return pair + 1
+            }
+            pair += 1
+        }
+        return 0
+    }
+
     // A function: its frame, its parameters from the argument registers, its body, and a return that ends it.
     fun function(mut self, asm: &mut x64::Asm, index: u64) -> bool {
         definition := self.program.functions[index]
@@ -1660,6 +1904,7 @@ extend Gen {
         when self.profiling {
             self.count_entry(asm, index)
         }
+        skip_first := self.early_return(asm, index)
         asm.push(x64::Reg::RBP)
         asm.mov_rr(x64::Reg::RBP, x64::Reg::RSP)
         // The frame holds the locals and the scratch cells; its size is patched in once the body is generated.
@@ -1758,7 +2003,17 @@ extend Gen {
         self.tail_label = asm.new_label()
         asm.bind(self.tail_label)
         self.in_function = true
-        when !self.body(asm, definition.statements.clone()) {
+        mut statements: Vec<u64> = Vec()
+        mut first: u64 = 0
+        // A tail call jumps back to the start of the body, which must then test the base case again.
+        when skip_first && !self.returns_own_call(definition.statements.clone(), index) {
+            first = 1
+        }
+        while first < definition.statements.len() {
+            statements.push(definition.statements[first])
+            first += 1
+        }
+        when !self.body(asm, statements) {
             return false
         }
         self.in_function = false
@@ -1805,13 +2060,20 @@ extend Gen {
             self.slot_reg.push(0)
             slot += 1
         }
-        mut chosen: u64 = 0
-        while chosen < 4 {
+        // The most used locals first; each takes the first of r12 to r15 that no local with an overlapping range holds. A register
+        // is saved on entry the first time it is used.
+        mut rejected: Vec<bool> = Vec()
+        slot = 0
+        while slot < count {
+            rejected.push(false)
+            slot += 1
+        }
+        while true {
             mut best: u64 = 0
             mut best_weight: u64 = 3
             slot = 0
             while slot < count && slot < self.def_seen.len() {
-                when self.def_seen[slot] && !self.def_noreg[slot] && !self.def_addressed[slot] && self.slot_reg[slot] == 0 && self.def_weight[slot] > best_weight && !self.is_constant_slot(slot) {
+                when self.def_seen[slot] && !self.def_noreg[slot] && !self.def_addressed[slot] && self.slot_reg[slot] == 0 && !rejected[slot] && self.def_weight[slot] > best_weight && !self.is_constant_slot(slot) {
                     best = slot + 1
                     best_weight = self.def_weight[slot]
                 }
@@ -1820,13 +2082,44 @@ extend Gen {
             when best == 0 {
                 return
             }
-            register := 12 + chosen
-            cell := self.scratch(1)
-            self.slot_reg.set(best - 1, register)
-            self.saved_regs.push(register)
-            self.saved_cells.push(cell)
-            asm.store(8, register, x64::Reg::RBP, slot_disp(cell))
-            chosen += 1
+            chosen := best - 1
+            mut register: u64 = 12
+            mut placed: bool = false
+            while register < 16 && !placed {
+                mut free: bool = true
+                other: u64 = 0
+                mut scan: u64 = 0
+                while scan < count && free {
+                    when self.slot_reg[scan] == register && self.live_overlap(chosen, scan) {
+                        free = false
+                    }
+                    scan += 1
+                }
+                when free {
+                    placed = true
+                } else {
+                    register += 1
+                }
+            }
+            when !placed {
+                rejected.set(chosen, true)
+            } else {
+                self.slot_reg.set(chosen, register)
+                mut saved: bool = false
+                mut at: u64 = 0
+                while at < self.saved_regs.len() {
+                    when self.saved_regs[at] == register {
+                        saved = true
+                    }
+                    at += 1
+                }
+                when !saved {
+                    cell := self.scratch(1)
+                    self.saved_regs.push(register)
+                    self.saved_cells.push(cell)
+                    asm.store(8, register, x64::Reg::RBP, slot_disp(cell))
+                }
+            }
         }
     }
 
@@ -1852,13 +2145,29 @@ extend Gen {
             return 0
         }
         slot := choose self.program.exprs[index] {
-            ir::IrExpr::LocalRef(slot, ty, span) => Option::Some(slot),
+            ir::IrExpr::LocalRef(slot, ty, span) => self.scalar_cell(slot, ty),
+            ir::IrExpr::FieldRead(value, id, field, ty, span) => self.field_cell(value, id, field),
             _ => Option::None,
         }
         when slot.is_none() {
             return 0
         }
         return self.reg_of(slot.unwrap())
+    }
+
+    fun scalar_cell(self, slot: u64, ty: u64) -> Option<u64> {
+        when self.struct_of(ty).is_some() {
+            return Option::None
+        }
+        return Option::Some(slot)
+    }
+
+    // The cell of a field of a structure local (not a field of anything else).
+    fun field_cell(self, value: u64, id: u64, field: u64) -> Option<u64> {
+        return choose self.program.exprs[value] {
+            ir::IrExpr::LocalRef(slot, ty, span) => Option::Some(slot + self.program.structs[id].fields[field].slot_offset),
+            _ => Option::None,
+        }
     }
 
     // Reads the 8 bytes of cell `slot` into `dst`: from its register when it has one.
@@ -1973,6 +2282,18 @@ extend Gen {
         self.def_seen = Vec()
         self.def_noreg = Vec()
         self.scan_depth = 0
+        self.live_first = Vec()
+        self.live_last = Vec()
+        self.loop_starts = Vec()
+        self.loop_ends = Vec()
+        self.scan_pos = 0
+        self.scan_whole = false
+        self.bce_vec = Vec()
+        self.bce_idx = Vec()
+        self.bce_cut = Vec()
+        self.bce_on = Vec()
+        self.sroa_base = Vec()
+        self.sroa_list = Vec()
         when self.no_opt {
             return
         }
@@ -1982,19 +2303,25 @@ extend Gen {
             self.def_init.push(0)
             self.def_reads.push(0)
             self.def_weight.push(0)
+            self.live_first.push(18446744073709551615)
+            self.live_last.push(0)
             self.def_seen.push(false)
             self.def_noreg.push(slot < addressed.len() && addressed[slot].is_some())
             self.def_addressed.push(slot < addressed.len() && addressed[slot].is_some())
             self.def_bad.push(slot < addressed.len() && addressed[slot].is_some())
+            self.sroa_base.push(0)
             slot += 1
         }
         mut pair: u64 = 0
         while pair < parameters.len() / 2 {
             self.def_bad_slot(parameters[pair * 2])
             self.note_target(parameters[pair * 2], parameters[pair * 2 + 1])
+            self.touch_whole(parameters[pair * 2])
             pair += 1
         }
         self.scan_statements(statements)
+        self.sroa_settle()
+        self.widen_over_loops()
     }
 
     fun def_bad_slot(mut self, slot: u64) {
@@ -2011,13 +2338,14 @@ extend Gen {
     }
 
     fun scan_statement(mut self, index: u64) -> bool {
+        self.scan_pos += 1
         return choose self.program.stmts[index] {
             ir::IrStmt::BlockStmt(body) => self.scan_statements(body),
             ir::IrStmt::LetStmt(slot, ty, value, span) => self.scan_let(slot, ty, value),
             ir::IrStmt::AssignStmt(slot, ty, value, span) => self.scan_assign(slot, ty, value),
             ir::IrStmt::ArrayAssignStmt(slot, element, length, at, value, span) => self.scan_write(slot, at, value),
             ir::IrStmt::DereferenceAssignStmt(pointer, ty, value) => self.scan_two(pointer, value),
-            ir::IrStmt::FieldAssignStmt(slot, ty, value) => self.scan_write(slot, value, value),
+            ir::IrStmt::FieldAssignStmt(slot, ty, value) => self.scan_field_assign(slot, ty, value),
             ir::IrStmt::ReferenceFieldAssignStmt(pointer, id, field, ty, value) => self.scan_two(pointer, value),
             ir::IrStmt::PrintStmt(value, ty) => self.scan_expression(value),
             ir::IrStmt::PrintTemplateStmt(parts) => self.scan_parts(parts),
@@ -2030,13 +2358,100 @@ extend Gen {
         }
     }
 
+    // A `let` of a structure whose fields are all scalars, built by a struct literal: each field is a local of its own, as long
+    // as the structure is only ever read and assigned by field (`sroa_settle` checks that when the scan ends).
+    fun sroa_candidate(self, ty: u64, value: u64) -> bool {
+        id := self.struct_of(ty)
+        when id.is_none() || self.has_destructor(ty) || self.program.structs[id.unwrap()].repr_c {
+            return false
+        }
+        literal := choose self.program.exprs[value] {
+            ir::IrExpr::StructValue(sid, fields, values) => sid == id.unwrap() && fields.len() == self.program.structs[sid].fields.len(),
+            _ => false,
+        }
+        when !literal || self.program.structs[id.unwrap()].fields.len() == 0 || self.program.structs[id.unwrap()].fields.len() != self.program.structs[id.unwrap()].slot_count {
+            return false
+        }
+        for field in self.program.structs[id.unwrap()].fields.clone() {
+            when !self.plain_word(field.ty) || self.value_width(field.ty) > 8 || self.is_float(field.ty) {
+                return false
+            }
+        }
+        return true
+    }
+
+    fun scan_struct_let(mut self, slot: u64, ty: u64, value: u64) -> bool {
+        id := self.struct_of(ty).unwrap()
+        when slot + self.program.structs[id].slot_count > self.sroa_base.len() {
+            self.no_register(slot, self.program.structs[id].slot_count)
+            return self.scan_expression(value)
+        }
+        when self.sroa_base[slot] == 0 {
+            self.sroa_list.push(slot)
+            for field in self.program.structs[id].fields.clone() {
+                self.sroa_base.set(slot + field.slot_offset, slot + 1)
+            }
+        }
+        for field in self.program.structs[id].fields.clone() {
+            self.note_target(slot + field.slot_offset, field.ty)
+        }
+        return self.scan_expression(value)
+    }
+
+    // The scan is over: a structure local that was read as a whole, addressed, or assigned whole keeps its cells in memory.
+    fun sroa_settle(mut self) {
+        for base in self.sroa_list.clone() {
+            mut count: u64 = 0
+            mut at: u64 = base
+            while at < self.sroa_base.len() && self.sroa_base[at] == base + 1 {
+                count += 1
+                at += 1
+            }
+            mut whole: bool = true
+            mut cell: u64 = base
+            while cell < base + count {
+                when self.def_noreg[cell] || self.def_addressed[cell] {
+                    whole = false
+                }
+                cell += 1
+            }
+            when !whole {
+                self.no_register(base, count)
+            }
+        }
+    }
+
+    // A read of field `field` of structure `id`: a field of a structure local that is replaced by scalars is read like a local.
+    fun scan_field_read(mut self, value: u64, id: u64, field: u64) -> bool {
+        base := choose self.program.exprs[value] {
+            ir::IrExpr::LocalRef(slot, ty, span) => slot + 1,
+            _ => 0,
+        }
+        when base != 0 && base - 1 < self.sroa_base.len() && self.sroa_base[base - 1] == base {
+            return self.scan_read(base - 1 + self.program.structs[id].fields[field].slot_offset)
+        }
+        return self.scan_expression(value)
+    }
+
     fun scan_let(mut self, slot: u64, ty: u64, value: u64) -> bool {
+        when self.sroa_candidate(ty, value) {
+            return self.scan_struct_let(slot, ty, value)
+        }
         self.note_target(slot, ty)
         when slot < self.def_count.len() {
             self.def_count.set(slot, self.def_count[slot] + 1)
             self.def_init.set(slot, value + 1)
         }
         return self.scan_expression(value)
+    }
+
+    // `slot = value` for a field of a structure local that is replaced by scalars: a write of that local.
+    fun scan_field_assign(mut self, slot: u64, ty: u64, value: u64) -> bool {
+        when slot < self.sroa_base.len() && self.sroa_base[slot] != 0 {
+            self.note_target(slot, ty)
+            return self.scan_expression(value)
+        }
+        return self.scan_write(slot, value, value)
     }
 
     // A write of `slot`; `first` and `second` are the expressions it evaluates (the same one twice is scanned twice).
@@ -2080,9 +2495,62 @@ extend Gen {
         return self.scan_statements(second)
     }
 
+    // The function uses `slot` at the position the scan has reached.
+    fun touch(mut self, slot: u64) {
+        when slot >= self.live_first.len() {
+            return
+        }
+        self.scan_pos += 1
+        when self.scan_whole {
+            self.touch_whole(slot)
+            return
+        }
+        when self.live_first[slot] == 18446744073709551615 {
+            self.live_first.set(slot, self.scan_pos)
+        }
+        self.live_last.set(slot, self.scan_pos)
+    }
+
+    // `slot` is live in the whole function: a parameter (which a tail call stores again), or a local that a deferred statement
+    // uses, which runs when the function ends.
+    fun touch_whole(mut self, slot: u64) {
+        when slot < self.live_first.len() {
+            self.live_first.set(slot, 0)
+            self.live_last.set(slot, 18446744073709551615)
+        }
+    }
+
+    // A local that is defined before a loop and used in it lives to the end of the loop, whichever iteration reads it.
+    fun widen_over_loops(mut self) {
+        mut changed: bool = true
+        while changed {
+            changed = false
+            mut at: u64 = 0
+            while at < self.loop_starts.len() {
+                start := self.loop_starts[at]
+                end := self.loop_ends[at]
+                mut slot: u64 = 0
+                while slot < self.live_first.len() {
+                    when self.live_first[slot] < start && self.live_last[slot] >= start && self.live_last[slot] < end {
+                        self.live_last.set(slot, end)
+                        changed = true
+                    }
+                    slot += 1
+                }
+                at += 1
+            }
+        }
+    }
+
+    // Whether the ranges of two locals share a position.
+    fun live_overlap(self, a: u64, b: u64) -> bool {
+        return self.live_first[a] <= self.live_last[b] && self.live_first[b] <= self.live_last[a]
+    }
+
     fun scan_for(mut self, slot: u64, end_slot: u64, ty: u64, start: u64, end: u64, body: Vec<u64>) -> bool {
         self.def_bad_slot(slot)
         self.def_bad_slot(end_slot)
+        loop_start := self.scan_pos
         self.scan_two(start, end)
         self.scan_depth += 1
         // The counter and the bound are read, and the counter written, in every iteration.
@@ -2091,6 +2559,11 @@ extend Gen {
         self.note_target(end_slot, ty)
         self.scan_statements(body)
         self.scan_depth -= 1
+        // The counter and the bound live to the end of the loop.
+        self.touch(slot)
+        self.touch(end_slot)
+        self.loop_starts.push(loop_start)
+        self.loop_ends.push(self.scan_pos)
         return true
     }
 
@@ -2106,11 +2579,14 @@ extend Gen {
 
     // A `while`: its condition, setup and body run once per iteration.
     fun scan_loop(mut self, condition: u64, setup: Vec<u64>, body: Vec<u64>) -> bool {
+        loop_start := self.scan_pos
         self.scan_depth += 1
         self.scan_expression(condition)
         self.scan_statements(setup)
         self.scan_statements(body)
         self.scan_depth -= 1
+        self.loop_starts.push(loop_start)
+        self.loop_ends.push(self.scan_pos)
         return true
     }
 
@@ -2134,6 +2610,7 @@ extend Gen {
         when self.plain_word(ty) && self.value_width(ty) <= 8 && !self.is_float(ty) {
             self.def_seen.set(slot, true)
             self.def_weight.set(slot, self.def_weight[slot] + self.use_weight())
+            self.touch(slot)
         } else {
             mut cells := self.cells_of(ty)
             when cells == 0 {
@@ -2162,13 +2639,13 @@ extend Gen {
 
     fun scan_expression(mut self, index: u64) -> bool {
         return choose self.program.exprs[index] {
-            ir::IrExpr::LocalRef(slot, ty, span) => self.scan_read(slot),
+            ir::IrExpr::LocalRef(slot, ty, span) => self.scan_local(slot, ty),
             ir::IrExpr::MoveRef(slot, ty) => self.scan_address(slot),
             ir::IrExpr::AddressOf(slot, ty, pointer_type, span) => self.scan_address(slot),
             ir::IrExpr::StructValue(id, fields, values) => self.scan_expressions(values),
-            ir::IrExpr::FieldRead(value, id, field, ty, span) => self.scan_expression(value),
+            ir::IrExpr::FieldRead(value, id, field, ty, span) => self.scan_field_read(value, id, field),
             ir::IrExpr::ReferenceFieldRead(value, id, field, ty, span, borrowed) => self.scan_expression(value),
-            ir::IrExpr::ValueAddress(value, ty, pointer_type, span) => self.scan_expression(value),
+            ir::IrExpr::ValueAddress(value, ty, pointer_type, span) => self.scan_place(value),
             ir::IrExpr::CallExpr(target, arguments, ty) => self.scan_expressions(arguments),
             ir::IrExpr::IfExpr(condition, then_value, else_value, ty) => self.scan_three(condition, then_value, else_value),
             ir::IrExpr::EnumMatch(value, id, arms, ty) => self.scan_match(value, arms),
@@ -2179,7 +2656,7 @@ extend Gen {
             ir::IrExpr::ArrayIndex(array, at, ty, length) => self.scan_two(array, at),
             ir::IrExpr::SliceIndex(slice, at, ty) => self.scan_two(slice, at),
             ir::IrExpr::SliceElementAddress(slice, at, ty, span) => self.scan_two(slice, at),
-            ir::IrExpr::PlaceAddress(place, ty) => self.scan_expression(place),
+            ir::IrExpr::PlaceAddress(place, ty) => self.scan_place(place),
             ir::IrExpr::Dereference(pointer, ty) => self.scan_expression(pointer),
             ir::IrExpr::StringFindOption(value, id) => self.scan_expression(value),
             ir::IrExpr::StringAsStr(value) => self.scan_expression(value),
@@ -2192,10 +2669,19 @@ extend Gen {
         }
     }
 
+    // A local read as a value. A structure local that is replaced by scalars is read by field only: this is a whole read.
+    fun scan_local(mut self, slot: u64, ty: u64) -> bool {
+        when slot < self.sroa_base.len() && self.sroa_base[slot] == slot + 1 && self.struct_of(ty).is_some() {
+            self.def_addressed.set(slot, true)
+        }
+        return self.scan_read(slot)
+    }
+
     fun scan_read(mut self, slot: u64) -> bool {
         when slot < self.def_reads.len() {
             self.def_reads.set(slot, self.def_reads[slot] + 1)
             self.def_weight.set(slot, self.def_weight[slot] + self.use_weight())
+            self.touch(slot)
         }
         return true
     }
@@ -2241,6 +2727,19 @@ extend Gen {
         return is_integer_word(word.clone()) || word == "Bool" || word == "Char"
     }
 
+    // An expression whose address is taken: a field of a structure local that is replaced by scalars keeps its cell then.
+    fun scan_place(mut self, place: u64) -> bool {
+        base := choose self.program.exprs[place] {
+            ir::IrExpr::FieldRead(value, id, field, ty, span) => self.bce_slot_of(value),
+            _ => 0,
+        }
+        when base != 0 && base - 1 < self.sroa_base.len() && self.sroa_base[base - 1] == base {
+            self.no_register(base - 1, 1)
+            self.def_noreg.set(base - 1, true)
+        }
+        return self.scan_expression(place)
+    }
+
     fun scan_address(mut self, slot: u64) -> bool {
         self.def_bad_slot(slot)
         self.no_register(slot, 1)
@@ -2254,7 +2753,12 @@ extend Gen {
 
     fun scan_propagate(mut self, value: u64, deferred: Vec<u64>) -> bool {
         self.scan_expression(value)
-        return self.scan_statements(deferred)
+        // A deferred statement runs when the function ends, wherever it is written.
+        was := self.scan_whole
+        self.scan_whole = true
+        self.scan_statements(deferred)
+        self.scan_whole = was
+        return true
     }
 
     // The arms of a `choose`: the slots it binds are written by it.
@@ -2288,6 +2792,12 @@ extend Gen {
     }
 
     fun stmt(mut self, asm: &mut x64::Asm, index: u64) -> bool {
+        ok := self.stmt_inner(asm, index)
+        self.bce_retire(index)
+        return ok
+    }
+
+    fun stmt_inner(mut self, asm: &mut x64::Asm, index: u64) -> bool {
         self.note_statement(index)
         return choose self.program.stmts[index] {
             ir::IrStmt::BlockStmt(body) => self.body(asm, body),
@@ -2516,11 +3026,116 @@ extend Gen {
     // A value stored into a local: a `repr(C)` local whose address was given out keeps its copy in C's layout, which the
     // store brings up to date.
     fun assign_value(mut self, asm: &mut x64::Asm, value: u64, slot: u64, ty: u64) -> bool {
+        updated := self.register_update(asm, value, slot, ty)
+        when updated.is_some() {
+            return updated.unwrap()
+        }
         when !self.assign_value_cells(asm, value, slot, ty) {
             return false
         }
         self.repack_shadows_at(asm, slot)
         return true
+    }
+
+    // `x = x op y` for a 64-bit integer local in a register: the operation is done on the register, with no copy through
+    // rax. `None` when the assignment is not of that form.
+    fun register_update(mut self, asm: &mut x64::Asm, value: u64, slot: u64, ty: u64) -> Option<bool> {
+        target := self.reg_of(slot)
+        when self.no_opt || target == 0 || self.value_width(ty) != 8 || !is_integer_word(self.word(ty)) {
+            return Option::None
+        }
+        op := choose self.program.exprs[value] {
+            ir::IrExpr::Binary(op, left, right, bty) => op,
+            _ => String(""),
+        }
+        when op != "Add" && op != "Sub" && op != "Mul" && op != "BitAnd" && op != "BitOr" && op != "BitXor" && op != "Div" && op != "ShiftLeft" && op != "ShiftRight" {
+            return Option::None
+        }
+        left := choose self.program.exprs[value] {
+            ir::IrExpr::Binary(op, left, right, bty) => left,
+            _ => 0,
+        }
+        right := choose self.program.exprs[value] {
+            ir::IrExpr::Binary(op, left, right, bty) => right,
+            _ => 0,
+        }
+        when self.operand_reg(left) != target {
+            return Option::None
+        }
+        // A constant power of two or shift count: one shift of the register.
+        known := self.const_value(right)
+        when op == "Div" || op == "ShiftLeft" || op == "ShiftRight" || (op == "Mul" && known.is_some()) {
+            when known.is_none() {
+                return Option::None
+            }
+            amount := known.unwrap()
+            signed := is_signed_word(self.word(ty))
+            mut count: u64 = amount
+            when op == "Div" || op == "Mul" {
+                when amount < 2 || (amount & (amount - 1)) != 0 || (op == "Div" && signed) {
+                    return Option::None
+                }
+                count = 0
+                mut rest: u64 = amount
+                while rest > 1 {
+                    rest = rest / 2
+                    count += 1
+                }
+            }
+            when count == 0 || count > 62 {
+                return Option::None
+            }
+            mut extension: u64 = 4
+            when op == "Div" || op == "ShiftRight" {
+                extension = 5
+                when signed && op == "ShiftRight" {
+                    extension = 7
+                }
+            }
+            asm.shift_ri(extension, target, count)
+            return Option::Some(true)
+        }
+        immediate := self.immediate_operand(op.clone(), right)
+        when immediate.is_some() && op != "Mul" {
+            mut extension: u64 = 0
+            when op == "Sub" {
+                extension = 5
+            } else when op == "BitAnd" {
+                extension = 4
+            } else when op == "BitOr" {
+                extension = 1
+            } else when op == "BitXor" {
+                extension = 6
+            }
+            asm.alu_ri(extension, target, immediate.unwrap() as i64)
+            return Option::Some(true)
+        }
+        mut source: u64 = self.operand_reg(right)
+        when source == 0 {
+            when self.is_stable_operand(right) {
+                self.load_stable_operand(asm, right, x64::Reg::RCX)
+                source = x64::Reg::RCX
+            } else {
+                when !self.expr(asm, right) {
+                    return Option::Some(false)
+                }
+                source = x64::Reg::RAX
+            }
+        }
+        when op == "Add" {
+            asm.alu_rr(1, target, source)
+        } else when op == "Sub" {
+            asm.alu_rr(41, target, source)
+        } else when op == "Mul" {
+            asm.imul_rr(target, source)
+        } else when op == "BitAnd" {
+            asm.alu_rr(33, target, source)
+        } else when op == "BitOr" {
+            asm.alu_rr(9, target, source)
+        } else {
+            asm.alu_rr(49, target, source)
+        }
+        return Option::Some(true)
     }
 
     // Packs the copy of each `repr(C)` local that holds `slot`, from the cells of the local.
@@ -2842,29 +3457,24 @@ extend Gen {
         asm.mov_rr(x64::Reg::RBP, x64::Reg::RSP)
         asm.alu_ri(5, x64::Reg::RSP, 48)
         asm.store(8, x64::Reg::RDI, x64::Reg::RBP, (0 as i64) - 8)
-        asm.mov_ri(x64::Reg::RAX, 0)
+        asm.mov_ri(x64::Reg::RAX, 40)
         asm.store(8, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 16)
         bucket_top := asm.new_label()
         buckets_done := asm.new_label()
         next_bucket := asm.new_label()
-        node_top := asm.new_label()
+        // The entries are dropped in order: the dense array at [header + 32], from byte offset 40 to len * 40.
         asm.bind(bucket_top)
         asm.load(8, false, x64::Reg::RDX, x64::Reg::RBP, (0 as i64) - 8)
-        asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 8)
+        asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 16)
+        asm.mov_ri(x64::Reg::R11, 40)
+        asm.imul_rr(x64::Reg::RCX, x64::Reg::R11)
         asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 16)
         asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RCX)
-        asm.jcc(x64::Cc::ABOVE_EQUAL, buckets_done)
-        asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 0)
-        self.scale_bytes(asm, x64::Reg::RAX, 8)
+        asm.jcc(x64::Cc::ABOVE, buckets_done)
+        asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 32)
         asm.alu_rr(1, x64::Reg::RCX, x64::Reg::RAX)
-        asm.load(8, false, x64::Reg::RAX, x64::Reg::RCX, 0)
-        asm.store(8, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 24)
-        asm.bind(node_top)
-        asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 24)
-        asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
-        asm.jcc(x64::Cc::EQUAL, next_bucket)
-        asm.load(8, false, x64::Reg::RCX, x64::Reg::RAX, 0)
-        asm.store(8, x64::Reg::RCX, x64::Reg::RBP, (0 as i64) - 32)
+        asm.store(8, x64::Reg::RCX, x64::Reg::RBP, (0 as i64) - 24)
+        asm.mov_rr(x64::Reg::RAX, x64::Reg::RCX)
         when keys {
             asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
             asm.alu_ri(0, x64::Reg::RDI, 16)
@@ -2894,17 +3504,15 @@ extend Gen {
             asm.load(8, false, x64::Reg::RDI, x64::Reg::RDI, 24)
             self.aligned_call(asm, String("free"))
         }
-        asm.load(8, false, x64::Reg::RDI, x64::Reg::RBP, (0 as i64) - 24)
-        self.aligned_call(asm, String("free"))
-        asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 32)
-        asm.store(8, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 24)
-        asm.jmp(node_top)
         asm.bind(next_bucket)
         asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 16)
-        asm.alu_ri(0, x64::Reg::RAX, 1)
+        asm.alu_ri(0, x64::Reg::RAX, 40)
         asm.store(8, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 16)
         asm.jmp(bucket_top)
         asm.bind(buckets_done)
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RBP, (0 as i64) - 8)
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RDI, 32)
+        self.aligned_call(asm, String("free"))
         asm.load(8, false, x64::Reg::RDI, x64::Reg::RBP, (0 as i64) - 8)
         asm.load(8, false, x64::Reg::RDI, x64::Reg::RDI, 0)
         self.aligned_call(asm, String("free"))
@@ -4538,13 +5146,12 @@ extend Gen {
             return Option::Some(false)
         }
         asm.cmov(comparison_condition(op, is_signed_word(compared_word)), x64::Reg::R8, x64::Reg::R9)
-        asm.mov_rr(x64::Reg::RAX, x64::Reg::R8)
         register := self.reg_of(slot)
         when register != 0 {
-            self.write_cell(asm, 8, x64::Reg::RAX, slot, register)
-            asm.mov_rr(register, x64::Reg::RAX)
+            self.write_cell(asm, 8, x64::Reg::R8, slot, register)
+            asm.mov_rr(register, x64::Reg::R8)
         } else {
-            self.store_cell(asm, ty, x64::Reg::RAX, x64::Reg::RBP, slot_disp(slot))
+            self.store_cell(asm, ty, x64::Reg::R8, x64::Reg::RBP, slot_disp(slot))
         }
         return Option::Some(true)
     }
@@ -4747,6 +5354,14 @@ extend Gen {
             asm.alu_rr(57, left_register, right_register)
             return true
         }
+        // A register local on the left stays as it is while the right side is computed.
+        when left_register != 0 {
+            when !self.expr(asm, right) {
+                return false
+            }
+            asm.alu_rr(57, left_register, x64::Reg::RAX)
+            return true
+        }
         when self.is_stable_operand(left) && !self.is_stable_operand(right) {
             when !self.expr(asm, right) {
                 return false
@@ -4788,7 +5403,11 @@ extend Gen {
             asm.bind(start)
             self.breaks.push(end)
             self.continues.push(top)
+            proved := self.bce_enter_while(setup.clone(), condition, body.clone())
             let_ok := self.body(asm, body)
+            when proved {
+                self.bce_leave()
+            }
             self.breaks.pop()
             self.continues.pop()
             when !let_ok {
@@ -4824,6 +5443,315 @@ extend Gen {
         return true
     }
 
+
+    // Whether the vector local `vec` is read at `index`, a local, below its length: a loop `while i < v.len()` or
+    // `for i in 0..v.len()` proved it, and nothing has changed `i` or the length since.
+    fun bce_proved(self, vec: u64, index: u64) -> bool {
+        when self.bce_vec.len() == 0 || self.inline_active {
+            return false
+        }
+        mut at: u64 = 0
+        while at < self.bce_vec.len() {
+            when self.bce_on[at] && self.bce_is_slot(vec, self.bce_vec[at]) && self.bce_is_slot(index, self.bce_idx[at]) {
+                return true
+            }
+            at += 1
+        }
+        return false
+    }
+
+    // The statement `index` ran: a pair that is cut after it no longer holds.
+    fun bce_retire(mut self, index: u64) {
+        mut at: u64 = 0
+        while at < self.bce_cut.len() {
+            when self.bce_cut[at] == index + 1 {
+                self.bce_on.set(at, false)
+            }
+            at += 1
+        }
+    }
+
+    fun bce_is_slot(self, value: u64, slot: u64) -> bool {
+        return choose self.program.exprs[value] {
+            ir::IrExpr::LocalRef(found, ty, span) => found == slot,
+            _ => false,
+        }
+    }
+
+    fun bce_slot_of(self, value: u64) -> u64 {
+        return choose self.program.exprs[value] {
+            ir::IrExpr::LocalRef(slot, ty, span) => slot + 1,
+            _ => 0,
+        }
+    }
+
+    // `v.len()` of a local `v`: the slot of `v` plus one, or 0.
+    fun bce_len_of(self, value: u64) -> u64 {
+        is_len := choose self.program.exprs[value] {
+            ir::IrExpr::CallExpr(target, arguments, ty) => choose target {
+                ir::CallTarget::VecOp(op, element) => op == "Len" && arguments.len() == 1,
+                _ => false,
+            },
+            _ => false,
+        }
+        when !is_len {
+            return 0
+        }
+        first := choose self.program.exprs[value] {
+            ir::IrExpr::CallExpr(target, arguments, ty) => arguments[0],
+            _ => 0,
+        }
+        return self.bce_slot_of(first)
+    }
+
+    fun bce_local_ok(self, slot: u64) -> bool {
+        return slot < self.def_addressed.len() && !self.def_addressed[slot] && self.frame_slot(slot).is_some()
+    }
+
+    // Whether the statement is `i = i + c`, `c` a small positive constant.
+    fun bce_is_step(self, statement: u64, idx: u64) -> bool {
+        target := choose self.program.stmts[statement] {
+            ir::IrStmt::AssignStmt(slot, ty, value, span) => slot,
+            _ => 0 - 1,
+        }
+        when target != idx {
+            return false
+        }
+        value := choose self.program.stmts[statement] {
+            ir::IrStmt::AssignStmt(slot, ty, value, span) => value,
+            _ => 0,
+        }
+        return choose self.program.exprs[value] {
+            ir::IrExpr::Binary(op, left, right, ty) => op == "Add" && self.bce_is_slot(left, idx) && self.step_constant(right),
+            _ => false,
+        }
+    }
+
+    fun step_constant(self, value: u64) -> bool {
+        constant := self.const_value(value)
+        return constant.is_some() && constant.unwrap() >= 1 && constant.unwrap() <= 4096
+    }
+
+    // Starts the proof for a `while` whose condition is `i < v.len()`: pushes the pair when the body keeps `v` and `i` as
+    // the proof needs. Returns whether it pushed.
+    fun bce_enter_while(mut self, setup: Vec<u64>, condition: u64, body: Vec<u64>) -> bool {
+        when self.no_opt || self.inline_active || setup.len() != 0 {
+            return false
+        }
+        less := choose self.program.exprs[condition] {
+            ir::IrExpr::Binary(op, left, right, ty) => op == "Lt" && !is_signed_word(self.word(ty)),
+            _ => false,
+        }
+        when !less {
+            return false
+        }
+        left := choose self.program.exprs[condition] {
+            ir::IrExpr::Binary(op, left, right, ty) => left,
+            _ => 0,
+        }
+        right := choose self.program.exprs[condition] {
+            ir::IrExpr::Binary(op, left, right, ty) => right,
+            _ => 0,
+        }
+        idx := self.bce_slot_of(left)
+        vec := self.bce_len_of(right)
+        when idx == 0 || vec == 0 {
+            return false
+        }
+        i := idx - 1
+        v := vec - 1
+        when !self.bce_local_ok(i) || !self.bce_local_ok(v) || i == v {
+            return false
+        }
+        // The statements before the first top-level write of `i` must be that step, and must not change `v` or `i`.
+        mut stop: u64 = body.len()
+        mut at: u64 = 0
+        while at < body.len() {
+            writes := choose self.program.stmts[body[at]] {
+                ir::IrStmt::AssignStmt(slot, ty, value, span) => slot == i,
+                _ => false,
+            }
+            when writes {
+                when !self.bce_is_step(body[at], i) {
+                    return false
+                }
+                stop = at
+                at = body.len()
+            } else {
+                at += 1
+            }
+        }
+        at = 0
+        while at < stop {
+            when !self.bce_statement_ok(body[at], v, i) {
+                return false
+            }
+            at += 1
+        }
+        mut cut: u64 = 0
+        when stop < body.len() {
+            cut = body[stop] + 1
+        }
+        self.bce_vec.push(v)
+        self.bce_idx.push(i)
+        self.bce_cut.push(cut)
+        self.bce_on.push(true)
+        return true
+    }
+
+    // The same for `for i in start..v.len()`: the counter is never written by the body.
+    fun bce_enter_for(mut self, slot: u64, ty: u64, start: u64, end: u64, inclusive: bool, body: Vec<u64>) -> bool {
+        when self.no_opt || self.inline_active || inclusive {
+            return false
+        }
+        vec := self.bce_len_of(end)
+        when vec == 0 {
+            return false
+        }
+        v := vec - 1
+        when !self.bce_local_ok(slot) || !self.bce_local_ok(v) || slot == v {
+            return false
+        }
+        when is_signed_word(self.word(ty)) {
+            first := self.const_value(start)
+            when first.is_none() || first.unwrap() >= 9223372036854775808 {
+                return false
+            }
+        }
+        mut at: u64 = 0
+        while at < body.len() {
+            when !self.bce_statement_ok(body[at], v, slot) {
+                return false
+            }
+            at += 1
+        }
+        self.bce_vec.push(v)
+        self.bce_idx.push(slot)
+        self.bce_cut.push(0)
+        self.bce_on.push(true)
+        return true
+    }
+
+    fun bce_leave(mut self) {
+        self.bce_vec.pop()
+        self.bce_idx.pop()
+        self.bce_cut.pop()
+        self.bce_on.pop()
+    }
+
+    fun bce_body_ok(self, statements: Vec<u64>, vec: u64, idx: u64) -> bool {
+        for statement in statements {
+            when !self.bce_statement_ok(statement, vec, idx) {
+                return false
+            }
+        }
+        return true
+    }
+
+    fun bce_exprs_ok(self, values: Vec<u64>, vec: u64, idx: u64) -> bool {
+        for value in values {
+            when !self.bce_expr_ok(value, vec, idx) {
+                return false
+            }
+        }
+        return true
+    }
+
+    fun bce_two_ok(self, a: u64, b: u64, vec: u64, idx: u64) -> bool {
+        return self.bce_expr_ok(a, vec, idx) && self.bce_expr_ok(b, vec, idx)
+    }
+
+    // A call keeps the length of `vec` when it only reads it or sets an element; any other use of the local does not.
+    fun bce_call_ok(self, target: ir::CallTarget, arguments: Vec<u64>, vec: u64, idx: u64) -> bool {
+        keeps := choose target {
+            ir::CallTarget::VecOp(op, element) => op == "Index" || op == "Len" || op == "IsEmpty" || op == "Capacity" || op == "Set",
+            _ => false,
+        }
+        when keeps && arguments.len() > 0 && self.bce_is_slot(arguments[0], vec) {
+            mut at: u64 = 1
+            while at < arguments.len() {
+                when !self.bce_expr_ok(arguments[at], vec, idx) {
+                    return false
+                }
+                at += 1
+            }
+            return true
+        }
+        return self.bce_exprs_ok(arguments, vec, idx)
+    }
+
+    fun bce_expr_ok(self, index: u64, vec: u64, idx: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ir::IrExpr::IntegerLit(text, ty) => true,
+            ir::IrExpr::FloatLit(bits, ty) => true,
+            ir::IrExpr::StrLit(text) => true,
+            ir::IrExpr::CharLit(value) => true,
+            ir::IrExpr::BoolLit(value) => true,
+            ir::IrExpr::FunctionAddress(function, ty) => true,
+            ir::IrExpr::LocalRef(slot, ty, span) => slot != vec,
+            ir::IrExpr::MoveRef(slot, ty) => slot != vec && slot != idx,
+            ir::IrExpr::AddressOf(slot, ty, pointer_type, span) => slot != vec && slot != idx,
+            ir::IrExpr::StructValue(id, fields, values) => self.bce_exprs_ok(values, vec, idx),
+            ir::IrExpr::FieldRead(value, id, field, ty, span) => self.bce_expr_ok(value, vec, idx),
+            ir::IrExpr::ReferenceFieldRead(value, id, field, ty, span, borrowed) => self.bce_expr_ok(value, vec, idx),
+            ir::IrExpr::ValueAddress(value, ty, pointer_type, span) => self.bce_expr_ok(value, vec, idx),
+            ir::IrExpr::CallExpr(target, arguments, ty) => self.bce_call_ok(target, arguments, vec, idx),
+            ir::IrExpr::IfExpr(condition, then_value, else_value, ty) => self.bce_expr_ok(condition, vec, idx) && self.bce_two_ok(then_value, else_value, vec, idx),
+            ir::IrExpr::ArrayValue(items) => self.bce_exprs_ok(items, vec, idx),
+            ir::IrExpr::ArrayRepeat(value, length) => self.bce_expr_ok(value, vec, idx),
+            ir::IrExpr::ArrayAsSlice(value, slice, length) => self.bce_expr_ok(value, vec, idx),
+            ir::IrExpr::ArrayIndex(array, at, ty, length) => self.bce_two_ok(array, at, vec, idx),
+            ir::IrExpr::SliceIndex(slice, at, ty) => self.bce_two_ok(slice, at, vec, idx),
+            ir::IrExpr::SliceElementAddress(slice, at, ty, span) => self.bce_two_ok(slice, at, vec, idx),
+            ir::IrExpr::PlaceAddress(place, ty) => self.bce_expr_ok(place, vec, idx),
+            ir::IrExpr::Dereference(pointer, ty) => self.bce_expr_ok(pointer, vec, idx),
+            ir::IrExpr::StringAsStr(value) => self.bce_expr_ok(value, vec, idx),
+            ir::IrExpr::StringFindOption(value, id) => self.bce_expr_ok(value, vec, idx),
+            ir::IrExpr::Binary(op, left, right, ty) => self.bce_two_ok(left, right, vec, idx),
+            ir::IrExpr::Negate(value, ty) => self.bce_expr_ok(value, vec, idx),
+            ir::IrExpr::Not(value) => self.bce_expr_ok(value, vec, idx),
+            ir::IrExpr::BitNot(value, ty) => self.bce_expr_ok(value, vec, idx),
+            ir::IrExpr::CastExpr(value, source, target) => self.bce_expr_ok(value, vec, idx),
+            _ => false,
+        }
+    }
+
+    // A statement that neither changes the length of `vec` nor writes `idx` (any other use of the two is a read).
+    fun bce_statement_ok(self, index: u64, vec: u64, idx: u64) -> bool {
+        return choose self.program.stmts[index] {
+            ir::IrStmt::BlockStmt(body) => self.bce_body_ok(body, vec, idx),
+            ir::IrStmt::DropStmt(slots, types) => !slots.contains(vec),
+            ir::IrStmt::LetStmt(slot, ty, value, span) => slot != vec && slot != idx && self.bce_expr_ok(value, vec, idx),
+            ir::IrStmt::AssignStmt(slot, ty, value, span) => slot != vec && slot != idx && self.bce_expr_ok(value, vec, idx),
+            ir::IrStmt::ArrayAssignStmt(slot, element, length, at, value, span) => slot != vec && slot != idx && self.bce_two_ok(at, value, vec, idx),
+            ir::IrStmt::DereferenceAssignStmt(pointer, ty, value) => self.bce_two_ok(pointer, value, vec, idx),
+            ir::IrStmt::FieldAssignStmt(slot, ty, value) => slot != vec && slot != idx && self.bce_expr_ok(value, vec, idx),
+            ir::IrStmt::ReferenceFieldAssignStmt(pointer, id, field, ty, value) => self.bce_two_ok(pointer, value, vec, idx),
+            ir::IrStmt::PrintStmt(value, ty) => self.bce_expr_ok(value, vec, idx),
+            ir::IrStmt::PrintTemplateStmt(parts) => self.bce_parts_ok(parts, vec, idx),
+            ir::IrStmt::CallStmt(target, arguments) => self.bce_call_ok(target, arguments, vec, idx),
+            ir::IrStmt::IfStmt(condition, then_body, else_body) => self.bce_expr_ok(condition, vec, idx) && self.bce_body_ok(then_body, vec, idx) && self.bce_body_ok(else_body, vec, idx),
+            ir::IrStmt::WhileStmt(setup, condition, body) => self.bce_body_ok(setup, vec, idx) && self.bce_expr_ok(condition, vec, idx) && self.bce_body_ok(body, vec, idx),
+            ir::IrStmt::ForStmt(slot, end_slot, ty, start, end, inclusive, body) => slot != vec && slot != idx && self.bce_two_ok(start, end, vec, idx) && self.bce_body_ok(body, vec, idx),
+            ir::IrStmt::BreakStmt => true,
+            ir::IrStmt::ContinueStmt => true,
+            ir::IrStmt::ReturnStmt(value) => value.is_none() || self.bce_expr_ok(value.unwrap(), vec, idx),
+        }
+    }
+
+    fun bce_parts_ok(self, parts: Vec<u64>, vec: u64, idx: u64) -> bool {
+        for part in parts {
+            value := choose self.program.parts[part] {
+                ir::PrintPart::ValuePart(value, ty) => Option::Some(value),
+                _ => Option::None,
+            }
+            when value.is_some() && !self.bce_expr_ok(value.unwrap(), vec, idx) {
+                return false
+            }
+        }
+        return true
+    }
+
     // `for slot in start..end` (or `..=`): the counter starts at `start`, and the loop stops at `end` (`end` is included
     // for `..=`). The test runs before each iteration, and for `..=` the counter stops before it would step past `end`.
     fun for_statement(mut self, asm: &mut x64::Asm, slot: u64, end_slot: u64, ty: u64, start: u64, end: u64, inclusive: bool, body: Vec<u64>) -> bool {
@@ -4856,7 +5784,11 @@ extend Gen {
             asm.bind(body_top)
             self.breaks.push(end_label)
             self.continues.push(step)
+            proved := self.bce_enter_for(slot, ty, start, end, inclusive, body.clone())
             let_ok := self.body(asm, body)
+            when proved {
+                self.bce_leave()
+            }
             self.breaks.pop()
             self.continues.pop()
             when !let_ok {
@@ -5536,13 +6468,25 @@ extend Gen {
     fun call_in_registers(mut self, asm: &mut x64::Asm, id: u64, arguments: Vec<u64>) -> bool {
         count := arguments.len()
         last_in_rax := self.shadow_slots.len() == 0
+        // An argument that is a constant, a local, or a register local plus a constant is loaded straight into its register
+        // after the others are computed: it has no effect and nothing changes it, so it need not wait on the stack.
+        mut last_complex: u64 = count
         mut position: u64 = 0
         while position < count {
-            when !self.expr(asm, arguments[position]) {
-                return false
+            when !self.is_simple_argument(arguments[position]) {
+                last_complex = position
             }
-            when position + 1 < count || !last_in_rax {
-                asm.push(x64::Reg::RAX)
+            position += 1
+        }
+        position = 0
+        while position < count {
+            when !self.is_simple_argument(arguments[position]) {
+                when !self.expr(asm, arguments[position]) {
+                    return false
+                }
+                when position != last_complex || !last_in_rax {
+                    asm.push(x64::Reg::RAX)
+                }
             }
             position += 1
         }
@@ -5551,13 +6495,22 @@ extend Gen {
             self.sync_shadows(asm, false)
         }
         mut at: u64 = count
-        when last_in_rax {
-            asm.mov_rr(arg_register(count - 1), x64::Reg::RAX)
-            at = count - 1
-        }
         while at > 0 {
             at -= 1
-            asm.pop(arg_register(at))
+            when !self.is_simple_argument(arguments[at]) {
+                when at == last_complex && last_in_rax {
+                    asm.mov_rr(arg_register(at), x64::Reg::RAX)
+                } else {
+                    asm.pop(arg_register(at))
+                }
+            }
+        }
+        position = 0
+        while position < count {
+            when self.is_simple_argument(arguments[position]) {
+                self.load_simple_argument(asm, arguments[position], arg_register(position))
+            }
+            position += 1
         }
         asm.call_label(self.labels[id])
         when self.shadow_slots.len() > 0 {
@@ -5566,6 +6519,62 @@ extend Gen {
             asm.pop(x64::Reg::RAX)
         }
         return true
+    }
+
+    // `register + constant` or `register - constant` for a 64-bit local in a register: the offset to add.
+    fun register_offset(mut self, index: u64) -> Option<i64> {
+        when self.no_opt {
+            return Option::None
+        }
+        plain := choose self.program.exprs[index] {
+            ir::IrExpr::Binary(op, left, right, ty) => (op == "Add" || op == "Sub") && self.value_width(ty) == 8 && is_integer_word(self.word(ty)),
+            _ => false,
+        }
+        when !plain {
+            return Option::None
+        }
+        name := choose self.program.exprs[index] {
+            ir::IrExpr::Binary(op, left, right, ty) => op,
+            _ => String(""),
+        }
+        left := choose self.program.exprs[index] {
+            ir::IrExpr::Binary(op, left, right, ty) => left,
+            _ => 0,
+        }
+        right := choose self.program.exprs[index] {
+            ir::IrExpr::Binary(op, left, right, ty) => right,
+            _ => 0,
+        }
+        when self.operand_reg(left) == 0 {
+            return Option::None
+        }
+        immediate := self.immediate_operand(name.clone(), right)
+        when immediate.is_none() || (immediate.unwrap() as i64) <= (0 as i64) - 2147483647 {
+            return Option::None
+        }
+        mut offset := immediate.unwrap() as i64
+        when name == "Sub" {
+            offset = (0 as i64) - offset
+        }
+        return Option::Some(offset)
+    }
+
+    fun is_simple_argument(mut self, index: u64) -> bool {
+        return self.is_stable_operand(index) || self.register_offset(index).is_some()
+    }
+
+    // Reads a simple argument (see `is_simple_argument`) into `reg`.
+    fun load_simple_argument(mut self, asm: &mut x64::Asm, index: u64, reg: u64) {
+        offset := self.register_offset(index)
+        when offset.is_some() {
+            left := choose self.program.exprs[index] {
+                ir::IrExpr::Binary(op, left, right, ty) => left,
+                _ => 0,
+            }
+            asm.lea(reg, self.operand_reg(left), offset.unwrap())
+            return
+        }
+        self.load_stable_operand(asm, index, reg)
     }
 
     fun call(mut self, asm: &mut x64::Asm, id: u64, arguments: Vec<u64>) -> bool {
@@ -5775,9 +6784,11 @@ extend Gen {
             return false
         }
         asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 0)
-        asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 8)
-        asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RCX)
-        asm.jcc(x64::Cc::ABOVE_EQUAL, self.index_error_label)
+        when !self.bce_proved(vec, index) {
+            asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 8)
+            asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RCX)
+            asm.jcc(x64::Cc::ABOVE_EQUAL, self.index_error_label)
+        }
         asm.load(8, false, x64::Reg::RSI, x64::Reg::RDX, 0)
         self.scale_bytes(asm, x64::Reg::RAX, 8 * cells)
         asm.alu_rr(1, x64::Reg::RAX, x64::Reg::RSI)
@@ -6631,6 +7642,43 @@ extend Gen {
         when !self.expr(asm, vec) {
             return false
         }
+        // An element of one cell with nothing to drop: the header and the value meet in registers.
+        when !self.no_opt && cells == 1 && self.is_cell(element) && !self.is_str(element) && !self.has_owners(element) {
+            asm.mov_rr(x64::Reg::RDX, x64::Reg::RAX)
+            when self.is_stable_operand(value) {
+                self.load_stable_operand(asm, value, x64::Reg::R9)
+            } else {
+                asm.push(x64::Reg::RDX)
+                when !self.expr(asm, value) {
+                    return false
+                }
+                asm.mov_rr(x64::Reg::R9, x64::Reg::RAX)
+                asm.pop(x64::Reg::RDX)
+            }
+            asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 8)
+            asm.load(8, false, x64::Reg::RAX, x64::Reg::RDX, 16)
+            asm.alu_rr(57, x64::Reg::RCX, x64::Reg::RAX)
+            room := asm.new_label()
+            asm.jcc(x64::Cc::BELOW, room)
+            self.grow_capacity(asm)
+            asm.store(8, x64::Reg::RAX, x64::Reg::RDX, 16)
+            asm.mov_rr(x64::Reg::RSI, x64::Reg::RAX)
+            asm.shift_ri(4, x64::Reg::RSI, 3)
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, 0)
+            asm.push(x64::Reg::RDX)
+            asm.push(x64::Reg::R9)
+            self.aligned_call(asm, String("realloc"))
+            asm.pop(x64::Reg::R9)
+            asm.pop(x64::Reg::RDX)
+            asm.store(8, x64::Reg::RAX, x64::Reg::RDX, 0)
+            asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 8)
+            asm.bind(room)
+            asm.load(8, false, x64::Reg::RSI, x64::Reg::RDX, 0)
+            asm.indexed(true, x64::Reg::R9, x64::Reg::RSI, x64::Reg::RCX)
+            asm.alu_ri(0, x64::Reg::RCX, 1)
+            asm.store(8, x64::Reg::RCX, x64::Reg::RDX, 8)
+            return true
+        }
         asm.push(x64::Reg::RAX)
         when !self.push_value(asm, value, element) {
             return false
@@ -7032,13 +8080,22 @@ extend Gen {
                 asm.mov_rr(x64::Reg::R9, x64::Reg::RAX)
                 asm.pop(x64::Reg::RDX)
             }
+            when self.bce_proved(vec, index) {
+                mut index_register := self.operand_reg(index)
+                when index_register == 0 {
+                    self.load_stable_operand(asm, index, x64::Reg::RCX)
+                    index_register = x64::Reg::RCX
+                }
+                asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, 0)
+                asm.indexed(true, x64::Reg::R9, x64::Reg::RDI, index_register)
+                return true
+            }
             self.load_stable_operand(asm, index, x64::Reg::RCX)
-            asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, 8)
-            asm.alu_rr(57, x64::Reg::RCX, x64::Reg::RDI)
-            in_range := asm.new_label()
-            asm.jcc(x64::Cc::BELOW, in_range)
-            self.fail_exit(asm, String("Ryn runtime error: Vec index is out of bounds\n"))
-            asm.bind(in_range)
+            when !self.bce_proved(vec, index) {
+                asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, 8)
+                asm.alu_rr(57, x64::Reg::RCX, x64::Reg::RDI)
+                asm.jcc(x64::Cc::ABOVE_EQUAL, self.set_error_label)
+            }
             asm.shift_ri(4, x64::Reg::RCX, 3)
             asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, 0)
             asm.alu_rr(1, x64::Reg::RCX, x64::Reg::RDI)
@@ -7061,10 +8118,7 @@ extend Gen {
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, (8 * cells) as i64)
         asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, 8)
         asm.alu_rr(57, x64::Reg::RCX, x64::Reg::RDI)
-        in_range := asm.new_label()
-        asm.jcc(x64::Cc::BELOW, in_range)
-        self.fail_exit(asm, String("Ryn runtime error: Vec index is out of bounds\n"))
-        asm.bind(in_range)
+        asm.jcc(x64::Cc::ABOVE_EQUAL, self.set_error_label)
         asm.mov_rr(x64::Reg::R8, x64::Reg::RCX)
         self.scale_bytes(asm, x64::Reg::R8, 8 * cells)
         asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, 0)
@@ -7198,6 +8252,18 @@ extend Gen {
         when !self.expr(asm, vec) {
             return false
         }
+        // An element of one cell with nothing to copy, read at an index a loop has proved in range: the data pointer and the
+        // index meet in an addressing mode.
+        when cells == 1 && self.is_cell(element) && !self.is_str(element) && !self.has_owners(element) && self.is_stable_operand(index) && self.bce_proved(vec, index) {
+            asm.load(8, false, x64::Reg::RDX, x64::Reg::RAX, 0)
+            mut index_register := self.operand_reg(index)
+            when index_register == 0 {
+                self.load_stable_operand(asm, index, x64::Reg::RCX)
+                index_register = x64::Reg::RCX
+            }
+            asm.indexed(false, x64::Reg::RAX, x64::Reg::RDX, index_register)
+            return true
+        }
         // An index that is a constant or a local nothing else can change is read after the vector, so the vector need not wait
         // on the stack while it is computed.
         direct := self.is_stable_operand(index)
@@ -7211,9 +8277,11 @@ extend Gen {
             }
             asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 0)
         }
-        asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 8)
-        asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RCX)
-        asm.jcc(x64::Cc::ABOVE_EQUAL, self.index_error_label)
+        when !self.bce_proved(vec, index) {
+            asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 8)
+            asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RCX)
+            asm.jcc(x64::Cc::ABOVE_EQUAL, self.index_error_label)
+        }
         asm.load(8, false, x64::Reg::RSI, x64::Reg::RDX, 0)
         self.scale_bytes(asm, x64::Reg::RAX, 8 * cells)
         asm.alu_rr(1, x64::Reg::RSI, x64::Reg::RAX)
@@ -7393,9 +8461,9 @@ extend Gen {
             asm.movq_to_xmm(wide, 1, x64::Reg::RAX)
             asm.ucomis(precision, 0, 1)
             asm.setcc(x64::Cc::EQUAL, x64::Reg::RAX)
-            asm.setcc(x64::Cc::NOT_PARITY, x64::Reg::RCX)
-            asm.alu_rr(33, x64::Reg::RAX, x64::Reg::RCX)
-            asm.alu_ri(4, x64::Reg::RAX, 1)
+            asm.mov_rr(x64::Reg::RDX, x64::Reg::RAX)
+            asm.setcc(x64::Cc::NOT_PARITY, x64::Reg::RAX)
+            asm.alu_rr(33, x64::Reg::RAX, x64::Reg::RDX)
             return true
         }
         word := self.word(ty)
@@ -7497,10 +8565,12 @@ extend Gen {
         }
         when op == "Eq" || op == "Ne" {
             // Equal when the comparison sets zero and not the unordered flag.
+            // `setcc` always writes `al`, so the first result is moved aside before the second is made.
             asm.ucomis(precision, 0, 1)
             asm.setcc(x64::Cc::EQUAL, x64::Reg::RAX)
-            asm.setcc(x64::Cc::NOT_PARITY, x64::Reg::RCX)
-            asm.alu_rr(33, x64::Reg::RAX, x64::Reg::RCX)
+            asm.mov_rr(x64::Reg::RDX, x64::Reg::RAX)
+            asm.setcc(x64::Cc::NOT_PARITY, x64::Reg::RAX)
+            asm.alu_rr(33, x64::Reg::RAX, x64::Reg::RDX)
             when op == "Ne" {
                 asm.alu_ri(6, x64::Reg::RAX, 1)
             }
@@ -7905,21 +8975,15 @@ extend Gen {
         when asm.is_pending(self.struct_key_drop) {
             self.struct_key_drop_routine(asm, self.struct_key_drop)
         }
-        // FNV-1a over the eight bytes of a scalar key.
+        // The hash of a scalar key (in rsi): a multiplication by an odd constant, whose high bits depend on every bit of the key,
+        // folded onto the low bits that pick the bucket. Four instructions, where eight rounds of FNV-1a took forty.
         when asm.is_pending(self.map_hash_scalar) {
             asm.bind(self.map_hash_scalar)
-            asm.mov_ri(x64::Reg::RAX, 14695981039346656037 as u64)
-            mut byte: u64 = 0
-            while byte < 8 {
-                asm.mov_rr(x64::Reg::RDX, x64::Reg::RSI)
-                asm.mov_ri(x64::Reg::RCX, byte * 8)
-                asm.shift_cl(5, x64::Reg::RDX)
-                asm.alu_ri(4, x64::Reg::RDX, 255)
-                asm.alu_rr(49, x64::Reg::RAX, x64::Reg::RDX)
-                asm.mov_ri(x64::Reg::RDX, 1099511628211)
-                asm.imul_rr(x64::Reg::RAX, x64::Reg::RDX)
-                byte += 1
-            }
+            asm.mov_ri(x64::Reg::RAX, 11400714819323198485 as u64)
+            asm.imul_rr(x64::Reg::RAX, x64::Reg::RSI)
+            asm.mov_rr(x64::Reg::RDX, x64::Reg::RAX)
+            asm.shift_ri(5, x64::Reg::RDX, 32)
+            asm.alu_rr(49, x64::Reg::RAX, x64::Reg::RDX)
             asm.ret()
         }
         // FNV-1a over the bytes of a String key, whose header is in rsi.
@@ -8004,7 +9068,7 @@ extend Gen {
         when asm.is_pending(self.map_find_string) {
             self.map_find_routine(asm, self.map_find_string, self.map_hash_string, true)
         }
-        // Doubling: the buckets become twice as many, and every node moves to its bucket in the new array.
+        // Doubling: the slots become twice as many and are filled again from the entries, which are read in order.
         when asm.is_pending(self.map_grow) {
             asm.bind(self.map_grow)
             asm.push(x64::Reg::RDI)
@@ -8012,49 +9076,49 @@ extend Gen {
             asm.alu_rr(1, x64::Reg::RAX, x64::Reg::RAX)
             asm.push(x64::Reg::RAX)
             asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
-            asm.mov_ri(x64::Reg::RSI, 8)
+            asm.mov_ri(x64::Reg::RSI, 16)
             self.aligned_call(asm, String("calloc"))
             asm.push(x64::Reg::RAX)
             asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 16)
-            asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 8)
-            asm.load(8, false, x64::Reg::R8, x64::Reg::RDX, 0)
-            asm.mov_ri(x64::Reg::R9, 0)
+            asm.load(8, false, x64::Reg::R8, x64::Reg::RDX, 32)
+            asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 16)
+            asm.mov_ri(x64::Reg::R11, 40)
+            asm.imul_rr(x64::Reg::RCX, x64::Reg::R11)
+            asm.mov_ri(x64::Reg::R9, 40)
             each := asm.new_label()
             each_done := asm.new_label()
-            chain := asm.new_label()
-            chained := asm.new_label()
+            probe := asm.new_label()
+            placed := asm.new_label()
             asm.bind(each)
             asm.alu_rr(57, x64::Reg::R9, x64::Reg::RCX)
-            asm.jcc(x64::Cc::ABOVE_EQUAL, each_done)
-            asm.mov_rr(x64::Reg::R11, x64::Reg::R9)
-            asm.alu_rr(1, x64::Reg::R11, x64::Reg::R11)
-            asm.alu_rr(1, x64::Reg::R11, x64::Reg::R11)
-            asm.alu_rr(1, x64::Reg::R11, x64::Reg::R11)
-            asm.alu_rr(1, x64::Reg::R11, x64::Reg::R8)
-            asm.load(8, false, x64::Reg::R11, x64::Reg::R11, 0)
-            asm.bind(chain)
-            asm.test_rr(x64::Reg::R11, x64::Reg::R11)
-            asm.jcc(x64::Cc::EQUAL, chained)
-            asm.load(8, false, x64::Reg::R10, x64::Reg::R11, 0)
-            asm.load(8, false, x64::Reg::RAX, x64::Reg::R11, 8)
-            asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 8)
-            asm.alu_ri(5, x64::Reg::RDX, 1)
+            asm.jcc(x64::Cc::ABOVE, each_done)
+            asm.mov_rr(x64::Reg::R10, x64::Reg::R9)
+            asm.alu_rr(1, x64::Reg::R10, x64::Reg::R8)
+            asm.load(8, false, x64::Reg::RAX, x64::Reg::R10, 8)
+            asm.load(8, false, x64::Reg::RSI, x64::Reg::RSP, 8)
+            asm.alu_ri(5, x64::Reg::RSI, 1)
             asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
-            asm.alu_rr(33, x64::Reg::RDI, x64::Reg::RDX)
-            asm.alu_rr(1, x64::Reg::RDI, x64::Reg::RDI)
-            asm.alu_rr(1, x64::Reg::RDI, x64::Reg::RDI)
-            asm.alu_rr(1, x64::Reg::RDI, x64::Reg::RDI)
-            asm.load(8, false, x64::Reg::RSI, x64::Reg::RSP, 0)
-            asm.alu_rr(1, x64::Reg::RDI, x64::Reg::RSI)
-            asm.load(8, false, x64::Reg::RDX, x64::Reg::RDI, 0)
-            asm.store(8, x64::Reg::RDX, x64::Reg::R11, 0)
-            asm.store(8, x64::Reg::R11, x64::Reg::RDI, 0)
-            asm.mov_rr(x64::Reg::R11, x64::Reg::R10)
-            asm.jmp(chain)
-            asm.bind(chained)
-            asm.alu_ri(0, x64::Reg::R9, 1)
+            asm.alu_rr(33, x64::Reg::RDI, x64::Reg::RSI)
+            asm.bind(probe)
+            asm.mov_rr(x64::Reg::RDX, x64::Reg::RDI)
+            asm.shift_ri(4, x64::Reg::RDX, 4)
+            asm.load(8, false, x64::Reg::R11, x64::Reg::RSP, 0)
+            asm.alu_rr(1, x64::Reg::RDX, x64::Reg::R11)
+            asm.load(8, false, x64::Reg::R11, x64::Reg::RDX, 8)
+            asm.test_rr(x64::Reg::R11, x64::Reg::R11)
+            asm.jcc(x64::Cc::EQUAL, placed)
+            asm.alu_ri(0, x64::Reg::RDI, 1)
+            asm.alu_rr(33, x64::Reg::RDI, x64::Reg::RSI)
+            asm.jmp(probe)
+            asm.bind(placed)
+            asm.store(8, x64::Reg::RAX, x64::Reg::RDX, 0)
+            asm.store(8, x64::Reg::R9, x64::Reg::RDX, 8)
+            asm.alu_ri(0, x64::Reg::R9, 40)
             asm.jmp(each)
             asm.bind(each_done)
+            asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 16)
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, 0)
+            self.aligned_call(asm, String("free"))
             asm.load(8, false, x64::Reg::RAX, x64::Reg::RSP, 0)
             asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 16)
             asm.store(8, x64::Reg::RAX, x64::Reg::RDX, 0)
@@ -8286,6 +9350,10 @@ extend Gen {
     // A lookup routine for one kind of key: the bucket of the key's hash is scanned for a node with that hash whose key
     // is equal, a String key comparing by its bytes and a scalar key by its word.
     fun map_find_routine(mut self, asm: &mut x64::Asm, label: u64, hash: u64, text: bool) {
+        // rdi is the header, rsi the key (a cell, or a String header). The index is an open-addressed array of slots {hash, node}: the
+        // probe starts at `hash & mask` and walks forward to an empty slot, so one cache line usually holds the whole probe. A slot
+        // holds the hash and the byte offset of its entry in the dense array of entries at [header + 32] (offset 0 is never used). The
+        // node is left in rax (0 when the key is missing) and its slot in rdx.
         asm.bind(label)
         asm.call_label(hash)
         asm.mov_rr(x64::Reg::R8, x64::Reg::RSI)
@@ -8293,53 +9361,69 @@ extend Gen {
         asm.alu_ri(5, x64::Reg::R10, 1)
         asm.mov_rr(x64::Reg::RCX, x64::Reg::RAX)
         asm.alu_rr(33, x64::Reg::RCX, x64::Reg::R10)
-        asm.load(8, false, x64::Reg::R11, x64::Reg::RDI, 0)
-        asm.mov_rr(x64::Reg::RDX, x64::Reg::RCX)
-        asm.alu_rr(1, x64::Reg::RDX, x64::Reg::RDX)
-        asm.alu_rr(1, x64::Reg::RDX, x64::Reg::RDX)
-        asm.alu_rr(1, x64::Reg::RDX, x64::Reg::RDX)
-        asm.alu_rr(1, x64::Reg::RDX, x64::Reg::R11)
-        asm.load(8, false, x64::Reg::R11, x64::Reg::RDX, 0)
-        next := asm.new_label()
         top := asm.new_label()
+        next := asm.new_label()
         miss := asm.new_label()
         hit := asm.new_label()
         out := asm.new_label()
         asm.bind(top)
+        asm.mov_rr(x64::Reg::RDX, x64::Reg::RCX)
+        asm.shift_ri(4, x64::Reg::RDX, 4)
+        asm.load(8, false, x64::Reg::R11, x64::Reg::RDI, 0)
+        asm.alu_rr(1, x64::Reg::RDX, x64::Reg::R11)
+        asm.load(8, false, x64::Reg::R11, x64::Reg::RDX, 8)
         asm.test_rr(x64::Reg::R11, x64::Reg::R11)
         asm.jcc(x64::Cc::EQUAL, miss)
-        asm.load(8, false, x64::Reg::RDX, x64::Reg::R11, 8)
-        asm.alu_rr(57, x64::Reg::RDX, x64::Reg::RAX)
+        asm.load(8, false, x64::Reg::R9, x64::Reg::RDX, 0)
+        asm.alu_rr(57, x64::Reg::R9, x64::Reg::RAX)
         asm.jcc(x64::Cc::NOT_EQUAL, next)
+        asm.load(8, false, x64::Reg::R9, x64::Reg::RDI, 32)
+        asm.alu_rr(1, x64::Reg::R11, x64::Reg::R9)
         when text {
+            matched := asm.new_label()
+            different := asm.new_label()
+            asm.push(x64::Reg::RCX)
+            asm.push(x64::Reg::R10)
+            asm.push(x64::Reg::RDX)
             asm.load(8, false, x64::Reg::RDX, x64::Reg::R11, 16)
             asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 8)
             asm.load(8, false, x64::Reg::R10, x64::Reg::R8, 8)
             asm.alu_rr(57, x64::Reg::RCX, x64::Reg::R10)
-            asm.jcc(x64::Cc::NOT_EQUAL, next)
+            asm.jcc(x64::Cc::NOT_EQUAL, different)
             asm.load(8, false, x64::Reg::RSI, x64::Reg::R8, 0)
             asm.load(8, false, x64::Reg::R9, x64::Reg::RDX, 0)
             bytes := asm.new_label()
             asm.bind(bytes)
             asm.test_rr(x64::Reg::RCX, x64::Reg::RCX)
-            asm.jcc(x64::Cc::EQUAL, hit)
+            asm.jcc(x64::Cc::EQUAL, matched)
             asm.load(1, false, x64::Reg::R10, x64::Reg::RSI, 0)
             asm.load(1, false, x64::Reg::RDX, x64::Reg::R9, 0)
             asm.alu_rr(57, x64::Reg::R10, x64::Reg::RDX)
-            asm.jcc(x64::Cc::NOT_EQUAL, next)
+            asm.jcc(x64::Cc::NOT_EQUAL, different)
             asm.alu_ri(0, x64::Reg::RSI, 1)
             asm.alu_ri(0, x64::Reg::R9, 1)
             asm.alu_ri(5, x64::Reg::RCX, 1)
             asm.jmp(bytes)
+            asm.bind(different)
+            asm.pop(x64::Reg::RDX)
+            asm.pop(x64::Reg::R10)
+            asm.pop(x64::Reg::RCX)
+            asm.jmp(next)
+            asm.bind(matched)
+            asm.pop(x64::Reg::RDX)
+            asm.pop(x64::Reg::R10)
+            asm.pop(x64::Reg::RCX)
+            asm.jmp(hit)
         }
         when !text {
-            asm.load(8, false, x64::Reg::RDX, x64::Reg::R11, 16)
-            asm.alu_rr(57, x64::Reg::RDX, x64::Reg::R8)
+            asm.load(8, false, x64::Reg::R9, x64::Reg::R11, 16)
+            asm.alu_rr(57, x64::Reg::R9, x64::Reg::R8)
             asm.jcc(x64::Cc::NOT_EQUAL, next)
             asm.jmp(hit)
         }
         asm.bind(next)
-        asm.load(8, false, x64::Reg::R11, x64::Reg::R11, 0)
+        asm.alu_ri(0, x64::Reg::RCX, 1)
+        asm.alu_rr(33, x64::Reg::RCX, x64::Reg::R10)
         asm.jmp(top)
         asm.bind(hit)
         asm.mov_rr(x64::Reg::RAX, x64::Reg::R11)
@@ -8378,27 +9462,50 @@ extend Gen {
     // sequence, and a copy of every node in its bucket. A String key or value is copied as a String. The frame holds the
     // bucket index, the new buckets, the new header, the source header, the node being copied and its copy.
     fun map_clone_routine(mut self, asm: &mut x64::Asm, label: u64, text_key: bool, text_value: bool, boxed: u64, owned: Vec<u64>) {
+        // The frame: 0 the offset of the entry being cloned, 8 the new slots, 16 the new header, 24 the source header, 32 and
+        // 40 the entry being cloned (the arrays are copied first, so the source and its copy are one memory).
         asm.bind(label)
         asm.alu_ri(5, x64::Reg::RSP, 48)
         asm.store(8, x64::Reg::RDI, x64::Reg::RSP, 24)
-        asm.mov_ri(x64::Reg::RDI, 32)
+        asm.mov_ri(x64::Reg::RDI, 48)
         self.aligned_call(asm, String("malloc"))
         asm.store(8, x64::Reg::RAX, x64::Reg::RSP, 16)
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 24)
+        mut header_word: u64 = 1
+        while header_word < 6 {
+            asm.load(8, false, x64::Reg::R8, x64::Reg::RCX, (8 * header_word) as i64)
+            asm.store(8, x64::Reg::R8, x64::Reg::RAX, (8 * header_word) as i64)
+            header_word += 1
+        }
         asm.load(8, false, x64::Reg::RDI, x64::Reg::RCX, 8)
-        asm.mov_ri(x64::Reg::RSI, 8)
-        self.aligned_call(asm, String("calloc"))
+        asm.shift_ri(4, x64::Reg::RDI, 4)
+        self.aligned_call(asm, String("malloc"))
         asm.store(8, x64::Reg::RAX, x64::Reg::RSP, 8)
         asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 16)
         asm.store(8, x64::Reg::RAX, x64::Reg::RDX, 0)
+        asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 24)
-        asm.load(8, false, x64::Reg::R8, x64::Reg::RCX, 8)
-        asm.store(8, x64::Reg::R8, x64::Reg::RDX, 8)
-        asm.load(8, false, x64::Reg::R8, x64::Reg::RCX, 16)
-        asm.store(8, x64::Reg::R8, x64::Reg::RDX, 16)
-        asm.load(8, false, x64::Reg::R8, x64::Reg::RCX, 24)
-        asm.store(8, x64::Reg::R8, x64::Reg::RDX, 24)
-        asm.mov_ri(x64::Reg::RAX, 0)
+        asm.load(8, false, x64::Reg::RSI, x64::Reg::RCX, 0)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RCX, 8)
+        asm.shift_ri(4, x64::Reg::RDX, 4)
+        self.aligned_call(asm, String("memcpy"))
+        asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 24)
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RCX, 40)
+        asm.alu_ri(0, x64::Reg::RDI, 1)
+        asm.mov_ri(x64::Reg::R11, 40)
+        asm.imul_rr(x64::Reg::RDI, x64::Reg::R11)
+        self.aligned_call(asm, String("malloc"))
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 16)
+        asm.store(8, x64::Reg::RAX, x64::Reg::RDX, 32)
+        asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
+        asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 24)
+        asm.load(8, false, x64::Reg::RSI, x64::Reg::RCX, 32)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RCX, 16)
+        asm.alu_ri(0, x64::Reg::RDX, 1)
+        asm.mov_ri(x64::Reg::R11, 40)
+        asm.imul_rr(x64::Reg::RDX, x64::Reg::R11)
+        self.aligned_call(asm, String("memcpy"))
+        asm.mov_ri(x64::Reg::RAX, 40)
         asm.store(8, x64::Reg::RAX, x64::Reg::RSP, 0)
         outer := asm.new_label()
         inner := asm.new_label()
@@ -8406,23 +9513,17 @@ extend Gen {
         done := asm.new_label()
         asm.bind(outer)
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 0)
-        asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 24)
-        asm.load(8, false, x64::Reg::R8, x64::Reg::RDX, 8)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 16)
+        asm.load(8, false, x64::Reg::R8, x64::Reg::RDX, 16)
+        asm.mov_ri(x64::Reg::R11, 40)
+        asm.imul_rr(x64::Reg::R8, x64::Reg::R11)
         asm.alu_rr(57, x64::Reg::RCX, x64::Reg::R8)
-        asm.jcc(x64::Cc::ABOVE_EQUAL, done)
-        asm.load(8, false, x64::Reg::R9, x64::Reg::RDX, 0)
-        asm.mov_rr(x64::Reg::RAX, x64::Reg::RCX)
-        self.scale8(asm, x64::Reg::RAX)
-        asm.alu_rr(1, x64::Reg::RAX, x64::Reg::R9)
-        asm.load(8, false, x64::Reg::RAX, x64::Reg::RAX, 0)
-        asm.store(8, x64::Reg::RAX, x64::Reg::RSP, 32)
+        asm.jcc(x64::Cc::ABOVE, done)
+        asm.load(8, false, x64::Reg::R9, x64::Reg::RDX, 32)
+        asm.alu_rr(1, x64::Reg::R9, x64::Reg::RCX)
+        asm.store(8, x64::Reg::R9, x64::Reg::RSP, 32)
+        asm.store(8, x64::Reg::R9, x64::Reg::RSP, 40)
         asm.bind(inner)
-        asm.load(8, false, x64::Reg::RAX, x64::Reg::RSP, 32)
-        asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
-        asm.jcc(x64::Cc::EQUAL, next)
-        asm.mov_ri(x64::Reg::RDI, 40)
-        self.aligned_call(asm, String("malloc"))
-        asm.store(8, x64::Reg::RAX, x64::Reg::RSP, 40)
         asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 32)
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 40)
         asm.load(8, false, x64::Reg::R8, x64::Reg::RDX, 8)
@@ -8492,26 +9593,9 @@ extend Gen {
                 at += 3
             }
         }
-        // The copy goes to the front of its bucket in the new array.
-        asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 40)
-        asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 16)
-        asm.load(8, false, x64::Reg::R8, x64::Reg::RDX, 8)
-        asm.alu_ri(5, x64::Reg::R8, 1)
-        asm.load(8, false, x64::Reg::R9, x64::Reg::RCX, 8)
-        asm.alu_rr(33, x64::Reg::R9, x64::Reg::R8)
-        self.scale8(asm, x64::Reg::R9)
-        asm.load(8, false, x64::Reg::R10, x64::Reg::RDX, 0)
-        asm.alu_rr(1, x64::Reg::R9, x64::Reg::R10)
-        asm.load(8, false, x64::Reg::R10, x64::Reg::R9, 0)
-        asm.store(8, x64::Reg::R10, x64::Reg::RCX, 0)
-        asm.store(8, x64::Reg::RCX, x64::Reg::R9, 0)
-        asm.load(8, false, x64::Reg::RAX, x64::Reg::RSP, 32)
-        asm.load(8, false, x64::Reg::RAX, x64::Reg::RAX, 0)
-        asm.store(8, x64::Reg::RAX, x64::Reg::RSP, 32)
-        asm.jmp(inner)
         asm.bind(next)
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 0)
-        asm.alu_ri(0, x64::Reg::RCX, 1)
+        asm.alu_ri(0, x64::Reg::RCX, 40)
         asm.store(8, x64::Reg::RCX, x64::Reg::RSP, 0)
         asm.jmp(outer)
         asm.bind(done)
@@ -8520,23 +9604,35 @@ extend Gen {
         asm.ret()
     }
 
-    // The map header of a new map: no node, and the buckets as a zeroed array of eight.
+    // The map header of a new map: no node, and the slots as a zeroed array of eight (16 bytes each).
     fun map_new(mut self, asm: &mut x64::Asm) -> bool {
-        asm.mov_ri(x64::Reg::RDI, 32)
+        asm.mov_ri(x64::Reg::RDI, 48)
         self.aligned_call(asm, String("malloc"))
         asm.push(x64::Reg::RAX)
+        self.map_arrays(asm)
+        asm.pop(x64::Reg::RAX)
+        return true
+    }
+
+    // Gives the header at [rsp] its first arrays: eight empty slots (16 bytes each) and room for four entries (40 bytes each,
+    // and the unused entry 0), with a length of zero. Leaves the header in rdx.
+    fun map_arrays(mut self, asm: &mut x64::Asm) {
         asm.mov_ri(x64::Reg::RDI, 8)
-        asm.mov_ri(x64::Reg::RSI, 8)
+        asm.mov_ri(x64::Reg::RSI, 16)
         self.aligned_call(asm, String("calloc"))
-        asm.pop(x64::Reg::RDX)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 0)
         asm.store(8, x64::Reg::RAX, x64::Reg::RDX, 0)
+        asm.mov_ri(x64::Reg::RDI, 200)
+        self.aligned_call(asm, String("malloc"))
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 0)
+        asm.store(8, x64::Reg::RAX, x64::Reg::RDX, 32)
         asm.mov_ri(x64::Reg::RCX, 8)
         asm.store(8, x64::Reg::RCX, x64::Reg::RDX, 8)
+        asm.mov_ri(x64::Reg::RCX, 4)
+        asm.store(8, x64::Reg::RCX, x64::Reg::RDX, 40)
         asm.mov_ri(x64::Reg::RCX, 0)
         asm.store(8, x64::Reg::RCX, x64::Reg::RDX, 16)
         asm.store(8, x64::Reg::RCX, x64::Reg::RDX, 24)
-        asm.mov_rr(x64::Reg::RAX, x64::Reg::RDX)
-        return true
     }
 
     // The Option whose payload is `value`, when the program has one.
@@ -8800,15 +9896,8 @@ extend Gen {
             asm.call_label(clear)
             asm.pop(x64::Reg::RAX)
             asm.push(x64::Reg::RAX)
-            asm.mov_ri(x64::Reg::RDI, 8)
-            asm.mov_ri(x64::Reg::RSI, 8)
-            self.aligned_call(asm, String("calloc"))
-            asm.pop(x64::Reg::RDX)
-            asm.store(8, x64::Reg::RAX, x64::Reg::RDX, 0)
-            asm.mov_ri(x64::Reg::RCX, 8)
-            asm.store(8, x64::Reg::RCX, x64::Reg::RDX, 8)
-            asm.mov_ri(x64::Reg::RCX, 0)
-            asm.store(8, x64::Reg::RCX, x64::Reg::RDX, 16)
+            self.map_arrays(asm)
+            asm.pop(x64::Reg::RAX)
             return true
         }
         when op == "ContainsKey" && arguments.len() == 2 {
@@ -8893,26 +9982,22 @@ extend Gen {
         self.aligned_call(asm, String("malloc"))
         asm.store(8, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 16)
         // The nodes, bucket by bucket.
-        asm.mov_ri(x64::Reg::RAX, 0)
+        asm.mov_ri(x64::Reg::RAX, 40)
         asm.store(8, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 32)
+        asm.mov_ri(x64::Reg::RAX, 0)
         asm.store(8, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 56)
         bucket_top := asm.new_label()
         bucket_done := asm.new_label()
-        chain_top := asm.new_label()
-        chain_done := asm.new_label()
         asm.bind(bucket_top)
         asm.load(8, false, x64::Reg::RDX, x64::Reg::RBP, (0 as i64) - 8)
         asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 32)
-        asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 8)
+        asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 16)
+        asm.mov_ri(x64::Reg::R11, 40)
+        asm.imul_rr(x64::Reg::RCX, x64::Reg::R11)
         asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RCX)
-        asm.jcc(x64::Cc::ABOVE_EQUAL, bucket_done)
-        self.scale_bytes(asm, x64::Reg::RAX, 8)
-        asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 0)
-        asm.alu_rr(1, x64::Reg::RCX, x64::Reg::RAX)
-        asm.load(8, false, x64::Reg::R8, x64::Reg::RCX, 0)
-        asm.bind(chain_top)
-        asm.test_rr(x64::Reg::R8, x64::Reg::R8)
-        asm.jcc(x64::Cc::EQUAL, chain_done)
+        asm.jcc(x64::Cc::ABOVE, bucket_done)
+        asm.load(8, false, x64::Reg::R8, x64::Reg::RDX, 32)
+        asm.alu_rr(1, x64::Reg::R8, x64::Reg::RAX)
         asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 56)
         asm.mov_rr(x64::Reg::R9, x64::Reg::RAX)
         self.scale_bytes(asm, x64::Reg::R9, 8)
@@ -8921,11 +10006,8 @@ extend Gen {
         asm.store(8, x64::Reg::R8, x64::Reg::R10, 0)
         asm.alu_ri(0, x64::Reg::RAX, 1)
         asm.store(8, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 56)
-        asm.load(8, false, x64::Reg::R8, x64::Reg::R8, 0)
-        asm.jmp(chain_top)
-        asm.bind(chain_done)
         asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 32)
-        asm.alu_ri(0, x64::Reg::RAX, 1)
+        asm.alu_ri(0, x64::Reg::RAX, 40)
         asm.store(8, x64::Reg::RAX, x64::Reg::RBP, (0 as i64) - 32)
         asm.jmp(bucket_top)
         asm.bind(bucket_done)
@@ -9230,55 +10312,79 @@ extend Gen {
         asm.alu_ri(0, x64::Reg::RSP, 24)
         asm.jmp(done)
         asm.bind(fresh)
-        asm.mov_ri(x64::Reg::RDI, 40)
-        self.aligned_call(asm, String("malloc"))
-        asm.push(x64::Reg::RAX)
-        asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 0)
-        asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 8)
-        asm.store(8, x64::Reg::RCX, x64::Reg::RDX, 24)
-        asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 16)
-        asm.store(8, x64::Reg::RCX, x64::Reg::RDX, 16)
-        asm.mov_rr(x64::Reg::RSI, x64::Reg::RCX)
+        // The entry array has room for one more, or doubles (the slots hold offsets, so they stay valid).
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 16)
+        asm.load(8, false, x64::Reg::RCX, x64::Reg::RDI, 16)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RDI, 40)
+        room := asm.new_label()
+        asm.alu_rr(57, x64::Reg::RCX, x64::Reg::RDX)
+        asm.jcc(x64::Cc::BELOW, room)
+        asm.alu_rr(1, x64::Reg::RDX, x64::Reg::RDX)
+        asm.store(8, x64::Reg::RDX, x64::Reg::RDI, 40)
+        asm.mov_rr(x64::Reg::RSI, x64::Reg::RDX)
+        asm.alu_ri(0, x64::Reg::RSI, 1)
+        asm.mov_ri(x64::Reg::R11, 40)
+        asm.imul_rr(x64::Reg::RSI, x64::Reg::R11)
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RDI, 32)
+        self.aligned_call(asm, String("realloc"))
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 16)
+        asm.store(8, x64::Reg::RAX, x64::Reg::RDI, 32)
+        asm.bind(room)
+        asm.load(8, false, x64::Reg::RSI, x64::Reg::RSP, 8)
         when text {
             asm.call_label(self.map_hash_string)
         }
         when !text {
             asm.call_label(self.map_hash_scalar)
         }
-        asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 0)
-        asm.store(8, x64::Reg::RAX, x64::Reg::RDX, 8)
-        asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 24)
-        asm.load(8, false, x64::Reg::RCX, x64::Reg::RDI, 24)
-        asm.store(8, x64::Reg::RCX, x64::Reg::RDX, 32)
-        asm.alu_ri(0, x64::Reg::RCX, 1)
-        asm.store(8, x64::Reg::RCX, x64::Reg::RDI, 24)
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 16)
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RDI, 16)
         asm.alu_ri(0, x64::Reg::RCX, 1)
         asm.store(8, x64::Reg::RCX, x64::Reg::RDI, 16)
-        // The bucket of the hash gets the node at its front.
+        asm.mov_ri(x64::Reg::R11, 40)
+        asm.imul_rr(x64::Reg::RCX, x64::Reg::R11)
+        asm.load(8, false, x64::Reg::R10, x64::Reg::RDI, 32)
+        asm.alu_rr(1, x64::Reg::R10, x64::Reg::RCX)
+        asm.store(8, x64::Reg::RAX, x64::Reg::R10, 8)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 8)
+        asm.store(8, x64::Reg::RDX, x64::Reg::R10, 16)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 0)
+        asm.store(8, x64::Reg::RDX, x64::Reg::R10, 24)
+        asm.mov_ri(x64::Reg::RDX, 0)
+        asm.store(8, x64::Reg::RDX, x64::Reg::R10, 0)
+        asm.store(8, x64::Reg::RDX, x64::Reg::R10, 32)
+        // The entry takes the first empty slot from `hash & mask` on.
         asm.load(8, false, x64::Reg::R8, x64::Reg::RDI, 8)
         asm.alu_ri(5, x64::Reg::R8, 1)
         asm.mov_rr(x64::Reg::R9, x64::Reg::RAX)
         asm.alu_rr(33, x64::Reg::R9, x64::Reg::R8)
-        asm.alu_rr(1, x64::Reg::R9, x64::Reg::R9)
-        asm.alu_rr(1, x64::Reg::R9, x64::Reg::R9)
-        asm.alu_rr(1, x64::Reg::R9, x64::Reg::R9)
-        asm.load(8, false, x64::Reg::R10, x64::Reg::RDI, 0)
-        asm.alu_rr(1, x64::Reg::R9, x64::Reg::R10)
-        asm.load(8, false, x64::Reg::R10, x64::Reg::R9, 0)
-        asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 0)
-        asm.store(8, x64::Reg::R10, x64::Reg::RDX, 0)
-        asm.store(8, x64::Reg::RDX, x64::Reg::R9, 0)
-        // More nodes than buckets: the buckets double.
+        place := asm.new_label()
+        free_slot := asm.new_label()
+        asm.bind(place)
+        asm.mov_rr(x64::Reg::R10, x64::Reg::R9)
+        asm.shift_ri(4, x64::Reg::R10, 4)
+        asm.load(8, false, x64::Reg::R11, x64::Reg::RDI, 0)
+        asm.alu_rr(1, x64::Reg::R10, x64::Reg::R11)
+        asm.load(8, false, x64::Reg::R11, x64::Reg::R10, 8)
+        asm.test_rr(x64::Reg::R11, x64::Reg::R11)
+        asm.jcc(x64::Cc::EQUAL, free_slot)
+        asm.alu_ri(0, x64::Reg::R9, 1)
+        asm.alu_rr(33, x64::Reg::R9, x64::Reg::R8)
+        asm.jmp(place)
+        asm.bind(free_slot)
+        asm.store(8, x64::Reg::RAX, x64::Reg::R10, 0)
+        asm.store(8, x64::Reg::RCX, x64::Reg::R10, 8)
+        // More than half the slots taken: the slots double.
         nogrow := asm.new_label()
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RDI, 16)
+        asm.alu_rr(1, x64::Reg::RCX, x64::Reg::RCX)
         asm.load(8, false, x64::Reg::R8, x64::Reg::RDI, 8)
         asm.alu_rr(57, x64::Reg::RCX, x64::Reg::R8)
         asm.jcc(x64::Cc::BELOW_EQUAL, nogrow)
         asm.call_label(self.map_grow)
         asm.bind(nogrow)
         asm.mov_ri(x64::Reg::RAX, 0)
-        asm.alu_ri(0, x64::Reg::RSP, 32)
+        asm.alu_ri(0, x64::Reg::RSP, 24)
         asm.bind(done)
         return true
     }
@@ -9394,28 +10500,78 @@ extend Gen {
         when !text {
             asm.call_label(self.map_hash_scalar)
         }
+        // The slot of the node is found again from its hash.
         asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 16)
         asm.load(8, false, x64::Reg::R8, x64::Reg::RDI, 8)
         asm.alu_ri(5, x64::Reg::R8, 1)
         asm.alu_rr(33, x64::Reg::RAX, x64::Reg::R8)
-        asm.alu_rr(1, x64::Reg::RAX, x64::Reg::RAX)
-        asm.alu_rr(1, x64::Reg::RAX, x64::Reg::RAX)
-        asm.alu_rr(1, x64::Reg::RAX, x64::Reg::RAX)
-        asm.load(8, false, x64::Reg::R9, x64::Reg::RDI, 0)
-        asm.alu_rr(1, x64::Reg::RAX, x64::Reg::R9)
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RSP, 0)
-        // The link that points at the node is found, and it takes the node's next.
-        walk := asm.new_label()
-        found := asm.new_label()
-        asm.bind(walk)
-        asm.load(8, false, x64::Reg::RDX, x64::Reg::RAX, 0)
-        asm.alu_rr(57, x64::Reg::RDX, x64::Reg::RCX)
-        asm.jcc(x64::Cc::EQUAL, found)
-        asm.mov_rr(x64::Reg::RAX, x64::Reg::RDX)
-        asm.jmp(walk)
-        asm.bind(found)
-        asm.load(8, false, x64::Reg::RDX, x64::Reg::RCX, 0)
-        asm.store(8, x64::Reg::RDX, x64::Reg::RAX, 0)
+        asm.load(8, false, x64::Reg::R9, x64::Reg::RDI, 32)
+        asm.alu_rr(41, x64::Reg::RCX, x64::Reg::R9)
+        // Linear probing from the home slot to the one that holds the node, then a backward shift: each later slot of the run whose
+        // home is not between the hole and itself moves into the hole.
+        find_slot := asm.new_label()
+        found_slot := asm.new_label()
+        asm.bind(find_slot)
+        asm.mov_rr(x64::Reg::R9, x64::Reg::RAX)
+        asm.shift_ri(4, x64::Reg::R9, 4)
+        asm.load(8, false, x64::Reg::R10, x64::Reg::RDI, 0)
+        asm.alu_rr(1, x64::Reg::R9, x64::Reg::R10)
+        asm.load(8, false, x64::Reg::R10, x64::Reg::R9, 8)
+        asm.alu_rr(57, x64::Reg::R10, x64::Reg::RCX)
+        asm.jcc(x64::Cc::EQUAL, found_slot)
+        asm.alu_ri(0, x64::Reg::RAX, 1)
+        asm.alu_rr(33, x64::Reg::RAX, x64::Reg::R8)
+        asm.jmp(find_slot)
+        asm.bind(found_slot)
+        // rax is the hole's index, r8 the mask. r10 scans forward.
+        shift_top := asm.new_label()
+        shift_done := asm.new_label()
+        shift_next := asm.new_label()
+        asm.mov_rr(x64::Reg::R10, x64::Reg::RAX)
+        asm.bind(shift_top)
+        asm.alu_ri(0, x64::Reg::R10, 1)
+        asm.alu_rr(33, x64::Reg::R10, x64::Reg::R8)
+        asm.mov_rr(x64::Reg::R11, x64::Reg::R10)
+        asm.shift_ri(4, x64::Reg::R11, 4)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RDI, 0)
+        asm.alu_rr(1, x64::Reg::R11, x64::Reg::RDX)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::R11, 8)
+        asm.test_rr(x64::Reg::RDX, x64::Reg::RDX)
+        asm.jcc(x64::Cc::EQUAL, shift_done)
+        // The home slot of the node at r10 is `hash & mask` (rsi); it may move into the hole (rax) unless its home lies cyclically
+        // in (hole, scan]: that is, unless (home - hole - 1) & mask < (scan - hole) & mask.
+        asm.load(8, false, x64::Reg::RSI, x64::Reg::R11, 0)
+        asm.alu_rr(33, x64::Reg::RSI, x64::Reg::R8)
+        asm.alu_rr(41, x64::Reg::RSI, x64::Reg::RAX)
+        asm.alu_ri(5, x64::Reg::RSI, 1)
+        asm.alu_rr(33, x64::Reg::RSI, x64::Reg::R8)
+        asm.mov_rr(x64::Reg::RDX, x64::Reg::R10)
+        asm.alu_rr(41, x64::Reg::RDX, x64::Reg::RAX)
+        asm.alu_rr(33, x64::Reg::RDX, x64::Reg::R8)
+        asm.alu_rr(57, x64::Reg::RSI, x64::Reg::RDX)
+        asm.jcc(x64::Cc::BELOW, shift_next)
+        // Move the slot at r10 into the hole at rax; the hole becomes r10.
+        asm.mov_rr(x64::Reg::R9, x64::Reg::RAX)
+        asm.shift_ri(4, x64::Reg::R9, 4)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RDI, 0)
+        asm.alu_rr(1, x64::Reg::R9, x64::Reg::RDX)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::R11, 0)
+        asm.store(8, x64::Reg::RDX, x64::Reg::R9, 0)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::R11, 8)
+        asm.store(8, x64::Reg::RDX, x64::Reg::R9, 8)
+        asm.mov_rr(x64::Reg::RAX, x64::Reg::R10)
+        asm.bind(shift_next)
+        asm.jmp(shift_top)
+        asm.bind(shift_done)
+        // The last hole is emptied.
+        asm.mov_rr(x64::Reg::R9, x64::Reg::RAX)
+        asm.shift_ri(4, x64::Reg::R9, 4)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RDI, 0)
+        asm.alu_rr(1, x64::Reg::R9, x64::Reg::RDX)
+        asm.mov_ri(x64::Reg::RDX, 0)
+        asm.store(8, x64::Reg::RDX, x64::Reg::R9, 0)
+        asm.store(8, x64::Reg::RDX, x64::Reg::R9, 8)
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RDI, 16)
         asm.alu_ri(5, x64::Reg::RCX, 1)
         asm.store(8, x64::Reg::RCX, x64::Reg::RDI, 16)
@@ -9455,8 +10611,46 @@ extend Gen {
             asm.load(8, false, x64::Reg::RDI, x64::Reg::RDI, 24)
             self.aligned_call(asm, String("free"))
         }
-        asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 0)
-        self.aligned_call(asm, String("free"))
+        // The last entry moves into the hole the removed one leaves, and the slot of the moved entry follows it.
+        asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 16)
+        asm.load(8, false, x64::Reg::RCX, x64::Reg::RDI, 16)
+        asm.alu_ri(0, x64::Reg::RCX, 1)
+        asm.mov_ri(x64::Reg::R11, 40)
+        asm.imul_rr(x64::Reg::RCX, x64::Reg::R11)
+        asm.load(8, false, x64::Reg::R9, x64::Reg::RDI, 32)
+        asm.mov_rr(x64::Reg::R10, x64::Reg::R9)
+        asm.alu_rr(1, x64::Reg::R10, x64::Reg::RCX)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 0)
+        stay := asm.new_label()
+        asm.alu_rr(57, x64::Reg::RDX, x64::Reg::R10)
+        asm.jcc(x64::Cc::EQUAL, stay)
+        mut word: u64 = 0
+        while word < 5 {
+            asm.load(8, false, x64::Reg::RAX, x64::Reg::R10, (8 * word) as i64)
+            asm.store(8, x64::Reg::RAX, x64::Reg::RDX, (8 * word) as i64)
+            word += 1
+        }
+        asm.load(8, false, x64::Reg::RAX, x64::Reg::RDX, 8)
+        asm.load(8, false, x64::Reg::RSI, x64::Reg::RDI, 8)
+        asm.alu_ri(5, x64::Reg::RSI, 1)
+        asm.alu_rr(33, x64::Reg::RAX, x64::Reg::RSI)
+        refix := asm.new_label()
+        refixed := asm.new_label()
+        asm.bind(refix)
+        asm.mov_rr(x64::Reg::R8, x64::Reg::RAX)
+        asm.shift_ri(4, x64::Reg::R8, 4)
+        asm.load(8, false, x64::Reg::R11, x64::Reg::RDI, 0)
+        asm.alu_rr(1, x64::Reg::R8, x64::Reg::R11)
+        asm.load(8, false, x64::Reg::R11, x64::Reg::R8, 8)
+        asm.alu_rr(57, x64::Reg::R11, x64::Reg::RCX)
+        asm.jcc(x64::Cc::EQUAL, refixed)
+        asm.alu_ri(0, x64::Reg::RAX, 1)
+        asm.alu_rr(33, x64::Reg::RAX, x64::Reg::RSI)
+        asm.jmp(refix)
+        asm.bind(refixed)
+        asm.alu_rr(41, x64::Reg::RDX, x64::Reg::R9)
+        asm.store(8, x64::Reg::RDX, x64::Reg::R8, 8)
+        asm.bind(stay)
         self.free_lookup_key(asm, temp, struct_ty)
         asm.mov_ri(x64::Reg::RAX, 1)
         asm.alu_ri(0, x64::Reg::RSP, 24)
@@ -10222,7 +11416,7 @@ extend Gen {
             return false
         }
         asm.push(x64::Reg::RAX)
-        return self.concat_pushed(asm)
+        return self.concat_pushed(asm, false)
     }
 
     // `concat(suffix)` of a String with a `str`: the suffix is copied into a String, which is then joined to the first.
@@ -10238,12 +11432,13 @@ extend Gen {
             return false
         }
         asm.push(x64::Reg::RAX)
-        return self.concat_pushed(asm)
+        // The suffix was copied into a String that nothing else owns: it is freed once it has been joined.
+        return self.concat_pushed(asm, true)
     }
 
     // Joins the two Strings whose headers are the two topmost cells of the stack, the first below the second. The result's
-    // header is left in rax, and both are popped.
-    fun concat_pushed(mut self, asm: &mut x64::Asm) -> bool {
+    // header is left in rax, and both are popped; `free_second` frees the second (a copy made for the join).
+    fun concat_pushed(mut self, asm: &mut x64::Asm, free_second: bool) -> bool {
         // The frame: the data of the copy at 0, its length at 8, and the header at 16; the second header is at 24 and the
         // first at 32.
         asm.alu_ri(5, x64::Reg::RSP, 24)
@@ -10280,6 +11475,15 @@ extend Gen {
         asm.store(8, x64::Reg::RCX, x64::Reg::RAX, 8)
         asm.store(8, x64::Reg::RCX, x64::Reg::RAX, 16)
         asm.load(8, false, x64::Reg::RAX, x64::Reg::RSP, 16)
+        when free_second {
+            asm.push(x64::Reg::RAX)
+            asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 32)
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, 0)
+            self.aligned_call(asm, String("free"))
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 32)
+            self.aligned_call(asm, String("free"))
+            asm.pop(x64::Reg::RAX)
+        }
         asm.alu_ri(0, x64::Reg::RSP, 40)
         return true
     }
@@ -11292,7 +12496,7 @@ extend Gen {
         when op.starts_with("Atomic") {
             return self.atomic_call(asm, op, arguments)
         }
-        when op.starts_with("Simd") || op.starts_with("Cpu") || op == "XGetBv" {
+        when op.starts_with("Simd") || op.starts_with("Cpu") || op == "XGetBv" || op == "MmxBin" {
             return self.simd_call(asm, op, arguments)
         }
         when op.starts_with("Bit") || op.starts_with("Mem") || op == "Prefetch" {
@@ -11460,6 +12664,7 @@ extend Gen {
         has_immediate := ((code >> (20 as u32)) & 1) != 0
         long := ((code >> (21 as u32)) & 1) != 0
         wide := (code >> (22 as u32)) & 1
+        zmm := ((code >> (23 as u32)) & 1) != 0
         mut size: u64 = 16
         when long {
             size = 32
@@ -11488,6 +12693,30 @@ extend Gen {
             }
             return true
         }
+        // `MmxBin` (code, dst, a, b): the 8-byte operands are loaded into mm0 and mm1, the MMX operation runs, the result is
+        // stored and `emms` frees the x87 registers again. The code is the MMX opcode with map 1 (0F), no prefix.
+        when op == "MmxBin" && arguments.len() == 4 {
+            when !self.expr(asm, arguments[1]) {
+                return false
+            }
+            asm.push(x64::Reg::RAX)
+            when !self.expr(asm, arguments[2]) {
+                return false
+            }
+            asm.push(x64::Reg::RAX)
+            when !self.expr(asm, arguments[3]) {
+                return false
+            }
+            asm.mov_rr(x64::Reg::RDX, x64::Reg::RAX)
+            asm.pop(x64::Reg::RCX)
+            asm.pop(x64::Reg::RDI)
+            asm.movq_mm_move_at(false, 0, x64::Reg::RCX, 0)
+            asm.movq_mm_move_at(false, 1, x64::Reg::RDX, 0)
+            asm.mmx_rr(mmx_name(opcode), opcode, 0, 1)
+            asm.movq_mm_move_at(true, 0, x64::Reg::RDI, 0)
+            asm.emms()
+            return true
+        }
         when op == "SimdBin" && arguments.len() == 4 {
             when !self.expr(asm, arguments[1]) {
                 return false
@@ -11503,7 +12732,18 @@ extend Gen {
             asm.mov_rr(x64::Reg::RDX, x64::Reg::RAX)
             asm.pop(x64::Reg::RCX)
             asm.pop(x64::Reg::RDI)
-            when long {
+            when zmm {
+                // The 512-bit form: one EVEX instruction on zmm0 and zmm1, which the program runs only after std::cpu
+                // reports AVX-512F. The code has no immediate form.
+                when has_immediate {
+                    return self.fail("a 512-bit vector operation with an immediate")
+                }
+                asm.zmm_move_at(false, 0, x64::Reg::RCX, 0, 0)
+                asm.zmm_move_at(false, 1, x64::Reg::RDX, 0, 0)
+                asm.evex_rr(String("evex"), prefix, map, opcode, wide, 2, 0, 0, 1, 0, 0)
+                asm.zmm_move_at(true, 0, x64::Reg::RDI, 0, 0)
+                asm.vzeroupper()
+            } else when long {
                 asm.vex_move(111, true, 0, x64::Reg::RCX)
                 asm.vex_move(111, true, 1, x64::Reg::RDX)
                 asm.vex_rr(prefix, map, opcode, wide, true, 0, 0, 1, has_immediate, immediate)
@@ -12254,8 +13494,12 @@ extend Gen {
     // A call of a C function with scalar, pointer and bool arguments and result: the arguments go to the System V
     // registers, the stack is aligned for the call, and the result is in rax, brought to its width.
     fun call_foreign(mut self, asm: &mut x64::Asm, parameters: Vec<u64>, result: Option<u64>, name: String, arguments: Vec<u64>) -> bool {
-        when arguments.len() != parameters.len() / 2 {
+        // Lowering passes more arguments than the parameters only to a variadic C function, and casts each one to its type.
+        when arguments.len() < parameters.len() / 2 {
             return self.fail("a foreign call with this number of arguments")
+        }
+        when arguments.len() > parameters.len() / 2 && self.windows {
+            return self.fail("a variadic C call on Windows")
         }
         // A `ryn_` shim belongs to the runtime; one the native compiler does not provide would not resolve when it runs.
         when name.starts_with("ryn_") && !rt_provides(name.clone()) {
@@ -12269,11 +13513,35 @@ extend Gen {
         mut types: Vec<u64> = Vec()
         mut position: u64 = 0
         for argument in arguments.clone() {
-            types.push(parameters[position * 2 + 1])
-            when !self.push_value(asm, argument, parameters[position * 2 + 1]) {
+            // A variable argument has the type of its cast, since it has no declared parameter.
+            mut ty: u64 = 0
+            when position < parameters.len() / 2 {
+                ty = parameters[position * 2 + 1]
+            } else {
+                found := self.variadic_type(argument)
+                when found.is_none() {
+                    return self.fail("a variable argument without its type")
+                }
+                ty = found.unwrap()
+            }
+            types.push(ty)
+            when !self.push_value(asm, argument, ty) {
                 return false
             }
             position += 1
+        }
+        // The System V convention passes in al the number of vector registers that hold arguments, for a variadic callee.
+        mut vector_registers: u64 = 0
+        for ty in types.clone() {
+            when self.is_sse(ty) {
+                vector_registers += 1
+            } else {
+                for class in self.c_classes(ty) {
+                    when class == 1 {
+                        vector_registers += 1
+                    }
+                }
+            }
         }
         // A Windows program reaches the operating system through the emulated system calls (`write`, `read`, `open`,
         // `close`) or the scalar functions of the C runtime library (`ucrtbase.dll`), called with the Windows convention.
@@ -12322,19 +13590,28 @@ extend Gen {
             self.wants_libc = true
             asm.trap()
         } else when self.c_overflow.len() > 0 {
-            when !self.stack_argument_call(asm, name.clone(), arguments.len()) {
+            when !self.stack_argument_call(asm, name.clone(), arguments.len(), vector_registers) {
                 return false
             }
         } else {
+            asm.mov_ri(x64::Reg::RAX, vector_registers)
             self.aligned_call(asm, name)
         }
         return self.finish_c_call(asm, result)
     }
 
+    // The type of a variable argument: lowering wraps it in a cast to its own type.
+    fun variadic_type(self, argument: u64) -> Option<u64> {
+        return choose self.program.exprs[argument] {
+            ir::IrExpr::CastExpr(value, source, target) => Option::Some(target),
+            _ => Option::None,
+        }
+    }
+
     // A call of a C function some of whose arguments (`self.c_overflow`, by position) go to the stack, of the `count`
     // arguments that are pushed in order: the stack is aligned, the stack arguments are pushed last one first, and
     // all the pushed cells are dropped after the call.
-    fun stack_argument_call(mut self, asm: &mut x64::Asm, name: String, count: u64) -> bool {
+    fun stack_argument_call(mut self, asm: &mut x64::Asm, name: String, count: u64, vector_registers: u64) -> bool {
         when self.freestanding || self.windows {
             return self.fail("a foreign call with this many arguments")
         }
@@ -12351,6 +13628,8 @@ extend Gen {
             asm.load(8, false, x64::Reg::RAX, x64::Reg::RBX, (8 + 8 * (count - 1 - spilled[at])) as i64)
             asm.push(x64::Reg::RAX)
         }
+        // The loads above use rax, so al is set after them.
+        asm.mov_ri(x64::Reg::RAX, vector_registers)
         asm.call_symbol(self.foreign_symbol(name))
         asm.mov_rr(x64::Reg::RSP, x64::Reg::RBX)
         asm.pop(x64::Reg::RBX)
@@ -12755,7 +14034,7 @@ extend Gen {
     fun array_element_address(mut self, asm: &mut x64::Asm, array: u64, index: u64, element: u64, length: u64) -> bool {
         slot := self.array_local_of(array)
         when slot.is_none() {
-            return self.fail("an index into an array that is not a local")
+            return self.memory_array_element_address(asm, array, index, element, length)
         }
         cells := self.cells_of(element)
         when !self.expr(asm, index) {
@@ -12765,6 +14044,28 @@ extend Gen {
         asm.jcc(x64::Cc::ABOVE_EQUAL, self.index_error_label)
         self.element_base_stride(asm, x64::Reg::RAX, cells)
         asm.lea(x64::Reg::RAX, x64::Reg::RDX, slot_disp(slot.unwrap() + length * cells - 1))
+        return true
+    }
+
+    // The address in rax of element `index` of an array that lies in memory (a field reached through a reference): the array's
+    // lowest cell is at `memory_address`, and element `i` is `8 * cells * i` above it.
+    fun memory_array_element_address(mut self, asm: &mut x64::Asm, array: u64, index: u64, element: u64, length: u64) -> bool {
+        when !self.is_memory_place(array) {
+            return self.fail("an index into an array that is not a local")
+        }
+        cells := self.cells_of(element)
+        when !self.memory_address(asm, array) {
+            return false
+        }
+        asm.push(x64::Reg::RAX)
+        when !self.expr(asm, index) {
+            return false
+        }
+        asm.alu_ri(7, x64::Reg::RAX, length as i64)
+        asm.jcc(x64::Cc::ABOVE_EQUAL, self.index_error_label)
+        self.scale_bytes(asm, x64::Reg::RAX, 8 * cells)
+        asm.pop(x64::Reg::RDX)
+        asm.alu_rr(1, x64::Reg::RAX, x64::Reg::RDX)
         return true
     }
 
@@ -12976,7 +14277,7 @@ extend Gen {
             // An element of a nested array: the element is read in the cells of the element that holds it.
             return choose self.program.exprs[array] {
                 ir::IrExpr::ArrayIndex(outer, outer_index, inner, outer_length) => self.nested_index(asm, outer, outer_index, inner, outer_length, index, element, length),
-                _ => self.fail("an index into an array that is not a local"),
+                _ => self.memory_array_index(asm, array, index, element, length),
             }
         }
         when !self.expr(asm, index) {
@@ -12988,10 +14289,18 @@ extend Gen {
         return self.load_cell(asm, element, x64::Reg::RDX, slot_disp(slot.unwrap() + length - 1))
     }
 
+    // `array[index]` of an array that lies in memory.
+    fun memory_array_index(mut self, asm: &mut x64::Asm, array: u64, index: u64, element: u64, length: u64) -> bool {
+        when !self.memory_array_element_address(asm, array, index, element, length) {
+            return false
+        }
+        return self.load_cell(asm, element, x64::Reg::RAX, 0)
+    }
+
     // `outer[outer_index][index]`: the inner array is the element `outer_index` of the local `outer`, whose address is found
     // first; the element `index` of it is `8 * index` above the inner array's lowest cell, as in any array in memory.
     fun nested_index(mut self, asm: &mut x64::Asm, outer: u64, outer_index: u64, inner: u64, outer_length: u64, index: u64, element: u64, length: u64) -> bool {
-        when !self.is_plain_array(inner) || self.array_local_of(outer).is_none() {
+        when !self.is_plain_array(inner) {
             return self.fail("an index into a nested array of this kind")
         }
         when !self.array_element_address(asm, outer, outer_index, inner, outer_length) {
@@ -14027,6 +15336,50 @@ extend Gen {
     // `x * 2^k`, `x / 2^k` and `x % 2^k` on an unsigned integer, with a constant power of two below the width of the type:
     // a shift left, a shift right and a mask. The constant of a multiplication may be its left operand. None when the
     // operation is not one of these; otherwise whether the emitted code succeeded.
+    // `3 * x`, `5 * x` or `9 * x` (either order) for a 64-bit local `x` in a register: the register in the bits above 8 and
+    // the scale of its `lea` (2, 4 or 8) in the low byte; 0 for any other expression.
+    fun scaled_register(mut self, index: u64) -> u64 {
+        when self.no_opt {
+            return 0
+        }
+        multiply := choose self.program.exprs[index] {
+            ir::IrExpr::Binary(op, left, right, ty) => op == "Mul" && self.value_width(ty) == 8 && is_integer_word(self.word(ty)),
+            _ => false,
+        }
+        when !multiply {
+            return 0
+        }
+        mut first := choose self.program.exprs[index] {
+            ir::IrExpr::Binary(op, left, right, ty) => left,
+            _ => 0,
+        }
+        mut second := choose self.program.exprs[index] {
+            ir::IrExpr::Binary(op, left, right, ty) => right,
+            _ => 0,
+        }
+        mut constant := self.const_value(second)
+        mut register := self.operand_reg(first)
+        when constant.is_none() {
+            constant = self.const_value(first)
+            register = self.operand_reg(second)
+        }
+        when constant.is_none() || register == 0 {
+            return 0
+        }
+        mut scale: u64 = 0
+        when constant.unwrap() == 3 {
+            scale = 2
+        } else when constant.unwrap() == 5 {
+            scale = 4
+        } else when constant.unwrap() == 9 {
+            scale = 8
+        }
+        when scale == 0 {
+            return 0
+        }
+        return (register << (8 as u32)) | scale
+    }
+
     fun power_of_two(mut self, asm: &mut x64::Asm, op: String, left: u64, right: u64, word: String) -> Option<bool> {
         when !is_integer_word(word.clone()) {
             return Option::None
@@ -14735,7 +16088,7 @@ extend Gen {
             ir::IrExpr::ReferenceFieldRead(pointer, id, field, ty, span, borrowed) => true,
             ir::IrExpr::FieldRead(value, id, field, ty, span) => self.is_memory_place(value),
             ir::IrExpr::Dereference(pointer, ty) => true,
-            ir::IrExpr::ArrayIndex(array, index, ty, length) => self.is_element_structure(ty),
+            ir::IrExpr::ArrayIndex(array, index, ty, length) => self.is_element_structure(ty) || self.is_plain_array(ty),
             ir::IrExpr::SliceIndex(slice, index, ty) => self.is_element_structure(ty),
             _ => false,
         }
@@ -14959,6 +16312,11 @@ extend Gen {
     }
 
     fun local_field(mut self, asm: &mut x64::Asm, slot: u64, id: u64, field: u64, ty: u64) -> bool {
+        register := self.reg_of(slot + self.program.structs[id].fields[field].slot_offset)
+        when register != 0 {
+            asm.mov_rr(x64::Reg::RAX, register)
+            return true
+        }
         displacement := slot_disp(slot + self.program.structs[id].fields[field].slot_offset)
         return self.load_cell(asm, ty, x64::Reg::RBP, displacement)
     }
@@ -15042,6 +16400,14 @@ extend Gen {
         return true
     }
 
+    fun is_place_address(self, index: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ir::IrExpr::PlaceAddress(place, ty) => true,
+            ir::IrExpr::AddressOf(slot, ty, pointer_type, span) => true,
+            _ => false,
+        }
+    }
+
     // Stores a scalar through a pointer, at `displacement` from the address the pointer holds.
     fun store_through(mut self, asm: &mut x64::Asm, value: u64, pointer: u64, displacement: i64, ty: u64) -> bool {
         when !self.is_cell(ty) {
@@ -15049,6 +16415,11 @@ extend Gen {
                 return self.store_c_struct_through(asm, value, pointer, displacement, ty)
             }
             when self.cells_of(ty) > 0 && !self.is_str(ty) && self.c_size_of(ty) == 8 * self.cells_of(ty) {
+                return self.store_cells_through(asm, value, pointer, displacement, ty)
+            }
+            // The address of a place in Ryn's own memory (an element of an array of structures, a field) holds the cells of the
+            // structure as they are, whatever size C would give it.
+            when self.cells_of(ty) > 0 && !self.is_str(ty) && self.struct_of(ty).is_some() && self.is_place_address(pointer) {
                 return self.store_cells_through(asm, value, pointer, displacement, ty)
             }
             return self.fail("an assignment of a structure through a pointer")
@@ -15542,6 +16913,17 @@ extend Gen {
         // A constant right operand that fits an immediate is part of the instruction.
         immediate := self.immediate_operand(op.clone(), right)
         when immediate.is_some() {
+            // A local in a register times 3, 5 or 9, plus or minus a constant, is one `lea`.
+            scaled := self.scaled_register(left)
+            when scaled != 0 && (op == "Add" || op == "Sub") && (immediate.unwrap() as i64) > (0 as i64) - 2147483647 {
+                mut offset := immediate.unwrap() as i64
+                when op == "Sub" {
+                    offset = (0 as i64) - offset
+                }
+                asm.lea_scaled(x64::Reg::RAX, scaled >> (8 as u32), scaled >> (8 as u32), scaled & 255, offset)
+                self.normalize(asm, operand)
+                return true
+            }
             // A local in a register plus or minus a constant is one `lea`.
             left_register := self.operand_reg(left)
             when left_register != 0 && (op == "Add" || op == "Sub") && (immediate.unwrap() as i64) > (0 as i64) - 2147483647 {

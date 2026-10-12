@@ -1,0 +1,95 @@
+// Prints the bytes that the x86-64 encoder writes for the cases of `tools/tests/test_encoder_bytes.py`, one case per line:
+// its number, then the bytes in decimal. The Python test assembles the same instructions with llvm-mc and compares.
+//
+//     ryn run selfhost/src/encodecheck.ryn
+
+use back::x64
+
+// Prints the number of a case and the bytes its encoder wrote.
+fun show(index: u64, asm: x64::Asm) {
+    mut line := String(index)
+    mut at: u64 = 0
+    while at < asm.code.len() {
+        line.push(' ')
+        line.append(String(asm.code[at] as u64))
+        at += 1
+    }
+    echo line
+}
+
+// Encodes case `index` into a fresh buffer and prints it.
+fun emit_case(index: u64) {
+    mut asm := x64::new_asm()
+    when index == 1 {
+        asm.zmm_move_at(false, 16, 0, 4096, 0)
+    } else when index == 2 {
+        asm.zmm_move_at(true, 17, 9, 4096, 0)
+    } else when index == 3 {
+        asm.zmm_move_at(false, 31, 4, 4096, 0)
+    } else when index == 4 {
+        asm.zmm_move_at(false, 0, 0, 4096, 2)
+    } else when index == 5 {
+        asm.evex_rr(String("vpaddd"), 1, 1, 254, 0, 2, 0, 1, 2, 0, 0)
+    } else when index == 6 {
+        asm.evex_rr(String("vpaddd"), 1, 1, 254, 0, 2, 20, 18, 16, 3, 0)
+    } else when index == 7 {
+        asm.evex_rr(String("vpaddd"), 1, 1, 254, 0, 2, 20, 18, 16, 3, 1)
+    } else when index == 8 {
+        asm.evex_rr(String("vaddps"), 0, 1, 88, 0, 2, 7, 8, 9, 0, 0)
+    } else when index == 9 {
+        asm.evex_rr(String("vpxord"), 1, 1, 239, 0, 2, 31, 30, 29, 0, 0)
+    } else when index == 10 {
+        asm.evex_rr(String("vpandd"), 1, 1, 219, 0, 2, 1, 2, 3, 0, 0)
+    } else when index == 11 {
+        asm.evex_rr(String("vmulps"), 0, 1, 89, 0, 2, 12, 13, 14, 0, 0)
+    } else when index == 12 {
+        asm.kmovw_from_gpr(1, 0)
+    } else when index == 13 {
+        asm.kmovw_to_gpr(10, 2)
+    } else when index == 14 {
+        asm.kmovq_from_gpr(7, 3)
+    } else when index == 15 {
+        asm.kmovq_to_gpr(12, 7)
+    } else when index == 16 {
+        asm.kop_w(String("kandw"), 65, 1, 2, 3)
+    } else when index == 17 {
+        asm.kop_w(String("korw"), 69, 4, 5, 6)
+    } else when index == 18 {
+        asm.kop_w(String("kxorw"), 71, 0, 1, 2)
+    } else when index == 19 {
+        asm.knotw(1, 2)
+    } else when index == 20 {
+        asm.kortestw(1, 2)
+    } else when index == 21 {
+        asm.ktestw(3, 4)
+    } else when index == 22 {
+        asm.mmx_rr(String("paddd"), 254, 1, 0)
+    } else when index == 23 {
+        asm.mmx_rr(String("pxor"), 239, 2, 3)
+    } else when index == 24 {
+        asm.movq_to_mm(3, 0)
+    } else when index == 25 {
+        asm.movq_from_mm(11, 4)
+    } else when index == 26 {
+        asm.movq_mm_move_at(false, 5, 2, 4096)
+    } else when index == 27 {
+        asm.movq_mm_move_at(true, 6, 12, 4096)
+    } else when index == 28 {
+        asm.emms()
+    } else when index == 29 {
+        asm.vex_rr(1, 1, 254, 0, true, 8, 9, 10, false, 0)
+    } else when index == 30 {
+        asm.vex_move_at(111, true, 12, 9, 4096)
+    } else when index == 31 {
+        asm.kmovw_from_gpr(5, 13)
+    }
+    show(index, asm)
+}
+
+fun main() {
+    mut index: u64 = 1
+    while index <= 31 {
+        emit_case(index)
+        index += 1
+    }
+}

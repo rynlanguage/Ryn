@@ -1,0 +1,109 @@
+// test: run
+// out: 100
+// out: 98
+// out: 5050
+// out: 55
+// out: 255
+// out: -3
+// out: true
+// out: 30
+// out: 12
+// out: 9
+// out: 13
+// out: 35
+// out: 13
+// out: 0
+// A structure local of scalars that is only read and written by field is held in registers, field by field. The cases here
+// keep the result the same when it is also copied whole, passed to a function, assigned whole, or has a field's address taken.
+struct Counter {
+    hits: u64,
+    sum: u64,
+    top: u64,
+}
+
+struct Small {
+    a: u8,
+    b: i32,
+    c: bool,
+}
+
+struct Pair {
+    left: u64,
+    right: u64,
+}
+
+fun total(pair: Pair) -> u64 {
+    return pair.left + pair.right
+}
+
+fun bump(counter: &mut Counter) {
+    counter.hits += 1
+}
+
+fun next(seed: u64) -> u64 {
+    return seed * 3 + 1
+}
+
+fun main() {
+    // Fields only: replaced by scalars.
+    mut counter := Counter { hits: 0, sum: 0, top: 0 }
+    mut i: u64 = 1
+    while i <= 100 {
+        counter.hits += 1
+        counter.sum += i
+        when i % 7 == 0 {
+            counter.top = i
+        }
+        i += 1
+    }
+    echo counter.hits
+    echo counter.top
+    echo counter.sum
+    mut running := Counter { hits: 0, sum: 0, top: 0 }
+    mut j: u64 = 1
+    while j <= 10 {
+        running.sum = running.sum + j
+        j += 1
+    }
+    echo running.sum
+
+    // Narrow fields keep their width.
+    mut small := Small { a: 250, b: 0 - 5, c: false }
+    small.a = small.a + 5
+    small.b = small.b + 2
+    small.c = small.a == 255
+    echo small.a
+    echo small.b
+    echo small.c
+
+    // The whole structure is passed on: its cells stay in memory, and the call sees the fields.
+    mut pair := Pair { left: 10, right: 5 }
+    pair.left = pair.left + 5
+    pair.right = pair.right + 10
+    echo total(pair)
+
+    // The structure is assigned whole.
+    mut again := Pair { left: 1, right: 2 }
+    again.left = 4
+    again = Pair { left: 5, right: 7 }
+    echo again.left + again.right
+
+    // A reference to the structure is taken.
+    mut shared := Counter { hits: 0, sum: 0, top: 0 }
+    bump(&mut shared)
+    bump(&mut shared)
+    shared.hits += 7
+    echo shared.hits
+
+    // Fields set by calls, in order, and read after calls that clobber registers.
+    mut chain := Pair { left: next(1), right: next(2) }
+    chain.left = next(chain.left)
+    chain.right = next(chain.right) + chain.left
+    echo chain.left
+    echo chain.right
+
+    mut copy := chain
+    chain.left = 0
+    echo copy.left
+    echo chain.left
+}

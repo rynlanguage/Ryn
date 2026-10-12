@@ -15,3 +15,6 @@
 
 # Build outputs of test projects, written next to their sources.
 build/
+
+# Python bytecode caches of the test tools.
+__pycache__/

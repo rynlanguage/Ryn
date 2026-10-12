@@ -1,0 +1,43 @@
+// test: run
+// out: big
+// out: 2
+// out: 13
+// out: 7
+// out: -1
+// out: 40
+// out: 96
+// `when` as a value (with `else when` chains), `|>` with extra arguments, `?.` and `??`.
+struct Item { weight: i32 }
+
+fun double(x: i32) -> i32 { return x * 2 }
+fun add(a: i32, b: i32) -> i32 { return a + b }
+
+fun weight_of(item: Option<Item>) -> Option<i32> {
+    return item?.weight
+}
+
+fun main() {
+    n: i32 = 30
+    size := when n > 20 { "big" } else when n > 10 { "mid" } else { "small" }
+    echo size
+    rank := when n > 20 { 1 } else { 0 } + 1
+    echo rank
+    echo 5 |> double |> add(3)
+    found: Option<Item> = Option::Some(Item { weight: 7 })
+    none: Option<Item> = Option::None
+    echo weight_of(found) ?? 0
+    echo weight_of(none) ?? -1
+    mut v: i32 = 10
+    v += 5
+    v *= 4
+    v -= 20
+    echo v
+    mut mask: u32 = 0xF0
+    mask >>= 2
+    mask |= 3
+    mask &= 0x3F
+    mask ^= 0x0F
+    mask <<= 1
+    mask %= 100
+    echo mask
+}

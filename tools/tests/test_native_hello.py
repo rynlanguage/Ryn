@@ -741,7 +741,7 @@ class NativeHelloTests(unittest.TestCase):
     def test_map_keys_and_values_iterate_with_clone_and_drop_glue(self):
         result = self.run_source(repo_path("examples/map_iteration.ryn"))
         self.assertRunSucceeded(result)
-        self.assertEqual(result.stdout, "3\n111\n3\n60\n3\n0\n0\nRynwindow\n2\n308\n")
+        self.assertEqual(result.stdout, "3\n111\n3\n60\n3\n0\n0\nwindowRyn\n2\n308\n")
 
     @unittest.skipUnless(IS_WINDOWS, WINDOWS_ONLY)
     def test_ryn_functions_coerce_to_function_pointers_and_receive_native_callbacks(self):

@@ -1,0 +1,18 @@
+// test: run
+// exit: 1
+// err: array index is out of bounds
+// An inner index past its row is an error, not a write into the next row.
+struct World { tiles: [[u8; 4]; 3], hp: [i32; 2] }
+extend World {
+    fun set(mut self, y: u64, x: u64, v: u8) { self.tiles[y][x] = v }
+    fun get(self, y: u64, x: u64) -> u8 { return self.tiles[y][x] }
+}
+fun main() {
+    mut w := World { tiles: [[0; 4]; 3], hp: [10, 20] }
+    w.set(2, 3, 7)
+    w.tiles[1][1] = 4
+    w.tiles[1][1] += 3
+    w.hp[1] -= 5
+    i: u64 = 5
+    w.tiles[0][i] = 1
+}

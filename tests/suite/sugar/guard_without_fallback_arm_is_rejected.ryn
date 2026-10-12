@@ -1,0 +1,9 @@
+// test: fail
+// code: R0235
+// msg: later arm
+fun main() {
+    n: i32 = 4
+    echo choose n {
+        x when x > 3 => 1,
+    }
+}

@@ -1,0 +1,47 @@
+// test: run
+// out: false
+// out: true
+// out: 7
+// out: 6
+// out: 22
+// out: false
+// out: 20
+// out: 22
+// out: true
+// out: 3
+// out: true
+// out: true
+// out: true
+// bitflags declares a structure with the flags as constants, the set operators, and methods; no heap is used.
+// Permissions of a thing.
+bitflags Perm: u32 {
+    READ = 1,
+    WRITE = 2, // comment
+    EXEC = 1 << 2,
+    RW = READ | WRITE,
+    HIDDEN,
+}
+
+bitflags Small: u8 { A = 1, B = 2 }
+
+fun main() {
+    mut p := Perm::READ
+    echo p.contains(Perm::WRITE)
+    p |= Perm::WRITE
+    echo p.contains(Perm::RW)
+    p.insert(Perm::EXEC)
+    echo p.bits
+    p.remove(Perm::READ)
+    echo p.bits
+    p.toggle(Perm::HIDDEN)
+    echo p.bits
+    echo (p & Perm::EXEC).is_empty()
+    echo (Perm::all() - Perm::RW).bits
+    echo (!Perm::READ).bits
+    echo Perm::from_bits(6) == (Perm::WRITE | Perm::EXEC)
+    s := Small::A | Small::B
+    echo s.bits
+    echo Perm::empty().is_empty()
+    echo p.intersects(Perm::RW)
+    echo Perm::all().is_all()
+}

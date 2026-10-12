@@ -1,0 +1,100 @@
+// test: run
+// out: -9
+// out: true
+// out: 4
+// out: 3
+// out: 2
+// out: 6
+// out: 2 visible
+// out: world done
+// out: cleanup main
+// Ryn 0.1.12 "GameDev Essentials": vectors with operators and swizzles, fixed arrays without the heap,
+// flag sets, and deterministic cleanup, in a few lines of a physics step.
+struct Vec2 { x: f32, y: f32 }
+struct Vec3 { x: f32, y: f32, z: f32 }
+
+extend Vec2 {
+    fun add(self, o: Vec2) -> Vec2 { return Vec2 { x: self.x + o.x, y: self.y + o.y } }
+    fun mul(self, k: f32) -> Vec2 { return Vec2 { x: self.x * k, y: self.y * k } }
+    fun rmul(self, k: f32) -> Vec2 { return Vec2 { x: self.x * k, y: self.y * k } }
+    fun neg(self) -> Vec2 { return Vec2 { x: 0.0 - self.x, y: 0.0 - self.y } }
+    fun eq(self, o: Vec2) -> bool { return self.x == o.x && self.y == o.y }
+}
+
+extend Vec3 {
+    fun add(self, o: Vec3) -> Vec3 { return Vec3 { x: self.x + o.x, y: self.y + o.y, z: self.z + o.z } }
+    fun index(self, i: u64) -> f32 {
+        return choose i {
+            0 => self.x,
+            1 => self.y,
+            _ => self.z,
+        }
+    }
+}
+
+bitflags Layer: u8 {
+    SOLID = 1,
+    TRIGGER = 2,
+    VISIBLE = 4,
+    DEFAULT = SOLID | VISIBLE,
+}
+
+const MAX_BODIES: u64 = 4
+
+struct Body { pos: Vec3, vel: Vec3, layers: Layer }
+
+struct World {
+    bodies: [Body; 4],
+    count: u64,
+}
+
+extend World {
+    fun step(mut self, dt: f32) {
+        for i in 0..self.count {
+            body := self.bodies[i]
+            moved := body.pos + Vec3 { x: body.vel.x * dt, y: body.vel.y * dt, z: body.vel.z * dt }
+            self.bodies[i] = Body { pos: moved, vel: body.vel, layers: body.layers }
+        }
+    }
+}
+
+fun cleanup(name: str) {
+    echo "cleanup {name}"
+}
+
+fun main() {
+    defer cleanup("main")
+    gravity := Vec2 { x: 0.0, y: -9.5 }
+    push := 2.0 * Vec2 { x: 1.0, y: 0.5 }
+    force := gravity + push * 0.5
+    echo force.y
+    echo -force == Vec2 { x: -force.x, y: -force.y }
+
+    p := Vec3 { x: 1.0, y: 2.0, z: 3.0 }
+    flat := p.xz
+    echo flat.x + flat.y
+    echo p[2]
+
+    mut world := World {
+        bodies: [
+            Body { pos: p, vel: Vec3 { x: 1.0, y: 0.0, z: 0.0 }, layers: Layer::DEFAULT },
+            Body { pos: p, vel: Vec3 { x: 0.0, y: 2.0, z: 0.0 }, layers: Layer::TRIGGER },
+            Body { pos: p, vel: Vec3 { x: 0.0, y: 0.0, z: 3.0 }, layers: Layer::DEFAULT | Layer::TRIGGER },
+            Body { pos: p, vel: Vec3 { x: 0.0, y: 0.0, z: 0.0 }, layers: Layer::empty() },
+        ],
+        count: 3,
+    }
+    for tick in 0..2 {
+        world.step(0.5)
+    }
+    echo world.bodies[0].pos.x
+    echo world.bodies[2].pos.z
+    mut visible: u64 = 0
+    for i in 0..MAX_BODIES {
+        when world.bodies[i].layers.contains(Layer::VISIBLE) {
+            visible += 1
+        }
+    }
+    echo "{visible} visible"
+    defer echo "world done"
+}

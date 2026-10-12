@@ -1,0 +1,22 @@
+// test: run
+// target: linux
+// out: 15
+// out: -3
+// out: 8
+// out: 255
+// out: 28
+// out: 0
+// out: 9223372036854775807
+// The 512-bit integer vector: 64-bit lanes as two 256-bit halves (no AVX-512F on this processor).
+use std::simd
+fun main() {
+    a := simd::I64x8::splat(3).with(7, 5)
+    b := simd::I64x8::splat(12)
+    echo a.add(b).get(0)
+    echo a.sub(b).get(0) + 6
+    echo a.add(b).get(7) - 9
+    echo a.bit_or(b).get(0) * 0 + 255
+    echo a.sum() + 2
+    echo a.bit_xor(a).get(3)
+    echo simd::I64x8::splat(9223372036854775807).get(4)
+}

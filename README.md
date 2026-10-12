@@ -21,7 +21,7 @@ Compile times in the animation are medians of real runs on one machine (`rync` b
 
 ## Status
 
-The latest release is [0.1.10](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.10), "Faster code, buffered output" (see the changelog); [0.1.9](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.9) was "Performance Revolution"; [0.1.8](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.8) was the one before; [0.1.7](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.7) was "Native Power & Benchmarks" and [0.1.6](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.6) was "Native First".
+The latest release is [0.1.13](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.13), "Registers, AArch64, variadic C calls, sugar and gamedev" (see the changelog); [0.1.10](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.10) was "Faster code, buffered output"; [0.1.9](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.9) was "Performance Revolution"; [0.1.8](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.8) was the one before; [0.1.7](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.7) was "Native Power & Benchmarks" and [0.1.6](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.6) was "Native First".
 
 - The whole toolchain is written in Ryn: the `ryn` command, the native compiler `rync` (lexer, parser,
   analysis, code generator, ELF and PE writers) and the runtime. There is no Rust code in the tree and no Cargo

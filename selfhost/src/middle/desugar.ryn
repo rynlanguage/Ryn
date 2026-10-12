@@ -230,6 +230,9 @@ extend Desugar {
                     extended = true
                 }
             }
+            when self.guard_of(record.body).is_some() {
+                extended = true
+            }
         }
         when !extended {
             return Result::Ok(true)
@@ -237,6 +240,21 @@ extend Desugar {
         result := self.compile_choose(parts[0], arms, self.span_of(index))?
         self.exprs.set(index, self.exprs[result])
         return Result::Ok(true)
+    }
+
+    // The arm body `$guard(condition, body)` the parser writes for `pattern when condition => body`: the two parts.
+    fun guard_of(self, index: u64) -> Option<Vec<u64>> {
+        return choose self.exprs[index] {
+            ast::ExprTree::CallE(name, type_arguments, arguments, span) => self.guard_parts(name, arguments),
+            _ => Option::None,
+        }
+    }
+
+    fun guard_parts(self, name: String, arguments: Vec<u64>) -> Option<Vec<u64>> {
+        when name == "$guard" && arguments.len() == 2 {
+            return Option::Some(arguments)
+        }
+        return Option::None
     }
 
     fun choose_parts(self, index: u64) -> Vec<u64> {
@@ -613,7 +631,48 @@ extend Desugar {
         return self.add_pat(2, self.text.slice(start, end), String(""), Vec(), Vec())
     }
 
+    // A pattern, with the ranges `lo..hi`, `lo..=hi`, `lo..`, `..hi` and `..=hi` of integer and character literals.
     fun pattern(mut self) -> Result<u64, String> {
+        when self.peek() == 46 {
+            return self.range_from(String(""))
+        }
+        first := self.pattern_core()?
+        when self.pats[first].kind == 2 && self.peek() == 46 {
+            return self.range_from(self.pats[first].text.clone())
+        }
+        return Result::Ok(first)
+    }
+
+    fun range_from(mut self, low: String) -> Result<u64, String> {
+        when self.peek() != 46 || self.at + 1 >= self.text.len() || (self.text.byte_at(self.at + 1) as u64) != 46 {
+            return Result::Err(self.malformed())
+        }
+        self.at += 2
+        mut inclusive := String("")
+        when self.peek() == 61 {
+            self.at += 1
+            inclusive = String("=")
+        }
+        mut high := String("")
+        next := self.peek()
+        when next == 39 || next == 45 || (next >= 48 && next <= 57) {
+            upper := self.pattern_core()?
+            when self.pats[upper].kind != 2 {
+                return Result::Err(self.malformed())
+            }
+            high = self.pats[upper].text.clone()
+        }
+        mut text := low.clone()
+        text.append("..")
+        text.append(inclusive.clone())
+        text.append(high.clone())
+        mut names: Vec<String> = Vec()
+        names.push(low)
+        names.push(inclusive)
+        return Result::Ok(self.add_pat(6, text, high, Vec(), names))
+    }
+
+    fun pattern_core(mut self) -> Result<u64, String> {
         next := self.peek()
         when next == 40 {
             self.at += 1
@@ -995,13 +1054,37 @@ extend Desugar {
                 }
                 position += 1
             }
-            body := self.copy_expr(first.body)
+            guarded := self.guard_of(first.body)
+            mut chosen: u64 = first.body
+            mut condition: u64 = 0
+            when guarded.is_some() {
+                condition = self.copy_expr(guarded.unwrap()[0])
+                chosen = guarded.unwrap()[1]
+            }
+            body := self.copy_expr(chosen)
             position = 0
             while position < names.len() {
                 self.replace_name(body, names[position].clone(), values[position])
+                when guarded.is_some() {
+                    self.replace_name(condition, names[position].clone(), values[position])
+                }
                 position += 1
             }
-            return Result::Ok(Option::Some(body))
+            when guarded.is_none() {
+                return Result::Ok(Option::Some(body))
+            }
+            // An arm with a guard falls through to the next arms when the guard is false.
+            mut later: Vec<MRow> = Vec()
+            mut next: u64 = 1
+            while next < rows.len() {
+                later.push(rows[next])
+                next += 1
+            }
+            otherwise := self.compile(vars.clone(), later, span)?
+            when otherwise.is_none() {
+                return Result::Err(ds_error_help(String("an arm with a `when` guard needs a later arm that covers the same values"), first.span, "add an arm without a guard, such as `_ => ...`"))
+            }
+            return Result::Ok(Option::Some(self.push_expr(ast::ExprTree::IfE(condition, body, otherwise.unwrap(), first.span))))
         }
         remaining := ds_without(vars.clone(), column)
         kind := self.pat_kind(first.pats[column])
@@ -1210,11 +1293,45 @@ extend Desugar {
         return next
     }
 
+    // `var >= low && var <= high` (or `<` for `..`), with a side left out when the range has no bound there.
+    fun range_condition(mut self, var: u64, range: Pat, span: ast::Span) -> u64 {
+        low := range.names[0].clone()
+        inclusive := range.names[1] == "="
+        mut condition: Option<u64> = Option::None
+        when !low.is_empty() {
+            left := self.copy_expr(var)
+            right := self.literal_expression(low, span)
+            condition = Option::Some(self.push_expr(ast::ExprTree::BinaryE(String("Ge"), left, right, span)))
+        }
+        when !range.variant.is_empty() {
+            left := self.copy_expr(var)
+            right := self.literal_expression(range.variant.clone(), span)
+            mut op := String("Lt")
+            when inclusive {
+                op = String("Le")
+            }
+            upper := self.push_expr(ast::ExprTree::BinaryE(op, left, right, span))
+            when condition.is_some() {
+                condition = Option::Some(self.push_expr(ast::ExprTree::BinaryE(String("And"), condition.unwrap(), upper, span)))
+            } else {
+                condition = Option::Some(upper)
+            }
+        }
+        when condition.is_none() {
+            return self.push_expr(ast::ExprTree::BoolLit(true, span))
+        }
+        return condition.unwrap()
+    }
+
     fun switch_literals(mut self, vars: Vec<u64>, remaining: Vec<u64>, column: u64, rows: Vec<MRow>, span: ast::Span) -> Result<Option<u64>, String> {
         mut literals: Vec<String> = Vec()
         for row in rows.clone() {
             pattern := self.pats[row.pats[column]]
             when pattern.kind == 2 {
+                when !ds_contains(literals.clone(), pattern.text.clone()) {
+                    literals.push(pattern.text)
+                }
+            } else when pattern.kind == 6 {
                 when !ds_contains(literals.clone(), pattern.text.clone()) {
                     literals.push(pattern.text)
                 }
@@ -1265,10 +1382,12 @@ extend Desugar {
         while position > 0 {
             position -= 1
             text := tests[position].clone()
+            // The rows that can match a value this test accepts: the ones that match everything, and the ones with this very
+            // pattern (a literal, or a range, tested as written).
             mut matching: Vec<MRow> = Vec()
             for row in rows.clone() {
                 pattern := self.pats[row.pats[column]]
-                when pattern.kind != 2 || pattern.text == text {
+                when pattern.kind <= 1 || pattern.text == text {
                     matching.push(self.bound_row(row, column, var))
                 }
             }
@@ -1276,9 +1395,21 @@ extend Desugar {
             when then_value.is_none() {
                 return Result::Err(ds_error(String("malformed pattern"), span))
             }
-            left := self.copy_expr(var)
-            right := self.literal_expression(text, span)
-            condition := self.push_expr(ast::ExprTree::BinaryE(String("Eq"), left, right, span))
+            mut condition: u64 = 0
+            mut range: Option<Pat> = Option::None
+            for row in rows.clone() {
+                pattern := self.pats[row.pats[column]]
+                when pattern.kind == 6 && pattern.text == text {
+                    range = Option::Some(pattern)
+                }
+            }
+            when range.is_some() {
+                condition = self.range_condition(var, range.unwrap(), span)
+            } else {
+                left := self.copy_expr(var)
+                right := self.literal_expression(text, span)
+                condition = self.push_expr(ast::ExprTree::BinaryE(String("Eq"), left, right, span))
+            }
             chain = self.push_expr(ast::ExprTree::IfE(condition, then_value.unwrap(), chain, span))
         }
         return Result::Ok(Option::Some(chain))

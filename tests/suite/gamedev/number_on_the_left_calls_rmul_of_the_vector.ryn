@@ -1,0 +1,20 @@
+// test: run
+// out: 15
+// out: 3
+// 2.0 * v calls rmul(self, k) of the structure on the right; v * 3.0 calls mul.
+struct V2 { x: f32, y: f32 }
+extend V2 {
+    fun mul(self, k: f32) -> V2 { return V2 { x: self.x * k, y: self.y * k } }
+    fun rmul(self, k: f32) -> V2 { return V2 { x: self.x * k, y: self.y * k } }
+    fun add(self, o: V2) -> V2 { return V2 { x: self.x + o.x, y: self.y + o.y } }
+}
+fun main() {
+    v := V2 { x: 1.0, y: 2.0 }
+    a := 2.0 * v
+    b := v * 3.0
+    c := a + b
+    echo c.x + c.y
+    k: f32 = 0.5
+    d := k * v + v
+    echo d.y
+}

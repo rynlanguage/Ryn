@@ -1,0 +1,9 @@
+// test: fail
+// code: R0225
+// msg: has no field
+struct Vec2 { x: f32, y: f32 }
+fun main() {
+    v := Vec2 { x: 1.0, y: 2.0 }
+    w := v.xyz
+    echo w.x
+}

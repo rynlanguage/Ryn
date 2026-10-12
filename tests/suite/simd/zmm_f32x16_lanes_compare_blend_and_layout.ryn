@@ -1,0 +1,36 @@
+// test: run
+// target: linux
+// out: 1
+// out: 1
+// out: 1
+// out: 32767
+// out: 32768
+// out: 1
+// out: 1
+// out: 1
+// out: 1
+// out: 1
+// The 512-bit float vector runs as two 256-bit halves here (this processor has no AVX-512F, so the EVEX form is not used).
+// The lanes are in memory order: lane 0 is the first float in memory, and a store writes them in that order.
+extern "C" fun malloc(size: u64) -> *u8;
+use std::simd
+fun main() {
+    a := simd::F32x16::splat(1.5).with(0, 4.0).with(15, -2.0)
+    b := simd::F32x16::splat(0.5)
+    sum := a.add(b)
+    when sum.get(0) == 4.5 { echo 1 } else { echo 0 }
+    when sum.get(15) == -1.5 { echo 1 } else { echo 0 }
+    when sum.get(7) == 2.0 { echo 1 } else { echo 0 }
+    echo a.gt(b)
+    echo a.lt(b)
+    blended := a.blend(b, 3 as u16)
+    when blended.get(0) == 0.5 { echo 1 } else { echo 0 }
+    when blended.get(1) == 0.5 { echo 1 } else { echo 0 }
+    when blended.get(2) == 1.5 { echo 1 } else { echo 0 }
+    when blended.get(15) == -2.0 { echo 1 } else { echo 0 }
+    buffer := malloc(64 as u64)
+    a.store(buffer)
+    first := *(buffer as *f32)
+    last := *((buffer as u64 + 60 as u64) as *f32)
+    when first == 4.0 && last == -2.0 { echo 1 } else { echo 0 }
+}

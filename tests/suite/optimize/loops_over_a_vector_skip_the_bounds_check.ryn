@@ -1,0 +1,112 @@
+// test: run
+// out: 4950
+// out: 4950
+// out: 9900
+// out: 20
+// out: 6
+// out: 9
+// out: 8
+// out: 40
+// Loops of the form `while i < v.len()` and `for i in 0..v.len()` read the vector without a bounds check, when the body keeps
+// the vector and the index as the loop test saw them. Each loop here is also compared with a sum that does not use them.
+fun sum_while(v: Vec<i64>) -> i64 {
+    mut total: i64 = 0
+    mut k: u64 = 0
+    while k < v.len() {
+        total += v[k]
+        k += 1
+    }
+    return total
+}
+
+fun sum_for(v: Vec<i64>) -> i64 {
+    mut total: i64 = 0
+    for k in 0..v.len() {
+        total += v[k]
+    }
+    return total
+}
+
+fun main() {
+    mut v: Vec<i64> = Vec()
+    mut i: u64 = 0
+    while i < 100 {
+        v.push(i as i64)
+        i += 1
+    }
+    echo sum_while(v.clone())
+    echo sum_for(v.clone())
+
+    // Elements are set inside the loop; the length does not change.
+    mut k: u64 = 0
+    while k < v.len() {
+        v.set(k, v[k] * 2)
+        k += 1
+    }
+    echo sum_while(v.clone())
+
+    // The index steps by two, and a read before the step stays checked by the loop test only.
+    mut w: Vec<i64> = Vec()
+    mut n: u64 = 0
+    while n < 10 {
+        w.push(n as i64)
+        n += 1
+    }
+    mut step: u64 = 0
+    mut odd: i64 = 0
+    while step < w.len() {
+        odd += w[step]
+        step += 2
+    }
+    echo odd
+
+    // A nested loop over the same vector with its own index.
+    mut small: Vec<i64> = Vec()
+    small.push(1)
+    small.push(2)
+    small.push(3)
+    mut pairs: i64 = 0
+    mut a: u64 = 0
+    while a < small.len() {
+        mut b: u64 = 0
+        while b < small.len() {
+            when a == b {
+                pairs += small[a]
+            }
+            b += 1
+        }
+        a += 1
+    }
+    echo pairs
+
+    // The vector grows in the body: the loop sees the new length.
+    mut grow: Vec<i64> = Vec()
+    grow.push(1)
+    grow.push(2)
+    mut seen: i64 = 0
+    mut g: u64 = 0
+    while g < grow.len() {
+        seen += grow[g]
+        when grow.len() < 4 {
+            grow.push(3)
+        }
+        g += 1
+    }
+    echo seen
+
+    // The index is read after the step: the loop test does not cover it, and the read is still in range.
+    mut late: i64 = 0
+    mut l: u64 = 0
+    while l + 1 < small.len() {
+        late += small[l]
+        l += 1
+        late += small[l]
+    }
+    echo late
+
+    // A for loop whose body sets elements.
+    for e in 0..small.len() {
+        small.set(e, small[e] * 10)
+    }
+    echo small[0] + small[1] + small[2] - 20
+}

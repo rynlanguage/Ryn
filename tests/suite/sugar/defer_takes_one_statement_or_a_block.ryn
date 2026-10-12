@@ -1,0 +1,26 @@
+// test: run
+// out: body
+// out: second
+// out: release 1
+// out: 1
+// out: inner
+// out: second
+// out: release 9
+// out: 18
+// `defer statement` runs when the scope ends, last first, on every path out; a block still works.
+struct Res { id: i32 }
+fun release(id: i32) { echo "release {id}" }
+fun work(n: i32) -> i32 {
+    defer release(n)
+    defer echo "second"
+    when n > 5 {
+        defer echo "inner"
+        return n * 2
+    }
+    echo "body"
+    return n
+}
+fun main() {
+    echo work(1)
+    echo work(9)
+}

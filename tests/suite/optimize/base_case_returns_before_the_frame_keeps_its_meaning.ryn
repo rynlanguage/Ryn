@@ -1,0 +1,82 @@
+// test: run
+// out: 55
+// out: 21
+// out: 6
+// out: 0
+// out: 100
+// out: -3
+// out: 7
+// out: 120
+// out: 9
+// out: 1
+// A function that opens with `when param <op> constant { return param or constant }` returns its base case before the frame is
+// built. Each shape here (unsigned and signed compares, equality, a constant result, a tail call that jumps back to the start)
+// must give the same answer as without it.
+fun fib(n: u64) -> u64 {
+    when n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fun gcd(a: u64, b: u64) -> u64 {
+    when b == 0 {
+        return a
+    }
+    return gcd(b, a % b)
+}
+
+fun sum_to(n: u64, total: u64) -> u64 {
+    when n == 0 {
+        return total
+    }
+    return sum_to(n - 1, total + n)
+}
+
+fun zero_below(n: i64) -> i64 {
+    when n < 0 {
+        return 0 - 3
+    }
+    return n * 2
+}
+
+fun clamp_high(n: u64, limit: u64) -> u64 {
+    when n > 100 {
+        return 100
+    }
+    return n + limit - limit
+}
+
+fun first_or(n: u64, m: u64) -> u64 {
+    when n != 0 {
+        return m
+    }
+    return 7
+}
+
+fun fact(n: u64) -> u64 {
+    when n <= 1 {
+        return 1
+    }
+    return n * fact(n - 1)
+}
+
+fun deep(n: u64) -> u64 {
+    when n >= 9 {
+        return n
+    }
+    return deep(n + 1)
+}
+
+fun main() {
+    echo fib(10)
+    echo gcd(21, 0) + gcd(0, 0) + gcd(63, 21) - 21
+    echo sum_to(3, 0)
+    echo sum_to(0, 0)
+    echo clamp_high(5000, 3) + clamp_high(0, 3) * 0
+    echo zero_below(0 - 4)
+    echo first_or(0, 5)
+    echo fact(5)
+    echo deep(0)
+    echo fact(0)
+}

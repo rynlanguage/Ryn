@@ -1,0 +1,45 @@
+// test: run
+// out: zed has 7 hp, alive=true, 3 2.5 q plain
+// out: zed
+// out: Hello bob, you are #4!
+// out: braces {not_a_var} and {} stay
+// out: 21890
+// out: 0
+// out: true
+// A string literal with `{name}` or `{value.field}` where every name is a variable is a `String` built at run time; one whose
+// braces name nothing in scope stays the `str` it was. The loop builds a thousand strings and none is left allocated.
+extern "C" fun ryn_native_live_allocations() -> u64;
+
+struct P {
+    name: String,
+    hp: i32,
+    alive: bool,
+}
+
+fun greet(name: String, n: i32) -> String {
+    return "Hello {name}, you are #{n}!"
+}
+
+fun main() {
+    p := P { name: String("zed"), hp: 7, alive: true }
+    n: u64 = 3
+    f: f64 = 2.5
+    c := 'q'
+    s := "plain"
+    t := "{p.name} has {p.hp} hp, alive={p.alive}, {n} {f} {c} {s}"
+    echo t
+    echo p.name
+    echo greet(String("bob"), 4)
+    lit := "braces {not_a_var} and {} stay"
+    echo lit
+    before := ryn_native_live_allocations()
+    mut i: i32 = 0
+    mut total: u64 = 0
+    while i < 1000 {
+        total += greet(String("x"), i).len()
+        i += 1
+    }
+    echo total
+    echo ryn_native_live_allocations() - before
+    echo t.len() > 10
+}

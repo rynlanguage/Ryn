@@ -127,9 +127,9 @@ Open items, as of this suite:
 - A fixed array cannot be passed to C by address (`&raw mut arr` is R0206); a `str` literal cannot
   be passed to a `*u8` parameter; top-level `static_assert` is not accepted (use it inside a
   function).
-- Variadic C functions (`printf`) cannot be declared with `...`. Cranelift cannot set the System V
-  vector-register count that a variadic call needs, so only a separate declaration with the exact
-  argument list works, and only for integer and pointer arguments.
+- Variadic C functions: `extern "C" fun printf(format: *u8, ...) -> i32;` is accepted (0.1.13). The variable
+  arguments must be integers of any width, `f64` or raw pointers (`R0270` otherwise; write `as f64` for an `f32`).
+  Not supported: variadic calls on Windows, function pointers with `...`, and a `...` in a Ryn (non-`extern "C"`) function (R0010).
 - Module system: a transitive path dependency can be imported by the root package; a missing path dependency gives R0425 under
   `ryn check` but R0410 under `ryn build` and `ryn run`; a private struct used from another module
   reports "unknown structure" (R0227) instead of a privacy diagnostic. A struct literal may set

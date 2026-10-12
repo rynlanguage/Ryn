@@ -1,0 +1,157 @@
+// test: run
+// out: 0
+// out: 1340
+// out: 0
+// out: 201
+// A Map<u64, u64> and a model made of two vectors take the same 30,000 inserts, replacements, removals and lookups over a small
+// range of keys (so that many collide and a removal has to move slots back), and must agree after every step and at the end.
+// The same is done for String keys.
+fun main() {
+    mut table: Map<u64, u64> = Map<u64, u64>()
+    mut keys: Vec<u64> = Vec()
+    mut values: Vec<u64> = Vec()
+    mut state: u64 = 88172645463325252
+    mut mismatches: u64 = 0
+    mut step: u64 = 0
+    while step < 30000 {
+        state = state * 6364136223846793005 + 1442695040888963407
+        key := (state >> (33 as u32)) % 700 * 1024 + (state >> (20 as u32)) % 3
+        action := (state >> (45 as u32)) % 10
+        mut at: i64 = 0 - 1
+        mut look: u64 = 0
+        while look < keys.len() {
+            when keys[look] == key {
+                at = look as i64
+                break
+            }
+            look += 1
+        }
+        when action < 5 {
+            // insert or replace
+            value := step * 7 + 1
+            replaced := table.insert(key, value)
+            when at >= (0 as i64) {
+                values.set(at as u64, value)
+                when !replaced {
+                    mismatches += 1
+                }
+            } else {
+                keys.push(key)
+                values.push(value)
+                when replaced {
+                    mismatches += 1
+                }
+            }
+        } else when action < 8 {
+            // remove
+            removed := table.remove(key)
+            when at >= (0 as i64) {
+                keys.take(at as u64)
+                values.take(at as u64)
+                when !removed {
+                    mismatches += 1
+                }
+            } else {
+                when removed {
+                    mismatches += 1
+                }
+            }
+        } else {
+            // look up
+            found := table.get(key)
+            when at >= (0 as i64) {
+                when found.is_none() {
+                    mismatches += 1
+                } else when found.unwrap() != values[at as u64] {
+                    mismatches += 1
+                }
+            } else {
+                when found.is_some() {
+                    mismatches += 1
+                }
+            }
+        }
+        when table.len() != keys.len() {
+            mismatches += 1
+        }
+        step += 1
+    }
+    // Every key of the model is in the table with its value, and nothing else is.
+    mut each: u64 = 0
+    while each < keys.len() {
+        found := table.get(keys[each])
+        when found.is_none() || found.unwrap() != values[each] {
+            mismatches += 1
+        }
+        each += 1
+    }
+    echo mismatches
+    echo keys.len()
+    table.clear()
+    when table.len() != 0 {
+        echo "clear failed"
+    }
+    // The same with String keys.
+    mut words: Map<String, u64> = Map<String, u64>()
+    mut names: Vec<u64> = Vec()
+    mut amounts: Vec<u64> = Vec()
+    mut faults: u64 = 0
+    mut round: u64 = 0
+    while round < 6000 {
+        state = state * 6364136223846793005 + 1442695040888963407
+        number := (state >> (33 as u32)) % 300
+        action := (state >> (45 as u32)) % 10
+        mut word := String("word-")
+        word.append(String(number))
+        mut place: i64 = 0 - 1
+        mut seen: u64 = 0
+        while seen < names.len() {
+            when names[seen] == number {
+                place = seen as i64
+                break
+            }
+            seen += 1
+        }
+        when action < 5 {
+            replaced := words.insert(word, round)
+            when place >= (0 as i64) {
+                amounts.set(place as u64, round)
+                when !replaced {
+                    faults += 1
+                }
+            } else {
+                names.push(number)
+                amounts.push(round)
+                when replaced {
+                    faults += 1
+                }
+            }
+        } else when action < 8 {
+            removed := words.remove(word)
+            when place >= (0 as i64) {
+                names.take(place as u64)
+                amounts.take(place as u64)
+                when !removed {
+                    faults += 1
+                }
+            } else when removed {
+                faults += 1
+            }
+        } else {
+            found := words.get(word)
+            when place >= (0 as i64) {
+                when found.is_none() || found.unwrap() != amounts[place as u64] {
+                    faults += 1
+                }
+            } else when found.is_some() {
+                faults += 1
+            }
+        }
+        when words.len() != names.len() {
+            faults += 1
+        }
+        round += 1
+    }
+    echo faults
+    echo names.len()
+}

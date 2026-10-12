@@ -94,6 +94,40 @@ fun xmm_name(register: u64) -> String {
     return text
 }
 
+fun ymm_name(register: u64) -> String {
+    mut text := String("ymm")
+    text.append(String(register))
+    return text
+}
+
+fun zmm_name(register: u64) -> String {
+    mut text := String("zmm")
+    text.append(String(register))
+    return text
+}
+
+fun kreg_name(register: u64) -> String {
+    mut text := String("k")
+    text.append(String(register))
+    return text
+}
+
+fun mm_name(register: u64) -> String {
+    mut text := String("mm")
+    text.append(String(register))
+    return text
+}
+
+// Bit `position` of `value`, as 0 or 1.
+fun bit_at(value: u64, position: u64) -> u64 {
+    return (value >> (position as u32)) & 1
+}
+
+// `value` moved up to bit `position`.
+fun place(value: u64, position: u64) -> u64 {
+    return value << (position as u32)
+}
+
 fun size_word(size: u64) -> String {
     when size == 1 {
         return String("byte")
@@ -431,6 +465,92 @@ extend Asm {
             }
         }
         self.mem(dst, base, disp)
+    }
+
+    // `mov dst, [base + index*8]` (8 bytes), or `mov [base + index*8], src` when `store` is true. `index` is not rsp.
+    pub fun indexed(mut self, store: bool, reg: u64, base: u64, index: u64) {
+        when self.listing {
+            mut place := String("qword [")
+            place.append(reg_name(base))
+            place.push('+')
+            place.append(reg_name(index))
+            place.append(String("*8]"))
+            when store {
+                self.note(inst2(String("mov"), place, reg_name(reg)))
+            } else {
+                self.note(inst2(String("mov"), reg_name(reg), place))
+            }
+        }
+        mut prefix: u64 = 72
+        when reg >= 8 {
+            prefix = prefix | 4
+        }
+        when index >= 8 {
+            prefix = prefix | 2
+        }
+        when base >= 8 {
+            prefix = prefix | 1
+        }
+        self.b(prefix)
+        when store {
+            self.b(137)
+        } else {
+            self.b(139)
+        }
+        // A base of rbp or r13 has no form without a displacement: it takes a zero one.
+        when (base & 7) == 5 {
+            self.b(64 | ((reg & 7) << (3 as u32)) | 4)
+        } else {
+            self.b(((reg & 7) << (3 as u32)) | 4)
+        }
+        self.b(192 | ((index & 7) << (3 as u32)) | (base & 7))
+        when (base & 7) == 5 {
+            self.b(0)
+        }
+    }
+
+    // `lea dst, [base + index*scale + disp]`; `scale` is 1, 2, 4 or 8, and `index` is not rsp.
+    pub fun lea_scaled(mut self, dst: u64, base: u64, index: u64, scale: u64, disp: i64) {
+        when self.listing {
+            mut place := String("[")
+            place.append(reg_name(base))
+            place.push('+')
+            place.append(reg_name(index))
+            place.push('*')
+            place.append(String(scale))
+            when disp < 0 {
+                place.push('-')
+                place.append(String((0 - disp) as u64))
+            } else when disp > 0 {
+                place.push('+')
+                place.append(String(disp as u64))
+            }
+            place.push(']')
+            self.note(inst2(String("lea"), reg_name(dst), place))
+        }
+        mut prefix: u64 = 72
+        when dst >= 8 {
+            prefix = prefix | 4
+        }
+        when index >= 8 {
+            prefix = prefix | 2
+        }
+        when base >= 8 {
+            prefix = prefix | 1
+        }
+        self.b(prefix)
+        self.b(141)
+        self.b(128 | ((dst & 7) << (3 as u32)) | 4)
+        mut bits: u64 = 0
+        when scale == 2 {
+            bits = 1
+        } else when scale == 4 {
+            bits = 2
+        } else when scale == 8 {
+            bits = 3
+        }
+        self.b((bits << (6 as u32)) | ((index & 7) << (3 as u32)) | (base & 7))
+        self.s32(disp)
     }
 
     // `mov [base + disp], src` writing the low `size` bytes.
@@ -809,11 +929,11 @@ extend Asm {
         }
     }
 
-    // The three-byte VEX prefix for registers 0 to 7: `long` selects 256-bit operands, `vvvv` is the extra source register
-    // (15 for none).
-    fun vex_prefix(mut self, pp: u64, map: u64, wide: u64, long: bool, vvvv: u64) {
+    // The three-byte VEX prefix: `long` selects 256-bit operands, `vvvv` is the extra source register (15 for none), and
+    // `reg` and `rm` take their bit 3 from R and B, so registers 8 to 15 are encoded too.
+    fun vex_prefix(mut self, pp: u64, map: u64, wide: u64, long: bool, reg: u64, vvvv: u64, rm: u64) {
         self.b(196)
-        self.b(224 | map)
+        self.b(place(1 - bit_at(reg, 3), 7) | place(1, 6) | place(1 - bit_at(rm, 3), 5) | map)
         // The field holds the register number inverted; 1111 (what 15 means here) says the instruction has no such operand.
         mut field: u64 = 15
         when vvvv != 15 {
@@ -834,7 +954,7 @@ extend Asm {
         when self.listing {
             self.note(inst3(packed_name(pp, map, opcode, has_imm, imm, true), xmm_name(dst), xmm_name(first), xmm_name(src)))
         }
-        self.vex_prefix(pp, map, wide, long, first)
+        self.vex_prefix(pp, map, wide, long, dst, first, src)
         self.b(opcode)
         self.rr(dst, src)
         when has_imm {
@@ -852,9 +972,166 @@ extend Asm {
         when self.listing {
             self.note(inst2(String("vmovdqu"), xmm_name(reg), mem_text(base, disp)))
         }
-        self.vex_prefix(2, 1, 0, long, 15)
+        self.vex_prefix(2, 1, 0, long, reg, 15, base)
         self.b(opcode)
         self.mem(reg, base, disp)
+    }
+
+    // The EVEX prefix `62 P0 P1 P2` of a vector instruction on registers 0 to 31: `map` 1 (0F), 2 (0F 38) or 3 (0F 3A); `pp`
+    // 0 (none), 1 (66), 2 (F3) or 3 (F2); `length` 0 (128 bits), 1 (256) or 2 (512). `reg` is ModRM.reg, `vvvv` the extra
+    // source (0 for none), `rm` is ModRM.rm, or the base when `memory`. `mask` is the opmask register (0 for none) and
+    // `zeroing` the z bit.
+    fun evex_head(mut self, pp: u64, map: u64, wide: u64, length: u64, reg: u64, vvvv: u64, rm: u64, memory: bool, mask: u64, zeroing: u64) {
+        // X extends the index register, which is absent in `[base + disp]`; for a register operand it is bit 4 of rm.
+        mut index_high: u64 = 1
+        when !memory {
+            index_high = 1 - bit_at(rm, 4)
+        }
+        self.b(98)
+        self.b(place(1 - bit_at(reg, 3), 7) | place(index_high, 6) | place(1 - bit_at(rm, 3), 5) | place(1 - bit_at(reg, 4), 4) | map)
+        self.b(place(wide, 7) | place(15 - (vvvv & 15), 3) | 4 | pp)
+        self.b(place(zeroing, 7) | place(length, 5) | place(1 - bit_at(vvvv, 4), 3) | mask)
+    }
+
+    // `name dst {mask}, first, src` on 512-bit (`length` 2) or other registers 0 to 31, the form of most EVEX arithmetic.
+    pub fun evex_rr(mut self, name: String, pp: u64, map: u64, opcode: u64, wide: u64, length: u64, dst: u64, first: u64, src: u64, mask: u64, zeroing: u64) {
+        when self.listing {
+            self.note(inst3(name, zmm_name(dst), zmm_name(first), zmm_name(src)))
+        }
+        self.evex_head(pp, map, wide, length, dst, first, src, false, mask, zeroing)
+        self.b(opcode)
+        self.rr(dst, src)
+    }
+
+    // `vmovdqu64 zmm, [base + disp]` (a load) or `vmovdqu64 [base + disp], zmm` (a store), with the opmask `mask`.
+    pub fun zmm_move_at(mut self, store: bool, reg: u64, base: u64, disp: i64, mask: u64) {
+        when self.listing {
+            when store {
+                self.note(inst2(String("vmovdqu64"), mem_text(base, disp), zmm_name(reg)))
+            } else {
+                self.note(inst2(String("vmovdqu64"), zmm_name(reg), mem_text(base, disp)))
+            }
+        }
+        mut opcode: u64 = 111
+        when store {
+            opcode = 127
+        }
+        self.evex_head(2, 1, 1, 2, reg, 0, base, true, mask, 0)
+        self.b(opcode)
+        self.mem(reg, base, disp)
+    }
+
+    // The three-byte VEX prefix of an opmask instruction, whose operands are k registers (0 to 7) or general registers.
+    fun vex3(mut self, pp: u64, map: u64, wide: u64, length: u64, reg: u64, vvvv: u64, rm: u64) {
+        self.b(196)
+        self.b(place(1 - bit_at(reg, 3), 7) | place(1, 6) | place(1 - bit_at(rm, 3), 5) | map)
+        self.b(place(wide, 7) | place(15 - (vvvv & 15), 3) | place(length, 2) | pp)
+    }
+
+    // One VEX instruction `opcode reg, vvvv, rm` (`vvvv` 0 when it has no such operand).
+    fun kop_rr(mut self, name: String, pp: u64, map: u64, opcode: u64, wide: u64, length: u64, reg: u64, vvvv: u64, rm: u64) {
+        when self.listing {
+            self.note(inst2(name, reg_name(reg), reg_name(rm)))
+        }
+        self.vex3(pp, map, wide, length, reg, vvvv, rm)
+        self.b(opcode)
+        self.rr(reg, rm)
+    }
+
+    // `kmovw k, r32` and `kmovw r32, k`: moves the low 16 bits of a mask register to or from a general register.
+    pub fun kmovw_from_gpr(mut self, mask: u64, gpr: u64) {
+        self.kop_rr(String("kmovw"), 0, 1, 146, 0, 0, mask, 0, gpr)
+    }
+
+    pub fun kmovw_to_gpr(mut self, gpr: u64, mask: u64) {
+        self.kop_rr(String("kmovw"), 0, 1, 147, 0, 0, gpr, 0, mask)
+    }
+
+    // `kmovq k, r64` and `kmovq r64, k`: all 64 bits of a mask register.
+    pub fun kmovq_from_gpr(mut self, mask: u64, gpr: u64) {
+        self.kop_rr(String("kmovq"), 3, 1, 146, 1, 0, mask, 0, gpr)
+    }
+
+    pub fun kmovq_to_gpr(mut self, gpr: u64, mask: u64) {
+        self.kop_rr(String("kmovq"), 3, 1, 147, 1, 0, gpr, 0, mask)
+    }
+
+    // The 16-bit mask operations `dst = a op b`: kandw (0x41), kandnw (0x42), korw (0x45), kxnorw (0x46), kxorw (0x47)
+    // and kaddw (0x4A). `opcode` names one of them.
+    pub fun kop_w(mut self, name: String, opcode: u64, dst: u64, a: u64, b: u64) {
+        self.kop_rr(name, 0, 1, opcode, 0, 1, dst, a, b)
+    }
+
+    // `knotw dst, src` (0x44), `kortestw a, b` (0x98) and `ktestw a, b` (0x99) set the flags from a mask.
+    pub fun knotw(mut self, dst: u64, src: u64) {
+        self.kop_rr(String("knotw"), 0, 1, 68, 0, 0, dst, 0, src)
+    }
+
+    pub fun kortestw(mut self, a: u64, b: u64) {
+        self.kop_rr(String("kortestw"), 0, 1, 152, 0, 0, a, 0, b)
+    }
+
+    pub fun ktestw(mut self, a: u64, b: u64) {
+        self.kop_rr(String("ktestw"), 0, 1, 153, 0, 0, a, 0, b)
+    }
+
+    // An MMX instruction `0F opcode` on two 64-bit registers mm0 to mm7 (no prefix, no REX).
+    pub fun mmx_rr(mut self, name: String, opcode: u64, dst: u64, src: u64) {
+        when self.listing {
+            self.note(inst2(name, mm_name(dst), mm_name(src)))
+        }
+        self.b(15)
+        self.b(opcode)
+        self.rr(dst, src)
+    }
+
+    // `movq mm, r64` (REX.W 0F 6E) and `movq r64, mm` (REX.W 0F 7E).
+    pub fun movq_to_mm(mut self, mm: u64, gpr: u64) {
+        when self.listing {
+            self.note(inst2(String("movq"), mm_name(mm), reg_name(gpr)))
+        }
+        self.rex(1, 0, gpr, false)
+        self.b(15)
+        self.b(110)
+        self.rr(mm, gpr)
+    }
+
+    pub fun movq_from_mm(mut self, gpr: u64, mm: u64) {
+        when self.listing {
+            self.note(inst2(String("movq"), reg_name(gpr), mm_name(mm)))
+        }
+        self.rex(1, 0, gpr, false)
+        self.b(15)
+        self.b(126)
+        self.rr(mm, gpr)
+    }
+
+    // `movq mm, [base + disp]` (0F 6F) and `movq [base + disp], mm` (0F 7F).
+    pub fun movq_mm_move_at(mut self, store: bool, mm: u64, base: u64, disp: i64) {
+        when self.listing {
+            when store {
+                self.note(inst2(String("movq"), mem_text(base, disp), mm_name(mm)))
+            } else {
+                self.note(inst2(String("movq"), mm_name(mm), mem_text(base, disp)))
+            }
+        }
+        self.rex(0, 0, base, false)
+        self.b(15)
+        mut opcode: u64 = 111
+        when store {
+            opcode = 127
+        }
+        self.b(opcode)
+        self.mem(mm, base, disp)
+    }
+
+    // `emms`: marks the MMX state free again, which the x87 unit needs after MMX code.
+    pub fun emms(mut self) {
+        when self.listing {
+            self.note(inst1(String("emms"), String()))
+        }
+        self.b(15)
+        self.b(119)
     }
 
     // `prefetcht0 [reg]`: a hint only, it never faults and never changes the program's meaning.

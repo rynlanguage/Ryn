@@ -1,0 +1,36 @@
+// test: run
+// target: linux
+// out: 42 -7 2.50 ok 4000000000
+// out: 25
+// `...` takes C's variable arguments after the named ones: integers of any width, `f64` and raw pointers are passed as they
+// are, and the number of vector registers used goes in al for the callee. The output goes through `write`, not `echo`.
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun write(fd: i32, buffer: *u8, count: u64) -> i64;
+extern "C" fun snprintf(buffer: *u8, size: u64, format: *u8, ...) -> i32;
+fun poke8(address: u64, value: u8) {
+    p := address as *u8
+    *p = value
+}
+// Copies `text` and its terminating zero to `address`.
+fun store(address: u64, text: str) {
+    mut at: u64 = 0
+    while at < text.len() {
+        poke8(address + at, text.byte_at(at))
+        at += 1
+    }
+    poke8(address + text.len(), 0 as u8)
+}
+fun at(base: u64, offset: u64) -> *u8 {
+    return (base + offset) as *u8
+}
+fun main() {
+    buffer := malloc(256 as u64)
+    base := buffer as u64
+    store(base + 128, "%d %ld %.2f %s %u\n")
+    store(base + 192, "ok")
+    line := snprintf(buffer, 128 as u64, at(base, 128), 42, -7, 2.5, at(base, 192), 4000000000 as u32)
+    write(1, buffer, line as u64)
+    store(base + 224, "%d\n")
+    digits := snprintf(buffer, 128 as u64, at(base, 224), line)
+    write(1, buffer, digits as u64)
+}

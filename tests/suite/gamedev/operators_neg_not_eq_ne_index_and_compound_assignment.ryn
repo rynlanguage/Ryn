@@ -1,0 +1,47 @@
+// test: run
+// out: -1
+// out: true
+// out: true
+// out: 3
+// out: 18
+// out: -3
+// out: 5
+// out: 4
+// out: 4294967290
+// A structure defines neg, not, eq, bitor, bitand and index; compound assignment of a structure calls add, sub and mul.
+struct V3 { x: f32, y: f32, z: f32 }
+extend V3 {
+    fun add(self, o: V3) -> V3 { return V3 { x: self.x + o.x, y: self.y + o.y, z: self.z + o.z } }
+    fun sub(self, o: V3) -> V3 { return V3 { x: self.x - o.x, y: self.y - o.y, z: self.z - o.z } }
+    fun mul(self, k: f32) -> V3 { return V3 { x: self.x * k, y: self.y * k, z: self.z * k } }
+    fun neg(self) -> V3 { return V3 { x: 0.0 - self.x, y: 0.0 - self.y, z: 0.0 - self.z } }
+    fun eq(self, o: V3) -> bool { return self.x == o.x && self.y == o.y && self.z == o.z }
+    fun index(self, i: u64) -> f32 {
+        return choose i { 0 => self.x, 1 => self.y, _ => self.z }
+    }
+}
+struct Flags { bits: u32 }
+extend Flags {
+    fun bitor(self, o: Flags) -> Flags { return Flags { bits: self.bits | o.bits } }
+    fun bitand(self, o: Flags) -> Flags { return Flags { bits: self.bits & o.bits } }
+    fun not(self) -> Flags { return Flags { bits: ~self.bits } }
+}
+fun main() {
+    a := V3 { x: 1.0, y: 2.0, z: 3.0 }
+    b := -a
+    echo b.x
+    echo a == a
+    echo a != b
+    echo a[2]
+    mut c := a
+    c += a
+    c -= V3 { x: 1.0, y: 1.0, z: 1.0 }
+    c *= 2.0
+    echo c.x + c.y + c.z
+    d := a + b * 2.0
+    echo d.z
+    f := Flags { bits: 1 } | Flags { bits: 4 }
+    echo f.bits
+    echo (f & Flags { bits: 4 }).bits
+    echo (!f).bits
+}

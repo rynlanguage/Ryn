@@ -3466,6 +3466,7 @@ extend Comptime {
                     self.function_defs.push(ast::Function {
                         name: name,
                         extern_c: false,
+                        variadic: false,
                         external_symbol: Option::None,
                         type_parameters: Vec(),
                         type_parameter_bounds: Vec(),

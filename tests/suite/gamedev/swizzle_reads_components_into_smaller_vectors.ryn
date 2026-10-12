@@ -1,0 +1,27 @@
+// test: run
+// out: 3
+// out: 32
+// out: 3
+// out: 0.125
+// out: 0.25
+// out: 2
+// Swizzles: v.xy, v.zy, c.rgb read components in the order written and build the structure with that many components.
+struct Vec2 { x: f32, y: f32 }
+struct Vec3 { x: f32, y: f32, z: f32 }
+struct Color { r: f32, g: f32, b: f32, a: f32 }
+struct Rgb { r: f32, g: f32, b: f32 }
+fun main() {
+    v := Vec3 { x: 1.0, y: 2.0, z: 3.0 }
+    p := v.xy
+    echo p.x + p.y
+    q := v.zy
+    echo q.x * 10.0 + q.y
+    w := v.xyz
+    echo w.z
+    c := Color { r: 0.5, g: 0.25, b: 0.125, a: 1.0 }
+    t := c.rgb
+    echo t.b
+    echo c.xy.y
+    s := v.yx
+    echo s.x
+}

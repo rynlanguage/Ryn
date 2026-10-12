@@ -1,0 +1,70 @@
+// test: run
+// out: 14850
+// out: 125
+// out: 1
+// out: 5000
+// out: 1099511627776
+// out: -4
+// out: 111
+// out: 111
+// out: 18446744073709551615
+// out: 21
+// A local in a register is updated in place by `x = x op y`, shifted by a constant, and scaled by 3, 5 or 9 inside an
+// address; each result here is checked against the value it must have.
+fun walk(start: u64) -> u64 {
+    mut x: u64 = start
+    mut steps: u64 = 0
+    while x != 1 {
+        when x % 2 == 0 {
+            x = x / 2
+        } else {
+            x = 3 * x + 1
+        }
+        steps += 1
+    }
+    return steps
+}
+
+fun mix(a: u64, b: u64, c: u64) -> u64 {
+    return a * 100 + b * 10 + c
+}
+
+fun main() {
+    mut total: u64 = 0
+    mut i: u64 = 0
+    while i < 100 {
+        total += i * 3 + 0
+        i += 1
+    }
+    mut s: u64 = 0
+    mut k: u64 = 1
+    while k <= 100 {
+        s = s + k
+        k += 1
+    }
+    echo total
+    mut p: u64 = 5
+    p = p * 5
+    p = p * 5
+    echo p
+    mut q: u64 = 1024
+    q = q / 1024
+    echo q
+    mut r: u64 = 5
+    r = r * 1000
+    echo r
+    mut sh: u64 = 1
+    sh = sh << 40
+    echo sh
+    mut neg: i64 = 0 - 16
+    neg = neg >> 2
+    echo neg
+    echo walk(27)
+    echo mix(1, 1, 1)
+    mut all: u64 = 0
+    all = all - 1
+    echo all
+    mut m: u64 = 7
+    m = m * 3
+    echo m
+}

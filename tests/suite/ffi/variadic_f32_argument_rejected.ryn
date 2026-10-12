@@ -1,0 +1,10 @@
+// test: fail
+// code: R0270
+// A variable argument has no `f32` form: C promotes it to `double`, so the program says `as f64` itself.
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun printf(format: *u8, ...) -> i32;
+fun main() {
+    buffer := malloc(8 as u64)
+    half: f32 = 0.5
+    printf(buffer, half)
+}

@@ -1,0 +1,15 @@
+// test: run
+// out: 16
+// out: 120
+// len() of a fixed array is its length.
+fun main() {
+    a: [f32; 16] = [0.0; 16]
+    echo a.len()
+    mut i: u64 = 0
+    mut t: u64 = 0
+    while i < a.len() {
+        t += i
+        i += 1
+    }
+    echo t
+}

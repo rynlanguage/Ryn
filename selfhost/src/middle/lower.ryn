@@ -74,6 +74,8 @@ pub struct Signature {
     params: Vec<String>,
     ret: String,
     public: bool,
+    // `...` after the parameters of an `extern "C"` function: the arguments after `params` are C's variable arguments.
+    variadic: bool,
     module: String,
     // The parameter that a function returns, when it returns a reference from one parameter.
     return_param: Option<u64>,
@@ -493,6 +495,13 @@ fun needs_folding(value: u64, ty: String) -> bool {
 
 fun is_float_word(ty: String) -> bool {
     return ty == "F32" || ty == "F64"
+}
+
+fun if_u64(condition: bool) -> String {
+    when condition {
+        return String("U64")
+    }
+    return String("")
 }
 
 fun is_numeric_word(ty: String) -> bool {
@@ -2586,6 +2595,140 @@ extend Lowering {
         return false
     }
 
+    // `v.xy`, `v.zyx`, `c.rgb`: a name made of the letters `xyzw`, `rgba` or `stpq` that the structure of the value does not
+    // declare reads those components and builds the structure with that many components (`x`, `y`, `z`, `w`, or `r`, `g`, `b`,
+    // `a`) of the same type. The value is read once per component, so it must be a variable or a field of one.
+    fun field_or_swizzle(mut self, value: u64, name: String, name_span: ast::Span, span: ast::Span, expected: String) -> Result<Lowered, String> {
+        built := self.swizzle(value, name.clone(), name_span, span)
+        when built.is_some() {
+            return self.expression(built.unwrap(), expected)
+        }
+        return self.field_read_checked(value, name, name_span, span, expected)
+    }
+
+    fun swizzle_letter(self, letter: u64, set: u64) -> u64 {
+        // The letter of the same position in set `set` (0 `xyzw`, 1 `rgba`, 2 `stpq`); 0 when `letter` is in none of them.
+        mut sets: Vec<String> = Vec()
+        sets.push(String("xyzw"))
+        sets.push(String("rgba"))
+        sets.push(String("stpq"))
+        mut which: u64 = 0
+        while which < 3 {
+            mut at: u64 = 0
+            while at < 4 {
+                when (sets[which].byte_at(at) as u64) == letter {
+                    return sets[set].byte_at(at) as u64
+                }
+                at += 1
+            }
+            which += 1
+        }
+        return 0
+    }
+
+    // Whether a swizzle is written with the letters `rgba`: its result prefers the structure with those field names.
+    fun swizzle_is_color(self, name: String) -> bool {
+        letter := name.byte_at(0) as u64
+        return letter == 114 || letter == 103 || letter == 98 || letter == 97
+    }
+
+    // The fields the letters of a swizzle name stand for (trying each set of letters in turn), or none.
+    fun swizzle_fields(self, id: u64, name: String) -> Vec<String> {
+        mut none: Vec<String> = Vec()
+        when name.len() < 2 || name.len() > 4 || self.structs[id].name.starts_with("$") || self.field_index(id, name.clone()).is_ok() {
+            return none
+        }
+        mut set: u64 = 0
+        while set < 3 {
+            mut candidate: Vec<String> = Vec()
+            mut complete: bool = true
+            mut at: u64 = 0
+            while at < name.len() {
+                letter := self.swizzle_letter(name.byte_at(at) as u64, set)
+                mut field := String("")
+                when letter != 0 {
+                    field.push(char_from_u32(letter as u32))
+                }
+                when letter == 0 || self.field_index(id, field.clone()).is_err() {
+                    complete = false
+                } else {
+                    candidate.push(field)
+                }
+                at += 1
+            }
+            when complete {
+                return candidate
+            }
+            set += 1
+        }
+        return none
+    }
+
+    // The structure a swizzle of `fields` builds: `k` fields of the components' type named `x y z w`, or else `r g b a`.
+    fun swizzle_target(self, id: u64, fields: Vec<String>, color: bool) -> Option<u64> {
+        when fields.is_empty() {
+            return Option::None
+        }
+        component := self.structs[id].field_types[self.field_index(id, fields[0].clone()).unwrap()].clone()
+        for field in fields.clone() {
+            when self.structs[id].field_types[self.field_index(id, field).unwrap()] != component {
+                return Option::None
+            }
+        }
+        mut naming: u64 = 0
+        while naming < 2 {
+            mut letters := String("xyzw")
+            when (naming == 1) != color {
+                letters = String("rgba")
+            }
+            mut candidate: u64 = 0
+            while candidate < self.structs.len() {
+                info := self.structs[candidate]
+                mut fits := !info.name.starts_with("$") && info.field_names.len() == fields.len()
+                mut position: u64 = 0
+                while fits && position < fields.len() {
+                    mut wanted := String("")
+                    wanted.push(char_from_u32(letters.byte_at(position) as u32))
+                    when info.field_names[position] != wanted || info.field_types[position] != component {
+                        fits = false
+                    }
+                    position += 1
+                }
+                when fits {
+                    return Option::Some(candidate)
+                }
+                candidate += 1
+            }
+            naming += 1
+        }
+        return Option::None
+    }
+
+    fun swizzle(mut self, value: u64, name: String, name_span: ast::Span, span: ast::Span) -> Option<u64> {
+        place := self.place_of(value)
+        when place.is_err() {
+            return Option::None
+        }
+        id := struct_id_of(place.unwrap().ty)
+        when id.is_none() {
+            return Option::None
+        }
+        fields := self.swizzle_fields(id.unwrap(), name.clone())
+        target := self.swizzle_target(id.unwrap(), fields.clone(), self.swizzle_is_color(name.clone()))
+        when target.is_none() {
+            return Option::None
+        }
+        mut inits: Vec<u64> = Vec()
+        mut position: u64 = 0
+        while position < fields.len() {
+            read := self.add_expr(ast::ExprTree::FieldE(value, fields[position].clone(), name_span, name_span))
+            inits.push(self.program.inits.len())
+            self.program.inits.push(ast::FieldInit { name: self.structs[target.unwrap()].field_names[position].clone(), value: read, span: name_span })
+            position += 1
+        }
+        return Option::Some(self.add_expr(ast::ExprTree::StructLit(self.structs[target.unwrap()].name.clone(), inits, span)))
+    }
+
     // A field of a local that owns storage is moved out of its slot when used by value.
     // `R0225` for a field that the structure of a local value does not declare, at the field's name span.
     // Values that are not local structures are declined, and so are the built-in structures (their names start with `$`),
@@ -2601,6 +2744,9 @@ extend Lowering {
         }
         definition := id.unwrap()
         when (self.structs[definition].name.starts_with("$") && !name.starts_with("_")) || self.field_index(definition, name.clone()).is_ok() {
+            return Option::None
+        }
+        when self.swizzle_target(definition, self.swizzle_fields(definition, name.clone()), false).is_some() {
             return Option::None
         }
         return Option::Some(self.unknown_struct_field(definition, name, name_span.start, name_span.end))
@@ -2683,6 +2829,10 @@ extend Lowering {
     }
 
     fun moved_field_checked(mut self, value: u64, name: String, name_span: ast::Span, span: ast::Span, expected: String) -> Result<Lowered, String> {
+        swizzled := self.swizzle(value, name.clone(), name_span, span)
+        when swizzled.is_some() {
+            return self.expression(swizzled.unwrap(), expected)
+        }
         unknown := self.unknown_field(value, name.clone(), name_span)
         when unknown.is_some() {
             return Result::Err(unknown.unwrap())
@@ -3937,6 +4087,10 @@ extend Lowering {
         when holder.starts_with("RawPointer ") { holder = holder.slice(11, holder.len()) }
         id := struct_id_of(holder)
         when id.is_some() {
+            swizzled := self.swizzle_target(id.unwrap(), self.swizzle_fields(id.unwrap(), name.clone()), self.swizzle_is_color(name.clone()))
+            when swizzled.is_some() {
+                return Result::Ok(struct_word(swizzled.unwrap()))
+            }
             field := self.field_index(id.unwrap(), name)?
             return Result::Ok(self.structs[id.unwrap()].field_types[field].clone())
         }
@@ -4380,6 +4534,29 @@ extend Lowering {
         return Result::Err(unsupported("unknown function"))
     }
 
+    // The type of the expression a function returns, with its parameters as the visible locals.
+    fun expression_function_type(mut self, parameters: Vec<u64>, types: Vec<String>, value: u64, module: String, name: String) -> Result<String, String> {
+        saved := self.visible
+        self.scope_path = declaration_namespace(name, module)
+        mut at: u64 = 0
+        while at < parameters.len() {
+            self.declare(Local { name: self.program.parameters[parameters[at]].name.clone(), slot: 0, ty: types[at].clone(), mutable: false })
+            at += 1
+        }
+        inferred := self.infer(value)
+        self.visible = saved
+        self.scope_path = String("")
+        when inferred.is_err() {
+            return inferred
+        }
+        mut word := inferred.unwrap()
+        // A number with no type of its own is an `i32`, as `x := 5` is.
+        when word.is_empty() {
+            word = String("I32")
+        }
+        return Result::Ok(word)
+    }
+
     fun signature_index(self, name: String) -> Result<u64, String> {
         // The native runtime module (`std::native`) calls its own functions first: a program may declare a C function of
         // the same name with another signature.
@@ -4474,14 +4651,14 @@ extend Lowering {
             ast::ExprTree::FloatLit(bits, span) => self.float_literal(bits, expected),
             ast::ExprTree::CharLit(value, span) => self.character_literal(value, expected),
             ast::ExprTree::BitNotE(value, span) => self.bit_not(value, span, expected),
-            ast::ExprTree::StrLit(text, span) => self.string_literal(text),
+            ast::ExprTree::StrLit(text, span) => self.string_expression(text, span),
             ast::ExprTree::NameRef(name, span) => self.name_with(name, span, expected),
             ast::ExprTree::BinaryE(op, left, right, span) => self.binary(op, left, right, expected, span),
             ast::ExprTree::BoolLit(value, span) => self.boolean_literal(value, expected),
             ast::ExprTree::NotE(value, span) => self.negation(value, span, expected),
             ast::ExprTree::NegateE(value, span) => self.arithmetic_negation(value, span, expected),
             ast::ExprTree::CastE(value, ty, span) => self.cast(value, ty, expected),
-            ast::ExprTree::FieldE(value, name, name_span, span) => self.field_read_checked(value, name, name_span, span, expected),
+            ast::ExprTree::FieldE(value, name, name_span, span) => self.field_or_swizzle(value, name, name_span, span, expected),
             ast::ExprTree::IfE(condition, then_value, else_value, span) => self.if_expression(condition, then_value, else_value, expected),
             ast::ExprTree::EnumE(enum_name, variant, arguments, span) => self.enum_construct(enum_name, variant, arguments, expected, span, true, true),
             ast::ExprTree::ChooseE(value, arms, span) => self.choose_expression(value, arms, span, expected),
@@ -4603,6 +4780,126 @@ extend Lowering {
             return Result::Err(unary_diagnostic("unary `~` requires an integer value", "use `~` with a signed or unsigned integer", span.start, span.end))
         }
         return Result::Ok(Lowered { text: join(words3(String("BitNot"), operand.text, operand.ty.clone())), ty: operand.ty })
+    }
+
+    // A string literal. One with `{name}` or `{value.field}` where every name is a variable in scope is built at run time: a
+    // `String` made of its pieces, the variables converted as `String(value)` does (`bool` as `true` or `false`). Any
+    // other literal, braces included, is the `str` it was.
+    fun string_expression(mut self, text: String, span: ast::Span) -> Result<Lowered, String> {
+        when text.find("{").is_none() {
+            return self.string_literal(text)
+        }
+        built := self.interpolation(text.clone(), span)
+        when built.is_none() {
+            return self.string_literal(text)
+        }
+        return self.expression(built.unwrap(), String(""))
+    }
+
+    fun interpolation_piece(mut self, text: String, span: ast::Span) -> u64 {
+        return self.add_expr(ast::ExprTree::StrLit(text, span))
+    }
+
+    fun interpolation_value(mut self, path: String, span: ast::Span) -> Option<u64> {
+        when path.is_empty() {
+            return Option::None
+        }
+        mut value: u64 = 0
+        mut first: bool = true
+        for segment in path.split(".") {
+            when segment.is_empty() {
+                return Option::None
+            }
+            mut at: u64 = 0
+            while at < segment.len() {
+                byte := segment.byte_at(at) as u64
+                when !((byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90) || byte == 95 || (at > 0 && byte >= 48 && byte <= 57)) {
+                    return Option::None
+                }
+                at += 1
+            }
+            when first {
+                value = self.add_expr(ast::ExprTree::NameRef(segment, span))
+                first = false
+            } else {
+                value = self.add_expr(ast::ExprTree::FieldE(value, segment, span, span))
+            }
+        }
+        ty := self.value_hint(value)
+        when ty == "Bool" {
+            mut yes_arguments: Vec<u64> = Vec()
+            yes_arguments.push(self.interpolation_piece(String("true"), span))
+            mut no_arguments: Vec<u64> = Vec()
+            no_arguments.push(self.interpolation_piece(String("false"), span))
+            yes := self.add_expr(ast::ExprTree::CallE(String("String"), Vec(), yes_arguments, span))
+            no := self.add_expr(ast::ExprTree::CallE(String("String"), Vec(), no_arguments, span))
+            return Option::Some(self.add_expr(ast::ExprTree::IfE(value, yes, no, span)))
+        }
+        when ty == "Char" {
+            mut arguments: Vec<u64> = Vec()
+            arguments.push(value)
+            return Option::Some(self.add_expr(ast::ExprTree::CallE(String("std::native::__char_string"), Vec(), arguments, span)))
+        }
+        when ty == "Str" || ty == "OwnedString" || is_numeric_word(ty.clone()) {
+            mut arguments: Vec<u64> = Vec()
+            arguments.push(value)
+            return Option::Some(self.add_expr(ast::ExprTree::CallE(String("String"), Vec(), arguments, span)))
+        }
+        return Option::None
+    }
+
+    // The expression that builds the interpolated text, or nothing when the literal has no placeholder or one that is not a
+    // variable of a type it can write.
+    fun interpolation(mut self, text: String, span: ast::Span) -> Option<u64> {
+        mut pieces: Vec<u64> = Vec()
+        mut literal := String("")
+        mut at: u64 = 0
+        mut found: bool = false
+        while at < text.len() {
+            byte := text.byte_at(at) as u64
+            when byte == 123 {
+                mut close := at + 1
+                while close < text.len() && (text.byte_at(close) as u64) != 125 && (text.byte_at(close) as u64) != 123 {
+                    close += 1
+                }
+                when close < text.len() && (text.byte_at(close) as u64) == 125 {
+                    value := self.interpolation_value(text.slice(at + 1, close), span)
+                    when value.is_none() {
+                        return Option::None
+                    }
+                    when !literal.is_empty() || pieces.is_empty() {
+                        pieces.push(self.interpolation_piece(literal.clone(), span))
+                        literal = String("")
+                    }
+                    pieces.push(value.unwrap())
+                    found = true
+                    at = close + 1
+                } else {
+                    literal.push('{')
+                    at += 1
+                }
+            } else {
+                literal.push(char_from_u32(byte as u32))
+                at += 1
+            }
+        }
+        when !found {
+            return Option::None
+        }
+        when !literal.is_empty() {
+            pieces.push(self.interpolation_piece(literal, span))
+        }
+        mut arguments: Vec<u64> = Vec()
+        arguments.push(pieces[0])
+        mut chain := self.add_expr(ast::ExprTree::CallE(String("String"), Vec(), arguments, span))
+        mut next: u64 = 1
+        while next < pieces.len() {
+            mut rest: Vec<u64> = Vec()
+            rest.push(pieces[next])
+            chain = self.add_expr(ast::ExprTree::MethodCallE(chain, String("concat"), Vec(), rest, span))
+            next += 1
+        }
+        return Option::Some(chain)
     }
 
     fun string_literal(self, text: String) -> Result<Lowered, String> {
@@ -4736,6 +5033,10 @@ extend Lowering {
             return Result::Err(refusal)
         }
         operand := lowered.unwrap()
+        called := self.unary_call(operand.clone(), String("neg"), span)
+        when called.is_some() {
+            return Result::Ok(called.unwrap())
+        }
         when !is_signed_word(operand.ty.clone()) && !is_float_word(operand.ty.clone()) {
             return Result::Err(unary_diagnostic("unary `-` requires a signed integer or floating-point value", "declare the value with a signed integer or floating-point type before negating it", span.start, span.end))
         }
@@ -4778,6 +5079,10 @@ extend Lowering {
             return Result::Err(refusal)
         }
         operand := lowered.unwrap()
+        called := self.unary_call(operand.clone(), String("not"), span)
+        when called.is_some() {
+            return Result::Ok(called.unwrap())
+        }
         when operand.ty != "Bool" {
             return Result::Err(unary_diagnostic("unary `!` requires a `bool` value", "use `!` with a boolean value or comparison", span.start, span.end))
         }
@@ -4851,15 +5156,135 @@ extend Lowering {
         when context.is_empty() && !is_shift_op(op.clone()) {
             context = self.operand_hint(right, bitwise)?
         }
-        lhs := self.expression(left, context.clone())?
         method := operator_method_name(op.clone())
+        // `2.0 * v` takes the type of the number from `rmul(self, k: f32)` of the structure on the right.
+        reverse_type := self.reverse_operand_type(method.clone(), right)
+        when !reverse_type.is_empty() {
+            context = reverse_type
+        }
+        lhs := self.expression(left, context.clone())?
         when struct_id_of(lhs.ty.clone()).is_some() && !method.is_empty() {
-            overloaded := self.operator_call(lhs.clone(), method, right, span)?
+            overloaded := self.operator_call(lhs.clone(), method.clone(), right, span)?
             when overloaded.is_some() {
                 return Result::Ok(overloaded.unwrap())
             }
+            // `a != b` is the negation of a user-written `eq`.
+            when op == "Ne" {
+                equal := self.operator_call(lhs.clone(), String("eq"), right, span)?
+                when equal.is_some() {
+                    return Result::Ok(Lowered { text: join(words2(String("Not"), equal.unwrap().text)), ty: String("Bool") })
+                }
+            }
+        }
+        // A structure with no method for the operator: say which method would define it.
+        when struct_id_of(lhs.ty.clone()).is_some() && !method.is_empty() && op != "Eq" && op != "Ne" && !self.structs[struct_id_of(lhs.ty.clone()).unwrap()].name.starts_with("$") {
+            mut message := String("operator `")
+            message.append(operator_symbol(op.clone()))
+            message.append("` is not defined for structure `")
+            message.append(self.structs[struct_id_of(lhs.ty.clone()).unwrap()].name.clone())
+            message.append("`")
+            mut help := String("define `fun ")
+            help.append(method.clone())
+            help.append("(self, other: ...)` in an `extend` block of the structure")
+            return Result::Err(diagnostic("R0206", span.start, span.end, message, help))
+        }
+        // `2.0 * v`: the structure on the right defines `rmul(self, k)`, `radd`, `rsub` or `rdiv` for a number on the left.
+        when !method.is_empty() && is_numeric_word(lhs.ty.clone()) {
+            right_ty := self.value_hint(right)
+            when struct_id_of(right_ty.clone()).is_some() {
+                mut reversed := String("r")
+                reversed.append(method.clone())
+                swapped := self.reverse_operator_call(lhs.clone(), reversed, right, span)?
+                when swapped.is_some() {
+                    return Result::Ok(swapped.unwrap())
+                }
+            }
         }
         return self.binary_rest(op, lhs, right, context, expected, self.expr_span_of(left), span, true)
+    }
+
+    // The type of the number in `rmul(self, number)` (or `radd`, ...) of the structure that expression `value` has, or empty.
+    fun reverse_operand_type(self, method: String, value: u64) -> String {
+        when method.is_empty() {
+            return String("")
+        }
+        id := struct_id_of(self.value_hint(value))
+        when id.is_none() {
+            return String("")
+        }
+        mut name := self.structs[id.unwrap()].name.clone()
+        name.append("::r")
+        name.append(method)
+        name.append("#method")
+        mut found := self.signature_index(name.clone())
+        when found.is_err() {
+            mut owned := self.structs[id.unwrap()].module_path.clone()
+            owned.append("::")
+            owned.append(name)
+            found = self.signature_index(owned)
+        }
+        when found.is_err() || self.signatures[found.unwrap()].params.len() != 2 {
+            return String("")
+        }
+        ty := self.signatures[found.unwrap()].params[1].clone()
+        when is_numeric_word(ty.clone()) {
+            return ty
+        }
+        return String("")
+    }
+
+    // `number op value` where the structure of `value` has the method `method(self, number)`.
+    fun reverse_operator_call(mut self, number: Lowered, method: String, value: u64, span: ast::Span) -> Result<Option<Lowered>, String> {
+        operand := self.expression(value, String(""))?
+        id := struct_id_of(operand.ty.clone())
+        when id.is_none() {
+            return Result::Ok(Option::None)
+        }
+        mut key := String("")
+        mut owner_prefix := self.structs[id.unwrap()].module_path.clone()
+        when !owner_prefix.is_empty() {
+            owner_prefix.append("::")
+            when !self.structs[id.unwrap()].name.starts_with(owner_prefix.clone()) {
+                key = self.structs[id.unwrap()].module_path.clone()
+                key.append("::")
+            }
+        }
+        key.append(self.structs[id.unwrap()].name.clone())
+        key.append("::")
+        key.append(method.clone())
+        key.append("#method")
+        mut found := self.signature_index(key)
+        when found.is_err() {
+            mut bare := self.structs[id.unwrap()].name.clone()
+            bare.append("::")
+            bare.append(method)
+            bare.append("#method")
+            found = self.signature_index(bare)
+        }
+        when found.is_err() {
+            return Result::Ok(Option::None)
+        }
+        params := self.signatures[found.unwrap()].params.clone()
+        when params.len() != 2 || params[1] != number.ty {
+            return Result::Ok(Option::None)
+        }
+        mut pointer := String("Reference ")
+        pointer.append(operand.ty.clone())
+        pointer.append(" 0")
+        receiver := join(words6(String("ValueAddress"), operand.text, operand.ty.clone(), pointer, num(span.start), num(span.end)))
+        mut ret := self.signatures[found.unwrap()].ret.clone()
+        when ret.is_empty() {
+            ret = operand.ty.clone()
+        }
+        mut tokens: Vec<String> = Vec()
+        tokens.push(String("Call"))
+        tokens.push(String("Function"))
+        tokens.push(num(found.unwrap()))
+        tokens.push(String("2"))
+        tokens.push(receiver)
+        tokens.push(number.text)
+        tokens.push(ret.clone())
+        return Result::Ok(Option::Some(Lowered { text: join(tokens), ty: ret }))
     }
 
     // Whether an operand is a numeric literal or a unary operation on one. Its type comes from the context
@@ -4930,6 +5355,54 @@ extend Lowering {
     }
 
     // `left <op> right` on a structure with an operator method (`add`, `sub`, ...) in its `extend`.
+    // The method a structure defines for a unary operator (`neg` for `-x`, `not` for `!x`): the call on `operand`, or nothing.
+    fun unary_call(mut self, operand: Lowered, method: String, span: ast::Span) -> Option<Lowered> {
+        id := struct_id_of(operand.ty.clone())
+        when id.is_none() {
+            return Option::None
+        }
+        mut key := String("")
+        mut owner_prefix := self.structs[id.unwrap()].module_path.clone()
+        when !owner_prefix.is_empty() {
+            owner_prefix.append("::")
+            when !self.structs[id.unwrap()].name.starts_with(owner_prefix.clone()) {
+                key = self.structs[id.unwrap()].module_path.clone()
+                key.append("::")
+            }
+        }
+        key.append(self.structs[id.unwrap()].name.clone())
+        key.append("::")
+        key.append(method.clone())
+        key.append("#method")
+        mut found := self.signature_index(key)
+        when found.is_err() {
+            mut bare := self.structs[id.unwrap()].name.clone()
+            bare.append("::")
+            bare.append(method)
+            bare.append("#method")
+            found = self.signature_index(bare)
+        }
+        when found.is_err() || self.signatures[found.unwrap()].params.len() != 1 {
+            return Option::None
+        }
+        mut pointer := String("Reference ")
+        pointer.append(operand.ty.clone())
+        pointer.append(" 0")
+        receiver := join(words6(String("ValueAddress"), operand.text, operand.ty.clone(), pointer, num(span.start), num(span.end)))
+        mut ret := self.signatures[found.unwrap()].ret.clone()
+        when ret.is_empty() {
+            ret = operand.ty.clone()
+        }
+        mut tokens: Vec<String> = Vec()
+        tokens.push(String("Call"))
+        tokens.push(String("Function"))
+        tokens.push(num(found.unwrap()))
+        tokens.push(String("1"))
+        tokens.push(receiver)
+        tokens.push(ret.clone())
+        return Option::Some(Lowered { text: join(tokens), ty: ret })
+    }
+
     fun operator_call(mut self, lhs: Lowered, method: String, right: u64, span: ast::Span) -> Result<Option<Lowered>, String> {
         id := struct_id_of(lhs.ty.clone()).unwrap()
         // As for any method, a structure in a module names its methods by the module (`std::simd::F32x4::add#method`).
@@ -5160,13 +5633,20 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
     // Checks the argument list against a signature and lowers each argument to its parameter type.
     fun arguments(mut self, id: u64, name: String, arguments: Vec<u64>) -> Result<Vec<String>, String> {
         params := self.signatures[id].params.clone()
-        when arguments.len() != params.len() {
+        variadic := self.signatures[id].variadic
+        when arguments.len() != params.len() && !(variadic && arguments.len() > params.len()) {
             return Result::Err(unsupported("argument count"))
         }
         mut lowered: Vec<String> = Vec()
         mut explicit: Vec<ExplicitBorrow> = Vec()
         mut position: u64 = 0
         while position < arguments.len() {
+            // An argument after the named parameters of a variadic C function (see `variadic_argument`).
+            when position >= params.len() {
+                lowered.push(self.variadic_argument(name.clone(), arguments[position])?)
+                position += 1
+                continue
+            }
             // A `str` parameter borrows an owning String for the call.
             when params[position] == "Str" && self.value_hint(arguments[position]) == "OwnedString" {
                 value := self.expression(arguments[position], String(""))?
@@ -5217,6 +5697,24 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         return Result::Ok(lowered)
     }
 
+    // An argument after the named parameters of a variadic C function. C takes it as it is, so it needs a C form: an
+    // integer of any width, `f64`, or a raw pointer (`R0270` otherwise). It is wrapped in a cast to its own type, which
+    // tells the native backend the type of each variable argument.
+    fun variadic_argument(mut self, name: String, argument: u64) -> Result<String, String> {
+        lowered := self.expression(argument, String(""))?
+        when is_integer_word(lowered.ty.clone()) || lowered.ty == "F64" || lowered.ty.starts_with("RawPointer ") {
+            return Result::Ok(join(words4(String("Cast"), lowered.text, lowered.ty.clone(), lowered.ty)))
+        }
+        span := self.expr_span_of(argument)
+        when lowered.ty == "F32" {
+            return Result::Err(diagnostic("R0270", span.start, span.end, String("an `f32` has no C form as a variadic argument"), String("pass it as `f64`: write `value as f64`")))
+        }
+        mut message := String("a variadic argument of `")
+        message.append(name)
+        message.append("` must be an integer, `f64`, or a raw pointer")
+        return Result::Err(diagnostic("R0270", span.start, span.end, message, String("integers of any width, `f64` and raw pointers are passed to C as they are")))
+    }
+
     // The local that a `&name` or `&mut name` expression borrows; a raw pointer is not a reference.
     fun explicit_borrow(self, index: u64) -> Option<ExplicitBorrow> {
         choose self.program.exprs[index] {
@@ -5247,7 +5745,14 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         when arguments.len() != 1 {
             return Result::Err(unsupported("String sigwords"))
         }
-        value := self.expression(arguments[0], String(""))?
+        // `String("{name}")` keeps its braces: only a bare literal is interpolated.
+        literal := self.string_literal_text(arguments[0])
+        mut value := Lowered { text: String(""), ty: String("") }
+        when literal.is_some() {
+            value = self.string_literal(literal.unwrap())?
+        } else {
+            value = self.expression(arguments[0], String(""))?
+        }
         mut operation := String("")
         when value.ty == "Str" {
             operation = String("New")
@@ -5435,7 +5940,8 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         }
         id := found.unwrap()
         expected := self.signatures[id].params.len()
-        when expected == count {
+        // A variadic C function takes its named parameters and any number of variable arguments after them.
+        when expected == count || (self.signatures[id].variadic && count > expected) {
             return Option::None
         }
         when !self.signatures[id].public && self.signatures[id].module != self.module {
@@ -5889,7 +6395,162 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
     // the bounds are lowered, and the variable is in scope only for the body.
     // The bootstrap reports the range's diagnostics at the loop variable's span, after a redeclared
     // name (`R0202`) and before the body.
+    // The integer type a loop counter over literal bounds is used as in its body: `total += i` takes the type of `total`,
+    // `i < n` the type of `n`, `f(i)` the parameter's. Empty when nothing says.
+    fun loop_hint(self, name: String, body: Vec<u64>) -> String {
+        for statement in body {
+            found := self.statement_loop_hint(statement, name.clone())
+            when !found.is_empty() {
+                return found
+            }
+        }
+        return String("")
+    }
+
+    fun integer_hint(self, ty: String) -> String {
+        when is_integer_word(ty.clone()) {
+            return ty
+        }
+        return String("")
+    }
+
+    fun is_named(self, index: u64, name: String) -> bool {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::NameRef(found, span) => found == name,
+            _ => false,
+        }
+    }
+
+    fun named_type_hint(self, value: u64, name: String, target: String) -> String {
+        when self.is_named(value, name) {
+            return self.integer_hint(self.hint_of_name(target))
+        }
+        return String("")
+    }
+
+    fun call_loop_hint(self, callee: String, arguments: Vec<u64>, name: String) -> String {
+        id := self.signature_exact(callee)
+        when id.is_err() {
+            return String("")
+        }
+        params := self.signatures[id.unwrap()].params.clone()
+        mut at: u64 = 0
+        while at < arguments.len() && at < params.len() {
+            when self.is_named(arguments[at], name.clone()) {
+                found := self.integer_hint(params[at].clone())
+                when !found.is_empty() {
+                    return found
+                }
+            }
+            at += 1
+        }
+        return String("")
+    }
+
+    // The expressions a statement evaluates, for `loop_hint`.
+    fun loop_roots(self, index: u64) -> Vec<u64> {
+        mut roots: Vec<u64> = Vec()
+        value := choose self.program.stmts[index] {
+            ast::Stmt::LetS(name, mutable, annotation, value, span) => Option::Some(value),
+            ast::Stmt::AssignS(name, value, span) => Option::Some(value),
+            ast::Stmt::CompoundS(name, op, value, span) => Option::Some(value),
+            ast::Stmt::PrintS(value, span) => Option::Some(value),
+            ast::Stmt::IfS(condition, then_body, else_body, span) => Option::Some(condition),
+            ast::Stmt::WhileS(condition, body, span) => Option::Some(condition),
+            ast::Stmt::ReturnS(value, span) => value,
+            _ => Option::None,
+        }
+        when value.is_some() {
+            roots.push(value.unwrap())
+        }
+        arguments := choose self.program.stmts[index] {
+            ast::Stmt::CallS(callee, type_arguments, arguments, span) => arguments,
+            ast::Stmt::MethodCallS(receiver, callee, arguments, span) => arguments,
+            _ => Vec(),
+        }
+        for argument in arguments {
+            roots.push(argument)
+        }
+        return roots
+    }
+
+    fun loop_bodies(self, index: u64) -> Vec<Vec<u64>> {
+        mut bodies: Vec<Vec<u64>> = Vec()
+        choose self.program.stmts[index] {
+            ast::Stmt::IfS(condition, then_body, else_body, span) => self.push_two(then_body, else_body),
+            ast::Stmt::WhileS(condition, body, span) => self.push_two(body, Vec()),
+            ast::Stmt::ForS(counter, counter_span, start, end, inclusive, body, span) => self.push_two(body, Vec()),
+            ast::Stmt::ForEachS(counter, counter_span, iterable, body, span) => self.push_two(body, Vec()),
+            _ => bodies,
+        }
+    }
+
+    fun push_two(self, first: Vec<u64>, second: Vec<u64>) -> Vec<Vec<u64>> {
+        mut bodies: Vec<Vec<u64>> = Vec()
+        bodies.push(first)
+        bodies.push(second)
+        return bodies
+    }
+
+    fun statement_loop_hint(self, index: u64, name: String) -> String {
+        direct := choose self.program.stmts[index] {
+            ast::Stmt::CompoundS(target, op, value, span) => self.named_type_hint(value, name.clone(), target),
+            ast::Stmt::AssignS(target, value, span) => self.named_type_hint(value, name.clone(), target),
+            ast::Stmt::CallS(callee, type_arguments, arguments, span) => self.call_loop_hint(callee, arguments, name.clone()),
+            _ => String(""),
+        }
+        when !direct.is_empty() {
+            return direct
+        }
+        for root in self.loop_roots(index) {
+            found := self.expression_loop_hint(root, name.clone())
+            when !found.is_empty() {
+                return found
+            }
+        }
+        for body in self.loop_bodies(index) {
+            found := self.loop_hint(name.clone(), body)
+            when !found.is_empty() {
+                return found
+            }
+        }
+        return String("")
+    }
+
+    fun expression_loop_hint(self, index: u64, name: String) -> String {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::BinaryE(op, left, right, span) => self.binary_loop_hint(left, right, name.clone()),
+            ast::ExprTree::CallE(callee, type_arguments, arguments, span) => self.call_loop_hint(callee, arguments, name.clone()),
+            ast::ExprTree::IndexE(value, position, span) => if_u64(self.is_named(position, name.clone())),
+            _ => String(""),
+        }
+    }
+
+    fun binary_loop_hint(self, left: u64, right: u64, name: String) -> String {
+        when self.is_named(left, name.clone()) {
+            found := self.integer_hint(self.numeric_hint(right))
+            when !found.is_empty() {
+                return found
+            }
+        }
+        when self.is_named(right, name.clone()) {
+            found := self.integer_hint(self.numeric_hint(left))
+            when !found.is_empty() {
+                return found
+            }
+        }
+        found := self.expression_loop_hint(left, name.clone())
+        when !found.is_empty() {
+            return found
+        }
+        return self.expression_loop_hint(right, name)
+    }
+
     fun for_statement(mut self, name: String, name_span: ast::Span, start: u64, end: u64, inclusive: bool, body: Vec<u64>) -> Result<bool, String> {
+        mut counter_hint := self.operand_hint(end, true)?
+        when counter_hint.is_empty() && self.literal_value(start).is_some() && self.literal_value(end).is_some() {
+            counter_hint = self.loop_hint(name.clone(), body.clone())
+        }
         when self.declared(name.clone()) {
             when self.recovering {
                 self.recovered.push(range_loop_redeclared(name.clone(), name_span.start, name_span.end))
@@ -5897,7 +6558,7 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
             }
             return Result::Err(range_loop_redeclared(name, name_span.start, name_span.end))
         }
-        start_hint := self.operand_hint(end, true)?
+        start_hint := counter_hint
         start_result := self.expression(start, start_hint.clone())
         mut start_value := Lowered { text: String(""), ty: String("") }
         when start_result.is_err() {
@@ -6384,6 +7045,15 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         }
         slot := self.locals[index].slot
         ty := self.locals[index].ty.clone()
+        // `a += b` of a structure is `a = a.add(b)` when it has the method.
+        when struct_id_of(ty.clone()).is_some() {
+            current := Lowered { text: join(words5(String("Local"), num(slot), ty.clone(), num(span.start), num(span.start + name.len()))), ty: ty.clone() }
+            called := self.operator_call(current, operator_method_name(op.clone()), value, span)?
+            when called.is_some() {
+                self.statements.push(join(words6(String("Assign"), num(slot), ty, called.unwrap().text, num(span.start), num(span.end))))
+                return Result::Ok(false)
+            }
+        }
         when !is_numeric_word(ty.clone()) {
             return Result::Err(unsupported("arithmetic on this type"))
         }
@@ -7087,7 +7757,7 @@ extend Lowering {
                 main_index = position
             }
             returned := self.returned_parameter(definition.body.clone(), definition.return_value, definition.parameters.clone(), ret.clone())
-            signatures.push(Signature { name: key, params: params, ret: ret, public: definition.public, module: definition.module_path.clone(), return_param: returned })
+            signatures.push(Signature { name: key, params: params, ret: ret, public: definition.public, variadic: definition.variadic, module: definition.module_path.clone(), return_param: returned })
             position += 1
         }
         when main_index == count {
@@ -7110,7 +7780,7 @@ extend Lowering {
                 mut clone_params: Vec<String> = Vec()
                 clone_params.push(self_type)
                 known_keys.insert(clone_key.clone(), signatures.len())
-                signatures.push(Signature { name: clone_key, params: clone_params, ret: struct_word(derive_index), public: true, module: self.structs[derive_index].module_path.clone(), return_param: Option::None })
+                signatures.push(Signature { name: clone_key, params: clone_params, ret: struct_word(derive_index), public: true, variadic: false, module: self.structs[derive_index].module_path.clone(), return_param: Option::None })
                 clone_structs.push(derive_index)
             }
             derive_index += 1
@@ -7125,6 +7795,22 @@ extend Lowering {
         }
         self.enums = enums
         self.add_aliases()
+        // `fun double(x: i32) => x * 2`: a function whose body is one expression and that names no result type has the type of
+        // the expression (a lambda is lifted to such a function).
+        mut infer_at: u64 = 0
+        while infer_at < count {
+            definition := self.program.function_defs[self.program.functions[infer_at]]
+            when definition.return_type.is_none() && definition.return_value.is_some() && definition.body.is_empty() {
+                inferred := self.expression_function_type(definition.parameters.clone(), self.signatures[infer_at].params.clone(), definition.return_value.unwrap(), definition.module_path.clone(), definition.name.clone())
+                when inferred.is_err() {
+                    return Result::Err(diagnostic("R0206", definition.span.start, definition.span.end, String("cannot tell the result type of this function"), String("write the result type: `-> type`")))
+                }
+                mut updated := self.signatures[infer_at]
+                updated.ret = inferred.unwrap()
+                self.signatures.set(infer_at, updated)
+            }
+            infer_at += 1
+        }
         // The functions of the native runtime module are lowered when something reaches them: the module is large, and most
         // programs use a few of its functions. A function that nothing reaches keeps an empty record, so that the numbers
         // of the others do not change. Everything else is lowered.
@@ -7379,7 +8065,7 @@ extend Lowering {
         when method.default_body.is_some() {
             body = method.default_body.unwrap()
         }
-        self.program.function_defs.push(ast::Function { name: key, extern_c: false, external_symbol: Option::None, type_parameters: Vec(), type_parameter_bounds: Vec(), public: true, module_path: module, parameters: parameters, return_type: method.return_type, body: body, return_value: method.default_value, span: method.span })
+        self.program.function_defs.push(ast::Function { name: key, extern_c: false, variadic: false, external_symbol: Option::None, type_parameters: Vec(), type_parameter_bounds: Vec(), public: true, module_path: module, parameters: parameters, return_type: method.return_type, body: body, return_value: method.default_value, span: method.span })
         self.program.functions.push(self.program.function_defs.len() - 1)
     }
 
@@ -8131,6 +8817,9 @@ extend Lowering {
         when ty == "Str" && (name == "len" || name == "byte_at") {
             return self.str_method(recv, name, arguments, span)
         }
+        when ty.starts_with("Array ") && name == "len" && arguments.is_empty() {
+            return Result::Ok(Lowered { text: join(words3(String("Integer"), num(array_length_of(array_parts(ty.clone()).unwrap())), String("U64"))), ty: String("U64") })
+        }
         when ty.starts_with("Slice ") && name == "len" && arguments.is_empty() {
             return Result::Ok(Lowered { text: join(words3(String("SliceLen"), String("1"), recv.text)), ty: String("U64") })
         }
@@ -8381,6 +9070,10 @@ extend Lowering {
         lowered := self.method_target(receiver, name.clone(), type_arguments, arguments, span)?
         when lowered.ty.is_empty() {
             return Result::Err(unsupported("value of a method without a result"))
+        }
+        // The length of an array is a constant, not a call.
+        when lowered.text.starts_with("Integer ") {
+            return Result::Ok(lowered)
         }
         // `find` yields an `Option<u64>` made from the signed position the runtime returns.
         when lowered.text.starts_with("String FindStr") || lowered.text.starts_with("String FindString") {
@@ -8861,6 +9554,12 @@ extend Lowering {
     // `values[index]` on a `Vec` (a clone of the element, as `values.index(index)`) or an array.
     fun index_expression(mut self, value: u64, index: u64, expected: String, span: ast::Span) -> Result<Lowered, String> {
         base := self.indexed_base(value)?
+        when struct_id_of(base.ty.clone()).is_some() {
+            called := self.operator_call(base.clone(), String("index"), index, span)?
+            when called.is_some() {
+                return Result::Ok(called.unwrap())
+            }
+        }
         element := vec_element_of(base.ty.clone())
         when element.is_some() {
             mut arguments: Vec<u64> = Vec()
@@ -9455,37 +10154,88 @@ extend Lowering {
     }
 
     // `name[index] = value`: stores into one element of an array local.
+    // `name[i] = value`, `name.field[i] = value` and `name[i][j] = value`: an element of a fixed array that is a local (or a
+    // field of one) or is reached through a mutable reference (`self.data[i] = value`). The name is the path `a.b.c`, and the
+    // position is a tuple when there are several indices. The simple case is a store into the array's cells; any other is a
+    // store through the element's address.
     fun index_assign(mut self, name: String, index: u64, value: u64, span: ast::Span) -> Result<bool, String> {
-        found := self.find(name.clone())?
+        path := name.split(".")
+        root := path[0].clone()
+        found := self.find(root.clone())?
         local := self.locals[found]
-        when !local.mutable {
-            return Result::Err(immutable_binding(name, span.start, span.end, "to assign an array element"))
+        mut through := local.ty.clone()
+        when reference_inner(local.ty.clone()).is_some() {
+            when !reference_is_mutable(local.ty.clone()) {
+                return Result::Err(shared_assign_error(span.start, span.end))
+            }
+            through = reference_inner(local.ty.clone()).unwrap()
+        } else when !local.mutable {
+            return Result::Err(immutable_binding(root.clone(), span.start, span.end, "to assign an array element"))
         }
-        parts := array_parts(local.ty.clone())
-        when parts.is_none() {
-            return Result::Err(unsupported("indexed assignment to this type"))
+        indices := self.index_list(index)
+        // The simple case: an element of an array local.
+        when path.len() == 1 && indices.len() == 1 && array_parts(local.ty.clone()).is_some() {
+            parts := array_parts(local.ty.clone()).unwrap()
+            element := parts[0].clone()
+            length := array_length_of(array_parts(local.ty.clone()).unwrap())
+            position := self.expression(index, String(""))?
+            when !is_integer_word(position.ty.clone()) {
+                return Result::Err(unsupported("index type"))
+            }
+            stored := self.moved_expression(value, element.clone())?
+            when stored.ty != element {
+                return Result::Err(unsupported("array element type"))
+            }
+            mut tokens: Vec<String> = Vec()
+            tokens.push(String("ArrayAssign"))
+            tokens.push(num(local.slot))
+            tokens.push(element)
+            tokens.push(num(length))
+            tokens.push(position.text)
+            tokens.push(stored.text)
+            tokens.push(num(span.start))
+            tokens.push(num(span.end))
+            self.statements.push(join(tokens))
+            return Result::Ok(false)
         }
-        element := parts.unwrap()[0].clone()
-        length := array_length_of(array_parts(local.ty.clone()).unwrap())
-        position := self.expression(index, String(""))?
-        when !is_integer_word(position.ty.clone()) {
-            return Result::Err(unsupported("index type"))
+        // The element as an expression, `root.field...[i]...[j]`, and its address.
+        mut place := self.add_expr(ast::ExprTree::NameRef(root, span))
+        mut step: u64 = 1
+        while step < path.len() {
+            place = self.add_expr(ast::ExprTree::FieldE(place, path[step].clone(), span, span))
+            step += 1
         }
-        stored := self.moved_expression(value, element.clone())?
-        when stored.ty != element {
+        for at in indices {
+            place = self.add_expr(ast::ExprTree::IndexE(place, at, span))
+        }
+        element := self.expression(place, String(""))?
+        when !is_numeric_word(element.ty.clone()) && element.ty != "Bool" && element.ty != "Char" && !(struct_id_of(element.ty.clone()).is_some() && self.record_is_copy(element.ty.clone())) {
+            return Result::Err(unsupported("indexed assignment of this element type"))
+        }
+        stored := self.moved_expression(value, element.ty.clone())?
+        when stored.ty != element.ty {
             return Result::Err(unsupported("array element type"))
         }
-        mut tokens: Vec<String> = Vec()
-        tokens.push(String("ArrayAssign"))
-        tokens.push(num(local.slot))
-        tokens.push(element)
-        tokens.push(num(length))
-        tokens.push(position.text)
-        tokens.push(stored.text)
-        tokens.push(num(span.start))
-        tokens.push(num(span.end))
-        self.statements.push(join(tokens))
+        mut pointer_type := String("Reference ")
+        pointer_type.append(element.ty.clone())
+        pointer_type.append(" 1")
+        address := join(words3(String("PlaceAddress"), element.text, pointer_type))
+        self.statements.push(join(words4(String("DereferenceAssign"), address, element.ty.clone(), stored.text)))
         return Result::Ok(false)
+    }
+
+    // The indices of an indexed assignment: the elements of a tuple, or the one expression.
+    fun index_list(self, index: u64) -> Vec<u64> {
+        items := choose self.program.exprs[index] {
+            ast::ExprTree::TupleE(values, span) => values,
+            _ => Vec(),
+        }
+        when items.is_empty() {
+            mut single: Vec<u64> = Vec()
+            single.push(index)
+            return single
+        }
+        return items
     }
 
     // `for name in range`: two loops, one for each kind of bound, chosen when the loop starts.
@@ -9580,6 +10330,8 @@ extend Lowering {
             item_ty = self.structs[range_id.unwrap()].field_types[0].clone()
         } else when lowered.ty.starts_with("Slice ") {
             item_ty = lowered.ty.slice(6, lowered.ty.len())
+        } else when lowered.ty.starts_with("Array ") {
+            item_ty = array_parts(lowered.ty.clone()).unwrap()[0].clone()
         } else {
             found := iterable_error(lowered.ty.clone(), collection_span.start, collection_span.end)
             when found.is_some() {
@@ -9605,6 +10357,10 @@ extend Lowering {
         } else when lowered.ty.starts_with("Slice ") {
             length = join(words5(String("Call"), String("SliceLen"), String("1"), view.clone(), String("U64")))
             take = join(words4(String("SliceIndex"), view.clone(), counter.clone(), item_ty.clone()))
+        } else when lowered.ty.starts_with("Array ") {
+            count := array_length_of(array_parts(lowered.ty.clone()).unwrap())
+            length = join(words3(String("Integer"), num(count), String("U64")))
+            take = join(words5(String("ArrayIndex"), view.clone(), counter.clone(), item_ty.clone(), num(count)))
         } else {
             length = join(words6(String("Call"), String("Vec"), String("Len"), item_ty.clone(), String("1"), join(words2(view.clone(), String("U64")))))
             take = join(words6(String("Call"), String("Vec"), String("Take"), item_ty.clone(), String("2"), join(words3(view.clone(), String("Integer 0 U64"), item_ty.clone()))))
@@ -10036,6 +10792,24 @@ fun entry_number(entry: String) -> u64 {
     return value
 }
 
+fun operator_symbol(op: String) -> String {
+    when op == "Add" { return String("+") }
+    when op == "Sub" { return String("-") }
+    when op == "Mul" { return String("*") }
+    when op == "Div" { return String("/") }
+    when op == "Rem" { return String("%") }
+    when op == "BitAnd" { return String("&") }
+    when op == "BitOr" { return String("|") }
+    when op == "BitXor" { return String("^") }
+    when op == "Shl" { return String("<<") }
+    when op == "Shr" { return String(">>") }
+    when op == "Lt" { return String("<") }
+    when op == "Le" { return String("<=") }
+    when op == "Gt" { return String(">") }
+    when op == "Ge" { return String(">=") }
+    return op
+}
+
 fun operator_method_name(op: String) -> String {
     when op == "Add" {
         return String("add")
@@ -10051,6 +10825,39 @@ fun operator_method_name(op: String) -> String {
     }
     when op == "Rem" {
         return String("rem")
+    }
+    when op == "BitAnd" {
+        return String("bitand")
+    }
+    when op == "BitOr" {
+        return String("bitor")
+    }
+    when op == "BitXor" {
+        return String("bitxor")
+    }
+    when op == "Shl" {
+        return String("shl")
+    }
+    when op == "Shr" {
+        return String("shr")
+    }
+    when op == "Eq" {
+        return String("eq")
+    }
+    when op == "Ne" {
+        return String("ne")
+    }
+    when op == "Lt" {
+        return String("lt")
+    }
+    when op == "Le" {
+        return String("le")
+    }
+    when op == "Gt" {
+        return String("gt")
+    }
+    when op == "Ge" {
+        return String("ge")
     }
     return String("")
 }
