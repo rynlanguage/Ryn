@@ -1,4 +1,5 @@
 // test: run
+// target: linux
 // out: Hell
 // `puts(&title[0])` gets the C string of a local array of bytes: the array's bytes are packed for the call, and the call
 // reads them from the element it is given. The array is read-only here, so nothing is copied back.
