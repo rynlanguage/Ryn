@@ -1,0 +1,132 @@
+// CPU feature detection for x86-64. The result is computed once from `cpuid` and `xgetbv` and kept in a cell of the
+// running program, so asking again costs a load.
+//
+// A feature that uses the extended register state (AVX, AVX2, FMA, AVX-512) is reported only when the operating system
+// has enabled that state: CPUID.1:ECX.OSXSAVE must be set and `xgetbv(0)` must show XMM and YMM state enabled
+// (bits 1 and 2) for AVX and AVX2, plus opmask, ZMM_Hi256 and Hi16_ZMM (bits 5, 6 and 7) for AVX-512. A processor that
+// has the instruction but whose operating system has not enabled the state reports `false`, so a program that
+// dispatches on these functions never executes an instruction the machine cannot run.
+//
+// The compiler targets x86-64 only. There is no ARM64 backend, so `has_neon` is always false and nothing here runs on
+// another architecture.
+
+const SSE2: u64 = 1
+const SSE41: u64 = 2
+const SSE42: u64 = 4
+const POPCNT: u64 = 8
+const BMI1: u64 = 16
+const BMI2: u64 = 32
+const AVX: u64 = 64
+const AVX2: u64 = 128
+const FMA: u64 = 256
+const AVX512F: u64 = 512
+const AVX512BW: u64 = 1024
+const AVX512VL: u64 = 2048
+const AVX512DQ: u64 = 4096
+const COMPUTED: u64 = 9223372036854775808
+
+fun bit(value: u64, position: u64) -> bool {
+    return ((value >> (position as u32)) & 1) != 0
+}
+
+fun detect_bits() -> u64 {
+    mut bits: u64 = COMPUTED | SSE2
+    top := __cpu_cpuid(0 as u64, 0 as u64, 0 as u64)
+    when top >= 1 {
+        ecx := __cpu_cpuid(1 as u64, 0 as u64, 2 as u64)
+        edx := __cpu_cpuid(1 as u64, 0 as u64, 3 as u64)
+        // every x86-64 processor has SSE2; the bit is read anyway so that a broken virtual machine reports it honestly
+        when !bit(edx, 26 as u64) {
+            bits = COMPUTED
+        }
+        when bit(ecx, 19 as u64) {
+            bits = bits | SSE41
+        }
+        when bit(ecx, 20 as u64) {
+            bits = bits | SSE42
+        }
+        when bit(ecx, 23 as u64) {
+            bits = bits | POPCNT
+        }
+        mut os_avx := false
+        mut os_avx512 := false
+        when bit(ecx, 27 as u64) {
+            xcr0 := __cpu_xgetbv(0 as u64)
+            os_avx = (xcr0 & 6) == 6
+            os_avx512 = (xcr0 & 230) == 230
+        }
+        when os_avx && bit(ecx, 28 as u64) {
+            bits = bits | AVX
+            when bit(ecx, 12 as u64) {
+                bits = bits | FMA
+            }
+            when top >= 7 {
+                ebx := __cpu_cpuid(7 as u64, 0 as u64, 1 as u64)
+                when bit(ebx, 5 as u64) {
+                    bits = bits | AVX2
+                }
+                when os_avx512 && bit(ebx, 16 as u64) {
+                    bits = bits | AVX512F
+                    when bit(ebx, 30 as u64) {
+                        bits = bits | AVX512BW
+                    }
+                    when bit(ebx, 31 as u64) {
+                        bits = bits | AVX512VL
+                    }
+                    when bit(ebx, 17 as u64) {
+                        bits = bits | AVX512DQ
+                    }
+                }
+            }
+        }
+        when top >= 7 {
+            ebx7 := __cpu_cpuid(7 as u64, 0 as u64, 1 as u64)
+            when bit(ebx7, 3 as u64) {
+                bits = bits | BMI1
+            }
+            when bit(ebx7, 8 as u64) {
+                bits = bits | BMI2
+            }
+        }
+    }
+    return bits
+}
+
+// The bit set of the features, computed on first use.
+fun feature_bits() -> u64 {
+    cell := __cpu_cell() as *u64
+    known := *cell
+    when known != 0 {
+        return known
+    }
+    detected := detect_bits()
+    *cell = detected
+    return detected
+}
+
+pub fun has_sse2() -> bool { return (feature_bits() & SSE2) != 0 }
+pub fun has_sse41() -> bool { return (feature_bits() & SSE41) != 0 }
+pub fun has_sse42() -> bool { return (feature_bits() & SSE42) != 0 }
+pub fun has_popcnt() -> bool { return (feature_bits() & POPCNT) != 0 }
+pub fun has_bmi1() -> bool { return (feature_bits() & BMI1) != 0 }
+pub fun has_bmi2() -> bool { return (feature_bits() & BMI2) != 0 }
+pub fun has_avx() -> bool { return (feature_bits() & AVX) != 0 }
+pub fun has_avx2() -> bool { return (feature_bits() & AVX2) != 0 }
+pub fun has_fma() -> bool { return (feature_bits() & FMA) != 0 }
+pub fun has_avx512f() -> bool { return (feature_bits() & AVX512F) != 0 }
+pub fun has_avx512bw() -> bool { return (feature_bits() & AVX512BW) != 0 }
+pub fun has_avx512vl() -> bool { return (feature_bits() & AVX512VL) != 0 }
+pub fun has_avx512dq() -> bool { return (feature_bits() & AVX512DQ) != 0 }
+// No ARM64 backend exists: this is false on every target the compiler can produce.
+pub fun has_neon() -> bool { return false }
+
+// The CPUID vendor, brand-independent name of the widest vector level available, for reports.
+pub fun vector_level() -> String {
+    when has_avx512f() { return String("avx512f") }
+    when has_avx2() { return String("avx2") }
+    when has_avx() { return String("avx") }
+    when has_sse42() { return String("sse4.2") }
+    when has_sse41() { return String("sse4.1") }
+    when has_sse2() { return String("sse2") }
+    return String("none")
+}

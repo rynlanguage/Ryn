@@ -1,0 +1,11 @@
+// test: fail
+// code: R0460
+// msg: the wire format puts count at 1
+#[repr(C)]
+struct Wire {
+    tag: u8,
+    count: u32
+}
+fun main() {
+    static_assert(offset_of::<Wire>("count") == 1, "the wire format puts count at 1")
+}

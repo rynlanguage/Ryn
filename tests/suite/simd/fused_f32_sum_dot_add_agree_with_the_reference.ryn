@@ -1,0 +1,188 @@
+// test: run
+// out: true
+// out: 500500
+// out: 14
+// out: 0
+// out: 0
+// out: 0
+// out: 0
+// out: 0
+// out: 0
+// out: 0
+// out: 0
+// out: false
+use std::simd
+use std::cpu
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(block: *u8);
+
+// The element at `index` of a float array, and the pointer to it.
+fun slot(base: *f32, index: u64) -> *f32 {
+    return (base as u64 + index * 4) as *f32
+}
+
+fun at(base: *f32, index: u64) -> f32 {
+    p := slot(base, index)
+    return *p
+}
+
+fun store(base: *f32, index: u64, value: f32) {
+    p := slot(base, index)
+    *p = value
+}
+
+// The bits of a float, to compare results exactly.
+fun bits(value: f32) -> u32 {
+    mut v := value
+    p := &raw mut v
+    return *(p as *u32)
+}
+
+// The term at `index`: a[index], or the product a[index] * b[index] (each product rounded to a float before it is added).
+fun term(a: *f32, b: *f32, index: u64, product: bool) -> f32 {
+    when product {
+        return at(a, index) * at(b, index)
+    }
+    return at(a, index)
+}
+
+// The documented order of a reduction, in scalar code: sixteen lane accumulators (the element at 4k + l of every block goes to
+// lane l of accumulator k), then (A0 + A2) + (A1 + A3) lane by lane, then (l0 + l2) + (l1 + l3), then the elements after the
+// last full block, one at a time.
+fun reference(a: *f32, b: *f32, count: u64, product: bool) -> f32 {
+    acc := malloc(64) as *f32
+    mut j: u64 = 0
+    while j < 16 {
+        store(acc, j, 0.0)
+        j += 1
+    }
+    blocks := count / 16
+    mut block: u64 = 0
+    while block < blocks {
+        mut k: u64 = 0
+        while k < 16 {
+            store(acc, k, at(acc, k) + term(a, b, block * 16 + k, product))
+            k += 1
+        }
+        block += 1
+    }
+    z0 := (at(acc, 0) + at(acc, 8)) + (at(acc, 4) + at(acc, 12))
+    z1 := (at(acc, 1) + at(acc, 9)) + (at(acc, 5) + at(acc, 13))
+    z2 := (at(acc, 2) + at(acc, 10)) + (at(acc, 6) + at(acc, 14))
+    z3 := (at(acc, 3) + at(acc, 11)) + (at(acc, 7) + at(acc, 15))
+    mut total := (z0 + z2) + (z1 + z3)
+    mut t: u64 = blocks * 16
+    while t < count {
+        total = total + term(a, b, t, product)
+        t += 1
+    }
+    free(acc as *u8)
+    return total
+}
+
+// Values that are not exact in binary (a seventh of an integer), different for each salt.
+fun fill(base: *f32, count: u64, salt: u64) {
+    mut i: u64 = 0
+    while i < count {
+        store(base, i, (((i * 37 + salt * 11 + 5) % 1009) as f32) / 7.0 - 60.0)
+        i += 1
+    }
+}
+
+// The lengths tested: the tail lengths 0 to 9 after 0, 1 and 2 full blocks, and one long array.
+fun length_of(index: u64) -> u64 {
+    when index == 30 {
+        return 1000
+    }
+    return (index / 10) * 16 + index % 10
+}
+
+// The number of mismatching results of one check over every length and every offset of 0 to 3 elements into the allocation
+// (so the vector loads start at every alignment): 0 sum_f32, 1 dot_f32, 2 add_f32 into a new array, 3 add_f32 in place
+// (dst is a).
+fun mismatches(which: u64) -> u64 {
+    mut bad: u64 = 0
+    mut index: u64 = 0
+    while index < 31 {
+        n := length_of(index)
+        mut off: u64 = 0
+        while off < 4 {
+            a := malloc((n + 8) * 4) as *f32
+            b := malloc((n + 8) * 4) as *f32
+            d := malloc((n + 8) * 4) as *f32
+            va := slot(a, off)
+            vb := slot(b, off)
+            vd := slot(d, off)
+            fill(va, n, 1)
+            fill(vb, n, 2)
+            when which == 0 {
+                when bits(simd::sum_f32(va, n)) != bits(reference(va, va, n, false)) {
+                    bad += 1
+                }
+            } else when which == 1 {
+                when bits(simd::dot_f32(va, vb, n)) != bits(reference(va, vb, n, true)) {
+                    bad += 1
+                }
+            } else when which == 2 {
+                simd::add_f32(vd, va, vb, n)
+                mut i: u64 = 0
+                while i < n {
+                    when bits(at(vd, i)) != bits(at(va, i) + at(vb, i)) {
+                        bad += 1
+                    }
+                    i += 1
+                }
+            } else {
+                mut i: u64 = 0
+                while i < n {
+                    store(vd, i, at(va, i))
+                    i += 1
+                }
+                simd::add_f32(vd, vd, vb, n)
+                i = 0
+                while i < n {
+                    when bits(at(vd, i)) != bits(at(va, i) + at(vb, i)) {
+                        bad += 1
+                    }
+                    i += 1
+                }
+            }
+            free(a as *u8)
+            free(b as *u8)
+            free(d as *u8)
+            off += 1
+        }
+        index += 1
+    }
+    return bad
+}
+
+fun report() {
+    echo mismatches(0)
+    echo mismatches(1)
+    echo mismatches(2)
+    echo mismatches(3)
+}
+
+fun main() {
+    echo cpu::has_avx2()
+    // exact values: the same numbers whatever the order of the additions
+    exact := malloc(4000) as *f32
+    mut i: u64 = 0
+    while i < 1000 {
+        store(exact, i, (i + 1) as f32)
+        i += 1
+    }
+    echo simd::sum_f32(exact, 1000)
+    echo simd::dot_f32(exact, exact, 3)
+    free(exact as *u8)
+    // the AVX2 path, then the SSE2 path (the AVX2 bit cleared in the cell, as the f32x8 tests do)
+    report()
+    cell := __cpu_cell() as *u64
+    bits0 := *cell
+    when cpu::has_avx2() {
+        *cell = bits0 - 128
+    }
+    report()
+    echo cpu::has_avx2()
+}

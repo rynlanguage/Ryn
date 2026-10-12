@@ -1,0 +1,118 @@
+// test: run
+// out: i
+// out: true
+// out: false
+// out: 3
+// out: 11000
+// Fields and elements of vector elements are read where they lie: only the field is cloned, or lent to a builtin that
+// only borrows it. Every consumer of such a read must give the same result as with a copy of the element.
+struct Info {
+    name: String,
+    items: Vec<String>,
+    count: u64,
+}
+
+struct Holder {
+    infos: Vec<Info>,
+}
+
+fun take(s: String) -> u64 {
+    return s.len()
+}
+
+fun takevec(v: Vec<String>) -> u64 {
+    return v.len()
+}
+
+extend Holder {
+    fun a_let(self, id: u64) -> u64 {
+        n := self.infos[id].name
+        return n.len()
+    }
+    fun b_arg(self, id: u64) -> u64 {
+        return take(self.infos[id].name)
+    }
+    fun c_vecarg(self, id: u64) -> u64 {
+        return takevec(self.infos[id].items)
+    }
+    fun d_len(self, id: u64) -> u64 {
+        return self.infos[id].items.len()
+    }
+    fun e_clone(self, id: u64) -> String {
+        return self.infos[id].name.clone()
+    }
+    fun f_ret(self, id: u64) -> String {
+        return self.infos[id].name
+    }
+    fun g_push(self, id: u64) -> u64 {
+        mut out: Vec<String> = Vec()
+        out.push(self.infos[id].name)
+        out.push(self.infos[id].items[0])
+        return out.len()
+    }
+    fun h_struct(self, id: u64) -> u64 {
+        i := Info { name: self.infos[id].name, items: self.infos[id].items, count: 1 }
+        return i.count
+    }
+    fun i_cmp(self, id: u64, other: String) -> bool {
+        return self.infos[id].name == other
+    }
+    fun j_echo(self, id: u64) {
+        echo self.infos[id].name
+    }
+    fun k_assign(self, id: u64) -> u64 {
+        mut s := String("zz")
+        s = self.infos[id].name
+        return s.len()
+    }
+    fun l_for(self, id: u64) -> u64 {
+        mut t: u64 = 0
+        for x in self.infos[id].items {
+            t += x.len()
+        }
+        return t
+    }
+}
+
+
+struct Grid {
+    rows: Vec<Vec<String>>,
+    tags: Vec<String>,
+}
+
+extend Grid {
+    fun same(self, row: u64, column: u64, other: String) -> bool {
+        return self.rows[row][column] == other
+    }
+
+    fun tag_len(self, at: u64) -> u64 {
+        return self.tags[at].len()
+    }
+}
+
+fun main() {
+    mut grid := Grid { rows: Vec(), tags: Vec() }
+    mut row: Vec<String> = Vec()
+    row.push(String("x"))
+    row.push(String("yy"))
+    grid.rows.push(row)
+    grid.tags.push(String("abc"))
+
+    mut h := Holder { infos: Vec() }
+    mut names: Vec<String> = Vec()
+    names.push(String("alpha"))
+    names.push(String("beta"))
+    h.infos.push(Info { name: String("i"), items: names, count: 2 })
+    mut total: u64 = 0
+    mut i: u64 = 0
+    while i < 500 {
+        total += h.a_let(0) + h.b_arg(0) + h.c_vecarg(0) + h.d_len(0) + h.e_clone(0).len() + h.f_ret(0).len() + h.g_push(0) + h.h_struct(0) + h.k_assign(0) + h.l_for(0)
+        when h.i_cmp(0, String("i")) { total += 1 }
+        i += 1
+    }
+    h.j_echo(0)
+    echo grid.same(0, 1, String("yy"))
+    echo grid.same(0, 0, String("yy"))
+    echo grid.tag_len(0)
+    echo total
+}

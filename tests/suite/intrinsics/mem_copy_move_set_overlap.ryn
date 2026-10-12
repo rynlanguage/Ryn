@@ -1,0 +1,49 @@
+// test: run
+// out: 1 2 3 4 5 6 7 8
+// out: 1 2 1 2 3 4 5 6
+// out: 3 4 5 6 7 8 7 8
+// out: 9 9 9 9 7 8 7 8
+// out: 0
+use std::mem
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(p: *u8);
+fun show(block: *u8) {
+    mut line := String()
+    mut at: u64 = 0
+    while at < 8 {
+        p := (block as u64 + at) as *u8
+        value := *p
+        when at > 0 {
+            line.push(' ')
+        }
+        line.append(String(value as u64))
+        at += 1
+    }
+    echo line
+}
+fun main() {
+    a := malloc(8 as u64)
+    b := malloc(8 as u64)
+    mut i: u64 = 0
+    while i < 8 {
+        p := (a as u64 + i) as *u8
+        *p = (i + 1) as u8
+        i += 1
+    }
+    mem::copy(b, a, 8 as u64)
+    show(b)
+    // overlap, destination above the source: must copy backward
+    mem::move_bytes((b as u64 + 2) as *u8, b, 6 as u64)
+    show(b)
+    // overlap, destination below the source: must copy forward
+    mem::copy(b, a, 8 as u64)
+    mem::move_bytes(b, (b as u64 + 2) as *u8, 6 as u64)
+    show(b)
+    mem::set(b, 9 as u8, 4 as u64)
+    show(b)
+    mem::prefetch(b)
+    mem::move_bytes(b, a, 0 as u64)
+    echo 0
+    free(a)
+    free(b)
+}

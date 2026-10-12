@@ -1,0 +1,41 @@
+// test: run
+// out: 4
+// out: 4
+// out: 3
+// out: label
+// out: 6
+// out: 5
+// A structure with a nested structure field, or a String field, keeps the pushed return: its fields are read back as before.
+struct Inner {
+    a: i32,
+    b: i32,
+}
+
+struct Outer {
+    inner: Inner,
+    tag: i32,
+}
+
+struct Labelled {
+    name: String,
+    n: i32,
+}
+
+fun outer(n: i32) -> Outer {
+    return Outer { tag: n + 1, inner: Inner { b: n * 2, a: n } }
+}
+
+fun labelled(n: i32) -> Labelled {
+    return Labelled { n: n * 2, name: String("label") }
+}
+
+fun main() {
+    o := outer(2)
+    echo o.inner.a + 2
+    echo o.inner.b
+    echo o.tag
+    l := labelled(3)
+    echo l.name
+    echo l.n
+    echo o.inner.a + o.tag
+}

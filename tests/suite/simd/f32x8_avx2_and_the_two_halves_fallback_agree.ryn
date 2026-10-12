@@ -1,0 +1,255 @@
+// test: run
+// out: 2
+// out: 6
+// out: 2.25
+// out: 6
+// out: 4
+// out: 0
+// out: -15
+// out: 0.375
+// out: 1
+// out: -10
+// out: 4.25
+// out: 2
+// out: -4
+// out: 200
+// out: 0
+// out: -0.125
+// out: 0.75
+// out: -16
+// out: -3.25
+// out: 8
+// out: 0
+// out: -10000
+// out: 56.25
+// out: 0.03125
+// out: 3
+// out: -0.25
+// out: -3.25
+// out: 2
+// out: 0
+// out: -1
+// out: 1
+// out: 0.5
+// out: 0.5
+// out: -2
+// out: -1
+// out: 2
+// out: 0
+// out: -100
+// out: -7.5
+// out: 0.125
+// out: 1.5
+// out: 8
+// out: 3.25
+// out: 4
+// out: 4
+// out: 100
+// out: -7.5
+// out: 0.25
+// out: 2
+// out: 3
+// out: 4
+// out: 5
+// out: 0
+// out: 1
+// out: 10
+// out: 1.5
+// out: -1.5
+// out: 2
+// out: -3.25
+// out: -4
+// out: 0
+// out: -100
+// out: 7.5
+// out: -0.125
+// out: 1.5
+// out: 2
+// out: 3.25
+// out: 4
+// out: 0
+// out: 100
+// out: 7.5
+// out: 0.125
+// out: 146
+// out: 210
+// out: 45
+// out: 109
+// out: 64
+// out: 191
+// out: 0.5
+// out: -2
+// out: -1
+// out: 2
+// out: 0
+// out: -100
+// out: -7.5
+// out: 0.125
+// out: 99.375
+// out: 100
+// out: -7.5
+// out: 0.125
+// out: 0.125
+// out: -7.5
+// out: 100
+// out: 0
+// out: 4
+// out: 3.25
+// out: -2
+// out: 1.5
+// out: true
+// out: true
+// out: 2
+// out: 6
+// out: 2.25
+// out: 6
+// out: 4
+// out: 0
+// out: -15
+// out: 0.375
+// out: 1
+// out: -10
+// out: 4.25
+// out: 2
+// out: -4
+// out: 200
+// out: 0
+// out: -0.125
+// out: 0.75
+// out: -16
+// out: -3.25
+// out: 8
+// out: 0
+// out: -10000
+// out: 56.25
+// out: 0.03125
+// out: 3
+// out: -0.25
+// out: -3.25
+// out: 2
+// out: 0
+// out: -1
+// out: 1
+// out: 0.5
+// out: 0.5
+// out: -2
+// out: -1
+// out: 2
+// out: 0
+// out: -100
+// out: -7.5
+// out: 0.125
+// out: 1.5
+// out: 8
+// out: 3.25
+// out: 4
+// out: 4
+// out: 100
+// out: -7.5
+// out: 0.25
+// out: 2
+// out: 3
+// out: 4
+// out: 5
+// out: 0
+// out: 1
+// out: 10
+// out: 1.5
+// out: -1.5
+// out: 2
+// out: -3.25
+// out: -4
+// out: 0
+// out: -100
+// out: 7.5
+// out: -0.125
+// out: 1.5
+// out: 2
+// out: 3.25
+// out: 4
+// out: 0
+// out: 100
+// out: 7.5
+// out: 0.125
+// out: 146
+// out: 210
+// out: 45
+// out: 109
+// out: 64
+// out: 191
+// out: 0.5
+// out: -2
+// out: -1
+// out: 2
+// out: 0
+// out: -100
+// out: -7.5
+// out: 0.125
+// out: 99.375
+// out: 100
+// out: -7.5
+// out: 0.125
+// out: 0.125
+// out: -7.5
+// out: 100
+// out: 0
+// out: 4
+// out: 3.25
+// out: -2
+// out: 1.5
+// out: true
+// out: true
+// out: false
+use std::simd
+use std::cpu
+fun show(v: simd::F32x8) {
+    echo v.get(0)
+    echo v.get(1)
+    echo v.get(2)
+    echo v.get(3)
+    echo v.get(4)
+    echo v.get(5)
+    echo v.get(6)
+    echo v.get(7)
+}
+fun put(cell: *u64, value: u64) {
+    *cell = value
+}
+fun pass() {
+    a := simd::F32x8::splat(0.0).with(0, 1.5).with(1, -2.0).with(2, 3.25).with(3, 4.0).with(4, 0.0).with(5, 100.0).with(6, -7.5).with(7, 0.125)
+    b := simd::F32x8::splat(0.0).with(0, 0.5).with(1, 8.0).with(2, -1.0).with(3, 2.0).with(4, 4.0).with(5, -100.0).with(6, -7.5).with(7, 0.25)
+    r := simd::F32x8::splat(0.0).with(0, 4.0).with(1, 9.0).with(2, 16.0).with(3, 25.0).with(4, 0.0).with(5, 1.0).with(6, 100.0).with(7, 2.25)
+    show(a.add(b))
+    show(a.sub(b))
+    show(a.mul(b))
+    show(a.div(b))
+    show(a.min(b))
+    show(a.max(b))
+    show(r.sqrt())
+    show(a.neg())
+    show(a.abs())
+    echo a.lt(b).movemask()
+    echo a.le(b).movemask()
+    echo a.gt(b).movemask()
+    echo a.ge(b).movemask()
+    echo a.eq(b).movemask()
+    echo a.ne(b).movemask()
+    show(a.lt(b).select(a, b))
+    echo a.sum()
+    echo a.reduce_max()
+    echo a.reduce_min()
+    echo a.get(7)
+    show(a.reverse())
+    echo a.lt(b).any()
+    echo a.eq(a).all()
+}
+fun main() {
+    pass()
+    cell := __cpu_cell() as *u64
+    bits := *cell
+    when cpu::has_avx2() {
+        put(cell, bits - 128)
+    }
+    pass()
+    echo cpu::has_avx2()
+}

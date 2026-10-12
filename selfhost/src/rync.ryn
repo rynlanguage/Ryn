@@ -35,6 +35,7 @@ use driver::manifest
 use std::fs
 use std::env
 use std::system
+use std::time
 
 extern "C" fun putchar(value: i32) -> i32;
 extern "C" fun getpid() -> i32;
@@ -606,8 +607,33 @@ fun rync_assign_modules(compilation: Compilation, parsed: ast::Program) -> Resul
     return Result::Ok(program)
 }
 
+// With `RYN_TIMINGS` set, `rync` writes the time of each phase to standard error: the seconds since `since`, measured now.
+fun rync_tick(label: str, since: f64) -> f64 {
+    now := time::monotonic()
+    when !env::get("RYN_TIMINGS").is_empty() {
+        milliseconds := ((now - since) * 1000000.0) as u64
+        mut line := String("timing ")
+        line.append(label)
+        line.append(": ")
+        line.append((milliseconds / 1000).to_string())
+        line.append(".")
+        fraction := milliseconds % 1000
+        when fraction < 100 {
+            line.append("0")
+        }
+        when fraction < 10 {
+            line.append("0")
+        }
+        line.append(fraction.to_string())
+        line.append(" ms")
+        eprint("{}", line)
+    }
+    return now
+}
+
 // The program from its entry file through the typed IR. `recovering` reports every syntax error of a file without modules.
 fun rync_frontend(loader: Loader, recovering: bool) -> Result<Compiled, Failure> {
+    mut clock := time::monotonic()
     units := loader.units
     single := units.len() == 1 && units[0].import_paths.is_empty()
     mut compilation := Compilation { units: units.clone(), segments: Vec(), single: true, joined: String("") }
@@ -617,7 +643,9 @@ fun rync_frontend(loader: Loader, recovering: bool) -> Result<Compiled, Failure>
         text = compilation.joined.clone()
     }
     // A program of modules is parsed recovering, as each of its files was; a single file only when it is being checked.
+    clock = rync_tick("join", clock)
     parsed_text := parser::parse(text, recovering || !single)
+    clock = rync_tick("parse", clock)
     parsed := rync_after_ok(parsed_text.clone())
     when parsed.is_none() {
         return Result::Err(Failure { text: compilation.render_frontend(parsed_text), status: 1 })
@@ -630,11 +658,14 @@ fun rync_frontend(loader: Loader, recovering: bool) -> Result<Compiled, Failure>
     when !single {
         program = rync_assign_modules(compilation.clone(), program)?
     }
+    clock = rync_tick("decode", clock)
     rewritten := desugar::rewrite_operators(program)
+    clock = rync_tick("rewrite operators", clock)
     when rewritten.is_err() {
         return Result::Err(compilation.stage_failure(rewritten.unwrap_err()))
     }
     specialized_text := generics::specialize(ast::encode_program(rewritten.unwrap()))
+    clock = rync_tick("specialize generics", clock)
     specialized := rync_after_ok(specialized_text.clone())
     when specialized.is_none() {
         return Result::Err(Failure { text: compilation.render_frontend(specialized_text), status: 1 })
@@ -643,15 +674,19 @@ fun rync_frontend(loader: Loader, recovering: bool) -> Result<Compiled, Failure>
     when specialized_program.is_err() {
         return Result::Err(Failure { text: report::plain("R0903", String("the specialized syntax tree cannot be read")), status: 1 })
     }
+    clock = rync_tick("decode specialized", clock)
     evaluated := comptime::evaluate_program(specialized_program.unwrap())
+    clock = rync_tick("comptime", clock)
     when evaluated.is_err() {
         return Result::Err(compilation.stage_failure(evaluated.unwrap_err()))
     }
     desugared := desugar::desugar_program(evaluated.unwrap())
+    clock = rync_tick("desugar patterns", clock)
     when desugared.is_err() {
         return Result::Err(compilation.stage_failure(desugared.unwrap_err()))
     }
-    lowered := lower::lower_recovering(desugared.unwrap())
+    lowered := lower::lower_recovering_with(desugared.unwrap(), !env::get("RYN_LOWER_ALL").is_empty())
+    clock = rync_tick("lower", clock)
     when lowered.is_err() {
         return Result::Err(compilation.stage_failure(lowered.unwrap_err()))
     }
@@ -752,7 +787,7 @@ fun rync_fail(message: String, code: i32) -> i32 {
 }
 
 fun rync_usage() -> String {
-    return String("usage: rync [build|check] [-o <path>] [--target <linux|windows>] [--stdlib <directory>] [--package <name>=<directory>] <entry.ryn|project-dir>\n       rync --version")
+    return String("usage: rync [build|check] [-o <path>] [--profile-generate <file>] [--profile-use <file>] [--target <linux|windows>] [--stdlib <directory>] [--package <name>=<directory>] <entry.ryn|project-dir>\n       rync asm [--function <name>] [--summary] [--arch x86-64] [--target <linux|windows>] [--stdlib <directory>] <entry.ryn|project-dir>\n       rync --version")
 }
 
 fun main() -> i32 {
@@ -760,6 +795,14 @@ fun main() -> i32 {
     mut entry := String("")
     mut output := String("")
     mut checking := false
+    // `rync asm`: print the assembly of the functions (all, or the one named by `--function`) instead of writing a program.
+    mut listing := false
+    mut only := String("")
+    mut summary := false
+    // `--profile-generate <file>` builds an instrumented program that writes its entry counts there; `--profile-use <file>`
+    // orders the code by such a profile (`build` only).
+    mut profile_out := String("")
+    mut profile_in := String("")
     mut package_names: Vec<String> = Vec()
     mut package_roots: Vec<String> = Vec()
     mut position: u32 = 0
@@ -769,7 +812,7 @@ fun main() -> i32 {
     while position < arg_count() {
         word := String(arg(position))
         when word == "--version" || word == "-V" {
-            echo "rync 0.1.8"
+            echo "rync 0.1.9"
             return 0
         }
         when word == "--help" || word == "-h" {
@@ -777,10 +820,28 @@ fun main() -> i32 {
             echo "{usage}"
             return 0
         }
-        when !seen_command && entry.is_empty() && (word == "build" || word == "check") {
+        when !seen_command && entry.is_empty() && (word == "build" || word == "check" || word == "asm") {
             checking = word == "check"
+            listing = word == "asm"
             seen_command = true
             position += 1
+        } else when listing && word == "--function" && position + 1 < arg_count() {
+            only = String(arg(position + 1))
+            position += 2
+        } else when listing && word == "--summary" {
+            summary = true
+            position += 1
+        } else when listing && word == "--arch" && position + 1 < arg_count() {
+            architecture := String(arg(position + 1))
+            when architecture != "x86-64" && architecture != "x86_64" && architecture != "amd64" {
+                mut message := String("error[R0910]: unsupported architecture `")
+                message.append(architecture)
+                message.append("`: the native compiler has an x86-64 backend only (there is no ARM64 backend, so no NEON code)")
+                return rync_fail(message, 2)
+            }
+            position += 2
+        } else when listing && word.starts_with("-O") {
+            return rync_fail(String("error[R0910]: the native backend has one code generation level, so there is no `-O` option; `ryn asm` shows the code it generates"), 2)
         } else when word == "--target" && position + 1 < arg_count() {
             target := String(arg(position + 1))
             when target == "windows" || target == "x86_64-windows" {
@@ -790,6 +851,12 @@ fun main() -> i32 {
             } else {
                 return rync_fail(rync_usage(), 2)
             }
+            position += 2
+        } else when word == "--profile-generate" && position + 1 < arg_count() {
+            profile_out = String(arg(position + 1))
+            position += 2
+        } else when word == "--profile-use" && position + 1 < arg_count() {
+            profile_in = String(arg(position + 1))
             position += 2
         } else when word == "--stdlib" && position + 1 < arg_count() {
             std_root = String(arg(position + 1))
@@ -816,6 +883,9 @@ fun main() -> i32 {
     }
     when entry.is_empty() {
         return rync_fail(rync_usage(), 2)
+    }
+    when (checking || listing) && (!profile_out.is_empty() || !profile_in.is_empty()) {
+        return rync_fail(String("error[R0914]: --profile-generate and --profile-use apply to `rync build` only"), 2)
     }
     // A project directory: its manifest names the path dependencies, and `src/main.ryn` is the entry file.
     mut source_root := manifest::directory_of(entry.clone())
@@ -898,7 +968,42 @@ fun main() -> i32 {
         }
         return 0
     }
-    linked := gen::generate_for_target(compiled.ir_text, windows)
+    when listing {
+        listed := gen::generate_listing(compiled.ir_text, windows, only.clone(), summary)
+        when listed.is_err() {
+            reason := listed.unwrap_err()
+            when reason == "no function with that name" {
+                mut message := String("error[R0911]: no function named `")
+                message.append(only)
+                message.append("` in the generated code (a name is the function's path, such as `main` or `Counter::add`)")
+                return rync_fail(message, 1)
+            }
+            failure := compilation.stage_failure(reason)
+            return rync_fail(failure.text, failure.status)
+        }
+        text := listed.unwrap()
+        print("{}", text)
+        return 0
+    }
+    mut generation_started := time::monotonic()
+    // The profile is read here, so that a missing file is reported before the program is generated.
+    mut profile_text := String("")
+    when !profile_in.is_empty() {
+        read_profile := read_file_result(profile_in.clone())
+        // A profile that cannot be read costs speed and nothing else: the program is built as without one.
+        when read_profile.is_err() {
+            eprint("warning[R0913]: cannot read the profile {}; the program is built without it", profile_in)
+        } else {
+            profile_text = read_profile.unwrap()
+        }
+    }
+    mut linked: Result<Vec<u8>, String> = Result::Err(String(""))
+    when !profile_out.is_empty() || !profile_text.is_empty() {
+        linked = gen::generate_profiled(compiled.ir_text.clone(), windows, profile_out.clone(), profile_text)
+    } else {
+        linked = gen::generate_for_target(compiled.ir_text.clone(), windows)
+    }
+    generation_started = rync_tick("decode IR, generate code and link", generation_started)
     when linked.is_err() {
         failure := compilation.stage_failure(linked.unwrap_err())
         return rync_fail(failure.text, failure.status)

@@ -629,7 +629,26 @@ fun ct_has_name(names: Vec<String>, name: String) -> bool {
 }
 
 fun ct_is_metadata(name: String) -> bool {
-    return name == "field_count" || name == "variant_count" || name == "type_name" || name == "has_field"
+    return name == "field_count" || name == "variant_count" || name == "type_name" || name == "has_field" || name == "size_of" || name == "align_of" || name == "offset_of"
+}
+
+// The number after `=` in a layout entry of a structure's derives (`$packed=4`, `$align=16`), or 0 when there is none.
+fun ct_layout_option(derives: Vec<String>, prefix: String) -> u64 {
+    for entry in derives {
+        when entry.starts_with(prefix.clone()) {
+            mut value: u64 = 0
+            mut at: u64 = prefix.len()
+            while at < entry.len() {
+                byte := entry.byte_at(at)
+                when byte >= 48 && byte <= 57 {
+                    value = value * 10 + (byte - 48) as u64
+                }
+                at += 1
+            }
+            return value
+        }
+    }
+    return 0
 }
 
 // Runs the compile-time pass on a specialized program: derived defaults, then constants, assertions and folding.
@@ -1844,6 +1863,42 @@ extend Comptime {
         when name == "type_name" {
             return Result::Ok(self.text_val(5, self.type_label(ty)))
         }
+        when name == "size_of" || name == "align_of" {
+            sizes := self.layout(ty)
+            when sizes.is_empty() {
+                mut message := String("`")
+                message.append(name.clone())
+                message.append("` needs a type whose layout is known at compile time")
+                return Result::Err(ct_error("R0465", message, span))
+            }
+            mut chosen := sizes[0]
+            when name == "align_of" {
+                chosen = sizes[1]
+            }
+            return Result::Ok(self.int_val(w_of_u64(chosen), 8))
+        }
+        when name == "offset_of" {
+            when structure.is_none() {
+                return Result::Err(ct_error("R0465", String("`offset_of` needs a structure type"), span))
+            }
+            mut field_text: Option<String> = Option::None
+            when arguments.len() == 1 {
+                field_text = self.string_literal(arguments[0])
+            }
+            when field_text.is_none() {
+                return Result::Err(ct_error("R0465", String("`offset_of` takes the field name as a string literal"), span))
+            }
+            offset := self.field_offset(wanted.clone(), field_text.unwrap())
+            when offset.is_none() {
+                mut message := String("structure `")
+                message.append(wanted.clone())
+                message.append("` has no field `")
+                message.append(field_text.unwrap())
+                message.append("` with a layout known at compile time")
+                return Result::Err(ct_error("R0465", message, span))
+            }
+            return Result::Ok(self.int_val(w_of_u64(offset.unwrap()), 8))
+        }
         when name == "field_count" {
             when structure.is_none() {
                 return Result::Err(ct_error("R0465", String("`field_count` needs a structure type"), span))
@@ -1924,24 +1979,63 @@ extend Comptime {
         return ct_pair(inner[0] * length, inner[1])
     }
 
+    // The layout of a structure: the fields follow each other, each at a multiple of its alignment (at most the packing of a
+    // `#[repr(C, packed)]` structure), and the whole is padded to its alignment (at least the `align(N)` of its `repr`).
     fun struct_layout(self, name: String) -> Vec<u64> {
         found := self.struct_named(name)
         when found.is_none() {
             return Vec()
         }
+        definition := self.program.struct_defs[found.unwrap()]
+        pack := ct_layout_option(definition.derives.clone(), String("$packed="))
         mut offset: u64 = 0
         mut align_max: u64 = 1
-        for field in self.program.struct_defs[found.unwrap()].fields.clone() {
+        for field in definition.fields.clone() {
             inner := self.layout(self.program.struct_fields[field].ty)
             when inner.is_empty() {
                 return inner
             }
-            offset = (offset + inner[1] - 1) / inner[1] * inner[1] + inner[0]
-            when inner[1] > align_max {
-                align_max = inner[1]
+            mut a := inner[1]
+            when pack != 0 && a > pack {
+                a = pack
+            }
+            offset = (offset + a - 1) / a * a + inner[0]
+            when a > align_max {
+                align_max = a
             }
         }
+        minimum := ct_layout_option(definition.derives.clone(), String("$align="))
+        when minimum > align_max {
+            align_max = minimum
+        }
         return ct_pair((offset + align_max - 1) / align_max * align_max, align_max)
+    }
+
+    // The byte offset of the field called `wanted` in structure `name` (the layout rules of `struct_layout`), or nothing.
+    fun field_offset(self, name: String, wanted: String) -> Option<u64> {
+        found := self.struct_named(name)
+        when found.is_none() {
+            return Option::None
+        }
+        definition := self.program.struct_defs[found.unwrap()]
+        pack := ct_layout_option(definition.derives.clone(), String("$packed="))
+        mut offset: u64 = 0
+        for field in definition.fields.clone() {
+            inner := self.layout(self.program.struct_fields[field].ty)
+            when inner.is_empty() {
+                return Option::None
+            }
+            mut a := inner[1]
+            when pack != 0 && a > pack {
+                a = pack
+            }
+            offset = (offset + a - 1) / a * a
+            when self.program.struct_fields[field].name == wanted {
+                return Option::Some(offset)
+            }
+            offset += inner[0]
+        }
+        return Option::None
     }
 
     // The readable name of a type, as `type_name` gives it.

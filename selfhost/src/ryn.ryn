@@ -5,7 +5,7 @@
 //     ryn check <file.ryn|project-dir>
 //     ryn build <file.ryn|project-dir> [--release] [-o|--output <path>]
 //     ryn run <file.ryn|project-dir> [--release] [-o|--output <path>] [-- <program-args...>]
-//     ryn bench <file.ryn|project-dir> [--iterations N] [--warmup N] [--compile-runs N] [--json]
+//     ryn update\n  ryn asm <file.ryn|project-dir> [--function NAME] [--summary] [--compare A B] [--arch x86-64] [--target linux|windows]\n  ryn bench <file.ryn|project-dir> [--iterations N] [--warmup N] [--compile-runs N] [--json]
 //               [--baseline <file>] [--save-baseline <file>] [--threshold PERCENT] [-- <program-args...>]
 //     ryn clean <project-dir>
 //
@@ -28,7 +28,7 @@ fun ryn_usage() -> String {
 fun ryn_help() -> String {
     mut text := String("Ryn — Reliable. Fast. Native.\n\n")
     text.append(ryn_usage())
-    text.append("\n\nCommands:\n  new <path>        Create a project with a native Hello World example\n  check <source>    Check a .ryn file or project directory\n  build <source>    Compile a .ryn file or project directory\n  run <source>      Compile and run a .ryn file or project directory\n  bench <source>    Compile, then time the program: warmup, median, baseline comparison, JSON\n  lock <project>     Resolve and write ryn.lock for supported dependencies\n  login <token>     Save a pods registry token for publishing\n  publish [project] Check, pack and upload the project to the pods registry\n  clean <project>   Remove the project's build directory\n\nA project directory uses src/main.ryn as its entry point.\nProject outputs go under build/debug or build/release; build/cache is reserved for compiler caches.\nAn i32 result from main becomes the process exit code for run.\nPass program arguments to run after --.\nclean removes only the direct build directory and refuses symbolic links.\n\nBench options:\n  --iterations N       Timed runs of the program (default 10)\n  --warmup N           Runs before timing starts, not counted (default 2)\n  --compile-runs N     Times the compiler is timed (default 1)\n  --json               Print the report as JSON only\n  --baseline <file>    Compare medians with a saved report; exit 1 on a regression\n  --save-baseline <f>  Write the report as JSON to a file\n  --threshold PERCENT  Slowdown that counts as a regression (default 10)\n  A project directory with a benches/ directory times every .ryn file in it.\n\nOptions:\n  --release            Use the project's release output directory\n  -o, --output <path>  Set the executable path for build or run\n  -h, --help           Show this help\n  -V, --version        Show compiler version\n")
+    text.append("\n\nCommands:\n  new <path>        Create a project with a native Hello World example\n  check <source>    Check a .ryn file or project directory\n  build <source>    Compile a .ryn file or project directory\n  run <source>      Compile and run a .ryn file or project directory\n  update            Install the latest release over this one (runs the installer of the repository; RYN_REPOSITORY and RYN_INSTALL_DIR are honoured)\n  asm <source>      Show the assembly the native backend generates (one function, a summary, or a comparison of two)\n  bench <source>    Compile, then time the program: warmup, median, baseline comparison, JSON\n  lock <project>     Resolve and write ryn.lock for supported dependencies\n  login <token>     Save a pods registry token for publishing\n  publish [project] Check, pack and upload the project to the pods registry\n  clean <project>   Remove the project's build directory\n\nA project directory uses src/main.ryn as its entry point.\nProject outputs go under build/debug or build/release; build/cache is reserved for compiler caches.\nAn i32 result from main becomes the process exit code for run.\nPass program arguments to run after --.\nclean removes only the direct build directory and refuses symbolic links.\n\nAsm options:\n  --function NAME      Only the function called NAME (`main`, `Counter::add`)\n  --summary            One line per function: instructions and bytes\n  --compare A B        Instruction and byte counts of functions A and B, then both listings (scalar against SIMD)\n  --arch ARCH          x86-64 (the only backend; ARM64 is not implemented)\n  --target T           linux or windows\n  The backend has a single code generation level, so there is no -O option.\n\nBench options:\n  --iterations N       Timed runs of the program (default 10)\n  --warmup N           Runs before timing starts, not counted (default 2)\n  --compile-runs N     Times the compiler is timed (default 1)\n  --json               Print the report as JSON only\n  --baseline <file>    Compare medians with a saved report; exit 1 on a regression\n  --save-baseline <f>  Write the report as JSON to a file\n  --threshold PERCENT  Slowdown that counts as a regression (default 10)\n  A project directory with a benches/ directory times every .ryn file in it.\n\nOptions:\n  --release            Use the project's release output directory\n  -o, --output <path>  Set the executable path for build or run\n  -h, --help           Show this help\n  -V, --version        Show compiler version\n")
     return text
 }
 
@@ -241,6 +241,141 @@ fun ryn_compiler(command: str, input: String, output: String, packages: Vec<Stri
         return ryn_fail(message)
     }
     return run_process_args(compiler, ryn_compiler_arguments(command, input, output, packages))
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// ryn update
+
+// Installs the latest release with the installer of the repository, the same script a first install uses: it reads the latest
+// GitHub release, checks the archive's SHA-256 and replaces the installed files. Nothing is downloaded until this command runs.
+fun ryn_update() -> i32 {
+    repository := env_or("RYN_REPOSITORY", "rynlanguage/Ryn")
+    mut base := String("https://raw.githubusercontent.com/")
+    base.append(repository)
+    base.append("/main/")
+    mut arguments: Vec<String> = Vec()
+    mut program := String("sh")
+    when os() == "windows" {
+        program = String("powershell")
+        arguments.push(String("-NoProfile"))
+        arguments.push(String("-Command"))
+        mut script := String("irm ")
+        script.append(base.clone())
+        script.append("install.ps1 | iex")
+        arguments.push(script)
+    } else {
+        arguments.push(String("-c"))
+        mut script := String("curl -fsSL ")
+        script.append(base.clone())
+        script.append("install.sh | bash")
+        arguments.push(script)
+    }
+    echo "Updating Ryn from {repository} ..."
+    status := run_process_args(program, arguments)
+    when status != 0 {
+        return ryn_fail(String("error[R0912]: the update failed; run the installer by hand (see the README)"))
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// ryn asm
+
+// The text of `rync asm` for one function (or all), captured.
+fun ryn_asm_capture(input: String, packages: Vec<String>, extra: Vec<String>) -> process::ProcessResult {
+    arguments := ryn_compiler_arguments("asm", input, String(""), packages)
+    mut full: Vec<String> = Vec()
+    full.push(arguments[0].clone())
+    for word in extra {
+        full.push(word)
+    }
+    mut at: u64 = 1
+    while at < arguments.len() {
+        full.push(arguments[at].clone())
+        at += 1
+    }
+    return process::run_capture_args(ryn_compiler_path(), full)
+}
+
+fun ryn_asm() -> i32 {
+    mut input := String("")
+    mut extra: Vec<String> = Vec()
+    mut first := String("")
+    mut second := String("")
+    mut position: u32 = 1
+    while position < arg_count() {
+        word := String(arg(position))
+        when (word == "--function" || word == "--arch" || word == "--target") && position + 1 < arg_count() {
+            extra.push(word)
+            extra.push(String(arg(position + 1)))
+            position += 2
+        } else when word == "--summary" {
+            extra.push(word)
+            position += 1
+        } else when word == "--compare" && position + 2 < arg_count() {
+            first = String(arg(position + 1))
+            second = String(arg(position + 2))
+            position += 3
+        } else when word.starts_with("-O") {
+            extra.push(word)
+            position += 1
+        } else when input.is_empty() && !word.starts_with("-") {
+            input = word
+            position += 1
+        } else {
+            return ryn_fail(ryn_usage())
+        }
+    }
+    when input.is_empty() {
+        return ryn_fail(ryn_usage())
+    }
+    compiler := ryn_compiler_path()
+    when !fs::exists(compiler.clone()) {
+        mut message := String("error[R0301]: the compiler is not installed at ")
+        message.append(compiler)
+        return ryn_fail(message)
+    }
+    packages := ryn_dependencies(input.clone())
+    when packages.len() == 1 {
+        return 1
+    }
+    when first.is_empty() {
+        shown := ryn_asm_capture(input, packages, extra)
+        when shown.exit_code != 0 {
+            eprint("{}", shown.stderr)
+            return shown.exit_code
+        }
+        print("{}", shown.stdout)
+        return 0
+    }
+    // --compare A B: the sizes of both, then both listings.
+    mut summary_first := extra.clone()
+    summary_first.push(String("--function"))
+    summary_first.push(first.clone())
+    mut summary_second := extra.clone()
+    summary_second.push(String("--function"))
+    summary_second.push(second.clone())
+    mut summary_first_only := summary_first.clone()
+    summary_first_only.push(String("--summary"))
+    mut summary_second_only := summary_second.clone()
+    summary_second_only.push(String("--summary"))
+    sizes_first := ryn_asm_capture(input.clone(), packages.clone(), summary_first_only)
+    when sizes_first.exit_code != 0 {
+        eprint("{}", sizes_first.stderr)
+        return sizes_first.exit_code
+    }
+    sizes_second := ryn_asm_capture(input.clone(), packages.clone(), summary_second_only)
+    when sizes_second.exit_code != 0 {
+        eprint("{}", sizes_second.stderr)
+        return sizes_second.exit_code
+    }
+    print("{}", sizes_first.stdout)
+    print("{}", sizes_second.stdout)
+    listing_first := ryn_asm_capture(input.clone(), packages.clone(), summary_first)
+    listing_second := ryn_asm_capture(input, packages, summary_second)
+    print("\n{}", listing_first.stdout)
+    print("\n{}", listing_second.stdout)
+    return 0
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -536,7 +671,7 @@ fun ryn_bench() -> i32 {
     when failed {
         return 1
     }
-    json_text := bench::bench_json_report(String("0.1.8"), entries)
+    json_text := bench::bench_json_report(String("0.1.9"), entries)
     when !save_path.is_empty() {
         parent := manifest::directory_of(save_path.clone())
         when !parent.is_empty() {
@@ -577,7 +712,7 @@ fun main() -> i32 {
         return 0
     }
     when command == "-V" || command == "--version" || command == "version" {
-        echo "ryn 0.1.8"
+        echo "ryn 0.1.9"
         return 0
     }
     when command == "bench" {
@@ -641,6 +776,12 @@ fun main() -> i32 {
         url := published.unwrap()
         echo "published {url}"
         return 0
+    }
+    when command == "update" {
+        return ryn_update()
+    }
+    when command == "asm" {
+        return ryn_asm()
     }
     when command != "check" && command != "build" && command != "run" {
         return ryn_fail(ryn_usage())

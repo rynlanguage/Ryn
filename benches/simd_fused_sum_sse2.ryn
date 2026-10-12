@@ -1,0 +1,29 @@
+// simd_fused_sum.ryn with the AVX2 bit cleared in the CPU cell first, so that std::simd::sum_f32 runs its SSE2 form: the same
+// loop structure and the same bits, for timing the SSE2 path on its own.
+use std::simd
+use std::cpu
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(block: *u8);
+fun main() {
+    cell := __cpu_cell() as *u64
+    bits := *cell
+    when cpu::has_avx2() {
+        *cell = bits - 128
+    }
+    count: u64 = 1048576
+    data := malloc(count * 4 as u64) as *f32
+    mut at: u64 = 0
+    while at < count {
+        slot := (data as u64 + at * 4 as u64) as *f32
+        *slot = ((at % 7 as u64) as f32) * 0.5
+        at += 1
+    }
+    mut total: f32 = 0.0
+    mut pass: u64 = 0
+    while pass < 64 {
+        total = total + simd::sum_f32(data, count)
+        pass += 1
+    }
+    echo total
+    free(data as *u8)
+}

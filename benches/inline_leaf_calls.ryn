@@ -1,0 +1,36 @@
+// Calls of small leaf functions in a hot loop: a scalar wrapper, a getter through a reference, a float helper and a
+// `std::math` wrapper. Each result goes into a running total, so the calls cannot be skipped. The leaves are inlined by
+// the native backend, so the loop pays for their arithmetic and not for a frame and a call per use.
+use std::math
+
+pub struct Counter { pub value: i64, pub step: i64 }
+
+fun square(x: i64) -> i64 {
+    return x * x
+}
+
+fun scaled(counter: &Counter) -> i64 {
+    return counter.value * counter.step
+}
+
+fun half(x: f64) -> f64 {
+    return x * 0.5
+}
+
+fun root(x: f64) -> f64 {
+    return math::sqrt(x)
+}
+
+fun main() {
+    counter := Counter { value: 3, step: 2 }
+    mut total: i64 = 0
+    mut float_total: f64 = 0.0
+    mut i: i64 = 0
+    while i < 20000000 {
+        total = total + square(i % 1000) + scaled(&counter)
+        float_total = float_total + root(half(i as f64))
+        i += 1
+    }
+    echo total
+    echo float_total
+}

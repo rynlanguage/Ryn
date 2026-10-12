@@ -1,0 +1,137 @@
+// test: run
+// out: true
+// out: false
+// out: true
+// out: true
+// out: true
+// out: true
+// out: true
+// out: true
+// out: false
+// out: true
+// out: true
+// out: false
+// out: true
+// out: true
+// out: false
+// out: false
+// out: true
+// out: true
+// out: false
+// out: true
+// out: false
+// out: true
+// out: false
+// out: false
+// out: true
+// out: true
+// out: false
+// out: true
+// out: true
+// out: true
+// out: true
+// out: true
+// out: true
+// out: true
+// out: true
+// out: false
+// out: true
+// out: false
+// out: false
+fun lt_i32(a: i32, b: i32) -> bool {
+    return a < b
+}
+
+fun lt_u32(a: u32, b: u32) -> bool {
+    return a < b
+}
+
+fun gt_u32(a: u32, b: u32) -> bool {
+    return a > b
+}
+
+fun lt_i8(a: i8, b: i8) -> bool {
+    return a < b
+}
+
+fun gt_u8(a: u8, b: u8) -> bool {
+    return a > b
+}
+
+fun ge_u8(a: u8, b: u8) -> bool {
+    return a >= b
+}
+
+fun le_u8(a: u8, b: u8) -> bool {
+    return a <= b
+}
+
+fun lt_i64(a: i64, b: i64) -> bool {
+    return a < b
+}
+
+fun gt_u64(a: u64, b: u64) -> bool {
+    return a > b
+}
+
+fun eq_i16(a: i16, b: i16) -> bool {
+    return a == b
+}
+
+fun and_bool(a: bool, b: bool) -> bool {
+    return a && b
+}
+
+fun or_bool(a: bool, b: bool) -> bool {
+    return a || b
+}
+
+fun not_bool(a: bool) -> bool {
+    return !a
+}
+
+fun guard(a: bool, b: i32) -> bool {
+    return a && (b / 0 == 0)
+}
+
+fun main() {
+    echo (0 as i32 - 1) < 0
+    echo (0 as u32 - 1 as u32) < 1 as u32
+    echo (0 as u32 - 1 as u32) > 1 as u32
+    echo (0 as i8 - 1 as i8) < 1 as i8
+    echo ((0 as i8 - 1 as i8) as u8) > 1 as u8
+    echo (0 as i64 - 9223372036854775807 as i64 - 1 as i64) < 0 as i64
+    echo (0 as u64 - 1 as u64) > 9223372036854775807 as u64
+    echo 255 as u8 >= 255 as u8
+    echo 254 as u8 >= 255 as u8
+    echo 254 as u8 <= 255 as u8
+    echo 1 as i16 == 1 as i16
+    echo 1 as i16 != 1 as i16
+    echo 'a' < 'b'
+    echo 'a' == 'a'
+    echo 'z' <= 'a'
+    echo true == false
+    echo true != false
+    echo (1 < 2) == true
+    echo true && false
+    echo true || false
+    echo false || (1 > 2)
+    echo !(1 > 2)
+    echo !true
+    echo false && (7 / 0 == 0)
+    echo true || (7 / 0 == 0)
+    echo lt_i32(0 as i32 - 1, 0)
+    echo lt_u32(0 as u32 - 1 as u32, 1 as u32)
+    echo gt_u32(0 as u32 - 1 as u32, 1 as u32)
+    echo lt_i8(0 as i8 - 1 as i8, 1 as i8)
+    echo gt_u8(0 as u8 - 1 as u8, 200 as u8)
+    echo ge_u8(255 as u8, 255 as u8)
+    echo le_u8(254 as u8, 255 as u8)
+    echo lt_i64(0 as i64 - 9223372036854775807 as i64 - 1 as i64, 0 as i64)
+    echo gt_u64(0 as u64 - 1 as u64, 9223372036854775807 as u64)
+    echo eq_i16(1 as i16, 1 as i16)
+    echo and_bool(false, true)
+    echo or_bool(true, false)
+    echo not_bool(true)
+    echo guard(false, 7)
+}

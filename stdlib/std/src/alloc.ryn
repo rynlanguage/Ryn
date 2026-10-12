@@ -1,0 +1,235 @@
+// Allocators with an explicit strategy. Nothing here is hidden or global: every allocator owns one block that it obtained
+// from the system when it was made, hands out pieces of it, and returns the block when it goes out of scope (RAII, no
+// garbage collector). Allocation never aborts: a request that does not fit gives a null pointer.
+//
+//   `std::arena::Arena`  bump allocation, everything is reclaimed together (`reset`)
+//   `Stack`              bump allocation with LIFO release: take a `mark`, allocate, `rewind` to the mark
+//   `Pool`               fixed-size blocks, freed one at a time in any order; double and foreign frees are detected
+//
+// An allocator stores plain data. It does not run destructors of what lives in it: move owning values (String, Vec,
+// custom-drop structures) out before the memory is reclaimed. Pointers into an allocator dangle after it is reset,
+// rewound past them, or dropped; Ryn Guard does not track raw pointers.
+//
+// The allocator contract, used by `Stack`, `Pool`, `std::arena::Arena` and by allocators written in a program:
+// `fun alloc_bytes(mut self, size: u64, align: u64) -> *u8` returns `size` bytes aligned to `align` (a power of two), or
+// null. A program that wants one function for every allocator declares that as a `shape` of its own (a shape bound cannot
+// yet be written with a module path, so the standard library does not declare it).
+
+
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun calloc(count: u64, size: u64) -> *u8;
+extern "C" fun free(block: *u8);
+
+// Writes `value` into `block`, a result of some allocator's `alloc_bytes(sizeof(T), alignof(T))`; null stays null.
+pub fun place<T>(block: *u8, value: T) -> *T {
+    typed := block as *T
+    when !pointer_is_null(block) {
+        *typed = value
+    }
+    return typed
+}
+
+fun is_power_of_two(value: u64) -> bool {
+    return value != 0 && (value & (value - 1)) == 0
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Stack allocator
+
+#[drop(release_stack)]
+pub struct Stack {
+    pub base: *u8,
+    capacity: u64,
+    top: u64,
+}
+
+fun release_stack(stack: Stack) {
+    when !pointer_is_null(stack.base) {
+        free(stack.base)
+    }
+}
+
+extend Stack {
+    pub fun with_capacity(bytes: u64) -> Stack {
+        return Stack { base: malloc(bytes), capacity: bytes, top: 0 as u64 }
+    }
+
+    pub fun capacity(self) -> u64 {
+        return self.capacity
+    }
+
+    pub fun used(self) -> u64 {
+        return self.top
+    }
+
+    pub fun alloc_bytes(mut self, size: u64, align: u64) -> *u8 {
+        when pointer_is_null(self.base) || !is_power_of_two(align) {
+            return 0 as *u8
+        }
+        start := self.base as u64
+        padding := (align - ((start + self.top) & (align - 1))) & (align - 1)
+        remaining := self.capacity - self.top
+        when padding > remaining || size > remaining - padding {
+            return 0 as *u8
+        }
+        aligned := start + self.top + padding
+        self.top = self.top + padding + size
+        return aligned as *u8
+    }
+
+    // The position to give back to `rewind`.
+    pub fun mark(self) -> u64 {
+        return self.top
+    }
+
+    // Releases everything allocated after `mark`. A mark that is above the current top (already released) is refused.
+    pub fun rewind(mut self, mark: u64) -> bool {
+        when mark > self.top {
+            return false
+        }
+        self.top = mark
+        return true
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Pool allocator
+
+#[drop(release_pool)]
+pub struct Pool {
+    pub base: *u8,
+    flags: *u8,
+    block_size: u64,
+    capacity: u64,
+    first_free: u64,
+    live: u64,
+}
+
+fun release_pool(pool: Pool) {
+    when !pointer_is_null(pool.base) {
+        free(pool.base)
+    }
+    when !pointer_is_null(pool.flags) {
+        free(pool.flags)
+    }
+}
+
+fun poke(address: u64, value: u64) {
+    p := address as *u64
+    *p = value
+}
+
+fun peek(address: u64) -> u64 {
+    p := address as *u64
+    return *p
+}
+
+fun poke_byte(address: u64, value: u8) {
+    p := address as *u8
+    *p = value
+}
+
+fun peek_byte(address: u64) -> u8 {
+    p := address as *u8
+    return *p
+}
+
+extend Pool {
+    // `count` blocks of `block_size` bytes each (rounded up to a multiple of 16, at least 16), 16-byte aligned. The free
+    // list lives in the free blocks, so it costs nothing extra. A pool that could not get its memory has capacity 0.
+    pub fun new(block_size: u64, count: u64) -> Pool {
+        mut size: u64 = block_size
+        when size < 16 {
+            size = 16
+        }
+        size = ((size + 15) / 16) * 16
+        empty := Pool { base: 0 as *u8, flags: 0 as *u8, block_size: size, capacity: 0 as u64, first_free: 0 as u64, live: 0 as u64 }
+        when count == 0 || count > 18446744073709551615 / size {
+            return empty
+        }
+        base := malloc(size * count)
+        flags := calloc(count, 1 as u64)
+        when pointer_is_null(base) || pointer_is_null(flags) {
+            when !pointer_is_null(base) {
+                free(base)
+            }
+            when !pointer_is_null(flags) {
+                free(flags)
+            }
+            return empty
+        }
+        mut index: u64 = 0
+        while index < count {
+            mut next: u64 = 0
+            when index + 1 < count {
+                next = index + 2
+            }
+            poke(base as u64 + index * size, next)
+            index += 1
+        }
+        return Pool { base: base, flags: flags, block_size: size, capacity: count, first_free: 1 as u64, live: 0 as u64 }
+    }
+
+    pub fun block_size(self) -> u64 {
+        return self.block_size
+    }
+
+    pub fun capacity(self) -> u64 {
+        return self.capacity
+    }
+
+    pub fun live(self) -> u64 {
+        return self.live
+    }
+
+    pub fun available(self) -> u64 {
+        return self.capacity - self.live
+    }
+
+    // One free block, or null when the pool is exhausted.
+    pub fun alloc(mut self) -> *u8 {
+        when self.first_free == 0 {
+            return 0 as *u8
+        }
+        index := self.first_free - 1
+        address := self.base as u64 + index * self.block_size
+        self.first_free = peek(address)
+        poke_byte(self.flags as u64 + index, 1 as u8)
+        self.live += 1
+        return address as *u8
+    }
+
+    // The same through the `Allocator` shape: a block serves any request that fits in it.
+    pub fun alloc_bytes(mut self, size: u64, align: u64) -> *u8 {
+        when size > self.block_size || align > 16 || !is_power_of_two(align) {
+            return 0 as *u8
+        }
+        return self.alloc()
+    }
+
+    // Gives a block back. False (and nothing changes) for an address that is not the start of a block of this pool or that
+    // is already free.
+    pub fun release(mut self, block: *u8) -> bool {
+        when pointer_is_null(self.base) {
+            return false
+        }
+        address := block as u64
+        start := self.base as u64
+        when address < start {
+            return false
+        }
+        offset := address - start
+        when offset % self.block_size != 0 {
+            return false
+        }
+        index := offset / self.block_size
+        when index >= self.capacity || peek_byte(self.flags as u64 + index) == 0 as u8 {
+            return false
+        }
+        poke_byte(self.flags as u64 + index, 0 as u8)
+        poke(address, self.first_free)
+        self.first_free = index + 1
+        self.live -= 1
+        return true
+    }
+}

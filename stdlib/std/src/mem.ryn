@@ -1,0 +1,8 @@
+// Raw memory intrinsics. `copy`, `move_bytes` and `set` compile to `rep movsb`/`rep stosb` (no C library call);
+// `move_bytes` is correct for overlapping ranges, `copy` requires that the ranges do not overlap. All of them are
+// unchecked: the caller owns the pointers and the byte count. `prefetch` only hints the processor and changes nothing
+// the program can observe.
+pub fun copy(destination: *u8, source: *u8, count: u64) { __mem_copy(destination, source, count) }
+pub fun move_bytes(destination: *u8, source: *u8, count: u64) { __mem_move(destination, source, count) }
+pub fun set(destination: *u8, value: u8, count: u64) { __mem_set(destination, value as u64, count) }
+pub fun prefetch(address: *u8) { __prefetch(address) }

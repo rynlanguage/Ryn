@@ -1,0 +1,28 @@
+// test: run
+// out: 6
+// out: 2147483648
+// out: 1
+// out: 6
+// out: 129
+// out: 3735928559
+// out: 4022250974
+// out: 52523
+// out: 255
+// out: 1306401677907840495
+// out: 17
+// out: 1
+use std::bits
+fun main() {
+    echo bits::rotl_u64(9223372036854775809 as u64, 2 as u32)
+    echo bits::rotr_u32(1 as u32, 1 as u32)
+    echo bits::rotr_u8(2 as u8, 1 as u32)
+    echo bits::rotl_u16(32769 as u16, 2 as u32)
+    echo bits::rotl_u8(192 as u8, 1 as u32)
+    echo bits::bswap_u32(4022250974 as u32)
+    echo bits::bswap_u32(3735928559 as u32)
+    echo bits::bswap_u16(11213 as u16)
+    echo bits::bswap_u8(255 as u8)
+    echo bits::bswap_u64(17279655951921914130 as u64)
+    echo bits::rotl_u8(17 as u8, 8 as u32)
+    echo bits::rotr_u64(2 as u64, 65 as u32)
+}

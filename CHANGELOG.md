@@ -4,6 +4,62 @@ All notable changes to Ryn are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses a `0.x` version
 sequence: minor releases may change language details while the compiler is pre-1.0.
 
+## [0.1.9] — 2026-10-12 — Performance Revolution
+
+Compiler speed, code speed and systems features. `docs/native-performance.md` has the state of each item, the
+measurements and the limits. Suite 688/688 with the self-built compiler. The committed seed is still the 0.1.8 compiler:
+stage2 == stage3 holds when the seed is a compiler built from this source (one stage), and the seed in `bootstrap/` has to be
+updated to a stage2 of this tree (and its checksum regenerated) before the CI bootstrap, which starts from the seed, passes.
+
+Scalar optimizations (`RYN_NO_OPT=1` turns them off): constant propagation of locals defined once, removal of
+unreachable statements, constant `if` conditions and unused scalar `let`s, strength reduction (division and remainder
+by constants without a divide, signed shifts, immediates), self-recursive tail calls in constant stack, and operands
+read without push/pop. `loop_sum` 1.97 s to 0.49 s. Copy propagation, loop invariant code motion, common
+subexpression elimination, loop bounds check elimination and escape analysis are not implemented
+(`docs/native-performance.md` says why). Suite 687/687.
+
+Compiling the compiler: 15.5 s to 6.7 s, bootstrap 32 s to 23 s, same peak memory. A field of a vector element
+(`self.structs[id].field_names`) is read where the element lies and cloned alone, or lent to a builtin that only
+borrows it, instead of copying the whole element; a few linear scans became hash lookups.
+`RYN_SYMBOLS=1` writes the function offsets of a build to standard error, for profiling the compiler.
+
+Compiler speed (all measured on one machine, medians of 5 runs; "before" is the shipped 0.1.8 `bootstrap/rync-seed`):
+
+- Lowering finds types, structures, functions and aliases through hash indexes instead of scanning every declaration
+  (`type_index`, `struct_index`, `signature_map`, `alias_index`), and the code generator finds drop and glue routines
+  the same way. This was the quadratic part: compiling the compiler took 152 s and takes 15 s; the bootstrap
+  (stage2 + stage3) took 4 min 50 s and takes 32 s.
+- Functions of the native runtime module (`std::native`) are lowered only when something reaches them, so a small
+  program no longer pays for the whole module: `hello` compiles in 0.11 s instead of 0.38 s. `RYN_LOWER_ALL=1`
+  lowers all of them (to check the module itself).
+- `RYN_TIMINGS=1` makes `rync` write the time of each phase to standard error.
+
+Code speed and size:
+
+- Leaf functions whose body is one small expression are inlined; a structure literal that is returned is written
+  straight into the result cells; expressions made of literals are folded to immediates (and multiplications,
+  divisions and remainders by a power of two become shifts and masks); a small frame is zeroed by a counted qword loop.
+  `inline_leaf_calls`: 1.11 s to 0.15 s; `alloc_pool`: 0.58 s to 0.22 s.
+- Only the runtime routines the code names are written, equal string literals share one copy, and large blocks own their
+  mapping: a hello program is 8.3 KB instead of 16 KB.
+- Profile-guided code layout: `rync build --profile-generate FILE` makes an executable that writes the entry count of
+  each function at exit; `rync build --profile-use FILE` generates the functions most entered first. An unreadable
+  or damaged profile only costs the layout (a warning is printed).
+- `std::simd::sum_f32`, `sum_i32`, `dot_f32` and `add_f32`: fused array loops that keep the vector registers across
+  iterations (AVX2 when `std::cpu` reports it, SSE2 otherwise, identical results on both). `simd_fused_sum`: 0.010 s
+  against 0.27 s for the scalar loop.
+
+Systems features (see `docs/native-performance.md` for the exact state and the limits).
+
+- `std::bits`, `std::mem`, `std::overflow`: bit and memory intrinsics (compiled to `bsr`/`bsf`/`bswap`/`rol`/`ror`/`rep movsb`), checked, wrapping and saturating arithmetic.
+- `std::atomic` (`Atomic<T>`, `AtomicCell`, orderings; `lock xadd`, `lock cmpxchg`, `xchg`, `mfence`), `std::sync` (threads with arguments, `Mutex`, `RwLock`, `Condvar`, `Barrier`, `Once`, thread-local storage).
+- `std::alloc`: `Stack` and `Pool` allocators next to `std::arena`.
+- `#[repr(C, packed)]`, `#[repr(C, packed(N))]`, `#[repr(C, align(N))]`; compile-time `size_of::<T>()`, `align_of::<T>()`, `offset_of::<S>("field")`.
+- `std::cpu` (CPUID and XGETBV with OS-state checks) and `std::simd` (SSE2/AVX2 vectors with runtime dispatch and scalar fallback).
+- `ryn asm` (assembly listing, `--function`, `--summary`, `--compare`), `ryn update`, and `benches/` for `ryn bench`.
+- Fixes: operator methods (`a + b`) on structures declared in a module; instances of a public generic structure are public; IR carries function names.
+- Known: the SIMD vector types are still slower than the scalar loop (only the fused array loops are fast); no ARM64/NEON.
+
 ## [0.1.8] — 2026-10-11
 
 Maintenance release. The version strings say 0.1.8; the compiler and the language are unchanged from 0.1.7.

@@ -1,0 +1,18 @@
+// 5,000,000 allocations of 48 bytes from a std::arena::Arena, reset every 4,096 allocations (what a frame allocator does).
+use std::arena
+fun main() {
+    mut memory := arena::Arena::with_capacity(4096 as u64 * 48 as u64)
+    mut checksum: u64 = 0
+    mut round: u64 = 0
+    while round < 5000000 {
+        when round % 4096 as u64 == 0 as u64 {
+            memory.reset()
+        }
+        block := memory.alloc_bytes(48 as u64, 8 as u64)
+        word := block as *u64
+        *word = round
+        checksum = checksum + *word
+        round += 1
+    }
+    echo checksum
+}

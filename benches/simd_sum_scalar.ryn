@@ -1,0 +1,28 @@
+// Sum of 1,048,576 f32 values, 64 passes, one lane at a time. Pair with simd_sum_sse2.ryn and simd_sum_avx2.ryn: the same data,
+// the same result, printed so that the work cannot be skipped.
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(block: *u8);
+fun main() {
+    count: u64 = 1048576
+    data := malloc(count * 4 as u64)
+    mut at: u64 = 0
+    while at < count {
+        slot := (data as u64 + at * 4 as u64) as *f32
+        *slot = ((at % 7 as u64) as f32) * 0.5
+        at += 1
+    }
+    mut total: f32 = 0.0
+    mut pass: u64 = 0
+    while pass < 64 {
+        mut index: u64 = 0
+        mut partial: f32 = 0.0
+        while index < count {
+            partial = partial + *((data as u64 + index * 4 as u64) as *f32)
+            index += 1
+        }
+        total = total + partial
+        pass += 1
+    }
+    echo total
+    free(data)
+}

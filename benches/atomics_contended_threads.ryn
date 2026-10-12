@@ -1,0 +1,26 @@
+// Four threads add 2,000,000 each to one atomic counter: the cost of a contended cache line.
+use std::atomic
+use std::sync
+fun bump(argument: *u8) -> *u8 {
+    counter := Atomic::<u64> { address: argument }
+    mut round: u64 = 0
+    while round < 2000000 {
+        counter.fetch_add(1 as u64, atomic::Ordering::Relaxed)
+        round += 1
+    }
+    return argument
+}
+fun main() {
+    cell := atomic::AtomicCell::new()
+    counter := Atomic::<u64> { address: cell.address }
+    mut handles: Vec<sync::JoinHandle> = Vec()
+    mut index: u64 = 0
+    while index < 4 {
+        handles.push(sync::JoinHandle::spawn(bump, cell.address))
+        index += 1
+    }
+    for worker in handles {
+        worker.join()
+    }
+    echo counter.load(atomic::Ordering::SeqCst)
+}

@@ -53,6 +53,8 @@ pub struct Asm {
     pub label_offsets: Vec<u64>,
     pub fixup_positions: Vec<u64>,
     pub fixup_labels: Vec<u64>,
+    // Whether some jump, call or address in the code names each label: a routine whose label is named is needed.
+    pub label_referenced: Vec<bool>,
     pub reloc_offsets: Vec<u64>,
     pub reloc_symbols: Vec<u64>,
     pub reloc_kinds: Vec<u64>,
@@ -60,10 +62,236 @@ pub struct Asm {
     // For a Windows image: every `syscall` becomes a call of the emulation routine at this label.
     pub windows: bool,
     pub syscall_label: u64,
+    // The assembly listing (`ryn asm`): off by default, so ordinary builds do no extra work. `note_at` is the code position
+    // where each instruction starts and `note_text` its text; `names_at` and `names_text` mark where each function starts.
+    pub listing: bool,
+    pub note_at: Vec<u64>,
+    pub note_text: Vec<String>,
+    pub names_at: Vec<u64>,
+    pub names_text: Vec<String>,
 }
 
 pub fun new_asm() -> Asm {
-    return Asm { code: Vec(), label_offsets: Vec(), fixup_positions: Vec(), fixup_labels: Vec(), reloc_offsets: Vec(), reloc_symbols: Vec(), reloc_kinds: Vec(), reloc_addends: Vec(), windows: false, syscall_label: 0 }
+    return Asm { code: Vec(), label_offsets: Vec(), fixup_positions: Vec(), fixup_labels: Vec(), label_referenced: Vec(), reloc_offsets: Vec(), reloc_symbols: Vec(), reloc_kinds: Vec(), reloc_addends: Vec(), windows: false, syscall_label: 0, listing: false, note_at: Vec(), note_text: Vec(), names_at: Vec(), names_text: Vec() }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The assembly listing (`ryn asm`): Intel syntax, one line per instruction. It is written only while `Asm.listing` is on, so an
+// ordinary build does none of this work.
+
+fun reg_name(register: u64) -> String {
+    names := String("rax rcx rdx rbx rsp rbp rsi rdi r8  r9  r10 r11 r12 r13 r14 r15 ")
+    return names.slice(register * 4, register * 4 + 3).trim()
+}
+
+fun xmm_name(register: u64) -> String {
+    mut text := String("xmm")
+    text.append(String(register))
+    return text
+}
+
+fun size_word(size: u64) -> String {
+    when size == 1 {
+        return String("byte")
+    }
+    when size == 2 {
+        return String("word")
+    }
+    when size == 4 {
+        return String("dword")
+    }
+    when size == 16 {
+        return String("xmmword")
+    }
+    when size == 32 {
+        return String("ymmword")
+    }
+    return String("qword")
+}
+
+fun mem_text(base: u64, disp: i64) -> String {
+    mut text := String("[")
+    text.append(reg_name(base))
+    when disp < 0 {
+        text.push('-')
+        text.append(String((0 - disp) as u64))
+    } else when disp > 0 {
+        text.push('+')
+        text.append(String(disp as u64))
+    }
+    text.push(']')
+    return text
+}
+
+fun inst0(op: String) -> String {
+    return op
+}
+
+fun inst1(op: String, first: String) -> String {
+    mut text := op
+    text.push(' ')
+    text.append(first)
+    return text
+}
+
+fun inst2(op: String, first: String, second: String) -> String {
+    mut text := inst1(op, first)
+    text.append(", ")
+    text.append(second)
+    return text
+}
+
+fun inst3(op: String, first: String, second: String, third: String) -> String {
+    mut text := inst2(op, first, second)
+    text.append(", ")
+    text.append(third)
+    return text
+}
+
+fun label_text(label: u64) -> String {
+    mut text := String(".L")
+    text.append(String(label))
+    return text
+}
+
+// The mnemonic of a two-register ALU opcode (add 1, or 9, and 33, sub 41, xor 49, cmp 57) or of an immediate form's extension.
+fun alu_name(opcode: u64) -> String {
+    when opcode == 1 { return String("add") }
+    when opcode == 9 { return String("or") }
+    when opcode == 33 { return String("and") }
+    when opcode == 41 { return String("sub") }
+    when opcode == 49 { return String("xor") }
+    when opcode == 57 { return String("cmp") }
+    return String("alu")
+}
+
+fun alu_extension_name(extension: u64) -> String {
+    when extension == 0 { return String("add") }
+    when extension == 1 { return String("or") }
+    when extension == 4 { return String("and") }
+    when extension == 5 { return String("sub") }
+    when extension == 6 { return String("xor") }
+    when extension == 7 { return String("cmp") }
+    return String("alu")
+}
+
+fun unary_name(extension: u64) -> String {
+    when extension == 2 { return String("not") }
+    when extension == 3 { return String("neg") }
+    when extension == 4 { return String("mul") }
+    when extension == 5 { return String("imul") }
+    when extension == 6 { return String("div") }
+    return String("idiv")
+}
+
+fun shift_name(extension: u64) -> String {
+    when extension == 0 { return String("rol") }
+    when extension == 1 { return String("ror") }
+    when extension == 4 { return String("shl") }
+    when extension == 5 { return String("shr") }
+    return String("sar")
+}
+
+// The condition suffix of `jcc`, `setcc` and `cmovcc` for a condition code.
+fun condition_name(condition: u64) -> String {
+    when condition == 2 { return String("b") }
+    when condition == 3 { return String("ae") }
+    when condition == 4 { return String("e") }
+    when condition == 5 { return String("ne") }
+    when condition == 6 { return String("be") }
+    when condition == 7 { return String("a") }
+    when condition == 10 { return String("p") }
+    when condition == 11 { return String("np") }
+    when condition == 12 { return String("l") }
+    when condition == 13 { return String("ge") }
+    when condition == 14 { return String("le") }
+    return String("g")
+}
+
+fun with_condition(prefix: str, condition: u64) -> String {
+    mut text := String(prefix)
+    text.append(condition_name(condition))
+    return text
+}
+
+// A packed-vector instruction of the SIMD operations, named by its encoding: `[66.|f3.|f2.]0f[38|3a].opcode [imm]`.
+fun packed_name(pp: u64, map: u64, opcode: u64, immediate: bool, amount: u64, vex: bool) -> String {
+    mut text := String("")
+    when vex {
+        text.append("vex.")
+    }
+    when pp == 1 { text.append("66.") } else when pp == 2 { text.append("f3.") } else when pp == 3 { text.append("f2.") }
+    when map == 2 { text.append("0f38.") } else when map == 3 { text.append("0f3a.") } else { text.append("0f.") }
+    text.append(String(opcode))
+    when immediate {
+        text.append(" imm=")
+        text.append(String(amount))
+    }
+    return text
+}
+
+fun hex_digit(value: u64) -> char {
+    when value < 10 {
+        return char_from_u32(48 + value as u32)
+    }
+    return char_from_u32(87 + value as u32)
+}
+
+// Whether function `name` is the one asked for: any function when `only` is empty, else the exact name or its last
+// segments (`Counter::add` finds `std::demo::Counter::add`).
+fun name_matches(name: String, only: String) -> bool {
+    when only.is_empty() || name == only {
+        return true
+    }
+    mut suffix := String("::")
+    suffix.append(only)
+    return name.ends_with(suffix)
+}
+
+fun summary_line(name: String, count: u64, size: u64, start: u64) -> String {
+    mut text := name
+    text.append(": ")
+    text.append(String(count))
+    text.append(" instructions, ")
+    text.append(String(size))
+    text.append(" bytes, at ")
+    text.append(String(start))
+    text.append("\n")
+    return text
+}
+
+// `  0042  48 89 e5            mov rbp, rsp`
+fun listing_line(position: u64, code: Vec<u8>, end: u64, text: String) -> String {
+    mut line := String("  ")
+    mut digits := String("")
+    mut shift: u64 = 12
+    while true {
+        digits.push(hex_digit((position >> (shift as u32)) & 15))
+        when shift == 0 {
+            break
+        }
+        shift -= 4
+    }
+    line.append(digits)
+    line.append("  ")
+    mut bytes := String("")
+    mut at := position
+    while at < end {
+        value := code[at] as u64
+        bytes.push(hex_digit(value >> (4 as u32)))
+        bytes.push(hex_digit(value & 15))
+        bytes.push(' ')
+        at += 1
+    }
+    line.append(bytes.clone())
+    mut pad: u64 = bytes.len()
+    while pad < 32 {
+        line.push(' ')
+        pad += 1
+    }
+    line.append(text)
+    line.push('\n')
+    return line
 }
 
 // Marks a label as not bound yet.
@@ -74,6 +302,18 @@ fun unbound() -> u64 {
 extend Asm {
     pub fun position(self) -> u64 {
         return self.code.len()
+    }
+
+    // Records the text of the instruction that starts here.
+    pub fun note(mut self, text: String) {
+        self.note_at.push(self.code.len())
+        self.note_text.push(text)
+    }
+
+    // Records that a function with this name starts here.
+    pub fun name_function(mut self, name: String) {
+        self.names_at.push(self.code.len())
+        self.names_text.push(name)
     }
 
     pub fun b(mut self, value: u64) {
@@ -143,6 +383,21 @@ extend Asm {
 
     // `mov dst, [base + disp]` reading `size` bytes, zero- or sign-extended to 64 bits.
     pub fun load(mut self, size: u64, signed: bool, dst: u64, base: u64, disp: i64) {
+        when self.listing {
+            mut op := String("mov")
+            when size < 4 {
+                op = String("movzx")
+                when signed {
+                    op = String("movsx")
+                }
+            } else when size == 4 && signed {
+                op = String("movsxd")
+            }
+            mut source := size_word(size)
+            source.push(' ')
+            source.append(mem_text(base, disp))
+            self.note(inst2(op, reg_name(dst), source))
+        }
         when size == 8 {
             self.rex(1, dst, base, false)
             self.b(139)
@@ -176,6 +431,12 @@ extend Asm {
 
     // `mov [base + disp], src` writing the low `size` bytes.
     pub fun store(mut self, size: u64, src: u64, base: u64, disp: i64) {
+        when self.listing {
+            mut target := size_word(size)
+            target.push(' ')
+            target.append(mem_text(base, disp))
+            self.note(inst2(String("mov"), target, reg_name(src)))
+        }
         when size == 8 {
             self.rex(1, src, base, false)
             self.b(137)
@@ -195,6 +456,9 @@ extend Asm {
 
     // `mov dst, imm`.
     pub fun mov_ri(mut self, dst: u64, value: u64) {
+        when self.listing {
+            self.note(inst2(String("mov"), reg_name(dst), String(value)))
+        }
         // The flags stay untouched, so this is safe between a compare and its use.
         when value <= 4294967295 {
             self.rex(0, 0, dst, false)
@@ -212,6 +476,9 @@ extend Asm {
         when dst == src {
             return
         }
+        when self.listing {
+            self.note(inst2(String("mov"), reg_name(dst), reg_name(src)))
+        }
         self.rex(1, src, dst, false)
         self.b(137)
         self.rr(src, dst)
@@ -219,6 +486,9 @@ extend Asm {
 
     // `lea dst, [base + disp]`.
     pub fun lea(mut self, dst: u64, base: u64, disp: i64) {
+        when self.listing {
+            self.note(inst2(String("lea"), reg_name(dst), mem_text(base, disp)))
+        }
         self.rex(1, dst, base, false)
         self.b(141)
         self.mem(dst, base, disp)
@@ -227,15 +497,28 @@ extend Asm {
     // `lea dst, [rip + symbol]`: the address of a symbol in this object.
     // `lea dst, [rip + label]`: the address of a label in the same code, patched when the labels are resolved.
     pub fun lea_label(mut self, dst: u64, label: u64) {
+        when self.listing {
+            mut target := String("[rip+")
+            target.append(label_text(label))
+            target.push(']')
+            self.note(inst2(String("lea"), reg_name(dst), target))
+        }
         self.rex(1, dst, 0, false)
         self.b(141)
         self.b(5 | ((dst & 7) << (3 as u32)))
         self.fixup_positions.push(self.code.len())
         self.fixup_labels.push(label)
+        self.label_referenced.set(label, true)
         self.d32(0)
     }
 
     pub fun lea_symbol(mut self, dst: u64, symbol: u64) {
+        when self.listing {
+            mut target := String("[rip+symbol")
+            target.append(String(symbol))
+            target.push(']')
+            self.note(inst2(String("lea"), reg_name(dst), target))
+        }
         self.rex(1, dst, 0, false)
         self.b(141)
         self.b(5 | ((dst & 7) << (3 as u32)))
@@ -254,6 +537,9 @@ extend Asm {
 
     // `op dst, src` for add (1), or (9), and (33), sub (41), xor (49), cmp (57), at 64 bits.
     pub fun alu_rr(mut self, opcode: u64, dst: u64, src: u64) {
+        when self.listing {
+            self.note(inst2(alu_name(opcode), reg_name(dst), reg_name(src)))
+        }
         self.rex(1, src, dst, false)
         self.b(opcode)
         self.rr(src, dst)
@@ -261,6 +547,16 @@ extend Asm {
 
     // `op dst, imm32` for add (0), or (1), and (4), sub (5), xor (6), cmp (7), at 64 bits.
     pub fun alu_ri(mut self, extension: u64, dst: u64, value: i64) {
+        when self.listing {
+            mut amount := String("")
+            when value < 0 {
+                amount.push('-')
+                amount.append(String((0 - value) as u64))
+            } else {
+                amount.append(String(value as u64))
+            }
+            self.note(inst2(alu_extension_name(extension), reg_name(dst), amount))
+        }
         self.rex(1, 0, dst, false)
         self.b(129)
         self.rr(extension, dst)
@@ -269,6 +565,9 @@ extend Asm {
 
     // `imul dst, src`.
     pub fun imul_rr(mut self, dst: u64, src: u64) {
+        when self.listing {
+            self.note(inst2(String("imul"), reg_name(dst), reg_name(src)))
+        }
         self.rex(1, dst, src, false)
         self.b(15)
         self.b(175)
@@ -277,6 +576,9 @@ extend Asm {
 
     // F7 group at 64 bits: not (2), neg (3), mul (4), imul (5), div (6), idiv (7).
     pub fun unary(mut self, extension: u64, reg: u64) {
+        when self.listing {
+            self.note(inst1(unary_name(extension), reg_name(reg)))
+        }
         self.rex(1, 0, reg, false)
         self.b(247)
         self.rr(extension, reg)
@@ -284,17 +586,37 @@ extend Asm {
 
     // Shift by cl at 64 bits: shl (4), shr (5), sar (7).
     pub fun shift_cl(mut self, extension: u64, reg: u64) {
+        when self.listing {
+            self.note(inst2(shift_name(extension), reg_name(reg), String("cl")))
+        }
         self.rex(1, 0, reg, false)
         self.b(211)
         self.rr(extension, reg)
     }
 
+    // Shift by an immediate at 64 bits: shl (4), shr (5), sar (7). The amount is below 64.
+    pub fun shift_ri(mut self, extension: u64, reg: u64, amount: u64) {
+        when self.listing {
+            self.note(inst2(shift_name(extension), reg_name(reg), String(amount)))
+        }
+        self.rex(1, 0, reg, false)
+        self.b(193)
+        self.rr(extension, reg)
+        self.b(amount)
+    }
+
     pub fun cqo(mut self) {
+        when self.listing {
+            self.note(inst0(String("cqo")))
+        }
         self.b(72)
         self.b(153)
     }
 
     pub fun test_rr(mut self, a: u64, b: u64) {
+        when self.listing {
+            self.note(inst2(String("test"), reg_name(a), reg_name(b)))
+        }
         self.rex(1, b, a, false)
         self.b(133)
         self.rr(b, a)
@@ -302,6 +624,9 @@ extend Asm {
 
     // `setcc al` followed by a zero extension into `dst`.
     pub fun setcc(mut self, condition: u64, dst: u64) {
+        when self.listing {
+            self.note(inst1(with_condition("set", condition), reg_name(dst)))
+        }
         self.b(15)
         self.b(144 + condition)
         self.b(192)
@@ -313,14 +638,226 @@ extend Asm {
 
     // `cmovcc dst, src` at 64 bits.
     pub fun cmov(mut self, condition: u64, dst: u64, src: u64) {
+        when self.listing {
+            self.note(inst2(with_condition("cmov", condition), reg_name(dst), reg_name(src)))
+        }
         self.rex(1, dst, src, false)
         self.b(15)
         self.b(64 + condition)
         self.rr(dst, src)
     }
 
+    // `bsr dst, src` (`reverse`) or `bsf dst, src` at 64 bits. The destination is undefined when `src` is zero, so callers test first.
+    pub fun bit_scan(mut self, reverse: bool, dst: u64, src: u64) {
+        when self.listing {
+            when reverse {
+                self.note(inst2(String("bsr"), reg_name(dst), reg_name(src)))
+            } else {
+                self.note(inst2(String("bsf"), reg_name(dst), reg_name(src)))
+            }
+        }
+        self.rex(1, dst, src, false)
+        self.b(15)
+        when reverse {
+            self.b(189)
+        } else {
+            self.b(188)
+        }
+        self.rr(dst, src)
+    }
+
+    // `bswap reg` at 64 bits.
+    pub fun bswap(mut self, reg: u64) {
+        when self.listing {
+            self.note(inst1(String("bswap"), reg_name(reg)))
+        }
+        self.rex(1, 0, reg, false)
+        self.b(15)
+        self.b(200 + (reg & 7))
+    }
+
+    // A locked read-modify-write on `[base]` of `size` bytes with `reg` as the register operand. `kind` 0 is `xchg` (locked by
+    // the processor itself), 1 is `lock xadd`, 2 is `lock cmpxchg` (which compares with and may update rax).
+    pub fun atomic_rmw(mut self, kind: u64, size: u64, reg: u64, base: u64) {
+        when self.listing {
+            mut target := size_word(size)
+            target.push(' ')
+            target.append(mem_text(base, 0))
+            when kind == 0 {
+                self.note(inst2(String("xchg"), target, reg_name(reg)))
+            } else when kind == 1 {
+                self.note(inst2(String("lock xadd"), target, reg_name(reg)))
+            } else {
+                self.note(inst2(String("lock cmpxchg"), target, reg_name(reg)))
+            }
+        }
+        when kind != 0 {
+            self.b(240)
+        }
+        when size == 2 {
+            self.b(102)
+        }
+        mut wide: u64 = 0
+        mut byte_form := false
+        when size == 8 {
+            wide = 1
+        }
+        when size == 1 {
+            byte_form = true
+        }
+        self.rex(wide, reg, base, false)
+        when kind == 0 {
+            when byte_form {
+                self.b(134)
+            } else {
+                self.b(135)
+            }
+        } else {
+            self.b(15)
+            mut opcode: u64 = 176
+            when kind == 1 {
+                opcode = 192
+            }
+            when !byte_form {
+                opcode += 1
+            }
+            self.b(opcode)
+        }
+        self.mem(reg, base, 0)
+    }
+
+    // `mfence`: the full barrier a sequentially consistent fence needs.
+    pub fun mfence(mut self) {
+        when self.listing {
+            self.note(inst0(String("mfence")))
+        }
+        self.b(15)
+        self.b(174)
+        self.b(240)
+    }
+
+    // `cpuid` (eax = leaf, ecx = sub-leaf; results in eax, ebx, ecx, edx) and `xgetbv` (ecx = register; result in edx:eax).
+    pub fun cpuid(mut self) {
+        when self.listing {
+            self.note(inst0(String("cpuid")))
+        }
+        self.b(15)
+        self.b(162)
+    }
+
+    pub fun xgetbv(mut self) {
+        when self.listing {
+            self.note(inst0(String("xgetbv")))
+        }
+        self.b(15)
+        self.b(1)
+        self.b(208)
+    }
+
+    // `vzeroupper`: clears the upper halves of the ymm registers after 256-bit code so that later SSE code is not slowed.
+    pub fun vzeroupper(mut self) {
+        when self.listing {
+            self.note(inst0(String("vzeroupper")))
+        }
+        self.b(197)
+        self.b(248)
+        self.b(119)
+    }
+
+    // The legacy prefix of a SIMD instruction: `pp` 1 is 66, 2 is F3 and 3 is F2.
+    fun simd_prefix(mut self, pp: u64) {
+        when pp == 1 {
+            self.b(102)
+        } else when pp == 2 {
+            self.b(243)
+        } else when pp == 3 {
+            self.b(242)
+        }
+    }
+
+    // `[prefix] 0F [38|3A] opcode modrm [imm8]` on two xmm registers (0 to 7) with `map` 1 (0F), 2 (0F 38) or 3 (0F 3A).
+    pub fun simd_rr(mut self, pp: u64, map: u64, opcode: u64, dst: u64, src: u64, has_imm: bool, imm: u64) {
+        when self.listing {
+            self.note(inst2(packed_name(pp, map, opcode, has_imm, imm, false), xmm_name(dst), xmm_name(src)))
+        }
+        self.simd_prefix(pp)
+        self.b(15)
+        when map == 2 {
+            self.b(56)
+        } else when map == 3 {
+            self.b(58)
+        }
+        self.b(opcode)
+        self.rr(dst, src)
+        when has_imm {
+            self.b(imm)
+        }
+    }
+
+    // The three-byte VEX prefix for registers 0 to 7: `long` selects 256-bit operands, `vvvv` is the extra source register
+    // (15 for none).
+    fun vex_prefix(mut self, pp: u64, map: u64, wide: u64, long: bool, vvvv: u64) {
+        self.b(196)
+        self.b(224 | map)
+        // The field holds the register number inverted; 1111 (what 15 means here) says the instruction has no such operand.
+        mut field: u64 = 15
+        when vvvv != 15 {
+            field = 15 - vvvv
+        }
+        mut second: u64 = (field << (3 as u32)) | pp
+        when wide != 0 {
+            second = second | 128
+        }
+        when long {
+            second = second | 4
+        }
+        self.b(second)
+    }
+
+    // The VEX form of `simd_rr`: `op dst, first, src` (`first` 15 when the instruction has no such operand).
+    pub fun vex_rr(mut self, pp: u64, map: u64, opcode: u64, wide: u64, long: bool, dst: u64, first: u64, src: u64, has_imm: bool, imm: u64) {
+        when self.listing {
+            self.note(inst3(packed_name(pp, map, opcode, has_imm, imm, true), xmm_name(dst), xmm_name(first), xmm_name(src)))
+        }
+        self.vex_prefix(pp, map, wide, long, first)
+        self.b(opcode)
+        self.rr(dst, src)
+        when has_imm {
+            self.b(imm)
+        }
+    }
+
+    // A VEX move of an xmm or ymm register to or from `[base]`: `opcode` 111 loads (`vmovdqu`), 127 stores.
+    pub fun vex_move(mut self, opcode: u64, long: bool, reg: u64, base: u64) {
+        self.vex_move_at(opcode, long, reg, base, 0)
+    }
+
+    // The same move at `[base + disp]`.
+    pub fun vex_move_at(mut self, opcode: u64, long: bool, reg: u64, base: u64, disp: i64) {
+        when self.listing {
+            self.note(inst2(String("vmovdqu"), xmm_name(reg), mem_text(base, disp)))
+        }
+        self.vex_prefix(2, 1, 0, long, 15)
+        self.b(opcode)
+        self.mem(reg, base, disp)
+    }
+
+    // `prefetcht0 [reg]`: a hint only, it never faults and never changes the program's meaning.
+    pub fun prefetch(mut self, reg: u64) {
+        when self.listing {
+            self.note(inst1(String("prefetcht0"), mem_text(reg, 0)))
+        }
+        self.rex(0, 0, reg, false)
+        self.b(15)
+        self.b(24)
+        self.mem(1, reg, 0)
+    }
+
     // Sign-extends the low `from` bytes of `src` into `dst`.
     pub fun sext_rr(mut self, dst: u64, src: u64, from: u64) {
+        when self.listing {
+            self.note(inst2(String("movsx"), reg_name(dst), reg_name(src)))
+        }
         when from == 8 {
             self.mov_rr(dst, src)
             return
@@ -341,6 +878,9 @@ extend Asm {
 
     // Zero-extends the low `from` bytes of `src` into `dst`.
     pub fun zext_rr(mut self, dst: u64, src: u64, from: u64) {
+        when self.listing {
+            self.note(inst2(String("movzx"), reg_name(dst), reg_name(src)))
+        }
         when from == 8 {
             self.mov_rr(dst, src)
             return
@@ -363,6 +903,7 @@ extend Asm {
 
     pub fun new_label(mut self) -> u64 {
         self.label_offsets.push(unbound())
+        self.label_referenced.push(false)
         return self.label_offsets.len() - 1
     }
 
@@ -370,25 +911,43 @@ extend Asm {
         self.label_offsets.set(label, self.code.len())
     }
 
+    // Whether a label is named by the code so far and not yet bound: the routine it names is still to be written.
+    pub fun is_pending(self, label: u64) -> bool {
+        return self.label_referenced[label] && self.label_offsets[label] == unbound()
+    }
+
     // `jmp label`.
     pub fun jmp(mut self, label: u64) {
+        when self.listing {
+            self.note(inst1(String("jmp"), label_text(label)))
+        }
         self.b(233)
         self.fixup_positions.push(self.code.len())
         self.fixup_labels.push(label)
+        self.label_referenced.set(label, true)
         self.d32(0)
     }
 
     // `jcc label`.
     pub fun jcc(mut self, condition: u64, label: u64) {
+        when self.listing {
+            self.note(inst1(with_condition("j", condition), label_text(label)))
+        }
         self.b(15)
         self.b(128 + condition)
         self.fixup_positions.push(self.code.len())
         self.fixup_labels.push(label)
+        self.label_referenced.set(label, true)
         self.d32(0)
     }
 
     // `call symbol` through the procedure linkage table.
     pub fun call_symbol(mut self, symbol: u64) {
+        when self.listing {
+            mut target := String("symbol")
+            target.append(String(symbol))
+            self.note(inst1(String("call"), target))
+        }
         self.b(232)
         self.reloc(symbol, RelocKind::PLT32)
     }
@@ -396,6 +955,11 @@ extend Asm {
     // `call symbol` for a C function: the stack is aligned to 16 bytes first, as the System V ABI wants, and rbx keeps the
     // old stack pointer across the call.
     pub fun call_aligned(mut self, symbol: u64) {
+        when self.listing {
+            mut target := String("symbol")
+            target.append(String(symbol))
+            self.note(inst1(String("call (stack aligned)"), target))
+        }
         self.push(Reg::RBX)
         self.mov_rr(Reg::RBX, Reg::RSP)
         self.alu_ri(4, Reg::RSP, (0 as i64) - 16)
@@ -406,32 +970,51 @@ extend Asm {
 
     // `call label` within the same code.
     pub fun call_label(mut self, label: u64) {
+        when self.listing {
+            self.note(inst1(String("call"), label_text(label)))
+        }
         self.b(232)
         self.fixup_positions.push(self.code.len())
         self.fixup_labels.push(label)
+        self.label_referenced.set(label, true)
         self.d32(0)
     }
 
     // `rep movsb`, `rep stosb`, and the direction flag: set (`std`) to copy backward, cleared (`cld`) otherwise.
     pub fun rep_movsb(mut self) {
+        when self.listing {
+            self.note(inst0(String("rep movsb")))
+        }
         self.b(243)
         self.b(164)
     }
 
     pub fun rep_stosb(mut self) {
+        when self.listing {
+            self.note(inst0(String("rep stosb")))
+        }
         self.b(243)
         self.b(170)
     }
 
     pub fun std(mut self) {
+        when self.listing {
+            self.note(inst0(String("std")))
+        }
         self.b(253)
     }
 
     pub fun cld(mut self) {
+        when self.listing {
+            self.note(inst0(String("cld")))
+        }
         self.b(252)
     }
 
     pub fun syscall(mut self) {
+        when self.listing {
+            self.note(inst0(String("syscall")))
+        }
         when self.windows {
             self.call_label(self.syscall_label)
             return
@@ -441,32 +1024,54 @@ extend Asm {
     }
 
     pub fun call_reg(mut self, reg: u64) {
+        when self.listing {
+            self.note(inst1(String("call"), reg_name(reg)))
+        }
         self.rex(0, 0, reg, false)
         self.b(255)
         self.rr(2, reg)
     }
 
     pub fun ret(mut self) {
+        when self.listing {
+            self.note(inst0(String("ret")))
+        }
         self.b(195)
     }
 
     pub fun push(mut self, reg: u64) {
+        when self.listing {
+            self.note(inst1(String("push"), reg_name(reg)))
+        }
         self.rex(0, 0, reg, false)
         self.b(80 + (reg & 7))
     }
 
     pub fun pop(mut self, reg: u64) {
+        when self.listing {
+            self.note(inst1(String("pop"), reg_name(reg)))
+        }
         self.rex(0, 0, reg, false)
         self.b(88 + (reg & 7))
     }
 
     pub fun trap(mut self) {
+        when self.listing {
+            self.note(inst0(String("ud2")))
+        }
         self.b(15)
         self.b(11)
     }
 
     // `movss`/`movsd` load: `precision` is 4 or 8.
     pub fun sse_load(mut self, precision: u64, xmm: u64, base: u64, disp: i64) {
+        when self.listing {
+            mut op := String("movss")
+            when precision == 8 {
+                op = String("movsd")
+            }
+            self.note(inst2(op, xmm_name(xmm), mem_text(base, disp)))
+        }
         self.b(sse_prefix(precision))
         self.rex(0, xmm, base, false)
         self.b(15)
@@ -475,6 +1080,13 @@ extend Asm {
     }
 
     pub fun sse_store(mut self, precision: u64, xmm: u64, base: u64, disp: i64) {
+        when self.listing {
+            mut op := String("movss")
+            when precision == 8 {
+                op = String("movsd")
+            }
+            self.note(inst2(op, mem_text(base, disp), xmm_name(xmm)))
+        }
         self.b(sse_prefix(precision))
         self.rex(0, xmm, base, false)
         self.b(15)
@@ -484,6 +1096,9 @@ extend Asm {
 
     // `movdqu`: sixteen bytes between an xmm register and memory, with any alignment.
     pub fun movdqu_load(mut self, xmm: u64, base: u64, disp: i64) {
+        when self.listing {
+            self.note(inst2(String("movdqu"), xmm_name(xmm), mem_text(base, disp)))
+        }
         self.b(243)
         self.rex(0, xmm, base, false)
         self.b(15)
@@ -492,6 +1107,9 @@ extend Asm {
     }
 
     pub fun movdqu_store(mut self, xmm: u64, base: u64, disp: i64) {
+        when self.listing {
+            self.note(inst2(String("movdqu"), mem_text(base, disp), xmm_name(xmm)))
+        }
         self.b(243)
         self.rex(0, xmm, base, false)
         self.b(15)
@@ -501,6 +1119,28 @@ extend Asm {
 
     // Scalar arithmetic on two xmm registers: add (88), mul (89), sub (92), div (94).
     pub fun sse_op(mut self, precision: u64, opcode: u64, dst: u64, src: u64) {
+        when self.listing {
+            mut op := String("addss")
+            when opcode == 89 {
+                op = String("mulss")
+            } else when opcode == 92 {
+                op = String("subss")
+            } else when opcode == 94 {
+                op = String("divss")
+            }
+            when precision == 8 {
+                when opcode == 88 {
+                    op = String("addsd")
+                } else when opcode == 89 {
+                    op = String("mulsd")
+                } else when opcode == 92 {
+                    op = String("subsd")
+                } else {
+                    op = String("divsd")
+                }
+            }
+            self.note(inst2(op, xmm_name(dst), xmm_name(src)))
+        }
         self.b(sse_prefix(precision))
         self.rex(0, dst, src, false)
         self.b(15)
@@ -510,6 +1150,13 @@ extend Asm {
 
     // `ucomiss`/`ucomisd`.
     pub fun ucomis(mut self, precision: u64, a: u64, b: u64) {
+        when self.listing {
+            mut op := String("ucomiss")
+            when precision == 8 {
+                op = String("ucomisd")
+            }
+            self.note(inst2(op, xmm_name(a), xmm_name(b)))
+        }
         when precision == 8 {
             self.b(102)
         }
@@ -521,6 +1168,13 @@ extend Asm {
 
     // Converts between single and double precision: `from` is the source precision.
     pub fun cvt_precision(mut self, from: u64, dst: u64, src: u64) {
+        when self.listing {
+            mut op := String("cvtss2sd")
+            when from == 8 {
+                op = String("cvtsd2ss")
+            }
+            self.note(inst2(op, xmm_name(dst), xmm_name(src)))
+        }
         self.b(sse_prefix(from))
         self.rex(0, dst, src, false)
         self.b(15)
@@ -530,6 +1184,9 @@ extend Asm {
 
     // `cvtsi2ss`/`cvtsi2sd` from a 64-bit integer register.
     pub fun cvt_from_int(mut self, precision: u64, dst: u64, src: u64) {
+        when self.listing {
+            self.note(inst2(String("cvtsi2sd/ss"), xmm_name(dst), reg_name(src)))
+        }
         self.b(sse_prefix(precision))
         self.rex(1, dst, src, false)
         self.b(15)
@@ -539,6 +1196,9 @@ extend Asm {
 
     // `cvttss2si`/`cvttsd2si` into a 64-bit integer register.
     pub fun cvt_to_int(mut self, precision: u64, dst: u64, src: u64) {
+        when self.listing {
+            self.note(inst2(String("cvttsd2si/ss2si"), reg_name(dst), xmm_name(src)))
+        }
         self.b(sse_prefix(precision))
         self.rex(1, dst, src, false)
         self.b(15)
@@ -548,6 +1208,9 @@ extend Asm {
 
     // `movd`/`movq` from an integer register to an xmm register.
     pub fun movq_to_xmm(mut self, wide: bool, xmm: u64, src: u64) {
+        when self.listing {
+            self.note(inst2(String("movq"), xmm_name(xmm), reg_name(src)))
+        }
         self.b(102)
         self.rex(if_wide(wide), xmm, src, false)
         self.b(15)
@@ -557,6 +1220,9 @@ extend Asm {
 
     // `movd`/`movq` from an xmm register to an integer register.
     pub fun movq_from_xmm(mut self, wide: bool, dst: u64, xmm: u64) {
+        when self.listing {
+            self.note(inst2(String("movq"), reg_name(dst), xmm_name(xmm)))
+        }
         self.b(102)
         self.rex(if_wide(wide), xmm, dst, false)
         self.b(15)
@@ -565,6 +1231,85 @@ extend Asm {
     }
 
     // Resolves every jump to a label that was bound.
+    // The listing as text: for each function, one line per instruction with its offset, its machine bytes and its text. With
+    // `only` set, just the function of that name; with `summary` set, one line per function (instructions and bytes) instead.
+    pub fun listing_text(self, only: String, summary: bool) -> String {
+        mut out := String("")
+        mut function: u64 = 0
+        mut found: u64 = 0
+        mut shown := false
+        mut header_pending := false
+        mut first_at: u64 = 0
+        mut count: u64 = 0
+        mut size: u64 = 0
+        mut current := String("")
+        mut index: u64 = 0
+        while index <= self.note_at.len() {
+            mut position: u64 = self.code.len()
+            when index < self.note_at.len() {
+                position = self.note_at[index]
+            }
+            // functions that start at or before this instruction
+            while function < self.names_at.len() && self.names_at[function] <= position {
+                when summary && count > 0 && name_matches(current.clone(), only.clone()) {
+                    out.append(summary_line(current.clone(), count, size, first_at))
+                }
+                current = self.names_text[function].clone()
+                count = 0
+                size = 0
+                function += 1
+                shown = name_matches(current.clone(), only.clone())
+                when shown {
+                    found += 1
+                }
+                header_pending = true
+            }
+            when index == self.note_at.len() {
+                break
+            }
+            mut end: u64 = self.code.len()
+            when index + 1 < self.note_at.len() {
+                end = self.note_at[index + 1]
+            }
+            // a note that emitted nothing (an instruction folded away) is not shown
+            when end > position {
+                when count == 0 {
+                    first_at = position
+                }
+                count += 1
+                size += end - position
+                when shown && !summary {
+                    when header_pending {
+                        when !out.is_empty() {
+                            out.push('\n')
+                        }
+                        out.append(current.clone())
+                        out.append(":\n")
+                        header_pending = false
+                    }
+                    mut label: u64 = 0
+                    while label < self.label_offsets.len() {
+                        when self.label_offsets[label] == position {
+                            out.append("  ")
+                            out.append(label_text(label))
+                            out.append(":\n")
+                        }
+                        label += 1
+                    }
+                    out.append(listing_line(position, self.code.clone(), end, self.note_text[index].clone()))
+                }
+            }
+            index += 1
+        }
+        when summary && count > 0 && name_matches(current.clone(), only.clone()) {
+            out.append(summary_line(current, count, size, first_at))
+        }
+        when !only.is_empty() && found == 0 {
+            return String("")
+        }
+        return out
+    }
+
     pub fun resolve(mut self) -> bool {
         mut index: u64 = 0
         while index < self.fixup_positions.len() {

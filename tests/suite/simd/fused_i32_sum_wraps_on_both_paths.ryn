@@ -1,0 +1,108 @@
+// test: run
+// out: true
+// out: 0
+// out: -2147483648
+// out: -6
+// out: 0
+// out: 0
+// out: -2147483648
+// out: -6
+// out: 0
+// out: false
+use std::simd
+use std::cpu
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(block: *u8);
+
+fun slot(base: *i32, index: u64) -> *i32 {
+    return (base as u64 + index * 4) as *i32
+}
+
+fun at(base: *i32, index: u64) -> i32 {
+    p := slot(base, index)
+    return *p
+}
+
+fun store(base: *i32, index: u64, value: i32) {
+    p := slot(base, index)
+    *p = value
+}
+
+// The sum with 64-bit arithmetic (exact for these lengths), truncated to 32 bits: the wrapping sum.
+fun wrapped_sum(values: *i32, count: u64) -> i32 {
+    mut total: i64 = 0
+    mut at_index: u64 = 0
+    while at_index < count {
+        total = total + (at(values, at_index) as i64)
+        at_index += 1
+    }
+    return total as i32
+}
+
+// Full-range 32-bit values (both signs), different for each salt, so that the sums overflow.
+fun fill(base: *i32, count: u64, salt: u64) {
+    mut i: u64 = 0
+    while i < count {
+        raw := (i * 2654435761 + salt * 40503 + 12345) & 4294967295
+        store(base, i, (raw as u32) as i32)
+        i += 1
+    }
+}
+
+// The lengths tested: the tail lengths 0 to 9 after 0, 1 and 2 full blocks, and one long array.
+fun length_of(index: u64) -> u64 {
+    when index == 30 {
+        return 1000
+    }
+    return (index / 10) * 16 + index % 10
+}
+
+// The number of sums that differ from the 64-bit reference, over every length and offset of 0 to 3 elements.
+fun mismatches() -> u64 {
+    mut bad: u64 = 0
+    mut index: u64 = 0
+    while index < 31 {
+        n := length_of(index)
+        mut off: u64 = 0
+        while off < 4 {
+            a := malloc((n + 8) * 4) as *i32
+            base := slot(a, off)
+            fill(base, n, index + off)
+            when simd::sum_i32(base, n) != wrapped_sum(base, n) {
+                bad += 1
+            }
+            free(a as *u8)
+            off += 1
+        }
+        index += 1
+    }
+    return bad
+}
+
+fun report() {
+    echo mismatches()
+    // the edges: wrap-around at the top of the range, a negative total, and an empty array
+    edge := malloc(16) as *i32
+    store(edge, 0, 2147483647)
+    store(edge, 1, 1)
+    echo simd::sum_i32(edge, 2)
+    store(edge, 0, -1)
+    store(edge, 1, -2)
+    store(edge, 2, -3)
+    echo simd::sum_i32(edge, 3)
+    echo simd::sum_i32(edge, 0)
+    free(edge as *u8)
+}
+
+fun main() {
+    echo cpu::has_avx2()
+    report()
+    // the SSE2 path: the AVX2 bit cleared in the cell, as the f32x8 tests do
+    cell := __cpu_cell() as *u64
+    bits0 := *cell
+    when cpu::has_avx2() {
+        *cell = bits0 - 128
+    }
+    report()
+    echo cpu::has_avx2()
+}

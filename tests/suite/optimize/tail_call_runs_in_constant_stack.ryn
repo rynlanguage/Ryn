@@ -1,0 +1,50 @@
+// test: run
+// out: 5000000050000000
+// out: 1
+// out: 55
+// out: 6
+// out: 120
+// out: 7
+// Self-recursive calls in a `return` reuse the frame: 100 million levels would overflow the stack otherwise.
+fun sum_to(n: i64, acc: i64) -> i64 {
+    when n == 0 { return acc }
+    return sum_to(n - 1, acc + n)
+}
+
+// The arguments read the old parameters, all of them, before any is replaced.
+fun swap_count(a: i64, b: i64, steps: i64) -> i64 {
+    when steps == 0 { return a }
+    return swap_count(b, a, steps - 1)
+}
+
+fun fib(n: i64, a: i64, b: i64) -> i64 {
+    when n == 0 { return a }
+    return fib(n - 1, b, a + b)
+}
+
+// Not a tail call: the result is used after the call returns.
+fun fact(n: i64) -> i64 {
+    when n <= 1 { return 1 }
+    return n * fact(n - 1)
+}
+
+// A local that is set in the body before it is read, on every level.
+fun with_local(n: i64, acc: i64) -> i64 {
+    step := n % 3 + 1
+    when n <= 0 { return acc }
+    return with_local(n - step, acc + 1)
+}
+
+fun count_down(n: u8) -> u8 {
+    when n == 0 { return 7 }
+    return count_down(n - 1)
+}
+
+fun main() {
+    echo sum_to(100000000, 0)
+    echo swap_count(1, 2, 100)
+    echo fib(10, 0, 1)
+    echo fact(3)
+    echo fact(5)
+    echo count_down(200)
+}

@@ -1,0 +1,9 @@
+// test: fail
+// code: R0465
+// msg: has no field `missing`
+struct Wire {
+    tag: u8
+}
+fun main() {
+    echo offset_of::<Wire>("missing")
+}

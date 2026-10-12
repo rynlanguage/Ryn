@@ -1,0 +1,37 @@
+// test: run
+// out: -3
+// out: 1.5
+// out: -7
+// out: true
+// out: 200
+// out: -7
+// out: 2.25
+// A returned literal keeps narrow fields (i8, f32, u8, bool) and negative values in their own cells: each reads back at its
+// own width, after the structure has been returned and copied again.
+struct Narrow {
+    small: i8,
+    half: f32,
+    count: i32,
+    flag: bool,
+    byte: u8,
+}
+
+fun build(n: i32) -> Narrow {
+    return Narrow { byte: 200 as u8, flag: n > 0, count: 0 - n, half: 1.5 as f32, small: -3 as i8 }
+}
+
+fun twice(n: Narrow) -> Narrow {
+    return n
+}
+
+fun main() {
+    v := build(7)
+    echo v.small
+    echo v.half
+    echo v.count
+    echo v.flag
+    echo v.byte
+    w := twice(v)
+    echo w.count
+    echo (w.half as f64) + 0.75
+}

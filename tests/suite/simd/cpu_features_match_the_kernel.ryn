@@ -1,0 +1,65 @@
+// test: run
+// target: linux
+// out: sse2 true true
+// out: sse41 ok
+// out: sse42 ok
+// out: popcnt ok
+// out: bmi1 ok
+// out: bmi2 ok
+// out: avx ok
+// out: avx2 ok
+// out: fma ok
+// out: avx512f ok
+// out: neon false
+// out: level ok
+use std::cpu
+// The kernel clears a flag in /proc/cpuinfo when the processor lacks the feature or the operating system has not enabled
+// its register state, which is the rule `std::cpu` applies, so the two must agree.
+fun listed(flags: String, name: str) -> bool {
+    mut padded := String(" ")
+    padded.append(name)
+    padded.push(' ')
+    return flags.contains(padded)
+}
+fun word(value: bool) -> String {
+    when value {
+        return String("true")
+    }
+    return String("false")
+}
+fun check(label: str, flags: String, name: str, detected: bool) {
+    when listed(flags, name) == detected {
+        echo String(label).concat(String(" ok"))
+    } else {
+        echo String(label).concat(String(" MISMATCH"))
+    }
+}
+fun main() {
+    mut flags := String(" ")
+    loaded := try_read_file("/proc/cpuinfo")
+    text := loaded.unwrap()
+    mut start: u64 = 0
+    mut found := false
+    for line in text.lines() {
+        when !found && line.starts_with("flags") {
+            flags.append(line)
+            flags.push(' ')
+            found = true
+        }
+    }
+    echo String("sse2 ").concat(word(cpu::has_sse2())).concat(String(" ")).concat(word(listed(flags.clone(), "sse2")))
+    check("sse41", flags.clone(), "sse4_1", cpu::has_sse41())
+    check("sse42", flags.clone(), "sse4_2", cpu::has_sse42())
+    check("popcnt", flags.clone(), "popcnt", cpu::has_popcnt())
+    check("bmi1", flags.clone(), "bmi1", cpu::has_bmi1())
+    check("bmi2", flags.clone(), "bmi2", cpu::has_bmi2())
+    check("avx", flags.clone(), "avx", cpu::has_avx())
+    check("avx2", flags.clone(), "avx2", cpu::has_avx2())
+    check("fma", flags.clone(), "fma", cpu::has_fma())
+    check("avx512f", flags.clone(), "avx512f", cpu::has_avx512f())
+    echo String("neon ").concat(word(cpu::has_neon()))
+    level := cpu::vector_level()
+    when level.len() > 0 {
+        echo "level ok"
+    }
+}

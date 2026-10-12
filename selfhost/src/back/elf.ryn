@@ -363,8 +363,8 @@ pub fun link_executable(input: ObjectInput) -> Result<Vec<u8>, String> {
     out.align(page)
     out.append(code)
     out.align(page)
+    // The file ends with the rodata: the bss takes no file space, so no padding follows.
     out.append(input.rodata.clone())
-    out.align(page)
     return Result::Ok(out.bytes)
 }
 

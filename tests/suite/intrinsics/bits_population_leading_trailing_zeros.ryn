@@ -1,0 +1,36 @@
+// test: run
+// out: 0
+// out: 64
+// out: 1
+// out: 5
+// out: 64
+// out: 0
+// out: 63
+// out: 2
+// out: 8
+// out: 8
+// out: 0
+// out: 7
+// out: 16
+// out: 15
+// out: 32
+// out: 31
+use std::bits
+fun main() {
+    echo bits::popcount_u64(0 as u64)
+    echo bits::popcount_u64(18446744073709551615 as u64)
+    echo bits::popcount_u32(65536 as u32)
+    echo bits::popcount_u8(31 as u8)
+    echo bits::clz_u64(0 as u64)
+    echo bits::clz_u64(9223372036854775808 as u64)
+    echo bits::ctz_u64(9223372036854775808 as u64)
+    echo bits::clz_u32(536870912 as u32)
+    echo bits::clz_u8(0 as u8)
+    echo bits::ctz_u8(0 as u8)
+    echo bits::ctz_u16(1 as u16)
+    echo bits::clz_u8(1 as u8)
+    echo bits::ctz_u16(0 as u16)
+    echo bits::clz_u16(1 as u16)
+    echo bits::ctz_u32(0 as u32)
+    echo bits::clz_u32(1 as u32)
+}

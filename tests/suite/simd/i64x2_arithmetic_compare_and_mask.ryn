@@ -1,0 +1,64 @@
+// test: run
+// out: 6
+// out: 9223372036854775807
+// out: -4
+// out: -9223372036854775807
+// out: 5
+// out: -9223372036854775808
+// out: 1
+// out: -9223372036854775808
+// out: 5
+// out: -1
+// out: 4
+// out: 9223372036854775807
+// out: 4
+// out: 9223372036854775807
+// out: 0
+// out: 3
+// out: 0
+// out: 3
+// out: 0
+// out: 3
+// out: 1
+// out: -9223372036854775808
+// out: 5
+// out: -1
+// out: -1
+// out: -9223372036854775808
+// out: -9223372036854775807
+// out: -9223372036854775808
+// out: 1
+// out: 5
+// out: -1
+// out: -9223372036854775808
+// out: 1
+use std::simd
+fun show(v: simd::I64x2) {
+    echo v.get(0)
+    echo v.get(1)
+}
+fun main() {
+    a := simd::I64x2::splat(0).with(0, 1).with(1, -9223372036854775808)
+    b := simd::I64x2::splat(0).with(0, 5).with(1, -1)
+    show(a.add(b))
+    show(a.sub(b))
+    show(a.mul(b))
+    show(a.bit_and(b))
+    show(a.bit_or(b))
+    show(a.bit_xor(b))
+    show(a.bit_andnot(b))
+    echo a.eq(b).movemask()
+    echo a.ne(b).movemask()
+    echo a.gt(b).movemask()
+    echo a.lt(b).movemask()
+    echo a.ge(b).movemask()
+    echo a.le(b).movemask()
+    show(a.min(b))
+    show(a.max(b))
+    show(a.neg())
+    echo a.sum()
+    echo a.reduce_min()
+    echo a.reduce_max()
+    show(a.gt(b).select(a, b))
+    show(a.reverse())
+}

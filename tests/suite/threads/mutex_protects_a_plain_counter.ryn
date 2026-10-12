@@ -1,0 +1,60 @@
+// test: run
+// out: 400000
+// out: true
+// out: false
+// out: true
+// out: true
+// out: false
+use std::sync
+use std::arena
+fun add_to(address: *u8, delta: i64) {
+    p := address as *i64
+    *p = *p + delta
+}
+fun put(address: *u64, value: u64) {
+    *address = value
+}
+// A shared record: [mutex raw, shared counter]. The mutex protects the plain (non-atomic) counter.
+fun locked_adder(argument: *u8) -> *u8 {
+    mutex_at := argument as *u64
+    mutex_word := *mutex_at
+    mutex := mutex_word as *u8
+    counter := (argument as u64 + 8 as u64) as *u8
+    mut round: u64 = 0
+    while round < 100000 {
+        guard := sync::lock_raw(mutex)
+        add_to(counter, 1)
+        round += 1
+    }
+    return argument
+}
+fun main() {
+    mutex := sync::Mutex::new()
+    mut memory := arena::Arena::with_capacity(256 as u64)
+    record := memory.alloc_bytes(16 as u64, 8 as u64)
+    put(record as *u64, mutex.raw() as u64)
+    put((record as u64 + 8 as u64) as *u64, 0 as u64)
+    mut handles: Vec<sync::JoinHandle> = Vec()
+    mut index: u64 = 0
+    while index < 4 {
+        handles.push(sync::JoinHandle::spawn(locked_adder, record))
+        index += 1
+    }
+    for worker in handles {
+        worker.join()
+    }
+    echo *((record as u64 + 8 as u64) as *i64)
+
+    // Mutex try_lock while held, and an RwLock with two readers
+    held := mutex.lock()
+    other := mutex.try_lock()
+    echo held.is_held()
+    echo other.is_held()
+    rw := sync::RwLock::new()
+    r1 := rw.read()
+    r2 := rw.read()
+    w := rw.try_write()
+    echo r1.is_held()
+    echo r2.is_held()
+    echo w.is_held()
+}

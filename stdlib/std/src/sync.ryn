@@ -1,0 +1,484 @@
+// Threads with data, and the synchronization primitives, on POSIX threads (Linux; not available for the Windows target).
+//
+// Every primitive owns a heap block that never moves (a `pthread_mutex_t` must not be copied), reached through one raw
+// pointer, and releases it when the owner goes out of scope. Guards unlock when they go out of scope. A primitive is shared
+// with a thread by passing its `raw()` address in the thread's argument and rebuilding a guard there with `lock_raw`,
+// `read_raw` or `write_raw`; the owner must outlive every thread that uses the address (join the threads first).
+// No data is held inside a lock (a generic structure cannot have a destructor): protect shared data with the lock by
+// convention, or use `std::atomic`.
+
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun calloc(count: u64, size: u64) -> *u8;
+extern "C" fun free(block: *u8);
+extern "C" fun pthread_create(thread: *u8, attributes: *u8, routine: *u8, argument: *u8) -> i32;
+extern "C" fun pthread_join(thread: u64, result: *u8) -> i32;
+extern "C" fun pthread_detach(thread: u64) -> i32;
+extern "C" fun pthread_mutex_init(mutex: *u8, attributes: *u8) -> i32;
+extern "C" fun pthread_mutex_destroy(mutex: *u8) -> i32;
+extern "C" fun pthread_mutex_lock(mutex: *u8) -> i32;
+extern "C" fun pthread_mutex_trylock(mutex: *u8) -> i32;
+extern "C" fun pthread_mutex_unlock(mutex: *u8) -> i32;
+extern "C" fun pthread_rwlock_init(lock: *u8, attributes: *u8) -> i32;
+extern "C" fun pthread_rwlock_destroy(lock: *u8) -> i32;
+extern "C" fun pthread_rwlock_rdlock(lock: *u8) -> i32;
+extern "C" fun pthread_rwlock_wrlock(lock: *u8) -> i32;
+extern "C" fun pthread_rwlock_tryrdlock(lock: *u8) -> i32;
+extern "C" fun pthread_rwlock_trywrlock(lock: *u8) -> i32;
+extern "C" fun pthread_rwlock_unlock(lock: *u8) -> i32;
+extern "C" fun pthread_cond_init(condition: *u8, attributes: *u8) -> i32;
+extern "C" fun pthread_cond_destroy(condition: *u8) -> i32;
+extern "C" fun pthread_cond_wait(condition: *u8, mutex: *u8) -> i32;
+extern "C" fun pthread_cond_signal(condition: *u8) -> i32;
+extern "C" fun pthread_cond_broadcast(condition: *u8) -> i32;
+extern "C" fun pthread_barrier_init(barrier: *u8, attributes: *u8, count: u32) -> i32;
+extern "C" fun pthread_barrier_destroy(barrier: *u8) -> i32;
+extern "C" fun pthread_barrier_wait(barrier: *u8) -> i32;
+extern "C" fun pthread_once(once: *u8, routine: extern "C" fun()) -> i32;
+extern "C" fun pthread_key_create(key: *u8, destructor: *u8) -> i32;
+extern "C" fun pthread_key_delete(key: u32) -> i32;
+extern "C" fun pthread_setspecific(key: u32, value: *u8) -> i32;
+extern "C" fun pthread_getspecific(key: u32) -> *u8;
+
+// The block of a primitive: zeroed, so that an initialisation that fails leaves a valid null-state value.
+fun block(size: u64) -> *u8 {
+    return calloc(1 as u64, size)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Threads that take an argument and give a result.
+
+#[drop(release_join)]
+pub struct JoinHandle {
+    pub record: *u8,
+}
+
+fun release_join(handle: JoinHandle) {
+    when pointer_is_null(handle.record) {
+        return
+    }
+    joined := *((handle.record as u64 + 8 as u64) as *u64)
+    when joined == 0 {
+        pthread_detach(*(handle.record as *u64))
+    }
+    free(handle.record)
+}
+
+extend JoinHandle {
+    // Starts `routine(argument)` on a new thread. The routine receives the argument and returns a pointer (or null).
+    // `is_started` is false when the operating system could not create the thread.
+    pub fun spawn(routine: extern "C" fun(*u8) -> *u8, argument: *u8) -> JoinHandle {
+        record := block(24 as u64)
+        when pointer_is_null(record) {
+            return JoinHandle { record: record }
+        }
+        when pthread_create(record, 0 as *u8, routine as *u8, argument) != 0 {
+            free(record)
+            return JoinHandle { record: 0 as *u8 }
+        }
+        return JoinHandle { record: record }
+    }
+
+    pub fun is_started(self) -> bool {
+        return !pointer_is_null(self.record)
+    }
+
+    // Waits for the thread and gives what its routine returned. Joining twice, or a thread that did not start, gives null.
+    pub fun join(self) -> *u8 {
+        when pointer_is_null(self.record) {
+            return 0 as *u8
+        }
+        flag := (self.record as u64 + 8 as u64) as *u64
+        when *flag != 0 {
+            return 0 as *u8
+        }
+        *flag = 1
+        slot := (self.record as u64 + 16 as u64) as *u8
+        when pthread_join(*(self.record as *u64), slot) != 0 {
+            return 0 as *u8
+        }
+        return *((self.record as u64 + 16 as u64) as *u64) as *u8
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Mutex
+
+#[drop(release_mutex)]
+pub struct Mutex {
+    pub handle: *u8,
+}
+
+fun release_mutex(mutex: Mutex) {
+    when !pointer_is_null(mutex.handle) {
+        pthread_mutex_destroy(mutex.handle)
+        free(mutex.handle)
+    }
+}
+
+#[drop(release_guard)]
+pub struct MutexGuard {
+    pub handle: *u8,
+}
+
+fun release_guard(guard: MutexGuard) {
+    when !pointer_is_null(guard.handle) {
+        pthread_mutex_unlock(guard.handle)
+    }
+}
+
+extend Mutex {
+    pub fun new() -> Mutex {
+        handle := block(64 as u64)
+        when pointer_is_null(handle) {
+            return Mutex { handle: handle }
+        }
+        when pthread_mutex_init(handle, 0 as *u8) != 0 {
+            free(handle)
+            return Mutex { handle: 0 as *u8 }
+        }
+        return Mutex { handle: handle }
+    }
+
+    pub fun is_valid(self) -> bool {
+        return !pointer_is_null(self.handle)
+    }
+
+    pub fun raw(self) -> *u8 {
+        return self.handle
+    }
+
+    // Blocks until the lock is held; the guard unlocks it. A guard with `is_held() == false` means the call failed.
+    pub fun lock(self) -> MutexGuard {
+        return lock_raw(self.handle)
+    }
+
+    // Takes the lock when it is free; otherwise the guard is not held.
+    pub fun try_lock(self) -> MutexGuard {
+        when pointer_is_null(self.handle) {
+            return MutexGuard { handle: 0 as *u8 }
+        }
+        when pthread_mutex_trylock(self.handle) != 0 {
+            return MutexGuard { handle: 0 as *u8 }
+        }
+        return MutexGuard { handle: self.handle }
+    }
+}
+
+extend MutexGuard {
+    pub fun is_held(self) -> bool {
+        return !pointer_is_null(self.handle)
+    }
+}
+
+pub fun lock_raw(handle: *u8) -> MutexGuard {
+    when pointer_is_null(handle) {
+        return MutexGuard { handle: 0 as *u8 }
+    }
+    when pthread_mutex_lock(handle) != 0 {
+        return MutexGuard { handle: 0 as *u8 }
+    }
+    return MutexGuard { handle: handle }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// RwLock: any number of readers, or one writer.
+
+#[drop(release_rwlock)]
+pub struct RwLock {
+    pub handle: *u8,
+}
+
+fun release_rwlock(lock: RwLock) {
+    when !pointer_is_null(lock.handle) {
+        pthread_rwlock_destroy(lock.handle)
+        free(lock.handle)
+    }
+}
+
+#[drop(release_rw_guard)]
+pub struct RwGuard {
+    pub handle: *u8,
+}
+
+fun release_rw_guard(guard: RwGuard) {
+    when !pointer_is_null(guard.handle) {
+        pthread_rwlock_unlock(guard.handle)
+    }
+}
+
+extend RwLock {
+    pub fun new() -> RwLock {
+        handle := block(256 as u64)
+        when pointer_is_null(handle) {
+            return RwLock { handle: handle }
+        }
+        when pthread_rwlock_init(handle, 0 as *u8) != 0 {
+            free(handle)
+            return RwLock { handle: 0 as *u8 }
+        }
+        return RwLock { handle: handle }
+    }
+
+    pub fun is_valid(self) -> bool {
+        return !pointer_is_null(self.handle)
+    }
+
+    pub fun raw(self) -> *u8 {
+        return self.handle
+    }
+
+    pub fun read(self) -> RwGuard {
+        return read_raw(self.handle)
+    }
+
+    pub fun write(self) -> RwGuard {
+        return write_raw(self.handle)
+    }
+
+    pub fun try_read(self) -> RwGuard {
+        when pointer_is_null(self.handle) || pthread_rwlock_tryrdlock(self.handle) != 0 {
+            return RwGuard { handle: 0 as *u8 }
+        }
+        return RwGuard { handle: self.handle }
+    }
+
+    pub fun try_write(self) -> RwGuard {
+        when pointer_is_null(self.handle) || pthread_rwlock_trywrlock(self.handle) != 0 {
+            return RwGuard { handle: 0 as *u8 }
+        }
+        return RwGuard { handle: self.handle }
+    }
+}
+
+extend RwGuard {
+    pub fun is_held(self) -> bool {
+        return !pointer_is_null(self.handle)
+    }
+}
+
+pub fun read_raw(handle: *u8) -> RwGuard {
+    when pointer_is_null(handle) || pthread_rwlock_rdlock(handle) != 0 {
+        return RwGuard { handle: 0 as *u8 }
+    }
+    return RwGuard { handle: handle }
+}
+
+pub fun write_raw(handle: *u8) -> RwGuard {
+    when pointer_is_null(handle) || pthread_rwlock_wrlock(handle) != 0 {
+        return RwGuard { handle: 0 as *u8 }
+    }
+    return RwGuard { handle: handle }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Condvar
+
+#[drop(release_condvar)]
+pub struct Condvar {
+    pub handle: *u8,
+}
+
+fun release_condvar(condition: Condvar) {
+    when !pointer_is_null(condition.handle) {
+        pthread_cond_destroy(condition.handle)
+        free(condition.handle)
+    }
+}
+
+extend Condvar {
+    pub fun new() -> Condvar {
+        handle := block(128 as u64)
+        when pointer_is_null(handle) {
+            return Condvar { handle: handle }
+        }
+        when pthread_cond_init(handle, 0 as *u8) != 0 {
+            free(handle)
+            return Condvar { handle: 0 as *u8 }
+        }
+        return Condvar { handle: handle }
+    }
+
+    pub fun is_valid(self) -> bool {
+        return !pointer_is_null(self.handle)
+    }
+
+    pub fun raw(self) -> *u8 {
+        return self.handle
+    }
+
+    // Atomically releases the mutex at `mutex` (the `handle` of the held `MutexGuard`, or `Mutex::raw`) and sleeps; the mutex
+    // is held again when this returns. Wake-ups can be spurious, so the caller re-checks its condition in a loop. Every
+    // waiter and notifier of one condition variable uses the same mutex. The guard itself is not passed: it would be moved
+    // into the call and unlock the mutex.
+    pub fun wait(self, mutex: *u8) -> bool {
+        when pointer_is_null(mutex) {
+            return false
+        }
+        return pthread_cond_wait(self.handle, mutex) == 0
+    }
+
+    // The same on a raw address (from `raw`), for a thread that was handed it.
+    pub fun notify_all_raw(handle: *u8) {
+        pthread_cond_broadcast(handle)
+    }
+
+    pub fun notify_one(self) {
+        pthread_cond_signal(self.handle)
+    }
+
+    pub fun notify_all(self) {
+        pthread_cond_broadcast(self.handle)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Barrier
+
+#[drop(release_barrier)]
+pub struct Barrier {
+    pub handle: *u8,
+}
+
+fun release_barrier(barrier: Barrier) {
+    when !pointer_is_null(barrier.handle) {
+        pthread_barrier_destroy(barrier.handle)
+        free(barrier.handle)
+    }
+}
+
+extend Barrier {
+    // A barrier that releases its waiters once `count` threads are waiting. `count` 0 is invalid (an invalid barrier).
+    pub fun new(count: u32) -> Barrier {
+        when count == 0 as u32 {
+            return Barrier { handle: 0 as *u8 }
+        }
+        handle := block(64 as u64)
+        when pointer_is_null(handle) {
+            return Barrier { handle: handle }
+        }
+        when pthread_barrier_init(handle, 0 as *u8, count) != 0 {
+            free(handle)
+            return Barrier { handle: 0 as *u8 }
+        }
+        return Barrier { handle: handle }
+    }
+
+    pub fun is_valid(self) -> bool {
+        return !pointer_is_null(self.handle)
+    }
+
+    pub fun raw(self) -> *u8 {
+        return self.handle
+    }
+
+    // True for exactly one of the threads released together.
+    pub fun wait(self) -> bool {
+        return barrier_wait_raw(self.handle)
+    }
+}
+
+pub fun barrier_wait_raw(handle: *u8) -> bool {
+    when pointer_is_null(handle) {
+        return false
+    }
+    // PTHREAD_BARRIER_SERIAL_THREAD is -1.
+    return pthread_barrier_wait(handle) == -1
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Once
+
+#[drop(release_once)]
+pub struct Once {
+    pub handle: *u8,
+}
+
+fun release_once(once: Once) {
+    when !pointer_is_null(once.handle) {
+        free(once.handle)
+    }
+}
+
+extend Once {
+    pub fun new() -> Once {
+        return Once { handle: block(16 as u64) }
+    }
+
+    pub fun raw(self) -> *u8 {
+        return self.handle
+    }
+
+    // Runs `routine` the first time any thread calls this, and waits for it in the others.
+    pub fun call(self, routine: extern "C" fun()) -> bool {
+        when pointer_is_null(self.handle) {
+            return false
+        }
+        return pthread_once(self.handle, routine) == 0
+    }
+}
+
+pub fun once_raw(handle: *u8, routine: extern "C" fun()) -> bool {
+    when pointer_is_null(handle) {
+        return false
+    }
+    return pthread_once(handle, routine) == 0
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Thread-local storage: one pointer-sized slot per thread, zero (null) until that thread sets it.
+
+#[drop(release_local)]
+pub struct Local {
+    pub key: *u8,
+}
+
+fun release_local(local: Local) {
+    when !pointer_is_null(local.key) {
+        pthread_key_delete(*(local.key as *u32))
+        free(local.key)
+    }
+}
+
+extend Local {
+    pub fun new() -> Local {
+        key := block(8 as u64)
+        when pointer_is_null(key) {
+            return Local { key: key }
+        }
+        when pthread_key_create(key, 0 as *u8) != 0 {
+            free(key)
+            return Local { key: 0 as *u8 }
+        }
+        return Local { key: key }
+    }
+
+    pub fun is_valid(self) -> bool {
+        return !pointer_is_null(self.key)
+    }
+
+    pub fun raw(self) -> *u8 {
+        return self.key
+    }
+
+    pub fun set(self, value: *u8) -> bool {
+        return local_set_raw(self.key, value)
+    }
+
+    pub fun get(self) -> *u8 {
+        return local_get_raw(self.key)
+    }
+}
+
+pub fun local_set_raw(key: *u8, value: *u8) -> bool {
+    when pointer_is_null(key) {
+        return false
+    }
+    return pthread_setspecific(*(key as *u32), value) == 0
+}
+
+pub fun local_get_raw(key: *u8) -> *u8 {
+    when pointer_is_null(key) {
+        return 0 as *u8
+    }
+    return pthread_getspecific(*(key as *u32))
+}

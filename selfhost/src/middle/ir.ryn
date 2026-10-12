@@ -134,6 +134,8 @@ pub struct IrStructDef {
     pub derives_clone: bool,
     pub derives_hash: bool,
     pub module_path: String,
+    // `repr(C)` layout options: the packing (low 16 bits, 0 for none) and the minimum alignment (the bits above), as bytes.
+    pub layout: u64,
 }
 
 pub struct EnumVariant {
@@ -166,6 +168,8 @@ pub struct IrProgram {
     pub structs: Vec<IrStructDef>,
     pub enums: Vec<IrEnumDef>,
     pub functions: Vec<IrFunction>,
+    // The name of each function, in order, when the producer wrote them (a trailing section; empty for programs without it).
+    pub names: Vec<String>,
     pub types: Vec<IrTy>,
     pub exprs: Vec<IrExpr>,
     pub stmts: Vec<IrStmt>,
@@ -406,12 +410,24 @@ extend IrDecoder {
             functions.push(self.function()?)
             function_index += 1
         }
+        // An optional trailing section: the names of the functions, for listings and diagnostics.
+        mut names: Vec<String> = Vec()
+        self.skip_spaces()
+        when self.at != self.text.len() {
+            name_count := self.uint()?
+            mut name_index: u64 = 0
+            while name_index < name_count {
+                names.push(self.string()?)
+                name_index += 1
+            }
+        }
         return Result::Ok(IrProgram {
             main_index: main_index,
             instant_drop: instant_drop,
             structs: structs,
             enums: enums,
             functions: functions,
+            names: names,
             types: self.types,
             exprs: self.exprs,
             stmts: self.stmts,
@@ -440,6 +456,7 @@ extend IrDecoder {
         derives_clone := self.boolean()?
         derives_hash := self.boolean()?
         module_path := self.string()?
+        layout := self.uint()?
         return Result::Ok(IrStructDef {
             name: name,
             fields: fields,
@@ -449,6 +466,7 @@ extend IrDecoder {
             derives_clone: derives_clone,
             derives_hash: derives_hash,
             module_path: module_path,
+            layout: layout,
         })
     }
 
@@ -1088,6 +1106,7 @@ pub fun append_ir(program: IrProgram, text: String) -> Result<IrProgram, String>
     added.structs = structs
     added.enums = enums
     added.functions = functions
+    added.names = program.names
     added.main_index = main_index
     added.instant_drop = instant_drop
     return Result::Ok(added)
@@ -1202,6 +1221,12 @@ extend IrWriter {
             self.function(function)
             index += 1
         }
+        when !self.program.names.is_empty() {
+            self.uint(self.program.names.len())
+            for name in self.program.names.clone() {
+                self.string(name)
+            }
+        }
     }
 
     fun struct_definition(mut self, definition: IrStructDef) {
@@ -1219,6 +1244,7 @@ extend IrWriter {
         self.boolean(definition.derives_clone)
         self.boolean(definition.derives_hash)
         self.string(definition.module_path)
+        self.uint(definition.layout)
     }
 
     fun enum_definition(mut self, definition: IrEnumDef) {

@@ -13,7 +13,7 @@ use frontend::lexer
 
 // Compile-time metadata functions take explicit type arguments but are not generic functions.
 fun is_comptime_intrinsic(name: String) -> bool {
-    return name == "field_count" || name == "variant_count" || name == "type_name" || name == "has_field"
+    return name == "field_count" || name == "variant_count" || name == "type_name" || name == "has_field" || name == "size_of" || name == "align_of" || name == "offset_of"
 }
 
 struct TypeKind {

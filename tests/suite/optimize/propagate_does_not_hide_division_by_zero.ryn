@@ -1,0 +1,11 @@
+// test: run
+// out: 1
+// err: division or remainder by zero
+// exit: 1
+fun main() {
+    echo 1
+    // A local that holds a constant zero is still a zero divisor when the division runs.
+    z := 0
+    echo 5 / z
+    echo 2
+}

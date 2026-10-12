@@ -13,7 +13,7 @@ own sources, and the tree contains no Rust.
 
 ## Status
 
-The latest release is [0.1.8](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.8); [0.1.7](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.7) was "Native Power & Benchmarks" and [0.1.6](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.6) was "Native First".
+The development version is 0.1.9, "Performance Revolution" (see the changelog); the latest release is [0.1.8](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.8); [0.1.7](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.7) was "Native Power & Benchmarks" and [0.1.6](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.6) was "Native First".
 
 - The whole toolchain is written in Ryn: the `ryn` command, the native compiler `rync` (lexer, parser,
   analysis, code generator, ELF and PE writers) and the runtime. There is no Rust code in the tree and no Cargo
@@ -149,6 +149,10 @@ The full language surface, including known limits, is documented in
 `std::arena`. The sources live in [`stdlib/std/src`](stdlib/std/src) and compile with the native
 compiler.
 
+<p align="center"><img src="assets/compile-time.gif" alt="Compile times of ryn build" width="700"></p>
+
+Compile times above are medians of real runs on one machine (`rync` built by a `rync` of this tree, 0.1.9; the animation is typed, not a recording).
+
 ## Documentation
 
 | Document | Contents |
@@ -159,6 +163,7 @@ compiler.
 | [docs/self-hosting-plan.md](docs/self-hosting-plan.md) | Plan and progress toward full self-hosting |
 | [docs/native-ownership-validation.md](docs/native-ownership-validation.md) | Ownership and bootstrap measurements |
 | [docs/native-float-validation.md](docs/native-float-validation.md) | Freestanding float runtime validation |
+| [docs/native-performance.md](docs/native-performance.md) | SIMD, atomics, threads, allocators, layout, `ryn asm`: state and limits |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 
 ## Testing

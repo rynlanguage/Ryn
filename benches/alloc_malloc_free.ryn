@@ -1,0 +1,17 @@
+// 5,000,000 allocations of 48 bytes from the C allocator, each written and freed; the checksum is printed. Pair with
+// alloc_pool.ryn and alloc_arena.ryn.
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(block: *u8);
+fun main() {
+    mut checksum: u64 = 0
+    mut round: u64 = 0
+    while round < 5000000 {
+        block := malloc(48 as u64)
+        word := block as *u64
+        *word = round
+        checksum = checksum + *word
+        free(block)
+        round += 1
+    }
+    echo checksum
+}

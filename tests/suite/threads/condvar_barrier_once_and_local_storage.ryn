@@ -1,0 +1,81 @@
+// test: run
+// out: once
+// out: ready 3
+// out: serial 1
+// out: local mismatches 0
+// out: main local 0
+use std::sync
+use std::arena
+use std::atomic
+// The shared record, one u64 cell each: 0 mutex, 1 condvar, 2 ready count, 3 barrier, 4 serial-thread cell,
+// 5 once, 6 mismatch cell, 7 local key.
+fun cell(record: *u8, index: u64) -> *u64 {
+    return (record as u64 + index * 8 as u64) as *u64
+}
+fun word(record: *u8, index: u64) -> u64 {
+    return *cell(record, index)
+}
+fun put(address: *u64, value: u64) {
+    *address = value
+}
+fun init() {
+    echo "once"
+}
+fun worker(argument: *u8) -> *u8 {
+    sync::once_raw(word(argument, 5) as *u8, init)
+    mine: i64 = 7
+    here := &raw mut mine
+    sync::local_set_raw(word(argument, 7) as *u8, here as *u8)
+    when sync::barrier_wait_raw(word(argument, 3) as *u8) {
+        serial := Atomic::<u64> { address: word(argument, 4) as *u8 }
+        serial.fetch_add(1 as u64, atomic::Ordering::SeqCst)
+    }
+    back := sync::local_get_raw(word(argument, 7) as *u8)
+    when back as u64 != here as u64 {
+        misses := Atomic::<u64> { address: word(argument, 6) as *u8 }
+        misses.fetch_add(1 as u64, atomic::Ordering::SeqCst)
+    }
+    guard := sync::lock_raw(word(argument, 0) as *u8)
+    ready := cell(argument, 2)
+    put(ready, *ready + 1 as u64)
+    sync::Condvar::notify_all_raw(word(argument, 1) as *u8)
+    return argument
+}
+fun main() {
+    mutex := sync::Mutex::new()
+    condition := sync::Condvar::new()
+    barrier := sync::Barrier::new(3 as u32)
+    once := sync::Once::new()
+    local := sync::Local::new()
+    serial := atomic::AtomicCell::new()
+    misses := atomic::AtomicCell::new()
+    mut memory := arena::Arena::with_capacity(256 as u64)
+    record := memory.alloc_bytes(64 as u64, 8 as u64)
+    put(cell(record, 0), mutex.raw() as u64)
+    put(cell(record, 1), condition.raw() as u64)
+    put(cell(record, 2), 0)
+    put(cell(record, 3), barrier.raw() as u64)
+    put(cell(record, 4), serial.address as u64)
+    put(cell(record, 5), once.raw() as u64)
+    put(cell(record, 6), misses.address as u64)
+    put(cell(record, 7), local.raw() as u64)
+    mut handles: Vec<sync::JoinHandle> = Vec()
+    mut index: u64 = 0
+    while index < 3 {
+        handles.push(sync::JoinHandle::spawn(worker, record))
+        index += 1
+    }
+    guard := mutex.lock()
+    while *cell(record, 2) < 3 {
+        condition.wait(guard.handle)
+    }
+    echo String("ready ").concat(String(*cell(record, 2)))
+    for handle in handles {
+        handle.join()
+    }
+    serial_total := Atomic::<u64> { address: serial.address }
+    miss_total := Atomic::<u64> { address: misses.address }
+    echo String("serial ").concat(String(serial_total.load(atomic::Ordering::SeqCst)))
+    echo String("local mismatches ").concat(String(miss_total.load(atomic::Ordering::SeqCst)))
+    echo String("main local ").concat(String(local.get() as u64))
+}

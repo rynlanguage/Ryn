@@ -1,0 +1,19 @@
+// Creating and joining 2,000 native threads, one at a time; each adds its number to an atomic sum.
+use std::atomic
+use std::sync
+fun add_one(argument: *u8) -> *u8 {
+    counter := Atomic::<u64> { address: argument }
+    counter.fetch_add(1 as u64, atomic::Ordering::SeqCst)
+    return argument
+}
+fun main() {
+    cell := atomic::AtomicCell::new()
+    counter := Atomic::<u64> { address: cell.address }
+    mut round: u64 = 0
+    while round < 2000 {
+        worker := sync::JoinHandle::spawn(add_one, cell.address)
+        worker.join()
+        round += 1
+    }
+    echo counter.load(atomic::Ordering::SeqCst)
+}

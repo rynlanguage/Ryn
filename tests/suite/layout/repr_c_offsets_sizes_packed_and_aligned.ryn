@@ -1,0 +1,73 @@
+// test: run
+// out: 24
+// out: 8
+// out: 0
+// out: 4
+// out: 8
+// out: 16
+// out: 14
+// out: 1
+// out: 0
+// out: 1
+// out: 5
+// out: 6
+// out: 32
+// out: 32
+// out: 6
+// out: 2
+// out: 2
+// out: 4
+// out: 2
+// out: 8
+// out: 24
+// out: true
+#[repr(C)]
+struct Header {
+    tag: u8,
+    count: u32,
+    flag: u8,
+    big: u64
+}
+#[repr(C, packed)]
+struct Packed {
+    tag: u8,
+    count: u32,
+    flag: u8,
+    big: u64
+}
+#[repr(C, align(32))]
+struct Aligned {
+    first: u32
+}
+#[repr(C, packed(2))]
+struct Pair {
+    a: u8,
+    b: u32
+}
+fun main() {
+    static_assert(offset_of::<Header>("big") == 16, "C puts the u64 at 16")
+    static_assert(size_of::<Packed>() == 14)
+    static_assert(align_of::<Aligned>() == 32)
+    echo size_of::<Header>()
+    echo align_of::<Header>()
+    echo offset_of::<Header>("tag")
+    echo offset_of::<Header>("count")
+    echo offset_of::<Header>("flag")
+    echo offset_of::<Header>("big")
+    echo size_of::<Packed>()
+    echo align_of::<Packed>()
+    echo offset_of::<Packed>("tag")
+    echo offset_of::<Packed>("count")
+    echo offset_of::<Packed>("flag")
+    echo offset_of::<Packed>("big")
+    echo size_of::<Aligned>()
+    echo align_of::<Aligned>()
+    echo size_of::<Pair>()
+    echo align_of::<Pair>()
+    echo offset_of::<Pair>("b")
+    echo size_of::<i32>()
+    echo align_of::<u16>()
+    echo align_of::<f64>()
+    echo sizeof(Header)
+    echo sizeof(Packed) == 14 as u64
+}

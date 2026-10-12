@@ -1,0 +1,12 @@
+// 20,000,000 `lock xadd` on one cell by one thread, then the value is printed.
+use std::atomic
+fun main() {
+    cell := atomic::AtomicCell::new()
+    counter := Atomic::<u64> { address: cell.address }
+    mut round: u64 = 0
+    while round < 20000000 {
+        counter.fetch_add(1 as u64, atomic::Ordering::Relaxed)
+        round += 1
+    }
+    echo counter.load(atomic::Ordering::SeqCst)
+}

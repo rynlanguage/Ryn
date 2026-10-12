@@ -1,0 +1,30 @@
+// test: run
+// out: 5
+// out: 9
+// out: 16
+// out: 1
+use std::alloc
+use std::arena
+// An allocator written for this program: it counts the bytes asked for and borrows its memory from an arena.
+struct Counting {
+    served: u64,
+    arena: arena::Arena,
+}
+extend Counting {
+    fun alloc_bytes(mut self, size: u64, align: u64) -> *u8 {
+        self.served += size
+        return self.arena.alloc_bytes(size, align)
+    }
+    fun served_bytes(self) -> u64 {
+        return self.served
+    }
+}
+fun main() {
+    mut c := Counting { served: 0 as u64, arena: arena::Arena::with_capacity(64 as u64) }
+    first := alloc::place(c.alloc_bytes(8 as u64, 8 as u64), 5 as i64)
+    second := alloc::place(c.alloc_bytes(8 as u64, 8 as u64), 9 as i64)
+    echo *first
+    echo *second
+    echo c.served_bytes()
+    echo 1
+}

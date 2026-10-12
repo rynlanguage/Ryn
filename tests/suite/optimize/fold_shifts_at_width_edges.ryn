@@ -1,0 +1,145 @@
+// test: run
+// out: 128
+// out: 128
+// out: 0
+// out: 0
+// out: 240
+// out: 240
+// out: 1
+// out: 1
+// out: 0
+// out: 0
+// out: -1
+// out: -1
+// out: -64
+// out: -64
+// out: -1
+// out: -1
+// out: 0
+// out: 0
+// out: 0
+// out: 0
+// out: -2
+// out: -2
+// out: -2147483648
+// out: -2147483648
+// out: -4
+// out: -4
+// out: -1
+// out: -1
+// out: -9223372036854775808
+// out: -9223372036854775808
+// out: -1
+// out: -1
+// out: -9223372036854775808
+// out: -9223372036854775808
+// out: 0
+// out: 0
+// out: 2147483648
+// out: 2147483648
+// out: 1
+// out: 1
+// out: 9223372036854775808
+// out: 9223372036854775808
+// out: 0
+// out: 0
+fun shl_u8(a: u8, n: u32) -> u8 {
+    return a << n
+}
+
+fun shr_u8(a: u8, n: u32) -> u8 {
+    return a >> n
+}
+
+fun shl_i8(a: i8, n: u32) -> i8 {
+    return a << n
+}
+
+fun sar_i8(a: i8, n: u32) -> i8 {
+    return a >> n
+}
+
+fun shl_i32(a: i32, n: u32) -> i32 {
+    return a << n
+}
+
+fun sar_i32(a: i32, n: u32) -> i32 {
+    return a >> n
+}
+
+fun shl_i64(a: i64, n: u32) -> i64 {
+    return a << n
+}
+
+fun sar_i64(a: i64, n: u32) -> i64 {
+    return a >> n
+}
+
+fun shl_u32(a: u32, n: u32) -> u32 {
+    return a << n
+}
+
+fun shr_u32(a: u32, n: u32) -> u32 {
+    return a >> n
+}
+
+fun shr_u64(a: u64, n: u32) -> u64 {
+    return a >> n
+}
+
+fun shl_u64(a: u64, n: u32) -> u64 {
+    return a << n
+}
+
+fun main() {
+    // u8: a count below 8 shifts; a count of 8 or more gives 0. Left shifts drop the bits that leave the width.
+    echo 1 as u8 << 7 as u32
+    echo shl_u8(1 as u8, 7 as u32)
+    echo 1 as u8 << 8 as u32
+    echo shl_u8(1 as u8, 8 as u32)
+    echo 255 as u8 << 4 as u32
+    echo shl_u8(255 as u8, 4 as u32)
+    echo 128 as u8 >> 7 as u32
+    echo shr_u8(128 as u8, 7 as u32)
+    echo 255 as u8 >> 9 as u32
+    echo shr_u8(255 as u8, 9 as u32)
+    // i8: a signed right shift keeps the sign; -128 is 0x80 and -1 is all ones.
+    echo (0 as i8 - 127 as i8 - 1 as i8) >> 7 as u32
+    echo sar_i8(0 as i8 - 127 as i8 - 1 as i8, 7 as u32)
+    echo (0 as i8 - 127 as i8 - 1 as i8) >> 1 as u32
+    echo sar_i8(0 as i8 - 127 as i8 - 1 as i8, 1 as u32)
+    echo (0 as i8 - 1 as i8) >> 8 as u32
+    echo sar_i8(0 as i8 - 1 as i8, 8 as u32)
+    echo 1 as i8 >> 8 as u32
+    echo sar_i8(1 as i8, 8 as u32)
+    // -128 << 1 is -256, which is 0 at 8 bits; 127 << 1 is 254, which is -2 at 8 bits.
+    echo (0 as i8 - 127 as i8 - 1 as i8) << 1 as u32
+    echo shl_i8(0 as i8 - 127 as i8 - 1 as i8, 1 as u32)
+    echo 127 as i8 << 1 as u32
+    echo shl_i8(127 as i8, 1 as u32)
+    // i32: 1 << 31 is the sign bit; -8 >> 1 is -4; a count of 32 or more of a negative value gives -1.
+    echo 1 as i32 << 31 as u32
+    echo shl_i32(1 as i32, 31 as u32)
+    echo (0 as i32 - 8) >> 1 as u32
+    echo sar_i32(0 as i32 - 8, 1 as u32)
+    echo (0 as i32 - 8) >> 32 as u32
+    echo sar_i32(0 as i32 - 8, 32 as u32)
+    // i64: the same at 63 and 64.
+    echo (0 as i64 - 1 as i64) << 63 as u32
+    echo shl_i64(0 as i64 - 1 as i64, 63 as u32)
+    echo (0 as i64 - 1 as i64) >> 63 as u32
+    echo sar_i64(0 as i64 - 1 as i64, 63 as u32)
+    echo 1 as i64 << 63 as u32
+    echo shl_i64(1 as i64, 63 as u32)
+    // u32 and u64: right shifts are logical; a count at the width gives 0.
+    echo 4294967295 as u32 >> 32 as u32
+    echo shr_u32(4294967295 as u32, 32 as u32)
+    echo 4294967295 as u32 << 31 as u32
+    echo shl_u32(4294967295 as u32, 31 as u32)
+    echo 18446744073709551615 as u64 >> 63 as u32
+    echo shr_u64(18446744073709551615 as u64, 63 as u32)
+    echo 1 as u64 << 63 as u32
+    echo shl_u64(1 as u64, 63 as u32)
+    echo 18446744073709551615 as u64 << 64 as u32
+    echo shl_u64(18446744073709551615 as u64, 64 as u32)
+}

@@ -1,0 +1,16 @@
+// The same 5,000,000 allocate-write-free cycles on a std::alloc::Pool of 48-byte blocks.
+use std::alloc
+fun main() {
+    mut pool := alloc::Pool::new(48 as u64, 64 as u64)
+    mut checksum: u64 = 0
+    mut round: u64 = 0
+    while round < 5000000 {
+        block := pool.alloc()
+        word := block as *u64
+        *word = round
+        checksum = checksum + *word
+        pool.release(block)
+        round += 1
+    }
+    echo checksum
+}

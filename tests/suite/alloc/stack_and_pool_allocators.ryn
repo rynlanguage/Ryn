@@ -1,0 +1,46 @@
+// test: run
+// out: 16
+// out: true
+// out: 0
+// out: 24
+// out: true
+// out: false
+// out: 2
+// out: 1
+// out: true
+// out: false
+// out: false
+// out: 7
+// out: 0
+// out: true
+use std::alloc
+fun main() {
+    mut stack := alloc::Stack::with_capacity(64 as u64)
+    first := stack.alloc_bytes(16 as u64, 16 as u64)
+    echo stack.used()
+    echo (first as u64) % 16 == 0 as u64
+    mark := stack.mark()
+    second := stack.alloc_bytes(8 as u64, 8 as u64)
+    other := stack.alloc_bytes(100 as u64, 1 as u64)
+    echo other as u64
+    echo stack.used()
+    echo stack.rewind(mark)
+    echo stack.rewind(40 as u64)
+
+    mut pool := alloc::Pool::new(20 as u64, 3 as u64)
+    a := pool.alloc()
+    b := pool.alloc()
+    echo pool.live()
+    echo pool.available()
+    echo pool.release(a)
+    echo pool.release(a)
+    echo pool.release((b as u64 + 1 as u64) as *u8)
+    slot := pool.alloc_bytes(8 as u64, 8 as u64)
+    value := alloc::place(slot, 7 as i64)
+    echo *value
+    mut zero_pool := alloc::Pool::new(8 as u64, 0 as u64)
+    echo zero_pool.capacity()
+    c := pool.alloc()
+    d := pool.alloc()
+    echo pool.alloc_bytes(8 as u64, 8 as u64) as u64 == 0 as u64
+}

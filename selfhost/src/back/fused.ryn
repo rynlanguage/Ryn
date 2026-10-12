@@ -1,0 +1,246 @@
+// The loops of the fused array operations of `std::simd` (`__simd_fused_*`, decoded by gen.ryn `simd_fused`). Each one is one
+// instruction sequence over the whole array, so the vector registers stay in place from one block to the next. The caller
+// has loaded the operands: rdi, rsi and rdx hold the pointers, rcx the element count, and a reduction writes its result
+// (4 bytes) to the address in rdx. `avx` selects the 256-bit form; the caller emits it only after `std::cpu` reports AVX2.
+//
+// The reductions have one fixed order, the same on the SSE2 and the AVX2 path, so both give the same bits:
+//   a block is 16 consecutive elements. Accumulator k (k = 0 to 3) adds elements 4k to 4k+3 of every block, lane by lane.
+//     SSE2: four xmm registers, xmm0 to xmm3. AVX2: ymm0 holds accumulators 0 (lanes 0 to 3) and 1 (lanes 4 to 7),
+//     ymm1 holds accumulators 2 and 3, so the two forms add the same elements to the same lanes.
+//   The accumulators are combined as (A0 + A2) + (A1 + A3), lane by lane; then the four lanes as (l0 + l2) + (l1 + l3).
+//   The elements after the last full block are added one at a time, in order.
+// A dot product adds the rounded products the same way. Integer sums wrap, so their order does not matter.
+// Only xmm0 to xmm5 and ymm0 to ymm2 are used, and the pointers are rdi, rsi, rdx and rcx, which the VEX forms address
+// without extension bits.
+
+use back::x64
+
+// The opcodes (the byte after 0F, or after the 66, F3 or VEX prefix; see x64.ryn simd_rr and vex_rr).
+pub struct Op { unused: u64 }
+
+extend Op {
+    pub const XORPS: u64 = 87
+    pub const ADDPS: u64 = 88
+    pub const MULPS: u64 = 89
+    pub const MOVHLPS: u64 = 18
+    pub const MOVAPS: u64 = 40
+    pub const SHUFPS: u64 = 198
+    pub const PXOR: u64 = 239
+    pub const PADDD: u64 = 254
+    pub const PSHUFD: u64 = 112
+    pub const VPERM2F128: u64 = 6
+    pub const VPERM2I128: u64 = 70
+}
+
+// A block of accumulators: `pp` is the mandatory prefix (0 for the float instructions, 1 for the integer ones).
+// The accumulators are xmm0 to xmm3 (SSE2) or ymm0 and ymm1 (AVX2), each of which covers two of them.
+fun zero_accumulators(asm: &mut x64::Asm, avx: bool, pp: u64, zero: u64) {
+    when avx {
+        asm.vex_rr(pp, 1, zero, 0, true, 0, 0, 0, false, 0)
+        asm.vex_rr(pp, 1, zero, 0, true, 1, 1, 1, false, 0)
+    } else {
+        asm.simd_rr(pp, 1, zero, 0, 0, false, 0)
+        asm.simd_rr(pp, 1, zero, 1, 1, false, 0)
+        asm.simd_rr(pp, 1, zero, 2, 2, false, 0)
+        asm.simd_rr(pp, 1, zero, 3, 3, false, 0)
+    }
+}
+
+// The full 16-element blocks, while at least 16 elements are left. `dot` multiplies the element of rdi by the one of rsi
+// before accumulating it, and advances rsi too. `add` and `mul` are the opcodes of the accumulation and the product.
+fun accumulate_blocks(asm: &mut x64::Asm, avx: bool, dot: bool, pp: u64, add: u64, mul: u64) {
+    top := asm.new_label()
+    done := asm.new_label()
+    asm.bind(top)
+    asm.alu_ri(7, x64::Reg::RCX, 16)
+    asm.jcc(x64::Cc::BELOW, done)
+    when avx {
+        mut half: u64 = 0
+        while half < 2 {
+            asm.vex_move_at(111, true, 4, x64::Reg::RDI, (half * 32) as i64)
+            when dot {
+                asm.vex_move_at(111, true, 5, x64::Reg::RSI, (half * 32) as i64)
+                asm.vex_rr(pp, 1, mul, 0, true, 4, 4, 5, false, 0)
+            }
+            asm.vex_rr(pp, 1, add, 0, true, half, half, 4, false, 0)
+            half += 1
+        }
+        asm.alu_ri(0, x64::Reg::RDI, 64)
+        when dot {
+            asm.alu_ri(0, x64::Reg::RSI, 64)
+        }
+    } else {
+        mut at: u64 = 0
+        while at < 4 {
+            asm.movdqu_load(4, x64::Reg::RDI, (at * 16) as i64)
+            when dot {
+                asm.movdqu_load(5, x64::Reg::RSI, (at * 16) as i64)
+                asm.simd_rr(pp, 1, mul, 4, 5, false, 0)
+            }
+            asm.simd_rr(pp, 1, add, at, 4, false, 0)
+            at += 1
+        }
+        asm.alu_ri(0, x64::Reg::RDI, 64)
+        when dot {
+            asm.alu_ri(0, x64::Reg::RSI, 64)
+        }
+    }
+    asm.alu_ri(5, x64::Reg::RCX, 16)
+    asm.jmp(top)
+    asm.bind(done)
+}
+
+// The accumulators to xmm0: (A0 + A2) + (A1 + A3) lane by lane. The AVX2 form does the same additions in the same order: the
+// low half of ymm0 + ymm1 is A0 + A2 and the high half is A1 + A3, and adding the two halves gives the same sum.
+fun combine_accumulators(asm: &mut x64::Asm, avx: bool, pp: u64, add: u64, perm: u64) {
+    when avx {
+        asm.vex_rr(pp, 1, add, 0, true, 0, 0, 1, false, 0)
+        asm.vex_rr(1, 3, perm, 0, true, 2, 0, 0, true, 1)
+        asm.vex_rr(pp, 1, add, 0, true, 0, 0, 2, false, 0)
+        asm.vzeroupper()
+    } else {
+        asm.simd_rr(pp, 1, add, 0, 2, false, 0)
+        asm.simd_rr(pp, 1, add, 1, 3, false, 0)
+        asm.simd_rr(pp, 1, add, 0, 1, false, 0)
+    }
+}
+
+// Float: the four lanes of xmm0 become (l0 + l2) + (l1 + l3) in lane 0. SSE only (movhlps and shufps are SSE, not SSE3).
+fun float_lanes(asm: &mut x64::Asm) {
+    asm.simd_rr(0, 1, Op::MOVHLPS, 1, 0, false, 0)
+    asm.simd_rr(0, 1, Op::ADDPS, 0, 1, false, 0)
+    asm.simd_rr(0, 1, Op::MOVAPS, 1, 0, false, 0)
+    asm.simd_rr(0, 1, Op::SHUFPS, 1, 1, true, 85)
+    asm.sse_op(4, Op::ADDPS, 0, 1)
+}
+
+// Integer: the four lanes of xmm0 are added into lane 0 (wrapping).
+fun int_lanes(asm: &mut x64::Asm) {
+    asm.simd_rr(1, 1, Op::PSHUFD, 1, 0, true, 78)
+    asm.simd_rr(1, 1, Op::PADDD, 0, 1, false, 0)
+    asm.simd_rr(1, 1, Op::PSHUFD, 1, 0, true, 177)
+    asm.simd_rr(1, 1, Op::PADDD, 0, 1, false, 0)
+}
+
+// The elements left (rcx of them) after the blocks, one at a time, added into the low lane of xmm0 (float). `dot` multiplies
+// the element of rdi by the one of rsi first.
+fun float_tail(asm: &mut x64::Asm, dot: bool) {
+    top := asm.new_label()
+    done := asm.new_label()
+    asm.bind(top)
+    asm.test_rr(x64::Reg::RCX, x64::Reg::RCX)
+    asm.jcc(x64::Cc::EQUAL, done)
+    asm.sse_load(4, 4, x64::Reg::RDI, 0)
+    when dot {
+        asm.sse_load(4, 5, x64::Reg::RSI, 0)
+        asm.sse_op(4, Op::MULPS, 4, 5)
+        asm.alu_ri(0, x64::Reg::RSI, 4)
+    }
+    asm.sse_op(4, Op::ADDPS, 0, 4)
+    asm.alu_ri(0, x64::Reg::RDI, 4)
+    asm.alu_ri(5, x64::Reg::RCX, 1)
+    asm.jmp(top)
+    asm.bind(done)
+}
+
+// The elements left after the blocks, one at a time, added into the integer in eax (a 64-bit add, of which the low 32 bits
+// are the wrapped sum).
+fun int_tail(asm: &mut x64::Asm) {
+    top := asm.new_label()
+    done := asm.new_label()
+    asm.bind(top)
+    asm.test_rr(x64::Reg::RCX, x64::Reg::RCX)
+    asm.jcc(x64::Cc::EQUAL, done)
+    asm.load(4, true, x64::Reg::RSI, x64::Reg::RDI, 0)
+    asm.alu_rr(1, x64::Reg::RAX, x64::Reg::RSI)
+    asm.alu_ri(0, x64::Reg::RDI, 4)
+    asm.alu_ri(5, x64::Reg::RCX, 1)
+    asm.jmp(top)
+    asm.bind(done)
+}
+
+// The sum of `count` floats at rdi, to the 4 bytes at rdx.
+pub fun sum_f32(asm: &mut x64::Asm, avx: bool) {
+    zero_accumulators(asm, avx, 0, Op::XORPS)
+    accumulate_blocks(asm, avx, false, 0, Op::ADDPS, Op::MULPS)
+    combine_accumulators(asm, avx, 0, Op::ADDPS, Op::VPERM2F128)
+    float_lanes(asm)
+    float_tail(asm, false)
+    asm.movq_from_xmm(false, x64::Reg::RAX, 0)
+    asm.store(4, x64::Reg::RAX, x64::Reg::RDX, 0)
+}
+
+// The dot product of `count` floats at rdi and rsi, to the 4 bytes at rdx.
+pub fun dot_f32(asm: &mut x64::Asm, avx: bool) {
+    zero_accumulators(asm, avx, 0, Op::XORPS)
+    accumulate_blocks(asm, avx, true, 0, Op::ADDPS, Op::MULPS)
+    combine_accumulators(asm, avx, 0, Op::ADDPS, Op::VPERM2F128)
+    float_lanes(asm)
+    float_tail(asm, true)
+    asm.movq_from_xmm(false, x64::Reg::RAX, 0)
+    asm.store(4, x64::Reg::RAX, x64::Reg::RDX, 0)
+}
+
+// The wrapping sum of `count` 32-bit integers at rdi, to the 4 bytes at rdx.
+pub fun sum_i32(asm: &mut x64::Asm, avx: bool) {
+    zero_accumulators(asm, avx, 1, Op::PXOR)
+    accumulate_blocks(asm, avx, false, 1, Op::PADDD, Op::PADDD)
+    combine_accumulators(asm, avx, 1, Op::PADDD, Op::VPERM2I128)
+    int_lanes(asm)
+    asm.movq_from_xmm(false, x64::Reg::RAX, 0)
+    int_tail(asm)
+    asm.store(4, x64::Reg::RAX, x64::Reg::RDX, 0)
+}
+
+// dst[i] = a[i] + b[i] for `count` floats: rdi is dst, rsi is a, rdx is b, rcx the count. Each element is one correctly rounded
+// addition, so the result does not depend on the path. dst may equal a or b, but must not partly overlap them.
+pub fun add_f32(asm: &mut x64::Asm, avx: bool) {
+    when avx {
+        top := asm.new_label()
+        done := asm.new_label()
+        asm.bind(top)
+        asm.alu_ri(7, x64::Reg::RCX, 8)
+        asm.jcc(x64::Cc::BELOW, done)
+        asm.vex_move_at(111, true, 0, x64::Reg::RSI, 0)
+        asm.vex_move_at(111, true, 1, x64::Reg::RDX, 0)
+        asm.vex_rr(0, 1, Op::ADDPS, 0, true, 0, 0, 1, false, 0)
+        asm.vex_move_at(127, true, 0, x64::Reg::RDI, 0)
+        asm.alu_ri(0, x64::Reg::RSI, 32)
+        asm.alu_ri(0, x64::Reg::RDX, 32)
+        asm.alu_ri(0, x64::Reg::RDI, 32)
+        asm.alu_ri(5, x64::Reg::RCX, 8)
+        asm.jmp(top)
+        asm.bind(done)
+        asm.vzeroupper()
+    }
+    top4 := asm.new_label()
+    done4 := asm.new_label()
+    asm.bind(top4)
+    asm.alu_ri(7, x64::Reg::RCX, 4)
+    asm.jcc(x64::Cc::BELOW, done4)
+    asm.movdqu_load(0, x64::Reg::RSI, 0)
+    asm.movdqu_load(1, x64::Reg::RDX, 0)
+    asm.simd_rr(0, 1, Op::ADDPS, 0, 1, false, 0)
+    asm.movdqu_store(0, x64::Reg::RDI, 0)
+    asm.alu_ri(0, x64::Reg::RSI, 16)
+    asm.alu_ri(0, x64::Reg::RDX, 16)
+    asm.alu_ri(0, x64::Reg::RDI, 16)
+    asm.alu_ri(5, x64::Reg::RCX, 4)
+    asm.jmp(top4)
+    asm.bind(done4)
+    top1 := asm.new_label()
+    done1 := asm.new_label()
+    asm.bind(top1)
+    asm.test_rr(x64::Reg::RCX, x64::Reg::RCX)
+    asm.jcc(x64::Cc::EQUAL, done1)
+    asm.sse_load(4, 0, x64::Reg::RSI, 0)
+    asm.sse_load(4, 1, x64::Reg::RDX, 0)
+    asm.sse_op(4, Op::ADDPS, 0, 1)
+    asm.sse_store(4, 0, x64::Reg::RDI, 0)
+    asm.alu_ri(0, x64::Reg::RSI, 4)
+    asm.alu_ri(0, x64::Reg::RDX, 4)
+    asm.alu_ri(0, x64::Reg::RDI, 4)
+    asm.alu_ri(5, x64::Reg::RCX, 1)
+    asm.jmp(top1)
+    asm.bind(done1)
+}

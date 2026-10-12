@@ -1,0 +1,29 @@
+// test: run
+// out: 12
+// out: 11
+// out: 11
+// out: 12
+// out: 19
+// A structure literal returned directly computes its fields in the order they are written, each into its own cell, so the
+// calls below echo in the written order (b before a), and the fields read back in declaration order.
+struct Pair {
+    a: i32,
+    b: i32,
+    c: i64,
+}
+
+fun tick(value: i32) -> i32 {
+    echo value
+    return value
+}
+
+fun make_pair(seed: i32) -> Pair {
+    return Pair { c: (seed as i64) + 9, b: tick(seed + 2), a: tick(seed + 1) }
+}
+
+fun main() {
+    p := make_pair(10)
+    echo p.a
+    echo p.b
+    echo p.c
+}

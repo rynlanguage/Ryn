@@ -1226,7 +1226,7 @@ extend Parser {
         out.append(enc_str(internal.clone()))
         out.append(enc_uint(0))
         out.append(enc_list(template.item_count, fields))
-        out.append(enc_bool(false))
+        out.append(enc_bool(template.public))
         out.append(enc_bool(template.repr_c))
         when template.has_drop {
             out.append(enc_some(enc_str(template.drop_function)))
@@ -1872,7 +1872,13 @@ extend Parser {
                 derive_end = self.prev_end()
                 has_derive = true
             } else {
-                repr_c = self.repr_c_attribute()?
+                layout_entries := self.repr_c_attribute()?
+                repr_c = true
+                // `packed` and `align(N)` are kept as pseudo-derive entries (`$packed=N`, `$align=N`): they travel with the
+                // structure through the tree, and only the layout code reads them.
+                for entry in layout_entries {
+                    derives.push(entry)
+                }
             }
         }
         public := self.consume_if(lexer::Tk::PUB)
@@ -2430,7 +2436,10 @@ extend Parser {
         return Result::Ok(out)
     }
 
-    fun repr_c_attribute(mut self) -> Result<bool, lexer::Diag> {
+    // `#[repr(C)]`, optionally followed by `packed`, `packed(N)` or `align(N)`: `#[repr(C, packed)]`, `#[repr(C, align(16))]`.
+    // The result lists the layout entries: `$packed=N` (N is the largest alignment a field keeps; `packed` is 1) and
+    // `$align=N` (the structure's alignment is at least N, a power of two).
+    fun repr_c_attribute(mut self) -> Result<Vec<String>, lexer::Diag> {
         self.expect(lexer::Tk::HASH, "expected `#`")?
         self.expect(lexer::Tk::LBRACKET, "expected `[` after `#`")?
         attribute := self.next()
@@ -2440,7 +2449,7 @@ extend Parser {
                 String("unsupported attribute"),
                 attribute.start,
                 attribute.end,
-                String("the supported representation attribute is `#[repr(C)]`")
+                String("the supported representation attribute is `#[repr(C)]`, optionally with `packed` or `align(N)`")
             ))
         }
         self.expect(lexer::Tk::LPAREN, "expected `(` after `repr`")?
@@ -2451,12 +2460,48 @@ extend Parser {
                 String("unsupported structure representation"),
                 representation.start,
                 representation.end,
-                String("the supported representation is `C`")
+                String("the supported representation is `C`, optionally with `packed` or `align(N)`")
             ))
+        }
+        mut entries := Vec<String>()
+        while self.peek_kind() == lexer::Tk::COMMA {
+            self.skip()
+            option := self.next()
+            when option.kind != lexer::Tk::IDENT {
+                return Result::Err(lexer::diag_help("R0014", String("unsupported structure representation"), option.start, option.end, String("expected `packed` or `align(N)` after `C,`")))
+            }
+            word := self.texts[option.text].clone()
+            when word == "packed" {
+                mut pack: u64 = 1
+                when self.peek_kind() == lexer::Tk::LPAREN {
+                    self.skip()
+                    amount := self.next()
+                    when amount.kind != lexer::Tk::INTEGER || amount.value == 0 || (amount.value & (amount.value - 1)) != 0 {
+                        return Result::Err(lexer::diag_help("R0014", String("invalid packing"), amount.start, amount.end, String("`packed(N)` takes a power of two")))
+                    }
+                    pack = amount.value
+                    self.expect(lexer::Tk::RPAREN, "expected `)` after the packing")?
+                }
+                mut entry := String("$packed=")
+                entry.append(String(pack))
+                entries.push(entry)
+            } else when word == "align" {
+                self.expect(lexer::Tk::LPAREN, "expected `(` after `align`")?
+                amount := self.next()
+                when amount.kind != lexer::Tk::INTEGER || amount.value == 0 || (amount.value & (amount.value - 1)) != 0 {
+                    return Result::Err(lexer::diag_help("R0014", String("invalid alignment"), amount.start, amount.end, String("`align(N)` takes a power of two")))
+                }
+                self.expect(lexer::Tk::RPAREN, "expected `)` after the alignment")?
+                mut entry := String("$align=")
+                entry.append(String(amount.value))
+                entries.push(entry)
+            } else {
+                return Result::Err(lexer::diag_help("R0014", String("unsupported structure representation"), option.start, option.end, String("the supported options are `packed` and `align(N)`")))
+            }
         }
         self.expect(lexer::Tk::RPAREN, "expected `)` after representation")?
         self.expect(lexer::Tk::RBRACKET, "expected `]` after attribute")?
-        return Result::Ok(true)
+        return Result::Ok(entries)
     }
 
     fun derive_attribute(mut self) -> Result<Vec<String>, lexer::Diag> {

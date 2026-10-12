@@ -1,0 +1,934 @@
+// test: run
+// out: 0
+// A division, remainder or multiplication by a constant is computed without a divide instruction.
+// Each is compared with the same operation on a divisor that is not a constant (a parameter), at every width.
+// The count of mismatches is printed.
+fun div_u8(x: u8, d: u8) -> u8 { return x / d }
+fun rem_u8(x: u8, d: u8) -> u8 { return x % d }
+fun mul_u8(x: u8, d: u8) -> u8 { return x * d }
+fun div_u16(x: u16, d: u16) -> u16 { return x / d }
+fun rem_u16(x: u16, d: u16) -> u16 { return x % d }
+fun mul_u16(x: u16, d: u16) -> u16 { return x * d }
+fun div_u32(x: u32, d: u32) -> u32 { return x / d }
+fun rem_u32(x: u32, d: u32) -> u32 { return x % d }
+fun mul_u32(x: u32, d: u32) -> u32 { return x * d }
+fun div_u64(x: u64, d: u64) -> u64 { return x / d }
+fun rem_u64(x: u64, d: u64) -> u64 { return x % d }
+fun mul_u64(x: u64, d: u64) -> u64 { return x * d }
+fun div_i8(x: i8, d: i8) -> i8 { return x / d }
+fun rem_i8(x: i8, d: i8) -> i8 { return x % d }
+fun mul_i8(x: i8, d: i8) -> i8 { return x * d }
+fun div_i16(x: i16, d: i16) -> i16 { return x / d }
+fun rem_i16(x: i16, d: i16) -> i16 { return x % d }
+fun mul_i16(x: i16, d: i16) -> i16 { return x * d }
+fun div_i32(x: i32, d: i32) -> i32 { return x / d }
+fun rem_i32(x: i32, d: i32) -> i32 { return x % d }
+fun mul_i32(x: i32, d: i32) -> i32 { return x * d }
+fun div_i64(x: i64, d: i64) -> i64 { return x / d }
+fun rem_i64(x: i64, d: i64) -> i64 { return x % d }
+fun mul_i64(x: i64, d: i64) -> i64 { return x * d }
+fun check_u8(x: u8, bad: &mut u64) {
+    when x / 1 != div_u8(x, 1) { *bad = *bad + 1 }
+    when x % 1 != rem_u8(x, 1) { *bad = *bad + 1 }
+    when x * 1 != mul_u8(x, 1) { *bad = *bad + 1 }
+    when x / 2 != div_u8(x, 2) { *bad = *bad + 1 }
+    when x % 2 != rem_u8(x, 2) { *bad = *bad + 1 }
+    when x * 2 != mul_u8(x, 2) { *bad = *bad + 1 }
+    when x / 3 != div_u8(x, 3) { *bad = *bad + 1 }
+    when x % 3 != rem_u8(x, 3) { *bad = *bad + 1 }
+    when x * 3 != mul_u8(x, 3) { *bad = *bad + 1 }
+    when x / 5 != div_u8(x, 5) { *bad = *bad + 1 }
+    when x % 5 != rem_u8(x, 5) { *bad = *bad + 1 }
+    when x * 5 != mul_u8(x, 5) { *bad = *bad + 1 }
+    when x / 6 != div_u8(x, 6) { *bad = *bad + 1 }
+    when x % 6 != rem_u8(x, 6) { *bad = *bad + 1 }
+    when x * 6 != mul_u8(x, 6) { *bad = *bad + 1 }
+    when x / 7 != div_u8(x, 7) { *bad = *bad + 1 }
+    when x % 7 != rem_u8(x, 7) { *bad = *bad + 1 }
+    when x * 7 != mul_u8(x, 7) { *bad = *bad + 1 }
+    when x / 9 != div_u8(x, 9) { *bad = *bad + 1 }
+    when x % 9 != rem_u8(x, 9) { *bad = *bad + 1 }
+    when x * 9 != mul_u8(x, 9) { *bad = *bad + 1 }
+    when x / 10 != div_u8(x, 10) { *bad = *bad + 1 }
+    when x % 10 != rem_u8(x, 10) { *bad = *bad + 1 }
+    when x * 10 != mul_u8(x, 10) { *bad = *bad + 1 }
+    when x / 11 != div_u8(x, 11) { *bad = *bad + 1 }
+    when x % 11 != rem_u8(x, 11) { *bad = *bad + 1 }
+    when x * 11 != mul_u8(x, 11) { *bad = *bad + 1 }
+    when x / 12 != div_u8(x, 12) { *bad = *bad + 1 }
+    when x % 12 != rem_u8(x, 12) { *bad = *bad + 1 }
+    when x * 12 != mul_u8(x, 12) { *bad = *bad + 1 }
+    when x / 13 != div_u8(x, 13) { *bad = *bad + 1 }
+    when x % 13 != rem_u8(x, 13) { *bad = *bad + 1 }
+    when x * 13 != mul_u8(x, 13) { *bad = *bad + 1 }
+    when x / 25 != div_u8(x, 25) { *bad = *bad + 1 }
+    when x % 25 != rem_u8(x, 25) { *bad = *bad + 1 }
+    when x * 25 != mul_u8(x, 25) { *bad = *bad + 1 }
+    when x / 60 != div_u8(x, 60) { *bad = *bad + 1 }
+    when x % 60 != rem_u8(x, 60) { *bad = *bad + 1 }
+    when x * 60 != mul_u8(x, 60) { *bad = *bad + 1 }
+    when x / 85 != div_u8(x, 85) { *bad = *bad + 1 }
+    when x % 85 != rem_u8(x, 85) { *bad = *bad + 1 }
+    when x / 100 != div_u8(x, 100) { *bad = *bad + 1 }
+    when x % 100 != rem_u8(x, 100) { *bad = *bad + 1 }
+    when x / 116 != div_u8(x, 116) { *bad = *bad + 1 }
+    when x % 116 != rem_u8(x, 116) { *bad = *bad + 1 }
+    when x / 120 != div_u8(x, 120) { *bad = *bad + 1 }
+    when x % 120 != rem_u8(x, 120) { *bad = *bad + 1 }
+    when x / 125 != div_u8(x, 125) { *bad = *bad + 1 }
+    when x % 125 != rem_u8(x, 125) { *bad = *bad + 1 }
+    when x / 127 != div_u8(x, 127) { *bad = *bad + 1 }
+    when x % 127 != rem_u8(x, 127) { *bad = *bad + 1 }
+    when x / 128 != div_u8(x, 128) { *bad = *bad + 1 }
+    when x % 128 != rem_u8(x, 128) { *bad = *bad + 1 }
+    when x / 131 != div_u8(x, 131) { *bad = *bad + 1 }
+    when x % 131 != rem_u8(x, 131) { *bad = *bad + 1 }
+    when x / 144 != div_u8(x, 144) { *bad = *bad + 1 }
+    when x % 144 != rem_u8(x, 144) { *bad = *bad + 1 }
+    when x / 200 != div_u8(x, 200) { *bad = *bad + 1 }
+    when x % 200 != rem_u8(x, 200) { *bad = *bad + 1 }
+    when x / 219 != div_u8(x, 219) { *bad = *bad + 1 }
+    when x % 219 != rem_u8(x, 219) { *bad = *bad + 1 }
+    when x / 220 != div_u8(x, 220) { *bad = *bad + 1 }
+    when x % 220 != rem_u8(x, 220) { *bad = *bad + 1 }
+    when x / 222 != div_u8(x, 222) { *bad = *bad + 1 }
+    when x % 222 != rem_u8(x, 222) { *bad = *bad + 1 }
+    when x / 237 != div_u8(x, 237) { *bad = *bad + 1 }
+    when x % 237 != rem_u8(x, 237) { *bad = *bad + 1 }
+    when x / 254 != div_u8(x, 254) { *bad = *bad + 1 }
+    when x % 254 != rem_u8(x, 254) { *bad = *bad + 1 }
+    when x / 255 != div_u8(x, 255) { *bad = *bad + 1 }
+    when x % 255 != rem_u8(x, 255) { *bad = *bad + 1 }
+}
+fun check_u16(x: u16, bad: &mut u64) {
+    when x / 1 != div_u16(x, 1) { *bad = *bad + 1 }
+    when x % 1 != rem_u16(x, 1) { *bad = *bad + 1 }
+    when x * 1 != mul_u16(x, 1) { *bad = *bad + 1 }
+    when x / 2 != div_u16(x, 2) { *bad = *bad + 1 }
+    when x % 2 != rem_u16(x, 2) { *bad = *bad + 1 }
+    when x * 2 != mul_u16(x, 2) { *bad = *bad + 1 }
+    when x / 3 != div_u16(x, 3) { *bad = *bad + 1 }
+    when x % 3 != rem_u16(x, 3) { *bad = *bad + 1 }
+    when x * 3 != mul_u16(x, 3) { *bad = *bad + 1 }
+    when x / 5 != div_u16(x, 5) { *bad = *bad + 1 }
+    when x % 5 != rem_u16(x, 5) { *bad = *bad + 1 }
+    when x * 5 != mul_u16(x, 5) { *bad = *bad + 1 }
+    when x / 6 != div_u16(x, 6) { *bad = *bad + 1 }
+    when x % 6 != rem_u16(x, 6) { *bad = *bad + 1 }
+    when x * 6 != mul_u16(x, 6) { *bad = *bad + 1 }
+    when x / 7 != div_u16(x, 7) { *bad = *bad + 1 }
+    when x % 7 != rem_u16(x, 7) { *bad = *bad + 1 }
+    when x * 7 != mul_u16(x, 7) { *bad = *bad + 1 }
+    when x / 9 != div_u16(x, 9) { *bad = *bad + 1 }
+    when x % 9 != rem_u16(x, 9) { *bad = *bad + 1 }
+    when x * 9 != mul_u16(x, 9) { *bad = *bad + 1 }
+    when x / 10 != div_u16(x, 10) { *bad = *bad + 1 }
+    when x % 10 != rem_u16(x, 10) { *bad = *bad + 1 }
+    when x * 10 != mul_u16(x, 10) { *bad = *bad + 1 }
+    when x / 11 != div_u16(x, 11) { *bad = *bad + 1 }
+    when x % 11 != rem_u16(x, 11) { *bad = *bad + 1 }
+    when x * 11 != mul_u16(x, 11) { *bad = *bad + 1 }
+    when x / 12 != div_u16(x, 12) { *bad = *bad + 1 }
+    when x % 12 != rem_u16(x, 12) { *bad = *bad + 1 }
+    when x * 12 != mul_u16(x, 12) { *bad = *bad + 1 }
+    when x / 13 != div_u16(x, 13) { *bad = *bad + 1 }
+    when x % 13 != rem_u16(x, 13) { *bad = *bad + 1 }
+    when x * 13 != mul_u16(x, 13) { *bad = *bad + 1 }
+    when x / 25 != div_u16(x, 25) { *bad = *bad + 1 }
+    when x % 25 != rem_u16(x, 25) { *bad = *bad + 1 }
+    when x * 25 != mul_u16(x, 25) { *bad = *bad + 1 }
+    when x / 60 != div_u16(x, 60) { *bad = *bad + 1 }
+    when x % 60 != rem_u16(x, 60) { *bad = *bad + 1 }
+    when x * 60 != mul_u16(x, 60) { *bad = *bad + 1 }
+    when x / 100 != div_u16(x, 100) { *bad = *bad + 1 }
+    when x % 100 != rem_u16(x, 100) { *bad = *bad + 1 }
+    when x / 125 != div_u16(x, 125) { *bad = *bad + 1 }
+    when x % 125 != rem_u16(x, 125) { *bad = *bad + 1 }
+    when x / 641 != div_u16(x, 641) { *bad = *bad + 1 }
+    when x % 641 != rem_u16(x, 641) { *bad = *bad + 1 }
+    when x / 12102 != div_u16(x, 12102) { *bad = *bad + 1 }
+    when x % 12102 != rem_u16(x, 12102) { *bad = *bad + 1 }
+    when x / 12202 != div_u16(x, 12202) { *bad = *bad + 1 }
+    when x % 12202 != rem_u16(x, 12202) { *bad = *bad + 1 }
+    when x / 12446 != div_u16(x, 12446) { *bad = *bad + 1 }
+    when x % 12446 != rem_u16(x, 12446) { *bad = *bad + 1 }
+    when x / 21845 != div_u16(x, 21845) { *bad = *bad + 1 }
+    when x % 21845 != rem_u16(x, 21845) { *bad = *bad + 1 }
+    when x / 31180 != div_u16(x, 31180) { *bad = *bad + 1 }
+    when x % 31180 != rem_u16(x, 31180) { *bad = *bad + 1 }
+    when x / 32767 != div_u16(x, 32767) { *bad = *bad + 1 }
+    when x % 32767 != rem_u16(x, 32767) { *bad = *bad + 1 }
+    when x / 32768 != div_u16(x, 32768) { *bad = *bad + 1 }
+    when x % 32768 != rem_u16(x, 32768) { *bad = *bad + 1 }
+    when x / 33549 != div_u16(x, 33549) { *bad = *bad + 1 }
+    when x % 33549 != rem_u16(x, 33549) { *bad = *bad + 1 }
+    when x / 38495 != div_u16(x, 38495) { *bad = *bad + 1 }
+    when x % 38495 != rem_u16(x, 38495) { *bad = *bad + 1 }
+    when x / 40237 != div_u16(x, 40237) { *bad = *bad + 1 }
+    when x % 40237 != rem_u16(x, 40237) { *bad = *bad + 1 }
+    when x / 41280 != div_u16(x, 41280) { *bad = *bad + 1 }
+    when x % 41280 != rem_u16(x, 41280) { *bad = *bad + 1 }
+    when x / 51969 != div_u16(x, 51969) { *bad = *bad + 1 }
+    when x % 51969 != rem_u16(x, 51969) { *bad = *bad + 1 }
+    when x / 52685 != div_u16(x, 52685) { *bad = *bad + 1 }
+    when x % 52685 != rem_u16(x, 52685) { *bad = *bad + 1 }
+    when x / 65534 != div_u16(x, 65534) { *bad = *bad + 1 }
+    when x % 65534 != rem_u16(x, 65534) { *bad = *bad + 1 }
+    when x / 65535 != div_u16(x, 65535) { *bad = *bad + 1 }
+    when x % 65535 != rem_u16(x, 65535) { *bad = *bad + 1 }
+}
+fun check_u32(x: u32, bad: &mut u64) {
+    when x / 1 != div_u32(x, 1) { *bad = *bad + 1 }
+    when x % 1 != rem_u32(x, 1) { *bad = *bad + 1 }
+    when x * 1 != mul_u32(x, 1) { *bad = *bad + 1 }
+    when x / 2 != div_u32(x, 2) { *bad = *bad + 1 }
+    when x % 2 != rem_u32(x, 2) { *bad = *bad + 1 }
+    when x * 2 != mul_u32(x, 2) { *bad = *bad + 1 }
+    when x / 3 != div_u32(x, 3) { *bad = *bad + 1 }
+    when x % 3 != rem_u32(x, 3) { *bad = *bad + 1 }
+    when x * 3 != mul_u32(x, 3) { *bad = *bad + 1 }
+    when x / 5 != div_u32(x, 5) { *bad = *bad + 1 }
+    when x % 5 != rem_u32(x, 5) { *bad = *bad + 1 }
+    when x * 5 != mul_u32(x, 5) { *bad = *bad + 1 }
+    when x / 6 != div_u32(x, 6) { *bad = *bad + 1 }
+    when x % 6 != rem_u32(x, 6) { *bad = *bad + 1 }
+    when x * 6 != mul_u32(x, 6) { *bad = *bad + 1 }
+    when x / 7 != div_u32(x, 7) { *bad = *bad + 1 }
+    when x % 7 != rem_u32(x, 7) { *bad = *bad + 1 }
+    when x * 7 != mul_u32(x, 7) { *bad = *bad + 1 }
+    when x / 9 != div_u32(x, 9) { *bad = *bad + 1 }
+    when x % 9 != rem_u32(x, 9) { *bad = *bad + 1 }
+    when x * 9 != mul_u32(x, 9) { *bad = *bad + 1 }
+    when x / 10 != div_u32(x, 10) { *bad = *bad + 1 }
+    when x % 10 != rem_u32(x, 10) { *bad = *bad + 1 }
+    when x * 10 != mul_u32(x, 10) { *bad = *bad + 1 }
+    when x / 11 != div_u32(x, 11) { *bad = *bad + 1 }
+    when x % 11 != rem_u32(x, 11) { *bad = *bad + 1 }
+    when x * 11 != mul_u32(x, 11) { *bad = *bad + 1 }
+    when x / 12 != div_u32(x, 12) { *bad = *bad + 1 }
+    when x % 12 != rem_u32(x, 12) { *bad = *bad + 1 }
+    when x * 12 != mul_u32(x, 12) { *bad = *bad + 1 }
+    when x / 13 != div_u32(x, 13) { *bad = *bad + 1 }
+    when x % 13 != rem_u32(x, 13) { *bad = *bad + 1 }
+    when x * 13 != mul_u32(x, 13) { *bad = *bad + 1 }
+    when x / 25 != div_u32(x, 25) { *bad = *bad + 1 }
+    when x % 25 != rem_u32(x, 25) { *bad = *bad + 1 }
+    when x * 25 != mul_u32(x, 25) { *bad = *bad + 1 }
+    when x / 60 != div_u32(x, 60) { *bad = *bad + 1 }
+    when x % 60 != rem_u32(x, 60) { *bad = *bad + 1 }
+    when x * 60 != mul_u32(x, 60) { *bad = *bad + 1 }
+    when x / 100 != div_u32(x, 100) { *bad = *bad + 1 }
+    when x % 100 != rem_u32(x, 100) { *bad = *bad + 1 }
+    when x / 125 != div_u32(x, 125) { *bad = *bad + 1 }
+    when x % 125 != rem_u32(x, 125) { *bad = *bad + 1 }
+    when x / 641 != div_u32(x, 641) { *bad = *bad + 1 }
+    when x % 641 != rem_u32(x, 641) { *bad = *bad + 1 }
+    when x / 65535 != div_u32(x, 65535) { *bad = *bad + 1 }
+    when x % 65535 != rem_u32(x, 65535) { *bad = *bad + 1 }
+    when x / 65537 != div_u32(x, 65537) { *bad = *bad + 1 }
+    when x % 65537 != rem_u32(x, 65537) { *bad = *bad + 1 }
+    when x / 389426982 != div_u32(x, 389426982) { *bad = *bad + 1 }
+    when x % 389426982 != rem_u32(x, 389426982) { *bad = *bad + 1 }
+    when x / 404257172 != div_u32(x, 404257172) { *bad = *bad + 1 }
+    when x % 404257172 != rem_u32(x, 404257172) { *bad = *bad + 1 }
+    when x / 609005469 != div_u32(x, 609005469) { *bad = *bad + 1 }
+    when x % 609005469 != rem_u32(x, 609005469) { *bad = *bad + 1 }
+    when x / 1303098498 != div_u32(x, 1303098498) { *bad = *bad + 1 }
+    when x % 1303098498 != rem_u32(x, 1303098498) { *bad = *bad + 1 }
+    when x / 1431655765 != div_u32(x, 1431655765) { *bad = *bad + 1 }
+    when x % 1431655765 != rem_u32(x, 1431655765) { *bad = *bad + 1 }
+    when x / 1918102983 != div_u32(x, 1918102983) { *bad = *bad + 1 }
+    when x % 1918102983 != rem_u32(x, 1918102983) { *bad = *bad + 1 }
+    when x / 2147483647 != div_u32(x, 2147483647) { *bad = *bad + 1 }
+    when x % 2147483647 != rem_u32(x, 2147483647) { *bad = *bad + 1 }
+    when x / 2147483648 != div_u32(x, 2147483648) { *bad = *bad + 1 }
+    when x % 2147483648 != rem_u32(x, 2147483648) { *bad = *bad + 1 }
+    when x / 2313671008 != div_u32(x, 2313671008) { *bad = *bad + 1 }
+    when x % 2313671008 != rem_u32(x, 2313671008) { *bad = *bad + 1 }
+    when x / 2724953955 != div_u32(x, 2724953955) { *bad = *bad + 1 }
+    when x % 2724953955 != rem_u32(x, 2724953955) { *bad = *bad + 1 }
+    when x / 2978295592 != div_u32(x, 2978295592) { *bad = *bad + 1 }
+    when x % 2978295592 != rem_u32(x, 2978295592) { *bad = *bad + 1 }
+    when x / 3477396800 != div_u32(x, 3477396800) { *bad = *bad + 1 }
+    when x % 3477396800 != rem_u32(x, 3477396800) { *bad = *bad + 1 }
+    when x / 3824155073 != div_u32(x, 3824155073) { *bad = *bad + 1 }
+    when x % 3824155073 != rem_u32(x, 3824155073) { *bad = *bad + 1 }
+    when x / 4294967294 != div_u32(x, 4294967294) { *bad = *bad + 1 }
+    when x % 4294967294 != rem_u32(x, 4294967294) { *bad = *bad + 1 }
+    when x / 4294967295 != div_u32(x, 4294967295) { *bad = *bad + 1 }
+    when x % 4294967295 != rem_u32(x, 4294967295) { *bad = *bad + 1 }
+}
+fun check_u64(x: u64, bad: &mut u64) {
+    when x / 1 != div_u64(x, 1) { *bad = *bad + 1 }
+    when x % 1 != rem_u64(x, 1) { *bad = *bad + 1 }
+    when x * 1 != mul_u64(x, 1) { *bad = *bad + 1 }
+    when x / 2 != div_u64(x, 2) { *bad = *bad + 1 }
+    when x % 2 != rem_u64(x, 2) { *bad = *bad + 1 }
+    when x * 2 != mul_u64(x, 2) { *bad = *bad + 1 }
+    when x / 3 != div_u64(x, 3) { *bad = *bad + 1 }
+    when x % 3 != rem_u64(x, 3) { *bad = *bad + 1 }
+    when x * 3 != mul_u64(x, 3) { *bad = *bad + 1 }
+    when x / 5 != div_u64(x, 5) { *bad = *bad + 1 }
+    when x % 5 != rem_u64(x, 5) { *bad = *bad + 1 }
+    when x * 5 != mul_u64(x, 5) { *bad = *bad + 1 }
+    when x / 6 != div_u64(x, 6) { *bad = *bad + 1 }
+    when x % 6 != rem_u64(x, 6) { *bad = *bad + 1 }
+    when x * 6 != mul_u64(x, 6) { *bad = *bad + 1 }
+    when x / 7 != div_u64(x, 7) { *bad = *bad + 1 }
+    when x % 7 != rem_u64(x, 7) { *bad = *bad + 1 }
+    when x * 7 != mul_u64(x, 7) { *bad = *bad + 1 }
+    when x / 9 != div_u64(x, 9) { *bad = *bad + 1 }
+    when x % 9 != rem_u64(x, 9) { *bad = *bad + 1 }
+    when x * 9 != mul_u64(x, 9) { *bad = *bad + 1 }
+    when x / 10 != div_u64(x, 10) { *bad = *bad + 1 }
+    when x % 10 != rem_u64(x, 10) { *bad = *bad + 1 }
+    when x * 10 != mul_u64(x, 10) { *bad = *bad + 1 }
+    when x / 11 != div_u64(x, 11) { *bad = *bad + 1 }
+    when x % 11 != rem_u64(x, 11) { *bad = *bad + 1 }
+    when x * 11 != mul_u64(x, 11) { *bad = *bad + 1 }
+    when x / 12 != div_u64(x, 12) { *bad = *bad + 1 }
+    when x % 12 != rem_u64(x, 12) { *bad = *bad + 1 }
+    when x * 12 != mul_u64(x, 12) { *bad = *bad + 1 }
+    when x / 13 != div_u64(x, 13) { *bad = *bad + 1 }
+    when x % 13 != rem_u64(x, 13) { *bad = *bad + 1 }
+    when x * 13 != mul_u64(x, 13) { *bad = *bad + 1 }
+    when x / 25 != div_u64(x, 25) { *bad = *bad + 1 }
+    when x % 25 != rem_u64(x, 25) { *bad = *bad + 1 }
+    when x * 25 != mul_u64(x, 25) { *bad = *bad + 1 }
+    when x / 60 != div_u64(x, 60) { *bad = *bad + 1 }
+    when x % 60 != rem_u64(x, 60) { *bad = *bad + 1 }
+    when x * 60 != mul_u64(x, 60) { *bad = *bad + 1 }
+    when x / 100 != div_u64(x, 100) { *bad = *bad + 1 }
+    when x % 100 != rem_u64(x, 100) { *bad = *bad + 1 }
+    when x / 125 != div_u64(x, 125) { *bad = *bad + 1 }
+    when x % 125 != rem_u64(x, 125) { *bad = *bad + 1 }
+    when x / 641 != div_u64(x, 641) { *bad = *bad + 1 }
+    when x % 641 != rem_u64(x, 641) { *bad = *bad + 1 }
+    when x / 65535 != div_u64(x, 65535) { *bad = *bad + 1 }
+    when x % 65535 != rem_u64(x, 65535) { *bad = *bad + 1 }
+    when x / 65537 != div_u64(x, 65537) { *bad = *bad + 1 }
+    when x % 65537 != rem_u64(x, 65537) { *bad = *bad + 1 }
+    when x / 657677712248192468 != div_u64(x, 657677712248192468) { *bad = *bad + 1 }
+    when x % 657677712248192468 != rem_u64(x, 657677712248192468) { *bad = *bad + 1 }
+    when x / 1165187156084522679 != div_u64(x, 1165187156084522679) { *bad = *bad + 1 }
+    when x % 1165187156084522679 != rem_u64(x, 1165187156084522679) { *bad = *bad + 1 }
+    when x / 6148914691236517205 != div_u64(x, 6148914691236517205) { *bad = *bad + 1 }
+    when x % 6148914691236517205 != rem_u64(x, 6148914691236517205) { *bad = *bad + 1 }
+    when x / 7307861646904461109 != div_u64(x, 7307861646904461109) { *bad = *bad + 1 }
+    when x % 7307861646904461109 != rem_u64(x, 7307861646904461109) { *bad = *bad + 1 }
+    when x / 8356280309292621241 != div_u64(x, 8356280309292621241) { *bad = *bad + 1 }
+    when x % 8356280309292621241 != rem_u64(x, 8356280309292621241) { *bad = *bad + 1 }
+    when x / 9223372036854775807 != div_u64(x, 9223372036854775807) { *bad = *bad + 1 }
+    when x % 9223372036854775807 != rem_u64(x, 9223372036854775807) { *bad = *bad + 1 }
+    when x / 9223372036854775808 != div_u64(x, 9223372036854775808) { *bad = *bad + 1 }
+    when x % 9223372036854775808 != rem_u64(x, 9223372036854775808) { *bad = *bad + 1 }
+    when x / 10983864747819576168 != div_u64(x, 10983864747819576168) { *bad = *bad + 1 }
+    when x % 10983864747819576168 != rem_u64(x, 10983864747819576168) { *bad = *bad + 1 }
+    when x / 11494691094597306472 != div_u64(x, 11494691094597306472) { *bad = *bad + 1 }
+    when x % 11494691094597306472 != rem_u64(x, 11494691094597306472) { *bad = *bad + 1 }
+    when x / 11991692969617228927 != div_u64(x, 11991692969617228927) { *bad = *bad + 1 }
+    when x % 11991692969617228927 != rem_u64(x, 11991692969617228927) { *bad = *bad + 1 }
+    when x / 13630592132760172439 != div_u64(x, 13630592132760172439) { *bad = *bad + 1 }
+    when x % 13630592132760172439 != rem_u64(x, 13630592132760172439) { *bad = *bad + 1 }
+    when x / 15342187024683046533 != div_u64(x, 15342187024683046533) { *bad = *bad + 1 }
+    when x % 15342187024683046533 != rem_u64(x, 15342187024683046533) { *bad = *bad + 1 }
+    when x / 16225109976529599756 != div_u64(x, 16225109976529599756) { *bad = *bad + 1 }
+    when x % 16225109976529599756 != rem_u64(x, 16225109976529599756) { *bad = *bad + 1 }
+    when x / 18446744073709551614 != div_u64(x, 18446744073709551614) { *bad = *bad + 1 }
+    when x % 18446744073709551614 != rem_u64(x, 18446744073709551614) { *bad = *bad + 1 }
+    when x / 18446744073709551615 != div_u64(x, 18446744073709551615) { *bad = *bad + 1 }
+    when x % 18446744073709551615 != rem_u64(x, 18446744073709551615) { *bad = *bad + 1 }
+}
+fun check_i8(x: i8, bad: &mut u64) {
+    when x / -128 != div_i8(x, -128) { *bad = *bad + 1 }
+    when x % -128 != rem_i8(x, -128) { *bad = *bad + 1 }
+    when x / -127 != div_i8(x, -127) { *bad = *bad + 1 }
+    when x % -127 != rem_i8(x, -127) { *bad = *bad + 1 }
+    when x / -10 != div_i8(x, -10) { *bad = *bad + 1 }
+    when x % -10 != rem_i8(x, -10) { *bad = *bad + 1 }
+    when x * -10 != mul_i8(x, -10) { *bad = *bad + 1 }
+    when x / -7 != div_i8(x, -7) { *bad = *bad + 1 }
+    when x % -7 != rem_i8(x, -7) { *bad = *bad + 1 }
+    when x * -7 != mul_i8(x, -7) { *bad = *bad + 1 }
+    when x / -3 != div_i8(x, -3) { *bad = *bad + 1 }
+    when x % -3 != rem_i8(x, -3) { *bad = *bad + 1 }
+    when x * -3 != mul_i8(x, -3) { *bad = *bad + 1 }
+    when x / -2 != div_i8(x, -2) { *bad = *bad + 1 }
+    when x % -2 != rem_i8(x, -2) { *bad = *bad + 1 }
+    when x * -2 != mul_i8(x, -2) { *bad = *bad + 1 }
+    when x / -1 != div_i8(x, -1) { *bad = *bad + 1 }
+    when x % -1 != rem_i8(x, -1) { *bad = *bad + 1 }
+    when x * -1 != mul_i8(x, -1) { *bad = *bad + 1 }
+    when x / 1 != div_i8(x, 1) { *bad = *bad + 1 }
+    when x % 1 != rem_i8(x, 1) { *bad = *bad + 1 }
+    when x * 1 != mul_i8(x, 1) { *bad = *bad + 1 }
+    when x / 2 != div_i8(x, 2) { *bad = *bad + 1 }
+    when x % 2 != rem_i8(x, 2) { *bad = *bad + 1 }
+    when x * 2 != mul_i8(x, 2) { *bad = *bad + 1 }
+    when x / 3 != div_i8(x, 3) { *bad = *bad + 1 }
+    when x % 3 != rem_i8(x, 3) { *bad = *bad + 1 }
+    when x * 3 != mul_i8(x, 3) { *bad = *bad + 1 }
+    when x / 4 != div_i8(x, 4) { *bad = *bad + 1 }
+    when x % 4 != rem_i8(x, 4) { *bad = *bad + 1 }
+    when x * 4 != mul_i8(x, 4) { *bad = *bad + 1 }
+    when x / 5 != div_i8(x, 5) { *bad = *bad + 1 }
+    when x % 5 != rem_i8(x, 5) { *bad = *bad + 1 }
+    when x * 5 != mul_i8(x, 5) { *bad = *bad + 1 }
+    when x / 6 != div_i8(x, 6) { *bad = *bad + 1 }
+    when x % 6 != rem_i8(x, 6) { *bad = *bad + 1 }
+    when x * 6 != mul_i8(x, 6) { *bad = *bad + 1 }
+    when x / 7 != div_i8(x, 7) { *bad = *bad + 1 }
+    when x % 7 != rem_i8(x, 7) { *bad = *bad + 1 }
+    when x * 7 != mul_i8(x, 7) { *bad = *bad + 1 }
+    when x / 9 != div_i8(x, 9) { *bad = *bad + 1 }
+    when x % 9 != rem_i8(x, 9) { *bad = *bad + 1 }
+    when x * 9 != mul_i8(x, 9) { *bad = *bad + 1 }
+    when x / 10 != div_i8(x, 10) { *bad = *bad + 1 }
+    when x % 10 != rem_i8(x, 10) { *bad = *bad + 1 }
+    when x * 10 != mul_i8(x, 10) { *bad = *bad + 1 }
+    when x / 11 != div_i8(x, 11) { *bad = *bad + 1 }
+    when x % 11 != rem_i8(x, 11) { *bad = *bad + 1 }
+    when x * 11 != mul_i8(x, 11) { *bad = *bad + 1 }
+    when x / 12 != div_i8(x, 12) { *bad = *bad + 1 }
+    when x % 12 != rem_i8(x, 12) { *bad = *bad + 1 }
+    when x * 12 != mul_i8(x, 12) { *bad = *bad + 1 }
+    when x / 13 != div_i8(x, 13) { *bad = *bad + 1 }
+    when x % 13 != rem_i8(x, 13) { *bad = *bad + 1 }
+    when x * 13 != mul_i8(x, 13) { *bad = *bad + 1 }
+    when x / 25 != div_i8(x, 25) { *bad = *bad + 1 }
+    when x % 25 != rem_i8(x, 25) { *bad = *bad + 1 }
+    when x * 25 != mul_i8(x, 25) { *bad = *bad + 1 }
+    when x / 26 != div_i8(x, 26) { *bad = *bad + 1 }
+    when x % 26 != rem_i8(x, 26) { *bad = *bad + 1 }
+    when x * 26 != mul_i8(x, 26) { *bad = *bad + 1 }
+    when x / 31 != div_i8(x, 31) { *bad = *bad + 1 }
+    when x % 31 != rem_i8(x, 31) { *bad = *bad + 1 }
+    when x * 31 != mul_i8(x, 31) { *bad = *bad + 1 }
+    when x / 42 != div_i8(x, 42) { *bad = *bad + 1 }
+    when x % 42 != rem_i8(x, 42) { *bad = *bad + 1 }
+    when x * 42 != mul_i8(x, 42) { *bad = *bad + 1 }
+    when x / 57 != div_i8(x, 57) { *bad = *bad + 1 }
+    when x % 57 != rem_i8(x, 57) { *bad = *bad + 1 }
+    when x * 57 != mul_i8(x, 57) { *bad = *bad + 1 }
+    when x / 60 != div_i8(x, 60) { *bad = *bad + 1 }
+    when x % 60 != rem_i8(x, 60) { *bad = *bad + 1 }
+    when x * 60 != mul_i8(x, 60) { *bad = *bad + 1 }
+    when x / 63 != div_i8(x, 63) { *bad = *bad + 1 }
+    when x % 63 != rem_i8(x, 63) { *bad = *bad + 1 }
+    when x * 63 != mul_i8(x, 63) { *bad = *bad + 1 }
+    when x / 64 != div_i8(x, 64) { *bad = *bad + 1 }
+    when x % 64 != rem_i8(x, 64) { *bad = *bad + 1 }
+    when x * 64 != mul_i8(x, 64) { *bad = *bad + 1 }
+    when x / 76 != div_i8(x, 76) { *bad = *bad + 1 }
+    when x % 76 != rem_i8(x, 76) { *bad = *bad + 1 }
+    when x / 77 != div_i8(x, 77) { *bad = *bad + 1 }
+    when x % 77 != rem_i8(x, 77) { *bad = *bad + 1 }
+    when x / 100 != div_i8(x, 100) { *bad = *bad + 1 }
+    when x % 100 != rem_i8(x, 100) { *bad = *bad + 1 }
+    when x / 108 != div_i8(x, 108) { *bad = *bad + 1 }
+    when x % 108 != rem_i8(x, 108) { *bad = *bad + 1 }
+    when x / 125 != div_i8(x, 125) { *bad = *bad + 1 }
+    when x % 125 != rem_i8(x, 125) { *bad = *bad + 1 }
+    when x / 126 != div_i8(x, 126) { *bad = *bad + 1 }
+    when x % 126 != rem_i8(x, 126) { *bad = *bad + 1 }
+    when x / 127 != div_i8(x, 127) { *bad = *bad + 1 }
+    when x % 127 != rem_i8(x, 127) { *bad = *bad + 1 }
+}
+fun check_i16(x: i16, bad: &mut u64) {
+    when x / -32768 != div_i16(x, -32768) { *bad = *bad + 1 }
+    when x % -32768 != rem_i16(x, -32768) { *bad = *bad + 1 }
+    when x / -32767 != div_i16(x, -32767) { *bad = *bad + 1 }
+    when x % -32767 != rem_i16(x, -32767) { *bad = *bad + 1 }
+    when x / -10 != div_i16(x, -10) { *bad = *bad + 1 }
+    when x % -10 != rem_i16(x, -10) { *bad = *bad + 1 }
+    when x * -10 != mul_i16(x, -10) { *bad = *bad + 1 }
+    when x / -7 != div_i16(x, -7) { *bad = *bad + 1 }
+    when x % -7 != rem_i16(x, -7) { *bad = *bad + 1 }
+    when x * -7 != mul_i16(x, -7) { *bad = *bad + 1 }
+    when x / -3 != div_i16(x, -3) { *bad = *bad + 1 }
+    when x % -3 != rem_i16(x, -3) { *bad = *bad + 1 }
+    when x * -3 != mul_i16(x, -3) { *bad = *bad + 1 }
+    when x / -2 != div_i16(x, -2) { *bad = *bad + 1 }
+    when x % -2 != rem_i16(x, -2) { *bad = *bad + 1 }
+    when x * -2 != mul_i16(x, -2) { *bad = *bad + 1 }
+    when x / -1 != div_i16(x, -1) { *bad = *bad + 1 }
+    when x % -1 != rem_i16(x, -1) { *bad = *bad + 1 }
+    when x * -1 != mul_i16(x, -1) { *bad = *bad + 1 }
+    when x / 1 != div_i16(x, 1) { *bad = *bad + 1 }
+    when x % 1 != rem_i16(x, 1) { *bad = *bad + 1 }
+    when x * 1 != mul_i16(x, 1) { *bad = *bad + 1 }
+    when x / 2 != div_i16(x, 2) { *bad = *bad + 1 }
+    when x % 2 != rem_i16(x, 2) { *bad = *bad + 1 }
+    when x * 2 != mul_i16(x, 2) { *bad = *bad + 1 }
+    when x / 3 != div_i16(x, 3) { *bad = *bad + 1 }
+    when x % 3 != rem_i16(x, 3) { *bad = *bad + 1 }
+    when x * 3 != mul_i16(x, 3) { *bad = *bad + 1 }
+    when x / 5 != div_i16(x, 5) { *bad = *bad + 1 }
+    when x % 5 != rem_i16(x, 5) { *bad = *bad + 1 }
+    when x * 5 != mul_i16(x, 5) { *bad = *bad + 1 }
+    when x / 6 != div_i16(x, 6) { *bad = *bad + 1 }
+    when x % 6 != rem_i16(x, 6) { *bad = *bad + 1 }
+    when x * 6 != mul_i16(x, 6) { *bad = *bad + 1 }
+    when x / 7 != div_i16(x, 7) { *bad = *bad + 1 }
+    when x % 7 != rem_i16(x, 7) { *bad = *bad + 1 }
+    when x * 7 != mul_i16(x, 7) { *bad = *bad + 1 }
+    when x / 9 != div_i16(x, 9) { *bad = *bad + 1 }
+    when x % 9 != rem_i16(x, 9) { *bad = *bad + 1 }
+    when x * 9 != mul_i16(x, 9) { *bad = *bad + 1 }
+    when x / 10 != div_i16(x, 10) { *bad = *bad + 1 }
+    when x % 10 != rem_i16(x, 10) { *bad = *bad + 1 }
+    when x * 10 != mul_i16(x, 10) { *bad = *bad + 1 }
+    when x / 11 != div_i16(x, 11) { *bad = *bad + 1 }
+    when x % 11 != rem_i16(x, 11) { *bad = *bad + 1 }
+    when x * 11 != mul_i16(x, 11) { *bad = *bad + 1 }
+    when x / 12 != div_i16(x, 12) { *bad = *bad + 1 }
+    when x % 12 != rem_i16(x, 12) { *bad = *bad + 1 }
+    when x * 12 != mul_i16(x, 12) { *bad = *bad + 1 }
+    when x / 13 != div_i16(x, 13) { *bad = *bad + 1 }
+    when x % 13 != rem_i16(x, 13) { *bad = *bad + 1 }
+    when x * 13 != mul_i16(x, 13) { *bad = *bad + 1 }
+    when x / 25 != div_i16(x, 25) { *bad = *bad + 1 }
+    when x % 25 != rem_i16(x, 25) { *bad = *bad + 1 }
+    when x * 25 != mul_i16(x, 25) { *bad = *bad + 1 }
+    when x / 60 != div_i16(x, 60) { *bad = *bad + 1 }
+    when x % 60 != rem_i16(x, 60) { *bad = *bad + 1 }
+    when x * 60 != mul_i16(x, 60) { *bad = *bad + 1 }
+    when x / 100 != div_i16(x, 100) { *bad = *bad + 1 }
+    when x % 100 != rem_i16(x, 100) { *bad = *bad + 1 }
+    when x / 125 != div_i16(x, 125) { *bad = *bad + 1 }
+    when x % 125 != rem_i16(x, 125) { *bad = *bad + 1 }
+    when x / 151 != div_i16(x, 151) { *bad = *bad + 1 }
+    when x % 151 != rem_i16(x, 151) { *bad = *bad + 1 }
+    when x / 641 != div_i16(x, 641) { *bad = *bad + 1 }
+    when x % 641 != rem_i16(x, 641) { *bad = *bad + 1 }
+    when x / 2785 != div_i16(x, 2785) { *bad = *bad + 1 }
+    when x % 2785 != rem_i16(x, 2785) { *bad = *bad + 1 }
+    when x / 7657 != div_i16(x, 7657) { *bad = *bad + 1 }
+    when x % 7657 != rem_i16(x, 7657) { *bad = *bad + 1 }
+    when x / 9639 != div_i16(x, 9639) { *bad = *bad + 1 }
+    when x % 9639 != rem_i16(x, 9639) { *bad = *bad + 1 }
+    when x / 10922 != div_i16(x, 10922) { *bad = *bad + 1 }
+    when x % 10922 != rem_i16(x, 10922) { *bad = *bad + 1 }
+    when x / 14986 != div_i16(x, 14986) { *bad = *bad + 1 }
+    when x % 14986 != rem_i16(x, 14986) { *bad = *bad + 1 }
+    when x / 16377 != div_i16(x, 16377) { *bad = *bad + 1 }
+    when x % 16377 != rem_i16(x, 16377) { *bad = *bad + 1 }
+    when x / 16383 != div_i16(x, 16383) { *bad = *bad + 1 }
+    when x % 16383 != rem_i16(x, 16383) { *bad = *bad + 1 }
+    when x / 16384 != div_i16(x, 16384) { *bad = *bad + 1 }
+    when x % 16384 != rem_i16(x, 16384) { *bad = *bad + 1 }
+    when x / 17011 != div_i16(x, 17011) { *bad = *bad + 1 }
+    when x % 17011 != rem_i16(x, 17011) { *bad = *bad + 1 }
+    when x / 20982 != div_i16(x, 20982) { *bad = *bad + 1 }
+    when x % 20982 != rem_i16(x, 20982) { *bad = *bad + 1 }
+    when x / 21457 != div_i16(x, 21457) { *bad = *bad + 1 }
+    when x % 21457 != rem_i16(x, 21457) { *bad = *bad + 1 }
+    when x / 21708 != div_i16(x, 21708) { *bad = *bad + 1 }
+    when x % 21708 != rem_i16(x, 21708) { *bad = *bad + 1 }
+    when x / 32766 != div_i16(x, 32766) { *bad = *bad + 1 }
+    when x % 32766 != rem_i16(x, 32766) { *bad = *bad + 1 }
+    when x / 32767 != div_i16(x, 32767) { *bad = *bad + 1 }
+    when x % 32767 != rem_i16(x, 32767) { *bad = *bad + 1 }
+}
+fun check_i32(x: i32, bad: &mut u64) {
+    when x / -2147483648 != div_i32(x, -2147483648) { *bad = *bad + 1 }
+    when x % -2147483648 != rem_i32(x, -2147483648) { *bad = *bad + 1 }
+    when x / -2147483647 != div_i32(x, -2147483647) { *bad = *bad + 1 }
+    when x % -2147483647 != rem_i32(x, -2147483647) { *bad = *bad + 1 }
+    when x / -10 != div_i32(x, -10) { *bad = *bad + 1 }
+    when x % -10 != rem_i32(x, -10) { *bad = *bad + 1 }
+    when x * -10 != mul_i32(x, -10) { *bad = *bad + 1 }
+    when x / -7 != div_i32(x, -7) { *bad = *bad + 1 }
+    when x % -7 != rem_i32(x, -7) { *bad = *bad + 1 }
+    when x * -7 != mul_i32(x, -7) { *bad = *bad + 1 }
+    when x / -3 != div_i32(x, -3) { *bad = *bad + 1 }
+    when x % -3 != rem_i32(x, -3) { *bad = *bad + 1 }
+    when x * -3 != mul_i32(x, -3) { *bad = *bad + 1 }
+    when x / -2 != div_i32(x, -2) { *bad = *bad + 1 }
+    when x % -2 != rem_i32(x, -2) { *bad = *bad + 1 }
+    when x * -2 != mul_i32(x, -2) { *bad = *bad + 1 }
+    when x / -1 != div_i32(x, -1) { *bad = *bad + 1 }
+    when x % -1 != rem_i32(x, -1) { *bad = *bad + 1 }
+    when x * -1 != mul_i32(x, -1) { *bad = *bad + 1 }
+    when x / 1 != div_i32(x, 1) { *bad = *bad + 1 }
+    when x % 1 != rem_i32(x, 1) { *bad = *bad + 1 }
+    when x * 1 != mul_i32(x, 1) { *bad = *bad + 1 }
+    when x / 2 != div_i32(x, 2) { *bad = *bad + 1 }
+    when x % 2 != rem_i32(x, 2) { *bad = *bad + 1 }
+    when x * 2 != mul_i32(x, 2) { *bad = *bad + 1 }
+    when x / 3 != div_i32(x, 3) { *bad = *bad + 1 }
+    when x % 3 != rem_i32(x, 3) { *bad = *bad + 1 }
+    when x * 3 != mul_i32(x, 3) { *bad = *bad + 1 }
+    when x / 5 != div_i32(x, 5) { *bad = *bad + 1 }
+    when x % 5 != rem_i32(x, 5) { *bad = *bad + 1 }
+    when x * 5 != mul_i32(x, 5) { *bad = *bad + 1 }
+    when x / 6 != div_i32(x, 6) { *bad = *bad + 1 }
+    when x % 6 != rem_i32(x, 6) { *bad = *bad + 1 }
+    when x * 6 != mul_i32(x, 6) { *bad = *bad + 1 }
+    when x / 7 != div_i32(x, 7) { *bad = *bad + 1 }
+    when x % 7 != rem_i32(x, 7) { *bad = *bad + 1 }
+    when x * 7 != mul_i32(x, 7) { *bad = *bad + 1 }
+    when x / 9 != div_i32(x, 9) { *bad = *bad + 1 }
+    when x % 9 != rem_i32(x, 9) { *bad = *bad + 1 }
+    when x * 9 != mul_i32(x, 9) { *bad = *bad + 1 }
+    when x / 10 != div_i32(x, 10) { *bad = *bad + 1 }
+    when x % 10 != rem_i32(x, 10) { *bad = *bad + 1 }
+    when x * 10 != mul_i32(x, 10) { *bad = *bad + 1 }
+    when x / 11 != div_i32(x, 11) { *bad = *bad + 1 }
+    when x % 11 != rem_i32(x, 11) { *bad = *bad + 1 }
+    when x * 11 != mul_i32(x, 11) { *bad = *bad + 1 }
+    when x / 12 != div_i32(x, 12) { *bad = *bad + 1 }
+    when x % 12 != rem_i32(x, 12) { *bad = *bad + 1 }
+    when x * 12 != mul_i32(x, 12) { *bad = *bad + 1 }
+    when x / 13 != div_i32(x, 13) { *bad = *bad + 1 }
+    when x % 13 != rem_i32(x, 13) { *bad = *bad + 1 }
+    when x * 13 != mul_i32(x, 13) { *bad = *bad + 1 }
+    when x / 25 != div_i32(x, 25) { *bad = *bad + 1 }
+    when x % 25 != rem_i32(x, 25) { *bad = *bad + 1 }
+    when x * 25 != mul_i32(x, 25) { *bad = *bad + 1 }
+    when x / 60 != div_i32(x, 60) { *bad = *bad + 1 }
+    when x % 60 != rem_i32(x, 60) { *bad = *bad + 1 }
+    when x * 60 != mul_i32(x, 60) { *bad = *bad + 1 }
+    when x / 100 != div_i32(x, 100) { *bad = *bad + 1 }
+    when x % 100 != rem_i32(x, 100) { *bad = *bad + 1 }
+    when x / 125 != div_i32(x, 125) { *bad = *bad + 1 }
+    when x % 125 != rem_i32(x, 125) { *bad = *bad + 1 }
+    when x / 641 != div_i32(x, 641) { *bad = *bad + 1 }
+    when x % 641 != rem_i32(x, 641) { *bad = *bad + 1 }
+    when x / 65535 != div_i32(x, 65535) { *bad = *bad + 1 }
+    when x % 65535 != rem_i32(x, 65535) { *bad = *bad + 1 }
+    when x / 65537 != div_i32(x, 65537) { *bad = *bad + 1 }
+    when x % 65537 != rem_i32(x, 65537) { *bad = *bad + 1 }
+    when x / 178678102 != div_i32(x, 178678102) { *bad = *bad + 1 }
+    when x % 178678102 != rem_i32(x, 178678102) { *bad = *bad + 1 }
+    when x / 545449556 != div_i32(x, 545449556) { *bad = *bad + 1 }
+    when x % 545449556 != rem_i32(x, 545449556) { *bad = *bad + 1 }
+    when x / 597350287 != div_i32(x, 597350287) { *bad = *bad + 1 }
+    when x % 597350287 != rem_i32(x, 597350287) { *bad = *bad + 1 }
+    when x / 715827882 != div_i32(x, 715827882) { *bad = *bad + 1 }
+    when x % 715827882 != rem_i32(x, 715827882) { *bad = *bad + 1 }
+    when x / 873550682 != div_i32(x, 873550682) { *bad = *bad + 1 }
+    when x % 873550682 != rem_i32(x, 873550682) { *bad = *bad + 1 }
+    when x / 1073741823 != div_i32(x, 1073741823) { *bad = *bad + 1 }
+    when x % 1073741823 != rem_i32(x, 1073741823) { *bad = *bad + 1 }
+    when x / 1073741824 != div_i32(x, 1073741824) { *bad = *bad + 1 }
+    when x % 1073741824 != rem_i32(x, 1073741824) { *bad = *bad + 1 }
+    when x / 1183838446 != div_i32(x, 1183838446) { *bad = *bad + 1 }
+    when x % 1183838446 != rem_i32(x, 1183838446) { *bad = *bad + 1 }
+    when x / 1520009599 != div_i32(x, 1520009599) { *bad = *bad + 1 }
+    when x % 1520009599 != rem_i32(x, 1520009599) { *bad = *bad + 1 }
+    when x / 1804349166 != div_i32(x, 1804349166) { *bad = *bad + 1 }
+    when x % 1804349166 != rem_i32(x, 1804349166) { *bad = *bad + 1 }
+    when x / 2000778784 != div_i32(x, 2000778784) { *bad = *bad + 1 }
+    when x % 2000778784 != rem_i32(x, 2000778784) { *bad = *bad + 1 }
+    when x / 2138231514 != div_i32(x, 2138231514) { *bad = *bad + 1 }
+    when x % 2138231514 != rem_i32(x, 2138231514) { *bad = *bad + 1 }
+    when x / 2142450373 != div_i32(x, 2142450373) { *bad = *bad + 1 }
+    when x % 2142450373 != rem_i32(x, 2142450373) { *bad = *bad + 1 }
+    when x / 2147483646 != div_i32(x, 2147483646) { *bad = *bad + 1 }
+    when x % 2147483646 != rem_i32(x, 2147483646) { *bad = *bad + 1 }
+    when x / 2147483647 != div_i32(x, 2147483647) { *bad = *bad + 1 }
+    when x % 2147483647 != rem_i32(x, 2147483647) { *bad = *bad + 1 }
+}
+fun check_i64(x: i64, bad: &mut u64) {
+    when x / -9223372036854775808 != div_i64(x, -9223372036854775808) { *bad = *bad + 1 }
+    when x % -9223372036854775808 != rem_i64(x, -9223372036854775808) { *bad = *bad + 1 }
+    when x / -9223372036854775807 != div_i64(x, -9223372036854775807) { *bad = *bad + 1 }
+    when x % -9223372036854775807 != rem_i64(x, -9223372036854775807) { *bad = *bad + 1 }
+    when x / -10 != div_i64(x, -10) { *bad = *bad + 1 }
+    when x % -10 != rem_i64(x, -10) { *bad = *bad + 1 }
+    when x * -10 != mul_i64(x, -10) { *bad = *bad + 1 }
+    when x / -7 != div_i64(x, -7) { *bad = *bad + 1 }
+    when x % -7 != rem_i64(x, -7) { *bad = *bad + 1 }
+    when x * -7 != mul_i64(x, -7) { *bad = *bad + 1 }
+    when x / -3 != div_i64(x, -3) { *bad = *bad + 1 }
+    when x % -3 != rem_i64(x, -3) { *bad = *bad + 1 }
+    when x * -3 != mul_i64(x, -3) { *bad = *bad + 1 }
+    when x / -2 != div_i64(x, -2) { *bad = *bad + 1 }
+    when x % -2 != rem_i64(x, -2) { *bad = *bad + 1 }
+    when x * -2 != mul_i64(x, -2) { *bad = *bad + 1 }
+    when x / -1 != div_i64(x, -1) { *bad = *bad + 1 }
+    when x % -1 != rem_i64(x, -1) { *bad = *bad + 1 }
+    when x * -1 != mul_i64(x, -1) { *bad = *bad + 1 }
+    when x / 1 != div_i64(x, 1) { *bad = *bad + 1 }
+    when x % 1 != rem_i64(x, 1) { *bad = *bad + 1 }
+    when x * 1 != mul_i64(x, 1) { *bad = *bad + 1 }
+    when x / 2 != div_i64(x, 2) { *bad = *bad + 1 }
+    when x % 2 != rem_i64(x, 2) { *bad = *bad + 1 }
+    when x * 2 != mul_i64(x, 2) { *bad = *bad + 1 }
+    when x / 3 != div_i64(x, 3) { *bad = *bad + 1 }
+    when x % 3 != rem_i64(x, 3) { *bad = *bad + 1 }
+    when x * 3 != mul_i64(x, 3) { *bad = *bad + 1 }
+    when x / 5 != div_i64(x, 5) { *bad = *bad + 1 }
+    when x % 5 != rem_i64(x, 5) { *bad = *bad + 1 }
+    when x * 5 != mul_i64(x, 5) { *bad = *bad + 1 }
+    when x / 6 != div_i64(x, 6) { *bad = *bad + 1 }
+    when x % 6 != rem_i64(x, 6) { *bad = *bad + 1 }
+    when x * 6 != mul_i64(x, 6) { *bad = *bad + 1 }
+    when x / 7 != div_i64(x, 7) { *bad = *bad + 1 }
+    when x % 7 != rem_i64(x, 7) { *bad = *bad + 1 }
+    when x * 7 != mul_i64(x, 7) { *bad = *bad + 1 }
+    when x / 9 != div_i64(x, 9) { *bad = *bad + 1 }
+    when x % 9 != rem_i64(x, 9) { *bad = *bad + 1 }
+    when x * 9 != mul_i64(x, 9) { *bad = *bad + 1 }
+    when x / 10 != div_i64(x, 10) { *bad = *bad + 1 }
+    when x % 10 != rem_i64(x, 10) { *bad = *bad + 1 }
+    when x * 10 != mul_i64(x, 10) { *bad = *bad + 1 }
+    when x / 11 != div_i64(x, 11) { *bad = *bad + 1 }
+    when x % 11 != rem_i64(x, 11) { *bad = *bad + 1 }
+    when x * 11 != mul_i64(x, 11) { *bad = *bad + 1 }
+    when x / 12 != div_i64(x, 12) { *bad = *bad + 1 }
+    when x % 12 != rem_i64(x, 12) { *bad = *bad + 1 }
+    when x * 12 != mul_i64(x, 12) { *bad = *bad + 1 }
+    when x / 13 != div_i64(x, 13) { *bad = *bad + 1 }
+    when x % 13 != rem_i64(x, 13) { *bad = *bad + 1 }
+    when x * 13 != mul_i64(x, 13) { *bad = *bad + 1 }
+    when x / 25 != div_i64(x, 25) { *bad = *bad + 1 }
+    when x % 25 != rem_i64(x, 25) { *bad = *bad + 1 }
+    when x * 25 != mul_i64(x, 25) { *bad = *bad + 1 }
+    when x / 60 != div_i64(x, 60) { *bad = *bad + 1 }
+    when x % 60 != rem_i64(x, 60) { *bad = *bad + 1 }
+    when x * 60 != mul_i64(x, 60) { *bad = *bad + 1 }
+    when x / 100 != div_i64(x, 100) { *bad = *bad + 1 }
+    when x % 100 != rem_i64(x, 100) { *bad = *bad + 1 }
+    when x / 125 != div_i64(x, 125) { *bad = *bad + 1 }
+    when x % 125 != rem_i64(x, 125) { *bad = *bad + 1 }
+    when x / 641 != div_i64(x, 641) { *bad = *bad + 1 }
+    when x % 641 != rem_i64(x, 641) { *bad = *bad + 1 }
+    when x / 65535 != div_i64(x, 65535) { *bad = *bad + 1 }
+    when x % 65535 != rem_i64(x, 65535) { *bad = *bad + 1 }
+    when x / 65537 != div_i64(x, 65537) { *bad = *bad + 1 }
+    when x % 65537 != rem_i64(x, 65537) { *bad = *bad + 1 }
+    when x / 155787066465207326 != div_i64(x, 155787066465207326) { *bad = *bad + 1 }
+    when x % 155787066465207326 != rem_i64(x, 155787066465207326) { *bad = *bad + 1 }
+    when x / 274413008040396209 != div_i64(x, 274413008040396209) { *bad = *bad + 1 }
+    when x % 274413008040396209 != rem_i64(x, 274413008040396209) { *bad = *bad + 1 }
+    when x / 616365694542581019 != div_i64(x, 616365694542581019) { *bad = *bad + 1 }
+    when x % 616365694542581019 != rem_i64(x, 616365694542581019) { *bad = *bad + 1 }
+    when x / 994308097797298706 != div_i64(x, 994308097797298706) { *bad = *bad + 1 }
+    when x % 994308097797298706 != rem_i64(x, 994308097797298706) { *bad = *bad + 1 }
+    when x / 995450101108011377 != div_i64(x, 995450101108011377) { *bad = *bad + 1 }
+    when x % 995450101108011377 != rem_i64(x, 995450101108011377) { *bad = *bad + 1 }
+    when x / 2683105625801077853 != div_i64(x, 2683105625801077853) { *bad = *bad + 1 }
+    when x % 2683105625801077853 != rem_i64(x, 2683105625801077853) { *bad = *bad + 1 }
+    when x / 3074457345618258602 != div_i64(x, 3074457345618258602) { *bad = *bad + 1 }
+    when x % 3074457345618258602 != rem_i64(x, 3074457345618258602) { *bad = *bad + 1 }
+    when x / 4611686018427387903 != div_i64(x, 4611686018427387903) { *bad = *bad + 1 }
+    when x % 4611686018427387903 != rem_i64(x, 4611686018427387903) { *bad = *bad + 1 }
+    when x / 4611686018427387904 != div_i64(x, 4611686018427387904) { *bad = *bad + 1 }
+    when x % 4611686018427387904 != rem_i64(x, 4611686018427387904) { *bad = *bad + 1 }
+    when x / 4730525896183341671 != div_i64(x, 4730525896183341671) { *bad = *bad + 1 }
+    when x % 4730525896183341671 != rem_i64(x, 4730525896183341671) { *bad = *bad + 1 }
+    when x / 5194070557430786753 != div_i64(x, 5194070557430786753) { *bad = *bad + 1 }
+    when x % 5194070557430786753 != rem_i64(x, 5194070557430786753) { *bad = *bad + 1 }
+    when x / 6317064252220328726 != div_i64(x, 6317064252220328726) { *bad = *bad + 1 }
+    when x % 6317064252220328726 != rem_i64(x, 6317064252220328726) { *bad = *bad + 1 }
+    when x / 6991224212458701309 != div_i64(x, 6991224212458701309) { *bad = *bad + 1 }
+    when x % 6991224212458701309 != rem_i64(x, 6991224212458701309) { *bad = *bad + 1 }
+    when x / 9223372036854775806 != div_i64(x, 9223372036854775806) { *bad = *bad + 1 }
+    when x % 9223372036854775806 != rem_i64(x, 9223372036854775806) { *bad = *bad + 1 }
+    when x / 9223372036854775807 != div_i64(x, 9223372036854775807) { *bad = *bad + 1 }
+    when x % 9223372036854775807 != rem_i64(x, 9223372036854775807) { *bad = *bad + 1 }
+}
+fun main() {
+    mut bad: u64 = 0
+    check_u8(0, &mut bad)
+    check_u8(1, &mut bad)
+    check_u8(2, &mut bad)
+    check_u8(3, &mut bad)
+    check_u8(7, &mut bad)
+    check_u8(26, &mut bad)
+    check_u8(37, &mut bad)
+    check_u8(85, &mut bad)
+    check_u8(101, &mut bad)
+    check_u8(107, &mut bad)
+    check_u8(109, &mut bad)
+    check_u8(127, &mut bad)
+    check_u8(128, &mut bad)
+    check_u8(138, &mut bad)
+    check_u8(172, &mut bad)
+    check_u8(192, &mut bad)
+    check_u8(203, &mut bad)
+    check_u8(214, &mut bad)
+    check_u8(240, &mut bad)
+    check_u8(253, &mut bad)
+    check_u8(254, &mut bad)
+    check_u8(255, &mut bad)
+    check_u16(0, &mut bad)
+    check_u16(1, &mut bad)
+    check_u16(2, &mut bad)
+    check_u16(3, &mut bad)
+    check_u16(7, &mut bad)
+    check_u16(1435, &mut bad)
+    check_u16(1985, &mut bad)
+    check_u16(7850, &mut bad)
+    check_u16(11422, &mut bad)
+    check_u16(13244, &mut bad)
+    check_u16(15465, &mut bad)
+    check_u16(17641, &mut bad)
+    check_u16(21845, &mut bad)
+    check_u16(32294, &mut bad)
+    check_u16(32767, &mut bad)
+    check_u16(32768, &mut bad)
+    check_u16(40790, &mut bad)
+    check_u16(43592, &mut bad)
+    check_u16(53746, &mut bad)
+    check_u16(60940, &mut bad)
+    check_u16(65533, &mut bad)
+    check_u16(65534, &mut bad)
+    check_u16(65535, &mut bad)
+    check_u32(0, &mut bad)
+    check_u32(1, &mut bad)
+    check_u32(2, &mut bad)
+    check_u32(3, &mut bad)
+    check_u32(7, &mut bad)
+    check_u32(430925917, &mut bad)
+    check_u32(500398015, &mut bad)
+    check_u32(562499339, &mut bad)
+    check_u32(904993522, &mut bad)
+    check_u32(914251117, &mut bad)
+    check_u32(915873307, &mut bad)
+    check_u32(1109293664, &mut bad)
+    check_u32(1431655765, &mut bad)
+    check_u32(2147483647, &mut bad)
+    check_u32(2147483648, &mut bad)
+    check_u32(2402154336, &mut bad)
+    check_u32(2764735410, &mut bad)
+    check_u32(3423181342, &mut bad)
+    check_u32(3800466732, &mut bad)
+    check_u32(4249018436, &mut bad)
+    check_u32(4294967293, &mut bad)
+    check_u32(4294967294, &mut bad)
+    check_u32(4294967295, &mut bad)
+    check_u64(0, &mut bad)
+    check_u64(1, &mut bad)
+    check_u64(2, &mut bad)
+    check_u64(3, &mut bad)
+    check_u64(7, &mut bad)
+    check_u64(1268695569197980173, &mut bad)
+    check_u64(1367642942600312432, &mut bad)
+    check_u64(1370242529362591600, &mut bad)
+    check_u64(2011567050427022538, &mut bad)
+    check_u64(4740470090493894107, &mut bad)
+    check_u64(5466227077576251891, &mut bad)
+    check_u64(6148914691236517205, &mut bad)
+    check_u64(7774513572060098239, &mut bad)
+    check_u64(9223372036854775807, &mut bad)
+    check_u64(9223372036854775808, &mut bad)
+    check_u64(10218227006567243789, &mut bad)
+    check_u64(11258659683429187032, &mut bad)
+    check_u64(13381101500887933768, &mut bad)
+    check_u64(17526912985532827443, &mut bad)
+    check_u64(17758339433442689115, &mut bad)
+    check_u64(18446744073709551613, &mut bad)
+    check_u64(18446744073709551614, &mut bad)
+    check_u64(18446744073709551615, &mut bad)
+    check_i8(-128, &mut bad)
+    check_i8(-127, &mut bad)
+    check_i8(-126, &mut bad)
+    check_i8(-120, &mut bad)
+    check_i8(-105, &mut bad)
+    check_i8(-98, &mut bad)
+    check_i8(-93, &mut bad)
+    check_i8(-38, &mut bad)
+    check_i8(-24, &mut bad)
+    check_i8(-20, &mut bad)
+    check_i8(-1, &mut bad)
+    check_i8(0, &mut bad)
+    check_i8(1, &mut bad)
+    check_i8(2, &mut bad)
+    check_i8(3, &mut bad)
+    check_i8(7, &mut bad)
+    check_i8(9, &mut bad)
+    check_i8(16, &mut bad)
+    check_i8(42, &mut bad)
+    check_i8(63, &mut bad)
+    check_i8(64, &mut bad)
+    check_i8(82, &mut bad)
+    check_i8(100, &mut bad)
+    check_i8(125, &mut bad)
+    check_i8(126, &mut bad)
+    check_i8(127, &mut bad)
+    check_i16(-32768, &mut bad)
+    check_i16(-32767, &mut bad)
+    check_i16(-32766, &mut bad)
+    check_i16(-30423, &mut bad)
+    check_i16(-28170, &mut bad)
+    check_i16(-20685, &mut bad)
+    check_i16(-15522, &mut bad)
+    check_i16(-14627, &mut bad)
+    check_i16(-14373, &mut bad)
+    check_i16(-1, &mut bad)
+    check_i16(0, &mut bad)
+    check_i16(1, &mut bad)
+    check_i16(2, &mut bad)
+    check_i16(3, &mut bad)
+    check_i16(7, &mut bad)
+    check_i16(10612, &mut bad)
+    check_i16(10922, &mut bad)
+    check_i16(14086, &mut bad)
+    check_i16(14699, &mut bad)
+    check_i16(15569, &mut bad)
+    check_i16(16383, &mut bad)
+    check_i16(16384, &mut bad)
+    check_i16(26259, &mut bad)
+    check_i16(29464, &mut bad)
+    check_i16(32765, &mut bad)
+    check_i16(32766, &mut bad)
+    check_i16(32767, &mut bad)
+    check_i32(-2147483648, &mut bad)
+    check_i32(-2147483647, &mut bad)
+    check_i32(-2147483646, &mut bad)
+    check_i32(-1824231944, &mut bad)
+    check_i32(-777799280, &mut bad)
+    check_i32(-76296968, &mut bad)
+    check_i32(-1, &mut bad)
+    check_i32(0, &mut bad)
+    check_i32(1, &mut bad)
+    check_i32(2, &mut bad)
+    check_i32(3, &mut bad)
+    check_i32(7, &mut bad)
+    check_i32(197978061, &mut bad)
+    check_i32(584908068, &mut bad)
+    check_i32(715827882, &mut bad)
+    check_i32(863159659, &mut bad)
+    check_i32(874844552, &mut bad)
+    check_i32(989981301, &mut bad)
+    check_i32(1017930850, &mut bad)
+    check_i32(1073741823, &mut bad)
+    check_i32(1073741824, &mut bad)
+    check_i32(1782422503, &mut bad)
+    check_i32(1987586369, &mut bad)
+    check_i32(2144724696, &mut bad)
+    check_i32(2147483645, &mut bad)
+    check_i32(2147483646, &mut bad)
+    check_i32(2147483647, &mut bad)
+    check_i64(-9223372036854775808, &mut bad)
+    check_i64(-9223372036854775807, &mut bad)
+    check_i64(-9223372036854775806, &mut bad)
+    check_i64(-2435867637903456393, &mut bad)
+    check_i64(-1097166333148169255, &mut bad)
+    check_i64(-351284713338069301, &mut bad)
+    check_i64(-1, &mut bad)
+    check_i64(0, &mut bad)
+    check_i64(1, &mut bad)
+    check_i64(2, &mut bad)
+    check_i64(3, &mut bad)
+    check_i64(7, &mut bad)
+    check_i64(339320932858063531, &mut bad)
+    check_i64(760962032565447446, &mut bad)
+    check_i64(2008239949323680995, &mut bad)
+    check_i64(3074457345618258602, &mut bad)
+    check_i64(4611686018427387903, &mut bad)
+    check_i64(4611686018427387904, &mut bad)
+    check_i64(5359369494332025724, &mut bad)
+    check_i64(6590940143396355578, &mut bad)
+    check_i64(7394118095694513825, &mut bad)
+    check_i64(7484242530997315501, &mut bad)
+    check_i64(7937660445621820101, &mut bad)
+    check_i64(9100188114694351958, &mut bad)
+    check_i64(9223372036854775805, &mut bad)
+    check_i64(9223372036854775806, &mut bad)
+    check_i64(9223372036854775807, &mut bad)
+    echo bad
+}

@@ -91,6 +91,7 @@ pub struct StructInfo {
     drop_name: String,
     module_path: String,
     public: bool,
+    layout: u64,
 }
 
 // A storage location a value can be read from or written to: a slot run and its type.
@@ -163,6 +164,12 @@ pub struct Lowering {
     structs: Vec<StructInfo>,
     type_names: Vec<String>,
     type_words: Vec<String>,
+    // The first position of each name in the tables above, so that a lookup is one hash instead of a scan of every
+    // declaration (the scans made lowering a program of thousands of functions quadratic).
+    type_index: Map<String, u64>,
+    struct_index: Map<String, u64>,
+    signature_map: Map<String, u64>,
+    alias_index: Map<String, u64>,
     scope_path: String,
     current_function: String,
     call_scope: String,
@@ -178,6 +185,8 @@ pub struct Lowering {
     recovering: bool,
     recovered: Vec<String>,
     abandoned: bool,
+    // Whether every function of the native runtime module is lowered; otherwise only those a program reaches are.
+    lower_all: bool,
 }
 
 // The IEEE bit pattern of a float literal's text, as the IR writes it.
@@ -2185,12 +2194,9 @@ extend Lowering {
     }
 
     fun struct_id(self, name: String) -> Result<u64, String> {
-        mut id: u64 = 0
-        while id < self.structs.len() {
-            when self.structs[id].name == name {
-                return Result::Ok(id)
-            }
-            id += 1
+        found := self.struct_index.get(name.clone())
+        when found.is_some() {
+            return Result::Ok(found.unwrap())
         }
         // A module alias names the structure too: `lexer::Token`.
         aliased := self.named_word(name.clone())
@@ -3923,7 +3929,17 @@ extend Lowering {
         return records
     }
 
+    // Infer the holder, not a flattened local slot: an intermediate field may
+    // itself be a pointer (holder.state.closed) or a temporary structure.
     fun field_type(self, value: u64, name: String) -> Result<String, String> {
+        mut holder := self.value_hint(value)
+        when reference_inner(holder.clone()).is_some() { holder = reference_inner(holder.clone()).unwrap() }
+        when holder.starts_with("RawPointer ") { holder = holder.slice(11, holder.len()) }
+        id := struct_id_of(holder)
+        when id.is_some() {
+            field := self.field_index(id.unwrap(), name)?
+            return Result::Ok(self.structs[id.unwrap()].field_types[field].clone())
+        }
         place := self.field_of(value, name)?
         return Result::Ok(place.ty)
     }
@@ -3997,7 +4013,8 @@ extend Lowering {
     // A field of a structure reached through a reference local: `ReferenceField pointer ...`, and
     // `Field` for every access after the first. `None` when the root of the access is not a reference.
     fun reference_field(mut self, value: u64, name: String, span: ast::Span) -> Result<Option<Lowered>, String> {
-        when !self.chain_root_is_reference(value) {
+        holder := self.value_hint(value)
+        when !self.chain_root_is_reference(value) && !holder.starts_with("RawPointer ") && reference_inner(holder).is_none() {
             return Result::Ok(Option::None)
         }
         return Result::Ok(Option::Some(self.field_tree_step(value, name, span)?))
@@ -4111,6 +4128,7 @@ extend Lowering {
             tokens.push(num(self.structs[id].derives_clone))
             tokens.push(num(self.structs[id].derives_hash))
             tokens.push(length_prefixed(self.structs[id].module_path.clone()))
+            tokens.push(num(self.structs[id].layout))
             records.push(join(tokens))
             id += 1
         }
@@ -4399,6 +4417,18 @@ extend Lowering {
                 }
             }
         }
+        // Constructors/static methods of a type alias belong to the original
+        // structure. Resolve the type prefix before treating the path as an enum.
+        cut := last_index_of(name.clone(), String("::"))
+        when cut.is_some() {
+            holder := self.struct_id(name.slice(0, cut.unwrap()))
+            when holder.is_ok() {
+                mut original := self.structs[holder.unwrap()].name.clone()
+                original.append(name.slice(cut.unwrap(), name.len()))
+                aliased := self.signature_exact(original)
+                when aliased.is_ok() { return aliased }
+            }
+        }
         qualified := qualified_in(self.scope_path.clone(), name)
         when !qualified.is_empty() {
             return self.signature_exact(qualified)
@@ -4407,19 +4437,13 @@ extend Lowering {
     }
 
     fun signature_exact(self, name: String) -> Result<u64, String> {
-        mut id: u64 = 0
-        while id < self.signatures.len() {
-            when self.signatures[id].name == name {
-                return Result::Ok(id)
-            }
-            id += 1
+        found := self.signature_map.get(name.clone())
+        when found.is_some() {
+            return Result::Ok(found.unwrap())
         }
-        mut alias: u64 = 0
-        while alias < self.alias_names.len() {
-            when self.alias_names[alias] == name {
-                return Result::Ok(self.alias_targets[alias])
-            }
-            alias += 1
+        alias := self.alias_index.get(name)
+        when alias.is_some() {
+            return Result::Ok(self.alias_targets[alias.unwrap()])
         }
         return Result::Err(unsupported("unknown function"))
     }
@@ -4908,11 +4932,28 @@ extend Lowering {
     // `left <op> right` on a structure with an operator method (`add`, `sub`, ...) in its `extend`.
     fun operator_call(mut self, lhs: Lowered, method: String, right: u64, span: ast::Span) -> Result<Option<Lowered>, String> {
         id := struct_id_of(lhs.ty.clone()).unwrap()
-        mut key := self.structs[id].name.clone()
+        // As for any method, a structure in a module names its methods by the module (`std::simd::F32x4::add#method`).
+        mut key := String("")
+        mut owner_prefix := self.structs[id].module_path.clone()
+        when !owner_prefix.is_empty() {
+            owner_prefix.append("::")
+            when !self.structs[id].name.starts_with(owner_prefix.clone()) {
+                key = self.structs[id].module_path.clone()
+                key.append("::")
+            }
+        }
+        key.append(self.structs[id].name.clone())
         key.append("::")
-        key.append(method)
+        key.append(method.clone())
         key.append("#method")
-        found := self.signature_index(key)
+        mut found := self.signature_index(key)
+        when found.is_err() {
+            mut bare := self.structs[id].name.clone()
+            bare.append("::")
+            bare.append(method.clone())
+            bare.append("#method")
+            found = self.signature_index(bare)
+        }
         when found.is_err() {
             return Result::Ok(Option::None)
         }
@@ -6527,15 +6568,50 @@ extend Lowering {
         return Result::Ok(word)
     }
 
+    // The IR word of a declared type name, read from the tables of the lowering itself (copying them for each lookup made the
+    // lowering of a large program take minutes).
+    fun type_word_of(self, name: String) -> Result<String, String> {
+        found := self.type_index.get(name)
+        when found.is_some() {
+            return Result::Ok(self.type_words[found.unwrap()].clone())
+        }
+        return Result::Err(unsupported("unknown type"))
+    }
+
+    // Declares a type name with its IR word. The first declaration of a name is the one a lookup finds.
+    fun register_type(mut self, name: String, word: String) {
+        when !self.type_index.contains_key(name.clone()) {
+            self.type_index.insert(name.clone(), self.type_names.len())
+        }
+        self.type_names.push(name)
+        self.type_words.push(word)
+    }
+
+    // Whether `name` is declared, itself or inside a namespace (`module::name`).
+    fun type_declared_in_a_namespace(self, name: String) -> bool {
+        mut at: u64 = 0
+        while at < self.type_names.len() {
+            when self.type_names[at] == name {
+                return true
+            }
+            declared_length := self.type_names[at].len()
+            when declared_length > name.len() + 2 && self.type_names[at].ends_with(name.clone()) && self.type_names[at].slice(declared_length - name.len() - 2, declared_length - name.len()) == "::" {
+                return true
+            }
+            at += 1
+        }
+        return false
+    }
+
     fun named_word(self, name: String) -> Result<String, String> {
         qualified := qualified_in(self.scope_path.clone(), name.clone())
         when !qualified.is_empty() {
-            found := named_type_word(self.type_names.clone(), self.type_words.clone(), qualified)
+            found := self.type_word_of(qualified)
             when found.is_ok() {
                 return found
             }
         }
-        return named_type_word(self.type_names.clone(), self.type_words.clone(), name)
+        return self.type_word_of(name)
     }
 
     // A named type. The placeholder of a generic structure that no instance matches is `R0262`, at the name's span. A
@@ -6545,7 +6621,7 @@ extend Lowering {
         when found.is_ok() {
             return found
         }
-        when !name.starts_with("$") && !name.contains("::") && !declared_in_a_namespace(self.type_names.clone(), name.clone()) {
+        when !name.starts_with("$") && !name.contains("::") && !self.type_declared_in_a_namespace(name.clone()) {
             return Result::Err(unknown_type_error(name, start, end))
         }
         when !name.starts_with("$RynStructParam#") {
@@ -6683,6 +6759,10 @@ fun new_lowering(program: ast::Program, recovering: bool) -> Lowering {
         enums: Vec(),
         type_names: Vec(),
         type_words: Vec(),
+        type_index: Map<String, u64>(),
+        struct_index: Map<String, u64>(),
+        signature_map: Map<String, u64>(),
+        alias_index: Map<String, u64>(),
         scope_path: String(""),
         current_function: String(""),
         call_scope: String(""),
@@ -6695,6 +6775,7 @@ fun new_lowering(program: ast::Program, recovering: bool) -> Lowering {
         recovering: recovering,
         recovered: Vec(),
         abandoned: false,
+        lower_all: false,
     }
 }
 
@@ -6706,7 +6787,14 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
 // Lowers the program and reports every error that does not depend on another one: one `diagnostic` line each, in
 // source order. A construct the analysis does not handle declines the whole program, as `lower_program` does.
 pub fun lower_recovering(program: ast::Program) -> Result<String, String> {
+    return lower_recovering_with(program, false)
+}
+
+// As `lower_recovering`; with `lower_all` every function of the native runtime module is lowered, not only the ones the
+// program reaches (to check the module itself).
+pub fun lower_recovering_with(program: ast::Program, lower_all: bool) -> Result<String, String> {
     mut lowering := new_lowering(program, true)
+    lowering.lower_all = lower_all
     outcome := lowering.lower()
     when outcome.is_ok() && lowering.recovered.len() == 0 {
         return outcome
@@ -6759,8 +6847,7 @@ extend Lowering {
         mut struct_position: u64 = 0
         while struct_position < self.program.structs.len() {
             definition := self.program.struct_defs[self.program.structs[struct_position]]
-            self.type_names.push(definition.name.clone())
-            self.type_words.push(struct_word(struct_position))
+            self.register_type(definition.name.clone(), struct_word(struct_position))
             struct_position += 1
         }
         mut enum_position: u64 = 0
@@ -6769,8 +6856,7 @@ extend Lowering {
             when !definition.type_parameters.is_empty() {
                 return Result::Err(unsupported("generic enum"))
             }
-            self.type_names.push(definition.name.clone())
-            self.type_words.push(join(words2(String("Enum"), num(enum_position))))
+            self.register_type(definition.name.clone(), join(words2(String("Enum"), num(enum_position))))
             enum_position += 1
         }
         self.add_type_aliases()
@@ -6780,8 +6866,7 @@ extend Lowering {
             // A generic alias is expanded where it is used; only plain aliases name a type.
             when alias.type_parameters.is_empty() {
                 target := self.resolve(alias.ty)?
-                self.type_names.push(alias.name.clone())
-                self.type_words.push(target)
+                self.register_type(alias.name.clone(), target)
             }
             alias_position += 1
         }
@@ -6835,7 +6920,7 @@ extend Lowering {
             }
             mut clone_flag: u64 = 0
             mut hash_flag: u64 = 0
-            for derive in definition.derives {
+            for derive in definition.derives.clone() {
                 when derive == "Clone" {
                     clone_flag = 1
                 }
@@ -6899,7 +6984,7 @@ extend Lowering {
                     self.report(destructor_layout_error(definition.span.start, definition.span.end))?
                 }
             }
-            structs.push(StructInfo { name: definition.name, field_names: field_names, field_types: field_types, field_public: field_public, repr_c: repr, derives_clone: clone_flag, derives_hash: hash_flag, drop_name: drop_name, module_path: definition.module_path.clone(), public: definition.public })
+            structs.push(StructInfo { name: definition.name, field_names: field_names, field_types: field_types, field_public: field_public, repr_c: repr, derives_clone: clone_flag, derives_hash: hash_flag, drop_name: drop_name, module_path: definition.module_path.clone(), public: definition.public, layout: layout_options(definition.derives.clone()) })
             struct_index += 1
         }
         for cycle in struct_cycle_errors(struct_names, struct_first, struct_edge_count, edge_targets, edge_starts, edge_ends) {
@@ -6934,6 +7019,13 @@ extend Lowering {
         enums = with_builtin_enums(enums)
         count := self.program.functions.len()
         self.structs = structs
+        mut struct_at: u64 = 0
+        while struct_at < self.structs.len() {
+            when !self.struct_index.contains_key(self.structs[struct_at].name.clone()) {
+                self.struct_index.insert(self.structs[struct_at].name.clone(), struct_at)
+            }
+            struct_at += 1
+        }
         when self.recovering {
             for found in self.signature_errors() {
                 self.recovered.push(found)
@@ -6943,6 +7035,8 @@ extend Lowering {
             }
         }
         mut signatures: Vec<Signature> = Vec()
+        // The keys of the signatures so far, to find a repeated one without comparing each pair.
+        mut known_keys: Map<String, u64> = Map<String, u64>()
         mut main_index: u64 = count
         mut position: u64 = 0
         while position < count {
@@ -6953,13 +7047,10 @@ extend Lowering {
                 key.append("#method")
             }
             // `R0201` for a function whose key an earlier function already has, before its signature is read.
-            mut earlier: u64 = 0
-            while earlier < signatures.len() {
-                when signatures[earlier].name == key {
-                    return Result::Err(duplicate_function_error(definition.name, definition.span.start, definition.span.end))
-                }
-                earlier += 1
+            when known_keys.contains_key(key.clone()) {
+                return Result::Err(duplicate_function_error(definition.name, definition.span.start, definition.span.end))
             }
+            known_keys.insert(key.clone(), position)
 
             // A signature names types as its function's namespace does, as the body does.
             self.scope_path = declaration_namespace(definition.name.clone(), definition.module_path.clone())
@@ -7011,60 +7102,120 @@ extend Lowering {
         while derive_index < self.structs.len() {
             mut clone_key := self.structs[derive_index].name.clone()
             clone_key.append("::clone#method")
-            mut present := false
-            for known in signatures.clone() {
-                when known.name == clone_key {
-                    present = true
-                }
-            }
+            present := known_keys.contains_key(clone_key.clone())
             when self.structs[derive_index].derives_clone == 1 && !present {
                 mut self_type := String("Reference ")
                 self_type.append(struct_word(derive_index))
                 self_type.append(" 0")
                 mut clone_params: Vec<String> = Vec()
                 clone_params.push(self_type)
+                known_keys.insert(clone_key.clone(), signatures.len())
                 signatures.push(Signature { name: clone_key, params: clone_params, ret: struct_word(derive_index), public: true, module: self.structs[derive_index].module_path.clone(), return_param: Option::None })
                 clone_structs.push(derive_index)
             }
             derive_index += 1
         }
         self.signatures = signatures
+        mut signature_at: u64 = 0
+        while signature_at < self.signatures.len() {
+            when !self.signature_map.contains_key(self.signatures[signature_at].name.clone()) {
+                self.signature_map.insert(self.signatures[signature_at].name.clone(), signature_at)
+            }
+            signature_at += 1
+        }
         self.enums = enums
         self.add_aliases()
-        mut functions: Vec<String> = Vec()
-        mut id: u64 = 0
-        while id < count {
-            // The bounds of a function are checked before its body, as the bootstrap's `prepare_function` does.
-            bound_failure := self.bound_conformance(id)
-            when bound_failure.is_some() {
-                self.report(bound_failure.unwrap())?
-                id += 1
-                continue
+        // The functions of the native runtime module are lowered when something reaches them: the module is large, and most
+        // programs use a few of its functions. A function that nothing reaches keeps an empty record, so that the numbers
+        // of the others do not change. Everything else is lowered.
+        mut wanted: Vec<bool> = Vec()
+        mut lazy: Vec<bool> = Vec()
+        mut placeholder_at: u64 = 0
+        while placeholder_at < count {
+            definition := self.program.function_defs[self.program.functions[placeholder_at]]
+            is_lazy := !self.lower_all && definition.external_symbol.is_none() && !definition.extern_c && (definition.module_path == "std::native" || definition.module_path == "std::native_windows")
+            lazy.push(is_lazy)
+            wanted.push(!is_lazy)
+            placeholder_at += 1
+        }
+        // A destructor is run by the code that drops its structure, which the IR does not name in a call.
+        for info in self.structs.clone() {
+            when !info.drop_name.is_empty() {
+                dropper := self.signature_index(info.drop_name.clone())
+                when dropper.is_ok() && dropper.unwrap() < count {
+                    wanted.set(dropper.unwrap(), true)
+                }
             }
-            lowered_function := self.function(id)
-            when lowered_function.is_err() {
-                message := lowered_function.unwrap_err()
-                when message.contains(" @ ") || message.starts_with("diagnostic ") {
-                    self.report(message)?
+        }
+        mut functions: Vec<String> = Vec()
+        mut lowered_flags: Vec<bool> = Vec()
+        mut fill: u64 = 0
+        while fill < count {
+            functions.push(String("0 - - - - 0 0 0 0"))
+            lowered_flags.push(false)
+            fill += 1
+        }
+        mut progress := true
+        while progress {
+            progress = false
+            mut id: u64 = 0
+            while id < count {
+                when !wanted[id] || lowered_flags[id] {
                     id += 1
                     continue
                 }
-                mut located := message
-                located.append(" @ ")
-                located.append(self.current_function.clone())
-                located.append(" 0")
-                return Result::Err(located)
+                lowered_flags.set(id, true)
+                progress = true
+                // The bounds of a function are checked before its body, as the bootstrap's `prepare_function` does.
+                bound_failure := self.bound_conformance(id)
+                when bound_failure.is_some() {
+                    self.report(bound_failure.unwrap())?
+                    id += 1
+                    continue
+                }
+                lowered_function := self.function(id)
+                when lowered_function.is_err() {
+                    message := lowered_function.unwrap_err()
+                    when message.contains(" @ ") || message.starts_with("diagnostic ") {
+                        self.report(message)?
+                        id += 1
+                        continue
+                    }
+                    mut located := message
+                    located.append(" @ ")
+                    located.append(self.current_function.clone())
+                    located.append(" 0")
+                    return Result::Err(located)
+                }
+                record := lowered_function.unwrap()
+                for reached in referenced_functions(record.clone()) {
+                    when reached < count && lazy[reached] && !wanted[reached] {
+                        wanted.set(reached, true)
+                    }
+                }
+                functions.set(id, record)
+                id += 1
             }
-            functions.push(lowered_function.unwrap())
-            id += 1
         }
-        for struct_id in clone_structs {
+        for struct_id in clone_structs.clone() {
             functions.push(self.clone_function(struct_id))
         }
         when self.recovering && self.recovered.len() > 0 {
             return Result::Err(String(""))
         }
-        return Result::Ok(assemble(main_index, self.struct_records()?, functions, self.user_enum_records()))
+        // The function names, one per function record in order: the signatures, then the generated `clone` functions.
+        mut function_names: Vec<String> = Vec()
+        mut name_at: u64 = 0
+        while name_at < count && function_names.len() < functions.len() {
+            function_names.push(self.signatures[name_at].name.clone())
+            name_at += 1
+        }
+        for struct_id in clone_structs.clone() {
+            mut clone_name := self.structs[struct_id].name.clone()
+            clone_name.append("::clone")
+            function_names.push(clone_name)
+        }
+        return Result::Ok(assemble(main_index, self.struct_records()?, functions, self.user_enum_records(), function_names))
     }
 }
 
@@ -7088,8 +7239,7 @@ extend Lowering {
                     mut alias_name := alias.clone()
                     alias_name.append("::")
                     alias_name.append(definition.name.clone())
-                    self.type_names.push(alias_name)
-                    self.type_words.push(struct_word(position))
+                    self.register_type(alias_name, struct_word(position))
                 }
                 position += 1
             }
@@ -7100,8 +7250,7 @@ extend Lowering {
                     mut alias_name := alias.clone()
                     alias_name.append("::")
                     alias_name.append(definition.name.clone())
-                    self.type_names.push(alias_name)
-                    self.type_words.push(join(words2(String("Enum"), num(enum_position))))
+                    self.register_type(alias_name, join(words2(String("Enum"), num(enum_position))))
                 }
                 enum_position += 1
             }
@@ -7141,6 +7290,9 @@ extend Lowering {
                         alias_name.append("#method")
                     }
                     when self.signature_exact(alias_name.clone()).is_err() {
+                        when !self.alias_index.contains_key(alias_name.clone()) {
+                            self.alias_index.insert(alias_name.clone(), self.alias_names.len())
+                        }
                         self.alias_names.push(alias_name)
                         self.alias_targets.push(function_id)
                     }
@@ -7514,7 +7666,7 @@ extend Lowering {
 }
 
 // The whole IR text: header, builtin enums, and the functions in source order.
-fun assemble(main_index: u64, structs: Vec<String>, functions: Vec<String>, enums: Vec<String>) -> String {
+fun assemble(main_index: u64, structs: Vec<String>, functions: Vec<String>, enums: Vec<String>, names: Vec<String>) -> String {
     mut tokens: Vec<String> = Vec()
     tokens.push(String("Ir"))
     tokens.push(num(main_index))
@@ -7527,14 +7679,61 @@ fun assemble(main_index: u64, structs: Vec<String>, functions: Vec<String>, enum
     for record in enums {
         tokens.push(record)
     }
-    tokens.push(num(functions.len()))
+    function_count := functions.len()
+    tokens.push(num(function_count))
     for function in functions {
         tokens.push(function)
+    }
+    // The function names, as an optional trailing section.
+    when names.len() == function_count {
+        tokens.push(num(names.len()))
+        for name in names {
+            tokens.push(length_prefixed(name))
+        }
     }
     // The bootstrap encoder writes a space before every word, including the first.
     mut out := String(" ")
     out.append(join(tokens))
     return out
+}
+
+// The numbers of the functions that the IR text of a function names: the word `Function` or `FunctionAddress` and the number
+// that follows it. A word inside a string literal gives a number too, which is harmless: it only keeps a function that nothing
+// needs.
+fun referenced_functions(record: String) -> Vec<u64> {
+    mut found: Vec<u64> = Vec()
+    mut at: u64 = 0
+    while at < record.len() {
+        // A word starts after a space (or at the start).
+        when (record.byte_at(at) as u64) == 70 && (at == 0 || (record.byte_at(at - 1) as u64) == 32) {
+            mut end := at
+            while end < record.len() && (record.byte_at(end) as u64) != 32 {
+                end += 1
+            }
+            word := record.slice(at, end)
+            when (word == "Function" || word == "FunctionAddress") && end + 1 < record.len() {
+                mut number: u64 = 0
+                mut digits: u64 = 0
+                mut cursor := end + 1
+                while cursor < record.len() {
+                    byte := record.byte_at(cursor) as u64
+                    when byte < 48 || byte > 57 {
+                        break
+                    }
+                    number = number * 10 + (byte - 48)
+                    digits += 1
+                    cursor += 1
+                }
+                when digits > 0 {
+                    found.push(number)
+                }
+            }
+            at = end
+        } else {
+            at += 1
+        }
+    }
+    return found
 }
 
 // The source span of an expression node.
@@ -7633,6 +7832,7 @@ extend Lowering {
         when reference_inner(base.clone()).is_some() {
             base = reference_inner(base.clone()).unwrap()
         }
+        when base.starts_with("RawPointer ") { base = base.slice(11, base.len()) }
         id := struct_id_of(base)
         when id.is_none() {
             return String("")
@@ -8711,7 +8911,10 @@ extend Lowering {
             flags.push(public)
         }
         id := self.structs.len()
-        self.structs.push(StructInfo { name: name, field_names: field_names, field_types: field_types, field_public: flags, repr_c: 0, derives_clone: 0, derives_hash: 0, drop_name: String(""), module_path: String(""), public: true })
+        when !self.struct_index.contains_key(name.clone()) {
+            self.struct_index.insert(name.clone(), self.structs.len())
+        }
+        self.structs.push(StructInfo { name: name, field_names: field_names, field_types: field_types, field_public: flags, repr_c: 0, derives_clone: 0, derives_hash: 0, drop_name: String(""), module_path: String(""), public: true, layout: 0 })
         return id
     }
 
@@ -8888,13 +9091,23 @@ extend Lowering {
             mut size: u64 = 0
             mut align: u64 = 1
             mut field: u64 = 0
+            // A `#[repr(C, packed)]` structure keeps at most its packing of each field's alignment; `align(N)` raises the whole.
+            pack := self.structs[id.unwrap()].layout & 65535
             while field < self.structs[id.unwrap()].field_types.len() {
                 inner := self.type_layout(self.structs[id.unwrap()].field_types[field].clone())
-                size = (size + inner[1] - 1) / inner[1] * inner[1] + inner[0]
-                when inner[1] > align {
-                    align = inner[1]
+                mut field_align := inner[1]
+                when pack != 0 && field_align > pack {
+                    field_align = pack
+                }
+                size = (size + field_align - 1) / field_align * field_align + inner[0]
+                when field_align > align {
+                    align = field_align
                 }
                 field += 1
+            }
+            minimum := self.structs[id.unwrap()].layout >> (16 as u32)
+            when minimum > align {
+                align = minimum
             }
             result.push((size + align - 1) / align * align)
             result.push(align)
@@ -9792,6 +10005,37 @@ extend Lowering {
     }
 }
 
+// The `repr(C)` layout options kept among a structure's derives (`$packed=N`, `$align=N`) as one number: the packing in the
+// low 16 bits and the minimum alignment above them.
+fun layout_options(derives: Vec<String>) -> u64 {
+    mut packed: u64 = 0
+    mut aligned: u64 = 0
+    for entry in derives {
+        when entry.starts_with("$packed=") {
+            packed = entry_number(entry.clone())
+        } else when entry.starts_with("$align=") {
+            aligned = entry_number(entry.clone())
+        }
+    }
+    return packed | (aligned << (16 as u32))
+}
+
+fun entry_number(entry: String) -> u64 {
+    mut value: u64 = 0
+    mut at: u64 = 0
+    mut digits := false
+    while at < entry.len() {
+        byte := entry.byte_at(at)
+        when byte == 61 {
+            digits = true
+        } else when digits && byte >= 48 && byte <= 57 {
+            value = value * 10 + (byte - 48) as u64
+        }
+        at += 1
+    }
+    return value
+}
+
 fun operator_method_name(op: String) -> String {
     when op == "Add" {
         return String("add")
@@ -10384,34 +10628,34 @@ extend Lowering {
     // with the other kind, and in recovering mode the functions.
     fun duplicate_declarations(self) -> Vec<String> {
         mut found: Vec<String> = Vec()
-        mut structure_names: Vec<String> = Vec()
+        mut structure_names: Map<String, bool> = Map<String, bool>()
         for index in self.program.structs.clone() {
             definition := self.program.struct_defs[index]
-            when listed(structure_names.clone(), definition.name.clone()) {
+            when structure_names.contains_key(definition.name.clone()) {
                 found.push(duplicate_structure_error(definition.name.clone(), definition.span.start, definition.span.end))
             } else {
-                structure_names.push(definition.name.clone())
+                structure_names.insert(definition.name.clone(), true)
             }
         }
-        mut enum_names: Vec<String> = Vec()
+        mut enum_names: Map<String, bool> = Map<String, bool>()
         for index in self.program.enums.clone() {
             definition := self.program.enum_defs[index]
-            when listed(enum_names.clone(), definition.name.clone()) {
+            when enum_names.contains_key(definition.name.clone()) {
                 found.push(duplicate_enum_error(definition.name.clone(), definition.span.start, definition.span.end))
-            } else when listed(structure_names.clone(), definition.name.clone()) {
+            } else when structure_names.contains_key(definition.name.clone()) {
                 found.push(enum_named_as_structure_error(definition.name.clone(), definition.span.start, definition.span.end))
             } else {
-                enum_names.push(definition.name.clone())
+                enum_names.insert(definition.name.clone(), true)
             }
         }
         for index in self.program.structs.clone() {
             definition := self.program.struct_defs[index]
-            when listed(enum_names.clone(), definition.name.clone()) {
+            when enum_names.contains_key(definition.name.clone()) {
                 found.push(structure_named_as_enum_error(definition.name.clone(), definition.span.start, definition.span.end))
             }
         }
         when self.recovering {
-            mut keys: Vec<String> = Vec()
+            mut keys: Map<String, bool> = Map<String, bool>()
             for index in self.program.functions.clone() {
                 definition := self.program.function_defs[index]
                 // The bootstrap's signature key, as the signature loop builds it.
@@ -10419,10 +10663,10 @@ extend Lowering {
                 when definition.parameters.len() > 0 && self.program.parameters[definition.parameters[0]].name == "self" && !definition.name.starts_with("String::") {
                     key.append("#method")
                 }
-                when listed(keys.clone(), key.clone()) {
+                when keys.contains_key(key.clone()) {
                     found.push(duplicate_function_error(definition.name.clone(), definition.span.start, definition.span.end))
                 } else {
-                    keys.push(key)
+                    keys.insert(key, true)
                 }
             }
         }

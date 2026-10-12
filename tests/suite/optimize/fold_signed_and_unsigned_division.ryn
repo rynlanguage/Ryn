@@ -1,0 +1,128 @@
+// test: run
+// out: -3
+// out: -3
+// out: -1
+// out: -1
+// out: -3
+// out: -3
+// out: 1
+// out: 1
+// out: 0
+// out: -7
+// out: 0
+// out: -7
+// out: -1
+// out: -1
+// out: -2147483648
+// out: -2147483648
+// out: 0
+// out: 0
+// out: -128
+// out: -128
+// out: 0
+// out: 0
+// out: -9223372036854775808
+// out: -9223372036854775808
+// out: 0
+// out: 0
+// out: 9223372036854775807
+// out: 9223372036854775807
+// out: 31
+// out: 31
+// out: 7
+// out: 7
+// out: 3
+// out: 3
+// out: 127
+// out: 15
+// out: 85
+// out: 0
+// out: 0
+// out: 255
+fun div_i32(a: i32, b: i32) -> i32 {
+    return a / b
+}
+
+fun rem_i32(a: i32, b: i32) -> i32 {
+    return a % b
+}
+
+fun div_i8(a: i8, b: i8) -> i8 {
+    return a / b
+}
+
+fun rem_i8(a: i8, b: i8) -> i8 {
+    return a % b
+}
+
+fun div_i64(a: i64, b: i64) -> i64 {
+    return a / b
+}
+
+fun rem_i64(a: i64, b: i64) -> i64 {
+    return a % b
+}
+
+fun div8_signed(a: i8) -> i8 {
+    return a / 8
+}
+
+fun rem8_signed(a: i8) -> i8 {
+    return a % 8
+}
+
+fun div8_unsigned(a: u8) -> u8 {
+    return a / 8
+}
+
+fun rem8_unsigned(a: u8) -> u8 {
+    return a % 8
+}
+
+fun main() {
+    // Signed division truncates toward zero; the remainder takes the sign of the dividend.
+    echo (0 as i32 - 7) / 2 as i32
+    echo div_i32(0 as i32 - 7, 2 as i32)
+    echo (0 as i32 - 7) % 2 as i32
+    echo rem_i32(0 as i32 - 7, 2 as i32)
+    echo 7 / (0 as i32 - 2)
+    echo div_i32(7, 0 as i32 - 2)
+    echo 7 % (0 as i32 - 2)
+    echo rem_i32(7, 0 as i32 - 2)
+    // Signed operands are not reduced to shifts: -7 / 8 is 0 and -7 % 8 is -7.
+    echo (0 as i32 - 7) / 8 as i32
+    echo (0 as i32 - 7) % 8 as i32
+    echo div8_signed(0 as i8 - 7 as i8)
+    echo rem8_signed(0 as i8 - 7 as i8)
+    echo (0 as i32 - 8) / 8 as i32
+    echo (0 as i32 - 9) % 8 as i32
+    // The least value divided by -1 wraps to itself, and its remainder is 0.
+    echo (0 as i32 - 2147483647 - 1) / (0 as i32 - 1)
+    echo div_i32(0 as i32 - 2147483647 - 1, 0 as i32 - 1)
+    echo (0 as i32 - 2147483647 - 1) % (0 as i32 - 1)
+    echo rem_i32(0 as i32 - 2147483647 - 1, 0 as i32 - 1)
+    echo (0 as i8 - 127 as i8 - 1 as i8) / (0 as i8 - 1 as i8)
+    echo div_i8(0 as i8 - 127 as i8 - 1 as i8, 0 as i8 - 1 as i8)
+    echo (0 as i8 - 127 as i8 - 1 as i8) % (0 as i8 - 1 as i8)
+    echo rem_i8(0 as i8 - 127 as i8 - 1 as i8, 0 as i8 - 1 as i8)
+    echo (0 as i64 - 9223372036854775807 as i64 - 1 as i64) / (0 as i64 - 1 as i64)
+    echo div_i64(0 as i64 - 9223372036854775807 as i64 - 1 as i64, 0 as i64 - 1 as i64)
+    echo (0 as i64 - 9223372036854775807 as i64 - 1 as i64) % (0 as i64 - 1 as i64)
+    echo rem_i64(0 as i64 - 9223372036854775807 as i64 - 1 as i64, 0 as i64 - 1 as i64)
+    echo (0 as i64 - 9223372036854775807 as i64) / (0 as i64 - 1 as i64)
+    echo div_i64(0 as i64 - 9223372036854775807 as i64, 0 as i64 - 1 as i64)
+    // Unsigned powers of two are shifts and masks: 255 / 8 is 31, 255 % 8 is 7.
+    echo 255 as u8 / 8 as u8
+    echo div8_unsigned(255 as u8)
+    echo 255 as u8 % 8 as u8
+    echo rem8_unsigned(255 as u8)
+    echo 203 as u8 % 8 as u8
+    echo rem8_unsigned(203 as u8)
+    echo 255 as u8 / 2 as u8
+    echo 255 as u8 % 16 as u8
+    // Other unsigned divisors keep the division itself.
+    echo 255 as u8 / 3 as u8
+    echo 255 as u8 % 3 as u8
+    echo 255 as u8 % 1 as u8
+    echo 255 as u8 / 1 as u8
+}

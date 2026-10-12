@@ -1,0 +1,492 @@
+// Explicit overflow control. The operators `+`, `-` and `*` always wrap at the width of their type; this module
+// names the other behaviours. `checked_*` gives `Option::None` when the result does not fit, `wrapping_*` is the
+// two's-complement result, and `saturating_*` clamps to the smallest or largest value of the type.
+
+pub fun checked_add_i8(left: i8, right: i8) -> Option<i8> {
+    low: i64 = -128
+    high: i64 = 127
+    wide: i64 = (left as i64) + (right as i64)
+    when wide < low || wide > high {
+        return Option::None
+    }
+    return Option::Some(wide as i8)
+}
+pub fun saturating_add_i8(left: i8, right: i8) -> i8 {
+    low: i64 = -128
+    high: i64 = 127
+    wide: i64 = (left as i64) + (right as i64)
+    when wide < low {
+        return low as i8
+    }
+    when wide > high {
+        return high as i8
+    }
+    return wide as i8
+}
+pub fun wrapping_add_i8(left: i8, right: i8) -> i8 { return left + right }
+pub fun checked_sub_i8(left: i8, right: i8) -> Option<i8> {
+    low: i64 = -128
+    high: i64 = 127
+    wide: i64 = (left as i64) - (right as i64)
+    when wide < low || wide > high {
+        return Option::None
+    }
+    return Option::Some(wide as i8)
+}
+pub fun saturating_sub_i8(left: i8, right: i8) -> i8 {
+    low: i64 = -128
+    high: i64 = 127
+    wide: i64 = (left as i64) - (right as i64)
+    when wide < low {
+        return low as i8
+    }
+    when wide > high {
+        return high as i8
+    }
+    return wide as i8
+}
+pub fun wrapping_sub_i8(left: i8, right: i8) -> i8 { return left - right }
+pub fun checked_mul_i8(left: i8, right: i8) -> Option<i8> {
+    low: i64 = -128
+    high: i64 = 127
+    wide: i64 = (left as i64) * (right as i64)
+    when wide < low || wide > high {
+        return Option::None
+    }
+    return Option::Some(wide as i8)
+}
+pub fun saturating_mul_i8(left: i8, right: i8) -> i8 {
+    low: i64 = -128
+    high: i64 = 127
+    wide: i64 = (left as i64) * (right as i64)
+    when wide < low {
+        return low as i8
+    }
+    when wide > high {
+        return high as i8
+    }
+    return wide as i8
+}
+pub fun wrapping_mul_i8(left: i8, right: i8) -> i8 { return left * right }
+pub fun checked_add_i16(left: i16, right: i16) -> Option<i16> {
+    low: i64 = -32768
+    high: i64 = 32767
+    wide: i64 = (left as i64) + (right as i64)
+    when wide < low || wide > high {
+        return Option::None
+    }
+    return Option::Some(wide as i16)
+}
+pub fun saturating_add_i16(left: i16, right: i16) -> i16 {
+    low: i64 = -32768
+    high: i64 = 32767
+    wide: i64 = (left as i64) + (right as i64)
+    when wide < low {
+        return low as i16
+    }
+    when wide > high {
+        return high as i16
+    }
+    return wide as i16
+}
+pub fun wrapping_add_i16(left: i16, right: i16) -> i16 { return left + right }
+pub fun checked_sub_i16(left: i16, right: i16) -> Option<i16> {
+    low: i64 = -32768
+    high: i64 = 32767
+    wide: i64 = (left as i64) - (right as i64)
+    when wide < low || wide > high {
+        return Option::None
+    }
+    return Option::Some(wide as i16)
+}
+pub fun saturating_sub_i16(left: i16, right: i16) -> i16 {
+    low: i64 = -32768
+    high: i64 = 32767
+    wide: i64 = (left as i64) - (right as i64)
+    when wide < low {
+        return low as i16
+    }
+    when wide > high {
+        return high as i16
+    }
+    return wide as i16
+}
+pub fun wrapping_sub_i16(left: i16, right: i16) -> i16 { return left - right }
+pub fun checked_mul_i16(left: i16, right: i16) -> Option<i16> {
+    low: i64 = -32768
+    high: i64 = 32767
+    wide: i64 = (left as i64) * (right as i64)
+    when wide < low || wide > high {
+        return Option::None
+    }
+    return Option::Some(wide as i16)
+}
+pub fun saturating_mul_i16(left: i16, right: i16) -> i16 {
+    low: i64 = -32768
+    high: i64 = 32767
+    wide: i64 = (left as i64) * (right as i64)
+    when wide < low {
+        return low as i16
+    }
+    when wide > high {
+        return high as i16
+    }
+    return wide as i16
+}
+pub fun wrapping_mul_i16(left: i16, right: i16) -> i16 { return left * right }
+pub fun checked_add_i32(left: i32, right: i32) -> Option<i32> {
+    low: i64 = -2147483648
+    high: i64 = 2147483647
+    wide: i64 = (left as i64) + (right as i64)
+    when wide < low || wide > high {
+        return Option::None
+    }
+    return Option::Some(wide as i32)
+}
+pub fun saturating_add_i32(left: i32, right: i32) -> i32 {
+    low: i64 = -2147483648
+    high: i64 = 2147483647
+    wide: i64 = (left as i64) + (right as i64)
+    when wide < low {
+        return low as i32
+    }
+    when wide > high {
+        return high as i32
+    }
+    return wide as i32
+}
+pub fun wrapping_add_i32(left: i32, right: i32) -> i32 { return left + right }
+pub fun checked_sub_i32(left: i32, right: i32) -> Option<i32> {
+    low: i64 = -2147483648
+    high: i64 = 2147483647
+    wide: i64 = (left as i64) - (right as i64)
+    when wide < low || wide > high {
+        return Option::None
+    }
+    return Option::Some(wide as i32)
+}
+pub fun saturating_sub_i32(left: i32, right: i32) -> i32 {
+    low: i64 = -2147483648
+    high: i64 = 2147483647
+    wide: i64 = (left as i64) - (right as i64)
+    when wide < low {
+        return low as i32
+    }
+    when wide > high {
+        return high as i32
+    }
+    return wide as i32
+}
+pub fun wrapping_sub_i32(left: i32, right: i32) -> i32 { return left - right }
+pub fun checked_mul_i32(left: i32, right: i32) -> Option<i32> {
+    low: i64 = -2147483648
+    high: i64 = 2147483647
+    wide: i64 = (left as i64) * (right as i64)
+    when wide < low || wide > high {
+        return Option::None
+    }
+    return Option::Some(wide as i32)
+}
+pub fun saturating_mul_i32(left: i32, right: i32) -> i32 {
+    low: i64 = -2147483648
+    high: i64 = 2147483647
+    wide: i64 = (left as i64) * (right as i64)
+    when wide < low {
+        return low as i32
+    }
+    when wide > high {
+        return high as i32
+    }
+    return wide as i32
+}
+pub fun wrapping_mul_i32(left: i32, right: i32) -> i32 { return left * right }
+pub fun checked_add_u8(left: u8, right: u8) -> Option<u8> {
+    low: u64 = 0
+    high: u64 = 255
+    wide: u64 = (left as u64) + (right as u64)
+    when wide < low || wide > high {
+        return Option::None
+    }
+    return Option::Some(wide as u8)
+}
+pub fun saturating_add_u8(left: u8, right: u8) -> u8 {
+    low: u64 = 0
+    high: u64 = 255
+    wide: u64 = (left as u64) + (right as u64)
+    when wide < low {
+        return low as u8
+    }
+    when wide > high {
+        return high as u8
+    }
+    return wide as u8
+}
+pub fun wrapping_add_u8(left: u8, right: u8) -> u8 { return left + right }
+pub fun checked_sub_u8(left: u8, right: u8) -> Option<u8> {
+    when right > left {
+        return Option::None
+    }
+    return Option::Some(left - right)
+}
+pub fun saturating_sub_u8(left: u8, right: u8) -> u8 {
+    when right > left {
+        return 0
+    }
+    return left - right
+}
+pub fun wrapping_sub_u8(left: u8, right: u8) -> u8 { return left - right }
+pub fun checked_mul_u8(left: u8, right: u8) -> Option<u8> {
+    low: u64 = 0
+    high: u64 = 255
+    wide: u64 = (left as u64) * (right as u64)
+    when wide < low || wide > high {
+        return Option::None
+    }
+    return Option::Some(wide as u8)
+}
+pub fun saturating_mul_u8(left: u8, right: u8) -> u8 {
+    low: u64 = 0
+    high: u64 = 255
+    wide: u64 = (left as u64) * (right as u64)
+    when wide < low {
+        return low as u8
+    }
+    when wide > high {
+        return high as u8
+    }
+    return wide as u8
+}
+pub fun wrapping_mul_u8(left: u8, right: u8) -> u8 { return left * right }
+pub fun checked_add_u16(left: u16, right: u16) -> Option<u16> {
+    low: u64 = 0
+    high: u64 = 65535
+    wide: u64 = (left as u64) + (right as u64)
+    when wide < low || wide > high {
+        return Option::None
+    }
+    return Option::Some(wide as u16)
+}
+pub fun saturating_add_u16(left: u16, right: u16) -> u16 {
+    low: u64 = 0
+    high: u64 = 65535
+    wide: u64 = (left as u64) + (right as u64)
+    when wide < low {
+        return low as u16
+    }
+    when wide > high {
+        return high as u16
+    }
+    return wide as u16
+}
+pub fun wrapping_add_u16(left: u16, right: u16) -> u16 { return left + right }
+pub fun checked_sub_u16(left: u16, right: u16) -> Option<u16> {
+    when right > left {
+        return Option::None
+    }
+    return Option::Some(left - right)
+}
+pub fun saturating_sub_u16(left: u16, right: u16) -> u16 {
+    when right > left {
+        return 0
+    }
+    return left - right
+}
+pub fun wrapping_sub_u16(left: u16, right: u16) -> u16 { return left - right }
+pub fun checked_mul_u16(left: u16, right: u16) -> Option<u16> {
+    low: u64 = 0
+    high: u64 = 65535
+    wide: u64 = (left as u64) * (right as u64)
+    when wide < low || wide > high {
+        return Option::None
+    }
+    return Option::Some(wide as u16)
+}
+pub fun saturating_mul_u16(left: u16, right: u16) -> u16 {
+    low: u64 = 0
+    high: u64 = 65535
+    wide: u64 = (left as u64) * (right as u64)
+    when wide < low {
+        return low as u16
+    }
+    when wide > high {
+        return high as u16
+    }
+    return wide as u16
+}
+pub fun wrapping_mul_u16(left: u16, right: u16) -> u16 { return left * right }
+pub fun checked_add_u32(left: u32, right: u32) -> Option<u32> {
+    low: u64 = 0
+    high: u64 = 4294967295
+    wide: u64 = (left as u64) + (right as u64)
+    when wide < low || wide > high {
+        return Option::None
+    }
+    return Option::Some(wide as u32)
+}
+pub fun saturating_add_u32(left: u32, right: u32) -> u32 {
+    low: u64 = 0
+    high: u64 = 4294967295
+    wide: u64 = (left as u64) + (right as u64)
+    when wide < low {
+        return low as u32
+    }
+    when wide > high {
+        return high as u32
+    }
+    return wide as u32
+}
+pub fun wrapping_add_u32(left: u32, right: u32) -> u32 { return left + right }
+pub fun checked_sub_u32(left: u32, right: u32) -> Option<u32> {
+    when right > left {
+        return Option::None
+    }
+    return Option::Some(left - right)
+}
+pub fun saturating_sub_u32(left: u32, right: u32) -> u32 {
+    when right > left {
+        return 0
+    }
+    return left - right
+}
+pub fun wrapping_sub_u32(left: u32, right: u32) -> u32 { return left - right }
+pub fun checked_mul_u32(left: u32, right: u32) -> Option<u32> {
+    low: u64 = 0
+    high: u64 = 4294967295
+    wide: u64 = (left as u64) * (right as u64)
+    when wide < low || wide > high {
+        return Option::None
+    }
+    return Option::Some(wide as u32)
+}
+pub fun saturating_mul_u32(left: u32, right: u32) -> u32 {
+    low: u64 = 0
+    high: u64 = 4294967295
+    wide: u64 = (left as u64) * (right as u64)
+    when wide < low {
+        return low as u32
+    }
+    when wide > high {
+        return high as u32
+    }
+    return wide as u32
+}
+pub fun wrapping_mul_u32(left: u32, right: u32) -> u32 { return left * right }
+pub fun checked_add_u64(left: u64, right: u64) -> Option<u64> {
+    sum := left + right
+    when sum < left {
+        return Option::None
+    }
+    return Option::Some(sum)
+}
+pub fun checked_sub_u64(left: u64, right: u64) -> Option<u64> {
+    when right > left {
+        return Option::None
+    }
+    return Option::Some(left - right)
+}
+pub fun checked_mul_u64(left: u64, right: u64) -> Option<u64> {
+    when left == 0 {
+        return Option::Some(left)
+    }
+    product := left * right
+    when product / left != right {
+        return Option::None
+    }
+    return Option::Some(product)
+}
+pub fun saturating_add_u64(left: u64, right: u64) -> u64 {
+    sum := left + right
+    when sum < left {
+        return 18446744073709551615
+    }
+    return sum
+}
+pub fun saturating_sub_u64(left: u64, right: u64) -> u64 {
+    when right > left {
+        return 0
+    }
+    return left - right
+}
+pub fun saturating_mul_u64(left: u64, right: u64) -> u64 {
+    when left == 0 {
+        return 0
+    }
+    product := left * right
+    when product / left != right {
+        return 18446744073709551615
+    }
+    return product
+}
+pub fun wrapping_add_u64(left: u64, right: u64) -> u64 { return left + right }
+pub fun wrapping_sub_u64(left: u64, right: u64) -> u64 { return left - right }
+pub fun wrapping_mul_u64(left: u64, right: u64) -> u64 { return left * right }
+pub fun checked_add_i64(left: i64, right: i64) -> Option<i64> {
+    sum := left + right
+    when (right > 0 && sum < left) || (right < 0 && sum > left) {
+        return Option::None
+    }
+    return Option::Some(sum)
+}
+pub fun checked_sub_i64(left: i64, right: i64) -> Option<i64> {
+    difference := left - right
+    when (right > 0 && difference > left) || (right < 0 && difference < left) {
+        return Option::None
+    }
+    return Option::Some(difference)
+}
+pub fun checked_mul_i64(left: i64, right: i64) -> Option<i64> {
+    smallest: i64 = -9223372036854775808
+    when left == 0 || right == 0 {
+        return Option::Some(0)
+    }
+    when (left == -1 && right == smallest) || (right == -1 && left == smallest) {
+        return Option::None
+    }
+    product := left * right
+    when product / right != left {
+        return Option::None
+    }
+    return Option::Some(product)
+}
+pub fun saturating_add_i64(left: i64, right: i64) -> i64 {
+    sum := left + right
+    when right > 0 && sum < left {
+        return 9223372036854775807
+    }
+    when right < 0 && sum > left {
+        smallest: i64 = -9223372036854775808
+        return smallest
+    }
+    return sum
+}
+pub fun saturating_sub_i64(left: i64, right: i64) -> i64 {
+    difference := left - right
+    when right > 0 && difference > left {
+        smallest: i64 = -9223372036854775808
+        return smallest
+    }
+    when right < 0 && difference < left {
+        return 9223372036854775807
+    }
+    return difference
+}
+pub fun saturating_mul_i64(left: i64, right: i64) -> i64 {
+    smallest: i64 = -9223372036854775808
+    when left == 0 || right == 0 {
+        return 0
+    }
+    overflowed := (left == -1 && right == smallest) || (right == -1 && left == smallest)
+    when !overflowed {
+        product := left * right
+        when product / right == left {
+            return product
+        }
+    }
+    when (left < 0) == (right < 0) {
+        return 9223372036854775807
+    }
+    return smallest
+}
+pub fun wrapping_add_i64(left: i64, right: i64) -> i64 { return left + right }
+pub fun wrapping_sub_i64(left: i64, right: i64) -> i64 { return left - right }
+pub fun wrapping_mul_i64(left: i64, right: i64) -> i64 { return left * right }

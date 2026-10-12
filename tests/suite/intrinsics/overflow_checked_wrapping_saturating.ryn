@@ -1,0 +1,54 @@
+// test: run
+// out: none
+// out: 11
+// out: 2147483647
+// out: -2147483648
+// out: 0
+// out: 255
+// out: 4
+// out: none
+// out: none
+// out: 9223372036854775807
+// out: -9223372036854775808
+// out: none
+// out: 12
+// out: 18446744073709551615
+// out: none
+// out: -128
+use std::overflow
+fun text32(v: Option<i32>) -> String {
+    return choose v {
+        Option::Some(x) => String(x),
+        Option::None => String("none")
+    }
+}
+fun text64(v: Option<i64>) -> String {
+    return choose v {
+        Option::Some(x) => String(x),
+        Option::None => String("none")
+    }
+}
+fun textu(v: Option<u64>) -> String {
+    return choose v {
+        Option::Some(x) => String(x),
+        Option::None => String("none")
+    }
+}
+fun main() {
+    echo text32(overflow::checked_add_i32(2147483647, 1))
+    echo text32(overflow::checked_add_i32(5, 6))
+    echo overflow::saturating_add_i32(2147483647, 9)
+    echo overflow::saturating_sub_i32(-2147483647, 9)
+    echo overflow::saturating_sub_u8(3, 9)
+    echo overflow::saturating_add_u8(250, 9)
+    echo overflow::wrapping_add_u8(250, 10)
+    echo text32(overflow::checked_mul_i32(65536, 65536))
+    echo textu(overflow::checked_sub_u64(1, 2))
+    echo overflow::saturating_mul_i64(4611686018427387904, 4)
+    echo overflow::saturating_mul_i64(4611686018427387904, -4)
+    echo text64(overflow::checked_add_i64(9223372036854775807, 1))
+    echo textu(overflow::checked_mul_u64(3, 4))
+    echo overflow::saturating_mul_u64(4294967296, 4294967296)
+    echo text64(overflow::checked_sub_i64(-9223372036854775808, 1))
+    echo overflow::wrapping_add_i8(127, 1)
+}

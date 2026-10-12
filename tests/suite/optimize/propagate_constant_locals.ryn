@@ -1,0 +1,62 @@
+// test: run
+// out: 33
+// out: kept
+// out: 7
+// out: 12
+// out: 3
+// out: 6
+// out: taken
+// out: 10
+fun bump(value: &mut i64) {
+    *value = *value + 1
+}
+
+fun main() {
+    // A local defined once by a constant is that constant wherever it is read.
+    n := 8
+    m := n * 4 + 1
+    echo m
+    // A local that is assigned afterwards is not a constant.
+    mut k: i64 = 5
+    k = k + 1
+    when k == 5 {
+        echo "wrong"
+    } else {
+        echo "kept"
+    }
+    // A local whose address is taken is not a constant either.
+    mut x: i64 = 6
+    bump(&mut x)
+    when x == 6 {
+        echo "wrong"
+    } else {
+        echo x
+    }
+    // A loop counter is not a constant.
+    mut total: i64 = 0
+    for i in 0..4 {
+        c := 3
+        total += c
+    }
+    echo total
+    // A constant condition keeps one branch; a shadowing local has its own value.
+    a := 3
+    echo a
+    b := a * 2
+    when b > 5 {
+        echo b
+    } else {
+        echo "wrong"
+    }
+    flag := a < 100
+    when flag {
+        echo "taken"
+    } else {
+        echo "wrong"
+    }
+    z := 0
+    when a > 100 {
+        echo 1 / z
+    }
+    echo 10 / (z + 1)
+}

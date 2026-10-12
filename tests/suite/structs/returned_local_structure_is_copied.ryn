@@ -1,0 +1,32 @@
+// test: run
+// out: 5
+// out: 7
+// out: 9
+// out: 6
+// out: 4
+// A structure local returned by value is copied from its cells, and the copy is independent of the local it came from.
+struct Span {
+    lo: i64,
+    hi: i64,
+}
+
+fun same(s: Span) -> Span {
+    return s
+}
+
+fun widen(s: Span) -> Span {
+    mut w := Span { lo: s.lo, hi: s.hi }
+    w.hi = w.hi + 2
+    return w
+}
+
+fun main() {
+    s := Span { lo: 5, hi: 7 }
+    t := same(s)
+    echo t.lo
+    echo t.hi
+    u := widen(t)
+    echo u.hi
+    echo s.hi - 1
+    echo u.lo - 1
+}

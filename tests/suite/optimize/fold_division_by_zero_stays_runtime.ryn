@@ -1,0 +1,10 @@
+// test: run
+// out: 1
+// err: division or remainder by zero
+// exit: 1
+fun main() {
+    echo 1
+    // A constant divisor of zero is not folded: the division still fails when the program runs.
+    echo (1 + 2) / (3 - 3)
+    echo 2
+}

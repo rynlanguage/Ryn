@@ -1,0 +1,49 @@
+// test: run
+// out: 5
+// out: 12
+// out: 12
+// out: 7
+// out: ok 7
+// out: err 9
+// out: 250
+// out: 4
+// out: -5
+// out: 11
+// out: 3
+// out: 11
+use std::atomic
+fun main() {
+    cell := atomic::AtomicCell::new()
+    a := Atomic::<u32> { address: cell.address }
+    a.store(5 as u32, atomic::Ordering::SeqCst)
+    echo a.load(atomic::Ordering::Acquire)
+    echo a.fetch_add(7 as u32, atomic::Ordering::Relaxed) + 7 as u32
+    echo a.exchange(12 as u32, atomic::Ordering::AcqRel)
+    a.fetch_sub(5 as u32, atomic::Ordering::SeqCst)
+    echo a.load(atomic::Ordering::SeqCst)
+    done := a.compare_exchange(7 as u32, 9 as u32, atomic::Ordering::SeqCst, atomic::Ordering::Relaxed)
+    echo choose done {
+        Result::Ok(v) => String("ok ").concat(String(v)),
+        Result::Err(v) => String("err ").concat(String(v))
+    }
+    miss := a.compare_exchange(7 as u32, 1 as u32, atomic::Ordering::SeqCst, atomic::Ordering::Relaxed)
+    echo choose miss {
+        Result::Ok(v) => String("ok ").concat(String(v)),
+        Result::Err(v) => String("err ").concat(String(v))
+    }
+    byte_cell := atomic::AtomicCell::new()
+    b := Atomic::<u8> { address: byte_cell.address }
+    b.store(255 as u8, atomic::Ordering::Release)
+    b.fetch_sub(5 as u8, atomic::Ordering::Relaxed)
+    echo b.load(atomic::Ordering::Relaxed)
+    b.fetch_add(10 as u8, atomic::Ordering::Relaxed)
+    echo b.load(atomic::Ordering::Relaxed)
+    signed_cell := atomic::AtomicCell::new()
+    s := Atomic::<i64> { address: signed_cell.address }
+    s.store(-5, atomic::Ordering::SeqCst)
+    echo s.load(atomic::Ordering::SeqCst)
+    s.fetch_or(3, atomic::Ordering::SeqCst)
+    echo s.fetch_and(7, atomic::Ordering::SeqCst) & 15
+    echo s.fetch_xor(8, atomic::Ordering::SeqCst) & 15
+    echo s.load(atomic::Ordering::SeqCst) & 15
+}

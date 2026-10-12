@@ -1,0 +1,79 @@
+// Bit intrinsics. The 64-bit forms compile to `bsr`, `bsf`, `bswap` and `rol`/`ror` (population count is the portable
+// parallel sum, so it runs on every x86-64 processor); the narrower widths are built from them in Ryn and give the
+// answer for their own width: `clz_u8(0)` is 8, not 64. Results are `u32`.
+
+pub fun popcount_u8(value: u8) -> u32 { return __bits_popcount64(value as u64) as u32 }
+pub fun popcount_u16(value: u16) -> u32 { return __bits_popcount64(value as u64) as u32 }
+pub fun popcount_u32(value: u32) -> u32 { return __bits_popcount64(value as u64) as u32 }
+pub fun popcount_u64(value: u64) -> u32 { return __bits_popcount64(value as u64) as u32 }
+pub fun clz_u8(value: u8) -> u32 { return (__bits_clz64(value as u64) - 56 as u64) as u32 }
+pub fun ctz_u8(value: u8) -> u32 {
+    marker: u64 = 1
+    return __bits_ctz64((value as u64) | (marker << (8 as u32))) as u32
+}
+pub fun clz_u16(value: u16) -> u32 { return (__bits_clz64(value as u64) - 48 as u64) as u32 }
+pub fun ctz_u16(value: u16) -> u32 {
+    marker: u64 = 1
+    return __bits_ctz64((value as u64) | (marker << (16 as u32))) as u32
+}
+pub fun clz_u32(value: u32) -> u32 { return (__bits_clz64(value as u64) - 32 as u64) as u32 }
+pub fun ctz_u32(value: u32) -> u32 {
+    marker: u64 = 1
+    return __bits_ctz64((value as u64) | (marker << (32 as u32))) as u32
+}
+pub fun clz_u64(value: u64) -> u32 { return __bits_clz64(value) as u32 }
+pub fun ctz_u64(value: u64) -> u32 { return __bits_ctz64(value) as u32 }
+pub fun bswap_u8(value: u8) -> u8 { return value }
+pub fun rotl_u8(value: u8, count: u32) -> u8 {
+    shift := count % 8 as u32
+    when shift == 0 {
+        return value
+    }
+    wide := value as u64
+    return ((wide << shift) | (wide >> ((8 as u32) - shift))) as u8
+}
+pub fun rotr_u8(value: u8, count: u32) -> u8 {
+    shift := count % 8 as u32
+    when shift == 0 {
+        return value
+    }
+    wide := value as u64
+    return ((wide >> shift) | (wide << ((8 as u32) - shift))) as u8
+}
+pub fun bswap_u16(value: u16) -> u16 { return (__bits_bswap64(value as u64) >> (48 as u32)) as u16 }
+pub fun rotl_u16(value: u16, count: u32) -> u16 {
+    shift := count % 16 as u32
+    when shift == 0 {
+        return value
+    }
+    wide := value as u64
+    return ((wide << shift) | (wide >> ((16 as u32) - shift))) as u16
+}
+pub fun rotr_u16(value: u16, count: u32) -> u16 {
+    shift := count % 16 as u32
+    when shift == 0 {
+        return value
+    }
+    wide := value as u64
+    return ((wide >> shift) | (wide << ((16 as u32) - shift))) as u16
+}
+pub fun bswap_u32(value: u32) -> u32 { return (__bits_bswap64(value as u64) >> (32 as u32)) as u32 }
+pub fun rotl_u32(value: u32, count: u32) -> u32 {
+    shift := count % 32 as u32
+    when shift == 0 {
+        return value
+    }
+    wide := value as u64
+    return ((wide << shift) | (wide >> ((32 as u32) - shift))) as u32
+}
+pub fun rotr_u32(value: u32, count: u32) -> u32 {
+    shift := count % 32 as u32
+    when shift == 0 {
+        return value
+    }
+    wide := value as u64
+    return ((wide >> shift) | (wide << ((32 as u32) - shift))) as u32
+}
+pub fun bswap_u64(value: u64) -> u64 { return __bits_bswap64(value) }
+pub fun rotl_u64(value: u64, count: u32) -> u64 { return __bits_rotl64(value, count as u64) }
+pub fun rotr_u64(value: u64, count: u32) -> u64 { return __bits_rotr64(value, count as u64) }

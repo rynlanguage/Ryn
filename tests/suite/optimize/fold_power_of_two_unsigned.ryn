@@ -1,0 +1,185 @@
+// test: run
+// out: 248
+// out: 31
+// out: 7
+// out: 4294967295
+// out: 1
+// out: 13835058055282163712
+// out: 4294967288
+// out: 248
+// out: 248
+// out: 248
+// out: 31
+// out: 0
+// out: 7
+// out: 0
+// out: 254
+// out: 128
+// out: 1
+// out: 127
+// out: 200
+// out: 0
+// out: 253
+// out: 85
+// out: 0
+// out: 248
+// out: 65280
+// out: 65280
+// out: 2147483648
+// out: 0
+// out: 4294967288
+// out: 13835058055282163712
+// out: 0
+// out: 9223372036854775808
+// out: 1
+// out: 0
+// out: 4294967295
+// out: 0
+// out: 2147483647
+// out: 9223372036854775807
+// out: -24
+// out: 0
+// out: -7
+fun times8(x: u8) -> u8 {
+    return x * 8
+}
+
+fun div8(x: u8) -> u8 {
+    return x / 8
+}
+
+fun mod8(x: u8) -> u8 {
+    return x % 8
+}
+
+fun times2_u8(x: u8) -> u8 {
+    return x * 2
+}
+
+fun times128_u8(x: u8) -> u8 {
+    return x * 128
+}
+
+fun div128_u8(x: u8) -> u8 {
+    return x / 128
+}
+
+fun mod128_u8(x: u8) -> u8 {
+    return x % 128
+}
+
+fun times1_u8(x: u8) -> u8 {
+    return x * 1
+}
+
+fun mod1_u8(x: u8) -> u8 {
+    return x % 1
+}
+
+fun times3_u8(x: u8) -> u8 {
+    return x * 3
+}
+
+fun div3_u8(x: u8) -> u8 {
+    return x / 3
+}
+
+fun mod3_u8(x: u8) -> u8 {
+    return x % 3
+}
+
+fun times_folded8(x: u8) -> u8 {
+    return x * (2 as u8 * 4 as u8)
+}
+
+fun times256_u16(x: u16) -> u16 {
+    return x * 256
+}
+
+fun times2_31_u32(x: u32) -> u32 {
+    return x * 2147483648
+}
+
+fun left8_u32(x: u32) -> u32 {
+    return 8 as u32 * x
+}
+
+fun times2_62_u64(x: u64) -> u64 {
+    return x * 4611686018427387904
+}
+
+fun times2_63_u64(x: u64) -> u64 {
+    return x * 9223372036854775808
+}
+
+fun div2_63_u64(x: u64) -> u64 {
+    return x / 9223372036854775808
+}
+
+fun mod2_32_u64(x: u64) -> u64 {
+    return x % 4294967296
+}
+
+fun mod2_31_u64(x: u64) -> u64 {
+    return x % 2147483648
+}
+
+fun mod2_63_u64(x: u64) -> u64 {
+    return x % 9223372036854775808
+}
+
+fun signed_ops(x: i8) -> i8 {
+    return x * 8
+}
+
+fun signed_div(x: i8) -> i8 {
+    return x / 8
+}
+
+fun signed_mod(x: i8) -> i8 {
+    return x % 8
+}
+
+fun main() {
+    echo 255 as u8 * 8 as u8
+    echo 255 as u8 / 8 as u8
+    echo 255 as u8 % 8 as u8
+    echo 18446744073709551615 as u64 % 4294967296 as u64
+    echo 18446744073709551615 as u64 / 9223372036854775808 as u64
+    echo 3 as u64 * 4611686018427387904 as u64
+    echo 8 as u32 * (4294967295 as u32)
+    echo 255 as u8 * (2 as u8 * 4 as u8)
+    echo times8(255)
+    echo times8(31)
+    echo div8(255)
+    echo div8(7)
+    echo mod8(255)
+    echo mod8(248)
+    echo times2_u8(255)
+    echo times128_u8(255)
+    echo div128_u8(255)
+    echo mod128_u8(255)
+    echo times1_u8(200)
+    echo mod1_u8(200)
+    echo times3_u8(255)
+    echo div3_u8(255)
+    echo mod3_u8(255)
+    echo times_folded8(255)
+    echo times256_u16(255)
+    echo times256_u16(65535)
+    echo times2_31_u32(3)
+    echo times2_31_u32(2)
+    echo left8_u32(4294967295)
+    echo times2_62_u64(3)
+    echo times2_62_u64(4)
+    echo times2_63_u64(3)
+    echo div2_63_u64(18446744073709551615)
+    echo div2_63_u64(9223372036854775807)
+    echo mod2_32_u64(18446744073709551615)
+    echo mod2_32_u64(4294967296)
+    echo mod2_31_u64(18446744073709551615)
+    echo mod2_63_u64(18446744073709551615)
+    echo signed_ops(0 as i8 - 3 as i8)
+    echo signed_div(0 as i8 - 7 as i8)
+    echo signed_mod(0 as i8 - 7 as i8)
+}

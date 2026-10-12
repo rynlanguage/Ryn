@@ -1,0 +1,221 @@
+// Atomics on x86-64. `Atomic<T>` is a handle to one aligned cell of memory shared between threads; it holds only the
+// address, so it is copied freely and passed to a thread through a raw pointer. The cell is owned by an `AtomicCell`,
+// which frees it when it goes out of scope (a generic structure cannot have a destructor, so ownership and access are
+// two types). `T` is an integer of 1, 2, 4 or 8 bytes.
+//
+// Ordering. `Relaxed`, `Acquire`, `Release`, `AcqRel` and `SeqCst` are checked the way C++ and Rust check them: a load
+// cannot be `Release` or `AcqRel`, a store cannot be `Acquire` or `AcqRel` (the program stops with a message). On x86-64
+// an aligned load already has acquire and a store release semantics, so those are plain `mov`s; a `SeqCst` store is an
+// `xchg`; exchange, `fetch_*` and `compare_exchange` are `lock`ed instructions and are full barriers whatever the ordering
+// says (stronger than required, never weaker). Every operation is one opaque instruction sequence for the compiler, which
+// never keeps a shared cell in a register across operations.
+
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(block: *u8);
+
+pub enum Ordering {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst
+}
+
+fun ordering_code(order: Ordering) -> u64 {
+    return choose order {
+        Ordering::Relaxed => 0 as u64,
+        Ordering::Acquire => 1 as u64,
+        Ordering::Release => 2 as u64,
+        Ordering::AcqRel => 3 as u64,
+        Ordering::SeqCst => 4 as u64
+    }
+}
+
+#[drop(release_cell)]
+pub struct AtomicCell {
+    pub address: *u8,
+}
+
+fun release_cell(cell: AtomicCell) {
+    when !pointer_is_null(cell.address) {
+        free(cell.address)
+    }
+}
+
+extend AtomicCell {
+    // A zeroed cell of 8 bytes, aligned for every supported width.
+    pub fun new() -> AtomicCell {
+        block := malloc(16 as u64)
+        when !pointer_is_null(block) {
+            __atomic_store64(block, 0 as u64)
+        }
+        return AtomicCell { address: block }
+    }
+
+    pub fun is_valid(self) -> bool {
+        return !pointer_is_null(self.address)
+    }
+}
+
+pub fun fence(order: Ordering) {
+    code := ordering_code(order)
+    when code == 0 {
+        panic("atomic fence cannot be Relaxed")
+    }
+    // Only a sequentially consistent fence needs an instruction on x86-64; the others are compiler barriers, which every
+    // atomic operation already is.
+    when code == 4 {
+        __atomic_fence()
+    }
+}
+
+pub struct Atomic<T> {
+    pub address: *u8,
+}
+
+// Build a handle with a literal that names the type: `Atomic::<u32> { address: cell.address }` (after `use std::atomic`).
+
+fun load_raw(address: *u8, width: u64) -> u64 {
+    when width == 1 { return __atomic_load8(address) }
+    when width == 2 { return __atomic_load16(address) }
+    when width == 4 { return __atomic_load32(address) }
+    return __atomic_load64(address)
+}
+
+fun store_raw(address: *u8, width: u64, value: u64, sequential: bool) {
+    when sequential {
+        when width == 1 { __atomic_store_seq8(address, value) return }
+        when width == 2 { __atomic_store_seq16(address, value) return }
+        when width == 4 { __atomic_store_seq32(address, value) return }
+        __atomic_store_seq64(address, value)
+        return
+    }
+    when width == 1 { __atomic_store8(address, value) return }
+    when width == 2 { __atomic_store16(address, value) return }
+    when width == 4 { __atomic_store32(address, value) return }
+    __atomic_store64(address, value)
+}
+
+fun exchange_raw(address: *u8, width: u64, value: u64) -> u64 {
+    when width == 1 { return __atomic_xchg8(address, value) }
+    when width == 2 { return __atomic_xchg16(address, value) }
+    when width == 4 { return __atomic_xchg32(address, value) }
+    return __atomic_xchg64(address, value)
+}
+
+fun add_raw(address: *u8, width: u64, value: u64) -> u64 {
+    when width == 1 { return __atomic_add8(address, value) }
+    when width == 2 { return __atomic_add16(address, value) }
+    when width == 4 { return __atomic_add32(address, value) }
+    return __atomic_add64(address, value)
+}
+
+fun cas_raw(address: *u8, width: u64, expected: u64, desired: u64) -> u64 {
+    when width == 1 { return __atomic_cas8(address, expected, desired) }
+    when width == 2 { return __atomic_cas16(address, expected, desired) }
+    when width == 4 { return __atomic_cas32(address, expected, desired) }
+    return __atomic_cas64(address, expected, desired)
+}
+
+// The mask of the low `width` bytes, to compare values the way the hardware does.
+fun width_mask(width: u64) -> u64 {
+    when width >= 8 {
+        return 18446744073709551615
+    }
+    one: u64 = 1
+    return (one << ((width * 8) as u32)) - 1
+}
+
+extend<T> Atomic<T> {
+    pub fun load(self, order: Ordering) -> T {
+        code := ordering_code(order)
+        when code == 2 || code == 3 {
+            panic("atomic load cannot be Release or AcqRel")
+        }
+        return load_raw(self.address, sizeof(T)) as T
+    }
+
+    pub fun store(self, value: T, order: Ordering) {
+        code := ordering_code(order)
+        when code == 1 || code == 3 {
+            panic("atomic store cannot be Acquire or AcqRel")
+        }
+        store_raw(self.address, sizeof(T), value as u64, code == 4)
+    }
+
+    pub fun exchange(self, value: T, order: Ordering) -> T {
+        return exchange_raw(self.address, sizeof(T), value as u64) as T
+    }
+
+    pub fun fetch_add(self, value: T, order: Ordering) -> T {
+        return add_raw(self.address, sizeof(T), value as u64) as T
+    }
+
+    pub fun fetch_sub(self, value: T, order: Ordering) -> T {
+        zero: u64 = 0
+        return add_raw(self.address, sizeof(T), zero - (value as u64)) as T
+    }
+
+    // Stores `desired` when the cell holds `expected`. `Ok(previous)` on success, `Err(current)` when it held another value.
+    // The failure ordering may not be `Release` or `AcqRel`.
+    pub fun compare_exchange(self, expected: T, desired: T, success: Ordering, failure: Ordering) -> Result<T, T> {
+        failed := ordering_code(failure)
+        when failed == 2 || failed == 3 {
+            panic("compare_exchange failure ordering cannot be Release or AcqRel")
+        }
+        width := sizeof(T)
+        mask := width_mask(width)
+        wanted := (expected as u64) & mask
+        previous := cas_raw(self.address, width, wanted, desired as u64) & mask
+        when previous == wanted {
+            return Result::Ok(previous as T)
+        }
+        return Result::Err(previous as T)
+    }
+
+    // The read-modify-write operations without an instruction of their own, as a compare-exchange loop.
+    pub fun fetch_or(self, value: T, order: Ordering) -> T {
+        width := sizeof(T)
+        mask := width_mask(width)
+        mut seen := load_raw(self.address, width)
+        while true {
+            wanted := (seen | (value as u64)) & mask
+            previous := cas_raw(self.address, width, seen, wanted) & mask
+            when previous == seen {
+                return seen as T
+            }
+            seen = previous
+        }
+        return seen as T
+    }
+
+    pub fun fetch_and(self, value: T, order: Ordering) -> T {
+        width := sizeof(T)
+        mask := width_mask(width)
+        mut seen := load_raw(self.address, width)
+        while true {
+            wanted := (seen & (value as u64)) & mask
+            previous := cas_raw(self.address, width, seen, wanted) & mask
+            when previous == seen {
+                return seen as T
+            }
+            seen = previous
+        }
+        return seen as T
+    }
+
+    pub fun fetch_xor(self, value: T, order: Ordering) -> T {
+        width := sizeof(T)
+        mask := width_mask(width)
+        mut seen := load_raw(self.address, width)
+        while true {
+            wanted := (seen ^ (value as u64)) & mask
+            previous := cas_raw(self.address, width, seen, wanted) & mask
+            when previous == seen {
+                return seen as T
+            }
+            seen = previous
+        }
+        return seen as T
+    }
+}

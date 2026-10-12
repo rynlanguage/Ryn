@@ -1,0 +1,34 @@
+// test: run
+// out: 800000
+// out: 8
+use std::atomic
+use std::sync
+fun bump(argument: *u8) -> *u8 {
+    counter := Atomic::<u64> { address: argument }
+    mut round: u64 = 0
+    while round < 100000 {
+        counter.fetch_add(1 as u64, atomic::Ordering::Relaxed)
+        round += 1
+    }
+    return argument
+}
+fun main() {
+    cell := atomic::AtomicCell::new()
+    counter := Atomic::<u64> { address: cell.address }
+    mut handles: Vec<sync::JoinHandle> = Vec()
+    mut started: u64 = 0
+    mut index: u64 = 0
+    while index < 8 {
+        worker := sync::JoinHandle::spawn(bump, cell.address)
+        when worker.is_started() {
+            started += 1
+        }
+        handles.push(worker)
+        index += 1
+    }
+    for worker in handles {
+        worker.join()
+    }
+    echo counter.load(atomic::Ordering::SeqCst)
+    echo started
+}

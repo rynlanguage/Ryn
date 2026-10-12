@@ -1,0 +1,22 @@
+// test: run
+// out: 4
+// out: 1
+// err: division or remainder by zero
+// exit: 1
+fun note(n: i64) -> i64 {
+    echo n
+    return n
+}
+
+fun main() {
+    // Unused locals with a value that cannot fail or have an effect are not generated.
+    a := 1 + 2
+    b := a * 3
+    // An unused local whose value is a call still runs the call.
+    unused := note(4)
+    z := 0
+    echo 1
+    // An unused local whose value divides still fails when the divisor is zero.
+    q := 5 / z
+    echo 2
+}
