@@ -11,9 +11,13 @@ collector: ownership is checked at compile time by Ryn Guard and released determ
 toolchain is written in Ryn: the `ryn` command, the compiler and the runtime. The compiler rebuilds itself from its
 own sources, and the tree contains no Rust.
 
+<p align="center"><img src="assets/compile-time.gif" alt="Compile times of ryn build" width="700"></p>
+
+Compile times in the animation are medians of real runs on one machine (`rync` built by a `rync` of this tree, 0.1.9; the animation is typed, not a recording).
+
 ## Status
 
-The development version is 0.1.9, "Performance Revolution" (see the changelog); the latest release is [0.1.8](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.8); [0.1.7](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.7) was "Native Power & Benchmarks" and [0.1.6](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.6) was "Native First".
+The latest release is [0.1.9](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.9), "Performance Revolution" (see the changelog); [0.1.8](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.8) was the one before; [0.1.7](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.7) was "Native Power & Benchmarks" and [0.1.6](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.6) was "Native First".
 
 - The whole toolchain is written in Ryn: the `ryn` command, the native compiler `rync` (lexer, parser,
   analysis, code generator, ELF and PE writers) and the runtime. There is no Rust code in the tree and no Cargo
@@ -148,10 +152,6 @@ The full language surface, including known limits, is documented in
 `std::process`, `std::thread`, `std::time`, `std::system`, `std::net`, `std::keyboard` and
 `std::arena`. The sources live in [`stdlib/std/src`](stdlib/std/src) and compile with the native
 compiler.
-
-<p align="center"><img src="assets/compile-time.gif" alt="Compile times of ryn build" width="700"></p>
-
-Compile times above are medians of real runs on one machine (`rync` built by a `rync` of this tree, 0.1.9; the animation is typed, not a recording).
 
 ## Documentation
 
