@@ -166,6 +166,77 @@ lowering writes the typed IR as text and the code generator decodes it again (th
 allocations); changing that is a larger redesign. Reading a `String` field of an element for `.len()` directly
 (`vector[i].name.len()`) is still rejected by the code generator, as before.
 
+### Calls, registers, inlining and frames (fourth pass of 0.1.9)
+
+A fourth pass went through the code that `rync` generates for a call, a local, a small function and a frame, with the
+assembly of `fib`, `collatz` and a sieve next to the output of `rustc -O` and `g++ -O2`. `RYN_NO_OPT=1` still switches all
+of it off. What the listings (`ryn asm`) showed, and what was done:
+
+| Item | State | What exists |
+|---|---|---|
+| Function call overhead | **Done** | A function with at most six one-cell parameters (integers, bools, chars, floats, references, pointers, handles) and no string or structure result gets its arguments in `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9` (the last argument stays in `rax`). Nothing is pushed or popped around the call and the callee does not copy parameters from the stack. Thunks (C to Ryn) move the C arguments into the same registers. Other functions keep the stack convention. |
+| Frame zeroing | **Done** | A function with no owner (no `String`, `Vec`, destructor or `repr(C)` copy) no longer zeroes its frame: the zeroing code is written after the function, and five `nop` bytes in the prologue jump to it only when it is needed. Before, every call ran 14 instructions to zero a frame that could be 16 bytes. |
+| Register allocation | **Done, simple** | The four most used scalar locals of a function (weighted by loop depth; `r12` to `r15`, which nothing else in the generated code or the runtime uses) live in callee-saved registers. A function saves the registers it uses in its frame on entry and restores them on every return. The frame cell is not written: nothing reads it (`RYN_REGPOISON=1` fills the cells of such locals with a marker, and the suite, the bootstrap and the command-line tests pass with it). Only locals that are written by `let`, assignment, `for` and parameters, and never addressed, are candidates. `x = x + c`, comparisons and `lea` use the registers directly. |
+| Inlining | **Extended** | Besides functions of one expression, a function of at most four scalar parameters, eight locals and 40 nodes whose body is `let`, assignment, `if` and `return`, and whose every path returns, is generated at its call (`max`, `clamp`, `sign`, `median`). Its locals get scratch cells of the caller; `return` jumps to the end. Functions with loops or owned values are not inlined. |
+| Stack frame | **Done** | A function ending in `return` writes no second epilogue, `leave` replaces `mov rsp, rbp; pop rbp`, a `then` that ends in `return`/`break`/`continue` or an empty `else` has no jump over the `else`. |
+| Conditions | **Done** | A comparison is one `cmp` and one conditional jump (`&&`, `||` and `!` become jumps), not `setcc`, `test` and `je`; `x & mask == 0` and `x % 2^k == 0` are one `test`; a loop tests at its bottom (one jump per iteration). |
+| Branch-free selection | **Done** | `when c { x = a } else { x = b }` (or no `else`) of an integer local, with a comparison for `c` and small operands that cannot fail, computes both values and picks one with `cmov`: no mispredicted jump. `collatz` mispredicted 61 million branches before and 3 million in C++. |
+| Strength reduction | **Extended** | Signed division and remainder by any constant use the multiply-high form of Hacker's Delight (the multiplier and shift are found at compile time); only unsigned and powers of two had it. `x * 2^k` and an element index are a shift. |
+| Standard output | **Done (behaviour change)** | On Linux, standard output that is not a terminal is buffered (64 KiB): `echo`, `print` and `io::print` fill the buffer, which is written when it is full, at exit (also after a panic, a runtime error and `exit`), before an error message, before the program reads standard input or starts a process, and on `io::stdout_flush()`. A terminal is not buffered, so prompts and progress show at once, and a program that starts a thread writes at once from then on. 1 000 000 lines took 1.50 s (two `write` calls each) and take 0.037 s. `RYN_NO_OPT=1` and the Windows target keep every write unbuffered. |
+| Vectors | **Partly** | `v[i]` and `v.set(i, x)` with a constant or local index and a scalar element no longer push the vector, the index and the value on the stack. Elements are still 8-byte cells: `Vec<u8>` takes 8 times the memory of C++ (the sieve below). |
+
+Instructions executed (`perf stat`, user mode), `fib(40)`, `collatz` below 3 000 000 and the sieve of 20 000 000, in
+billions:
+
+| Program | Ryn 0.1.9 first pass | Ryn now | `rustc -O` | `g++ -O2` |
+|---|---|---|---|---|
+| `fib` | 12.7 | 5.6 | 3.1 | 2.0 |
+| `collatz` | 9.2 | 6.9 | 3.9 | 2.3 |
+| sieve | 2.6 | 1.6 | 0.42 | 0.41 |
+
+`fib` in assembly: 49 instructions and 219 bytes before, 25 instructions and 104 bytes now (`ryn asm --function fib`).
+`g++ -O2` unrolls the recursion, so its `fib` is 207 instructions; `rustc` inlines it into `main`. The inner loop of
+`collatz` runs 22 instructions per step on average before (428 million steps, 9.2 billion instructions), 16 now, 9 in
+`rustc` (`lea`, `test`, `cmov`) and 8 per iteration in `g++`, which folds `3x+1` into the halving (5.4 per step).
+
+Run time and build time, same program in three languages (one machine, 12 cores, medians of 5 runs; `rync` of this tree,
+`rustc 1.99 -O`, `g++ 16.2 -O2`; sources in `benches/versus/`):
+
+| Program | Ryn before this pass | Ryn | Rust | C++ |
+|---|---|---|---|---|
+| `fib(40)`, run | 1.07 s | 0.67 s | 0.33 s | 0.16 s |
+| `collatz`, run | 1.05 s | 0.56 s | 0.45 s | 0.33 s |
+| sieve of 20 000 000, run | 0.45 s | 0.39 s | 0.12 s | 0.10 s |
+| hash map of 2 000 000 keys, run | 0.75 s | 0.78 s | 0.25 s | 0.30 s |
+| sum of 1 048 576 `f32`, 64 passes (`std::simd::sum_f32`), run | 0.009 s | 8.5 ms | 53.1 ms | 14.9 ms |
+| 5 000 000 list nodes from `std::alloc::Pool`, run | 0.15 s | 0.14 s | 0.21 s (`Box`) | 0.21 s (`new`) |
+| 1 000 000 lines of `echo` / `println!` / `printf` to a pipe, run | 1.50 s | 0.037 s | 0.46 s | 0.068 s |
+| `hello`, start and exit | 0.18 ms | 0.19 ms | 0.62 ms | 0.43 ms |
+| `hello`, binary size | 8.3 KB | 8.3 KB | 4.3 MB | 16 KB |
+| 3000 functions (42 000 lines), build | 2.5 s | 2.5 s | 15.2 s | 13.3 s |
+| `hello`, build | 0.10 s | 0.10 s | 0.06 s | 0.04 s |
+
+Ryn is faster at starting, in size, at printing lines, when it builds a large program against an optimizing compiler, when a program uses
+the allocators and the SIMD loops of its standard library, and slower on compute-bound code: 1.3x to 4.2x slower than
+`g++ -O2` and `rustc -O` on `fib`, `collatz` and the sieve, and 3x on the hash map. The reasons are the ones in the first
+sections: one pass, no register allocator for temporaries (only four locals), no loop optimizer, a chained hash map with a
+node per entry (every lookup is two cache misses where a flat table has one), and 8-byte vector cells. `rustc` and `g++`
+also build with optimizations a Ryn build does not have (`-O0` builds are faster than `rync`: `rustc` debug 1.1 s, `g++ -O0`
+2.0 s for the 3000 functions). The `std::simd` result compares an explicit AVX2 loop with a plain `f32` loop: `rustc` cannot
+reorder the additions (it prints the same total only because the data is exact in binary), `g++ -O2` vectorizes it, and
+`g++ -O3 -march=native -ffast-math` matches Ryn (0.009 s).
+
+Checked: 692 of 692 tests of `tests/suite/` with the compiler built by the committed seed, `tools/bootstrap-native.sh`
+gives stage2 == stage3 (sha256), the 260 command-line tests of `tools/run-tests.py` pass with the `ryn` of its distribution,
+and `RYN_NO_OPT=1` gives the same output as the optimized build on every new test. The tests of this pass are
+`call_arguments_travel_in_registers`, `small_functions_with_statements_are_inlined`,
+`locals_in_registers_survive_calls_and_returns` and `conditions_and_loops_keep_their_meaning` in `tests/suite/optimize/`;
+the signed division is checked by `strength_reduction_matches_checked_division`. A function that had only a local was
+inlined and no longer counts its entries, so the profile test (`tools/tests/test_perf_019.py`) puts a loop in each function.
+
+Not done: a register allocator for temporaries, loop-invariant code motion, a flat hash table, vector elements narrower than 8 bytes,
+and recursion unrolling.
+
 ### Not integrated
 
 Reading `vector[index].field` in place (a prototype in the `perf/0.1.8` worktree) made the code generator miscompile
@@ -173,9 +244,10 @@ the compiler (the self-built stage grew to 12 GB while lowering), so it is not p
 
 ### Limits of the verification
 
-* The committed seed (`bootstrap/rync-seed`) is the 0.1.8 compiler and was not touched: `tools/bootstrap-native.sh` started from it
-  gives stage2 != stage3 (stage2 is compiled by the old code generator). Started from a compiler built from this tree it gives
-  stage2 == stage3 (sha256 identical). Updating the seed is the release step that remains.
+* The committed seed (`bootstrap/rync-seed`) is a stage2 of the 0.1.9 release commit. A change of the compiler source
+  (the fourth pass above) needs the seed replaced by a stage2 of the new tree, with its checksum, in the same commit:
+  the release workflow requires the seed to be the fixpoint of the source. The new tree builds with the committed seed (one
+  step) and bootstraps to stage2 == stage3.
 * Windows: `rync` and `ryn` build for Windows (`tools/make-dist.py` produces the zip), but nothing was executed there (no Wine
   container was available); lazy lowering also applies to `std::native_windows`.
 * `simd_fused_sum` and `simd_sum_scalar` sum the same 1 048 576 f32 values for 64 passes and print the same total.

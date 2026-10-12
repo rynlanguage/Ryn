@@ -6,7 +6,7 @@
 //
 // The baseline file is the JSON `ryn bench --json` prints:
 //
-//     {"ryn":"0.1.9","benchmarks":[{"name":"path/to/program.ryn","compile":{...},"run":{...}}]}
+//     {"ryn":"0.1.10","benchmarks":[{"name":"path/to/program.ryn","compile":{...},"run":{...}}]}
 //
 // Only `"name"` and, inside `"run"`, `"median_ns"` are read back, so a baseline stays readable when more fields are added.
 

@@ -671,7 +671,7 @@ fun ryn_bench() -> i32 {
     when failed {
         return 1
     }
-    json_text := bench::bench_json_report(String("0.1.9"), entries)
+    json_text := bench::bench_json_report(String("0.1.10"), entries)
     when !save_path.is_empty() {
         parent := manifest::directory_of(save_path.clone())
         when !parent.is_empty() {
@@ -712,7 +712,7 @@ fun main() -> i32 {
         return 0
     }
     when command == "-V" || command == "--version" || command == "version" {
-        echo "ryn 0.1.9"
+        echo "ryn 0.1.10"
         return 0
     }
     when command == "bench" {

@@ -37,6 +37,8 @@ pub struct Labels {
     pub live_allocations: u64,
     pub live_bytes: u64,
     pub state: u64,
+    // The routine that writes out the buffer of standard output (0 when it is not buffered); the C stream functions call it first.
+    pub flush: u64,
 }
 
 // The size in bytes of the state.
@@ -503,10 +505,10 @@ pub fun emit(asm: &mut x64::Asm, labels: &Labels, error_numbers: Vec<u64>, error
     // fread(rdi = buffer, rsi = size, rdx = count, rcx = handle) and fwrite with the same arguments: the transfer repeats
     // until all bytes are moved or the call gives nothing; the result is the number of whole items.
     when asm.is_pending(labels.fread) {
-        transfer(asm, labels.fread, 0)
+        transfer(asm, labels.fread, 0, 0)
     }
     when asm.is_pending(labels.fwrite) {
-        transfer(asm, labels.fwrite, 1)
+        transfer(asm, labels.fwrite, 1, labels.flush)
     }
 
     // fclose(rdi = handle)
@@ -525,6 +527,9 @@ pub fun emit(asm: &mut x64::Asm, labels: &Labels, error_numbers: Vec<u64>, error
     // putchar(rdi = character) -> the character
     when asm.is_pending(labels.putchar) {
         asm.bind(labels.putchar)
+        when labels.flush != 0 {
+            asm.call_label(labels.flush)
+        }
         asm.push(x64::Reg::RDI)
         asm.mov_rr(x64::Reg::RSI, x64::Reg::RSP)
         asm.mov_ri(x64::Reg::RDX, 1)
@@ -611,8 +616,14 @@ pub fun emit(asm: &mut x64::Asm, labels: &Labels, error_numbers: Vec<u64>, error
 }
 
 // A `read` (kind 0) or `write` (kind 1) of size * count bytes at the label.
-fun transfer(asm: &mut x64::Asm, label: u64, kind: u64) {
+fun transfer(asm: &mut x64::Asm, label: u64, kind: u64, flush: u64) {
     asm.bind(label)
+    // Standard output goes out first, so that what the program wrote before keeps its place; rcx is the stream.
+    when flush != 0 {
+        asm.push(x64::Reg::RCX)
+        asm.call_label(flush)
+        asm.pop(x64::Reg::RCX)
+    }
     asm.push(x64::Reg::RBP)
     asm.mov_rr(x64::Reg::RBP, x64::Reg::RSP)
     // Locals: the buffer, the total, the descriptor, the bytes done, and the item size.

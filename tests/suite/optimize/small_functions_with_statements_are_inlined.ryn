@@ -1,0 +1,225 @@
+// test: run
+// out: 27
+// out: 20
+// out: 8
+// out: 0
+// out: 16
+// out: 2147483647
+// out: 5
+// out: in
+// out: 3
+// out: 8
+// out: 8
+// out: 1
+// out: 2
+// out: 3
+// out: 2
+// out: 7
+// out: 5
+// out: 6
+// out: 6
+// out: 0
+// out: 162
+// A small function of `let`s, assignments, `if`s and `return`s is generated at its call, with its locals in the caller's frame.
+// Each is compared with a loop version of itself, which is not inlined, and the arguments must be evaluated once, in order.
+fun note(n: i64) -> i64 {
+    echo n
+    return n
+}
+
+fun max2(a: i64, b: i64) -> i64 {
+    when a > b {
+        return a
+    }
+    return b
+}
+
+fun max2_slow(a: i64, b: i64) -> i64 {
+    mut best: i64 = b
+    mut once: i64 = 0
+    while once < 1 {
+        when a > b {
+            best = a
+        }
+        once += 1
+    }
+    return best
+}
+
+fun clamp(x: i64, low: i64, high: i64) -> i64 {
+    mut value: i64 = x
+    when value < low {
+        value = low
+    }
+    when value > high {
+        value = high
+    }
+    return value
+}
+
+fun clamp_slow(x: i64, low: i64, high: i64) -> i64 {
+    mut value: i64 = x
+    mut once: i64 = 0
+    while once < 1 {
+        when value < low {
+            value = low
+        }
+        when value > high {
+            value = high
+        }
+        once += 1
+    }
+    return value
+}
+
+fun sign(x: i64) -> i64 {
+    when x < 0 {
+        return 0 - 1
+    } else when x > 0 {
+        return 1
+    } else {
+        return 0
+    }
+}
+
+fun sign_slow(x: i64) -> i64 {
+    mut result: i64 = 0
+    mut once: i64 = 0
+    while once < 1 {
+        when x < 0 {
+            result = 0 - 1
+        } else when x > 0 {
+            result = 1
+        }
+        once += 1
+    }
+    return result
+}
+
+fun absolute(x: i32) -> i32 {
+    when x < 0 {
+        return 0 - x
+    }
+    return x
+}
+
+fun median3(a: i64, b: i64, c: i64) -> i64 {
+    mut low: i64 = a
+    mut high: i64 = b
+    when low > high {
+        low = b
+        high = a
+    }
+    when c < low {
+        return low
+    }
+    when c > high {
+        return high
+    }
+    return c
+}
+
+fun median3_slow(a: i64, b: i64, c: i64) -> i64 {
+    mut best: i64 = a
+    mut spread: i64 = 0 - 1
+    mut candidate: i64 = 0
+    while candidate < 3 {
+        mut value: i64 = a
+        when candidate == 1 {
+            value = b
+        }
+        when candidate == 2 {
+            value = c
+        }
+        mut below: i64 = 0
+        mut above: i64 = 0
+        when value > a {
+            above += 1
+        }
+        when value < a {
+            below += 1
+        }
+        when value > b {
+            above += 1
+        }
+        when value < b {
+            below += 1
+        }
+        when value > c {
+            above += 1
+        }
+        when value < c {
+            below += 1
+        }
+        when above == below {
+            best = value
+        }
+        candidate += 1
+    }
+    return best
+}
+
+fun both_in(x: i64, low: i64, high: i64) -> bool {
+    when x < low {
+        return false
+    }
+    return x <= high
+}
+
+fun smaller_square(a: i64, b: i64) -> i64 {
+    left := a * a
+    right := b * b
+    when left < right {
+        return left
+    }
+    return right
+}
+
+fun main() {
+    mut mismatches: u64 = 0
+    mut i: i64 = 0 - 40
+    while i <= 40 {
+        mut j: i64 = 0 - 40
+        while j <= 40 {
+            when max2(i, j) != max2_slow(i, j) {
+                mismatches += 1
+            }
+            when clamp(i, 0 - 10, j) != clamp_slow(i, 0 - 10, j) {
+                mismatches += 1
+            }
+            when median3(i, j, i + j) != median3_slow(i, j, i + j) {
+                mismatches += 1
+            }
+            when sign(i - j) != sign_slow(i - j) {
+                mismatches += 1
+            }
+            j += 3
+        }
+        i += 1
+    }
+    echo mismatches
+    // Calls nest and take calls as arguments.
+    echo max2(clamp(50, 0, 20), clamp(0 - 5, 3, 9))
+    echo clamp(max2(3, 8), median3(1, 9, 5), 100)
+    echo sign(max2(0 - 3, 0 - 8)) + sign(clamp(7, 8, 9))
+    echo smaller_square(0 - 9, 4)
+    echo absolute(0 - 2147483647)
+    echo absolute(5)
+    when both_in(5, 1, 9) && !both_in(10, 1, 9) {
+        echo "in"
+    }
+    // The arguments are evaluated once each, in order.
+    echo max2(note(3), note(8))
+    echo clamp(note(1), note(2), note(3))
+    echo median3(note(7), note(5), note(6))
+    // The same function twice in one expression does not share its locals.
+    echo clamp(clamp(100, 0, 50) + 1, 0, 60) + clamp(clamp(0 - 100, 0 - 50, 50) - 1, 0 - 60, 60)
+    // In a loop, and with the result as a loop bound.
+    mut total: i64 = 0
+    mut k: i64 = 0
+    while k < max2(clamp(30, 0, 12), 3) {
+        total += median3(k, k * 2, 9) + max2(k, 4)
+        k += 1
+    }
+    echo total
+}

@@ -35,18 +35,18 @@ jobs:
 
       - name: Build the distribution
         run: |
-          python3 tools/make-dist.py "$RUNNER_TEMP/fixpoint/rync-stage2" 0.1.9 "$RUNNER_TEMP/dist"
+          python3 tools/make-dist.py "$RUNNER_TEMP/fixpoint/rync-stage2" 0.1.10 "$RUNNER_TEMP/dist"
           mkdir "$RUNNER_TEMP/unpacked"
-          tar -xzf "$RUNNER_TEMP/dist/ryn-0.1.9-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/unpacked"
+          tar -xzf "$RUNNER_TEMP/dist/ryn-0.1.10-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/unpacked"
 
       - name: Run the command-line tests with the built ryn
-        run: RYN_EXPECTED_VERSION=0.1.9 python3 tools/run-tests.py "$RUNNER_TEMP/unpacked/ryn-0.1.9-linux-x86_64/ryn"
+        run: RYN_EXPECTED_VERSION=0.1.10 python3 tools/run-tests.py "$RUNNER_TEMP/unpacked/ryn-0.1.10-linux-x86_64/ryn"
 
       - name: Upload the Windows archive for the Windows job
         uses: actions/upload-artifact@v4
         with:
           name: windows-archive
-          path: ${{ runner.temp }}/dist/ryn-0.1.9-windows-x86_64.zip
+          path: ${{ runner.temp }}/dist/ryn-0.1.10-windows-x86_64.zip
 
   windows-wine:
     name: Windows target under Wine
@@ -82,8 +82,8 @@ jobs:
       - name: Run ryn on Windows
         shell: pwsh
         run: |
-          Expand-Archive -LiteralPath ryn-0.1.9-windows-x86_64.zip -DestinationPath unpacked
-          $ryn = "unpacked/ryn-0.1.9-windows-x86_64/ryn.exe"
+          Expand-Archive -LiteralPath ryn-0.1.10-windows-x86_64.zip -DestinationPath unpacked
+          $ryn = "unpacked/ryn-0.1.10-windows-x86_64/ryn.exe"
           & $ryn --version
           if ($LASTEXITCODE -ne 0) { throw "ryn --version failed" }
           "fun main() {`n    echo `"hello from windows`"`n}`n" | Set-Content -NoNewline hello.ryn

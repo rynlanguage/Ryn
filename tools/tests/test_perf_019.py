@@ -15,22 +15,35 @@ STDLIB = REPO_ROOT / "stdlib" / "std" / "src"
 TIMEOUT = 120
 
 # A hot function (called often), a warm one and a cold one, so that a profile has something to order.
-# Each function has a local, so none of them is inlined and each one counts its real entries.
+# Each function has a loop, so none of them is inlined (a small function of statements would be) and each one counts its
+# real entries.
 PROGRAM = """fun cold(n: i64) -> i64 {
     mut r: i64 = n
-    r += 1
+    mut once: i64 = 0
+    while once < 1 {
+        r += 1
+        once += 1
+    }
     return r
 }
 
 fun warm(n: i64) -> i64 {
     mut r: i64 = n * 3
-    r += cold(n)
+    mut once: i64 = 0
+    while once < 1 {
+        r += cold(n)
+        once += 1
+    }
     return r
 }
 
 fun hot(n: i64) -> i64 {
     mut r: i64 = n % 7
-    r += 1
+    mut once: i64 = 0
+    while once < 1 {
+        r += 1
+        once += 1
+    }
     return r
 }
 

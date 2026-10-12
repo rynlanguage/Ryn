@@ -1,0 +1,30 @@
+use std::alloc
+fun main() {
+    n: u64 = 5000000
+    mut pool := alloc::Pool::new(16 as u64, n)
+    mut head: u64 = 0
+    mut i: u64 = 0
+    while i < n {
+        node := pool.alloc()
+        value := node as *u64
+        next := (node as u64 + 8) as *u64
+        *value = i
+        *next = head
+        head = node as u64
+        i += 1
+    }
+    mut sum: u64 = 0
+    mut at: u64 = head
+    while at != 0 {
+        sum += *(at as *u64)
+        at = *((at + 8) as *u64)
+    }
+    echo sum
+    at = head
+    while at != 0 {
+        following := *((at + 8) as *u64)
+        pool.release(at as *u8)
+        at = following
+    }
+    echo pool.live()
+}

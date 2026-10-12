@@ -1,0 +1,20 @@
+fun main() {
+    n: u64 = 2000000
+    mut table: Map<u64, u64> = Map<u64, u64>()
+    mut i: u64 = 0
+    while i < n {
+        table.insert(i * 2654435761 % 1000003 + i, i)
+        i += 1
+    }
+    mut sum: u64 = 0
+    i = 0
+    while i < n {
+        found := table.get(i * 2654435761 % 1000003 + i)
+        when found.is_some() {
+            sum += found.unwrap()
+        }
+        i += 1
+    }
+    echo sum
+    echo table.len()
+}

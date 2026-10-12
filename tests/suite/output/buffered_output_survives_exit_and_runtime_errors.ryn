@@ -1,0 +1,20 @@
+// test: run
+// out: one
+// out: two
+// err: Ryn runtime error: integer division or remainder by zero
+// exit: 1
+// What was written before `exit` or a runtime error is written out.
+use std::process
+fun divide(a: i64, b: i64) -> i64 {
+    return a / b
+}
+fun main() {
+    echo "one"
+    echo "two"
+    mut zero: i64 = 0
+    when arg_count() > 5 {
+        zero = 1
+    }
+    echo divide(10, zero)
+    echo "never"
+}

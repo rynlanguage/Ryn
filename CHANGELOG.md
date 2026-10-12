@@ -4,6 +4,34 @@ All notable changes to Ryn are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses a `0.x` version
 sequence: minor releases may change language details while the compiler is pre-1.0.
 
+## [0.1.10] — 2026-10-12 — Faster code, buffered output
+
+Code speed: a fourth pass over what `rync` generates for calls, locals, small functions and frames, with the assembly of
+the same programs in Rust and C++ next to it (`docs/native-performance.md`, `benches/versus/`). `RYN_NO_OPT=1` turns it all off.
+
+- Arguments of a function with at most six one-cell parameters travel in registers (`rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`),
+  not on the stack; the callee does not copy them. `fib(40)`: 49 instructions and 219 bytes became 25 and 104.
+- The four most used scalar locals of a function live in `r12` to `r15` (saved in the frame, restored on every return);
+  `x = x + c`, comparisons and `lea` use them directly.
+- A function with no owned value no longer zeroes its frame (14 instructions per call); `leave`, no second epilogue, no jump
+  over an empty `else`; a comparison is one compare and one jump (`&&`, `||`, `!` are jumps); `x & mask == 0` and
+  `x % 2^k == 0` are one `test`; loops test at the bottom; `when c { x = a } else { x = b }` of integers is a `cmov`.
+- Small functions of `let`, assignment, `if` and `return` (four parameters, eight locals, 40 nodes) are inlined, with their
+  locals in the caller's frame.
+- Signed division and remainder by any constant use the multiply-high form (only unsigned and powers of two had it);
+  indexing and `set` of a vector with a constant or local index push nothing.
+- Measured against `rustc -O` and `g++ -O2` on one machine: `fib(40)` 1.07 s to 0.67 s (Rust 0.32, C++ 0.16), `collatz`
+  1.05 s to 0.58 s (0.44, 0.32), the sieve 0.45 s to 0.39 s (0.12, 0.10); the hash map is unchanged at 0.76 s (0.25, 0.27).
+  Ryn starts in 0.19 ms (Rust 0.62, C++ 0.43), `hello` is 8 KB (4.3 MB, 16 KB), 3000 functions build in 2.5 s (15.2 s, 13.3 s),
+  `std::simd::sum_f32` sums in 0.0085 s (0.052 s, 0.014 s) and 5 000 000 list nodes from `std::alloc::Pool` take 0.15 s
+  (0.21 s, 0.21 s). Ryn is slower on compute-bound code, as the document says.
+- Standard output that is not a terminal is buffered on Linux (64 KiB, flushed at exit, after a panic or runtime error, before
+  an error message, before reading standard input or starting a process, and by `io::stdout_flush()`); a terminal and a program
+  with threads write at once. Printing 1 000 000 lines: 1.50 s to 0.037 s (Rust 0.46 s, C++ 0.068 s). The frame cell of a local
+  that lives in a register is no longer written (checked by running the suite and the bootstrap with `RYN_REGPOISON=1`).
+- Seven new tests in `tests/suite/` (`optimize/` and `output/`); suite 695/695, `tools/run-tests.py` 260 tests. A function with only a few
+  statements is now inlined, so `tools/tests/test_perf_019.py` gives its functions a loop to keep them out of line.
+
 ## [0.1.9] — 2026-10-12 — Performance Revolution
 
 Compiler speed, code speed and systems features. `docs/native-performance.md` has the state of each item, the

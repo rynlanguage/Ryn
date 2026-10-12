@@ -63,6 +63,7 @@ fun builtin_rows() -> Vec<String> {
     rows.push(String("__io_stdout_write;System WriteStdout;Str;"))
     rows.push(String("__io_stderr_write;System WriteStderr;Str;"))
     rows.push(String("__io_stdout_flush;System FlushStdout;;"))
+    rows.push(String("__io_stdout_direct;System StdoutDirect;;"))
     rows.push(String("__io_stderr_flush;System FlushStderr;;"))
     rows.push(String("__input_key_down;System KeyDown;U32;Bool"))
     rows.push(String("__input_key_pressed;System KeyPressed;U32;Bool"))

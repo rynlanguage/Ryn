@@ -1,0 +1,198 @@
+// test: run
+// out: 0
+// out: 9142
+// out: 629
+// out: 17023
+// out: 1007
+// out: -1
+// out: 17023
+// out: -1
+// out: 2103
+// out: 103
+// out: 300000
+// out: 292
+// out: 1007
+// The busiest scalar locals of a function live in registers, and the function restores the caller's registers on every
+// return. Each function here has more such locals than there are registers, calls other functions that use registers, and
+// returns from inside loops; each result is compared with the same computation on an array, which is kept in memory.
+fun churn(seed: i64) -> i64 {
+    mut a: i64 = seed
+    mut b: i64 = seed * 3 + 1
+    mut c: i64 = 0
+    mut d: i64 = 7
+    mut e: i64 = 0 - seed
+    mut f: i64 = 11
+    mut round: i64 = 0
+    while round < 20 {
+        a = (a * 31 + b) % 1009
+        b = (b + c * 5 + round) % 997
+        c = (c + d + a) % 983
+        d = (d * 7 + e) % 991
+        e = (e + f + round) % 977
+        f = (f * 3 + a) % 971
+        round += 1
+    }
+    return a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6
+}
+
+fun churn_in_memory(seed: i64) -> i64 {
+    mut cell: [i64; 6] = [seed, seed * 3 + 1, 0, 7, 0 - seed, 11]
+    mut round: i64 = 0
+    while round < 20 {
+        cell[0] = (cell[0] * 31 + cell[1]) % 1009
+        cell[1] = (cell[1] + cell[2] * 5 + round) % 997
+        cell[2] = (cell[2] + cell[3] + cell[0]) % 983
+        cell[3] = (cell[3] * 7 + cell[4]) % 991
+        cell[4] = (cell[4] + cell[5] + round) % 977
+        cell[5] = (cell[5] * 3 + cell[0]) % 971
+        round += 1
+    }
+    return cell[0] + cell[1] * 2 + cell[2] * 3 + cell[3] * 4 + cell[4] * 5 + cell[5] * 6
+}
+
+// The locals of the caller stay what they were across calls of functions that use registers themselves.
+fun across(seed: i64) -> i64 {
+    mut p: i64 = seed + 1
+    mut q: i64 = seed + 2
+    mut r: i64 = seed + 3
+    mut s: i64 = seed + 4
+    mut t: i64 = seed + 5
+    mut step: i64 = 0
+    while step < 6 {
+        p += churn(step) % 10
+        q += churn(p) % 10
+        r += churn(q) % 10
+        s += churn(r) % 10
+        t += churn(s) % 10
+        step += 1
+    }
+    return p + q * 2 + r * 3 + s * 4 + t * 5
+}
+
+fun across_in_memory(seed: i64) -> i64 {
+    mut cell: [i64; 5] = [seed + 1, seed + 2, seed + 3, seed + 4, seed + 5]
+    mut step: i64 = 0
+    while step < 6 {
+        cell[0] = cell[0] + churn_in_memory(step) % 10
+        cell[1] = cell[1] + churn_in_memory(cell[0]) % 10
+        cell[2] = cell[2] + churn_in_memory(cell[1]) % 10
+        cell[3] = cell[3] + churn_in_memory(cell[2]) % 10
+        cell[4] = cell[4] + churn_in_memory(cell[3]) % 10
+        step += 1
+    }
+    return cell[0] + cell[1] * 2 + cell[2] * 3 + cell[3] * 4 + cell[4] * 5
+}
+
+// Returns from inside nested loops.
+fun first_pair(limit: i64, target: i64) -> i64 {
+    mut x: i64 = 1
+    while x < limit {
+        mut y: i64 = x
+        while y < limit {
+            when x * y == target {
+                return x * 1000 + y
+            }
+            y += 1
+        }
+        x += 1
+    }
+    return 0 - 1
+}
+
+fun first_pair_in_memory(limit: i64, target: i64) -> i64 {
+    mut cell: [i64; 2] = [1, 1]
+    while cell[0] < limit {
+        cell[1] = cell[0]
+        while cell[1] < limit {
+            when cell[0] * cell[1] == target {
+                return cell[0] * 1000 + cell[1]
+            }
+            cell[1] = cell[1] + 1
+        }
+        cell[0] = cell[0] + 1
+    }
+    return 0 - 1
+}
+
+// A tail call stores the new arguments over the parameters, which may live in registers.
+fun gcd_steps(a: i64, b: i64, steps: i64) -> i64 {
+    when b == 0 {
+        return a * 100 + steps
+    }
+    return gcd_steps(b, a % b, steps + 1)
+}
+
+fun count_down(n: i64, acc: i64) -> i64 {
+    when n == 0 {
+        return acc
+    }
+    return count_down(n - 1, acc + n % 7)
+}
+
+// Narrow and unsigned locals wrap at their width, in a register too.
+fun narrow_wrap(rounds: i64) -> i64 {
+    mut small: u8 = 250
+    mut signed: i8 = 120
+    mut half: u16 = 65530
+    mut word: u32 = 4294967290
+    mut round: i64 = 0
+    mut total: i64 = 0
+    while round < rounds {
+        small += 3
+        signed += 5
+        half += 7
+        word += 9
+        total += (small as i64) + (signed as i64) + (half as i64) + (word as i64)
+        round += 1
+    }
+    return total
+}
+
+fun flags(n: i64) -> i64 {
+    mut even: bool = true
+    mut big: bool = false
+    mut letter: char = 'a'
+    mut count: i64 = 0
+    mut i: i64 = 0
+    while i < n {
+        even = !even
+        when i > 5 {
+            big = true
+        }
+        when even && big {
+            count += 1
+        }
+        i += 1
+    }
+    when letter == 'a' {
+        count += 1000
+    }
+    return count
+}
+
+fun main() {
+    mut bad: u64 = 0
+    mut seed: i64 = 0 - 20
+    while seed < 20 {
+        when churn(seed) != churn_in_memory(seed) {
+            bad += 1
+        }
+        when across(seed) != across_in_memory(seed) {
+            bad += 1
+        }
+        seed += 1
+    }
+    echo bad
+    echo churn(5)
+    echo across(3)
+    echo first_pair(40, 391)
+    echo first_pair(40, 7)
+    echo first_pair(40, 1599)
+    echo first_pair_in_memory(40, 391)
+    echo first_pair_in_memory(40, 1599)
+    echo gcd_steps(1071, 462, 0)
+    echo gcd_steps(17, 5, 0)
+    echo count_down(100000, 0)
+    echo narrow_wrap(10)
+    echo flags(20)
+}

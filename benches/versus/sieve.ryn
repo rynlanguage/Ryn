@@ -1,0 +1,29 @@
+fun main() {
+    n: u64 = 20000000
+    mut composite: Vec<u8> = Vec()
+    mut i: u64 = 0
+    while i <= n {
+        composite.push(0 as u8)
+        i += 1
+    }
+    mut p: u64 = 2
+    while p * p <= n {
+        when composite[p] == 0 {
+            mut j: u64 = p * p
+            while j <= n {
+                composite.set(j, 1 as u8)
+                j += p
+            }
+        }
+        p += 1
+    }
+    mut count: u64 = 0
+    mut k: u64 = 2
+    while k <= n {
+        when composite[k] == 0 {
+            count += 1
+        }
+        k += 1
+    }
+    echo count
+}

@@ -1,0 +1,7 @@
+fun main() {
+    mut i: u64 = 0
+    while i < 1000000 {
+        echo i
+        i += 1
+    }
+}

@@ -1,0 +1,10 @@
+fun fib(n: u64) -> u64 {
+    when n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fun main() {
+    echo fib(40)
+}

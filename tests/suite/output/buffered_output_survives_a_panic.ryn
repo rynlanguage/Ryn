@@ -1,0 +1,11 @@
+// test: run
+// out: before
+// out: 1
+// err: Ryn panic: stop
+// exit: 1
+// What was written before a panic is written out, and before its message.
+fun main() {
+    echo "before"
+    echo 1
+    panic("stop")
+}

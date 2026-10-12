@@ -6,7 +6,7 @@ import unittest
 
 from ryn_harness import REPO_ROOT
 
-EXPECTED_TOTAL = 688
+EXPECTED_TOTAL = 695
 
 
 class SuiteInventory(unittest.TestCase):

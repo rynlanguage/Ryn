@@ -291,6 +291,12 @@ pub struct Gen {
     division_literal: u64,
     // The labels of the runtime routines: writing a buffer, and printing an unsigned, signed or boolean value.
     write_label: u64,
+    // Standard output is buffered (Linux only): 64 KiB, written when it is full, at exit, before an error message, before the
+    // program reads standard input or starts a process, and on `flush`. A terminal, and a program with threads, are not
+    // buffered. `stdout_symbol` holds the mode (0 not known, 1 buffered, 2 direct), the length and the bytes.
+    buffered: bool,
+    stdout_symbol: u64,
+    flush_label: u64,
     map_hash_scalar: u64,
     map_hash_string: u64,
     // The slot of the structure key whose words are being written.
@@ -433,6 +439,13 @@ pub struct Gen {
     inline_slots: Vec<u64>,
     inline_cells: Vec<u64>,
     inline_nodes: u64,
+    // The most nodes an inlined body may have, whether the body being checked may read locals other than parameters, and the
+    // labels that the `return`s of the inlined bodies of statements jump to (the innermost last).
+    inline_limit: u64,
+    inline_locals: bool,
+    inline_exits: Vec<u64>,
+    // Per function, how its calls are inlined (see `inline_kind`), or 9 while that is not known.
+    inline_kinds: Vec<u64>,
     // Per expression: 0 when its constness is not known yet, 1 when it is not a constant, 2 when it is, with its bits in
     // `const_bits`. Memoized so that a deep chain of operations is evaluated once per node.
     const_state: Vec<u64>,
@@ -445,6 +458,18 @@ pub struct Gen {
     def_bad: Vec<bool>,
     def_addressed: Vec<bool>,
     def_reads: Vec<u64>,
+    // Per slot: how much the function uses it (a use in a loop counts 8 times, in two loops 64), whether it is the target of
+    // a `let`, assignment, loop or parameter of a scalar type, and whether anything else writes it. A slot that is only
+    // written by those, and is not addressed, can live in a register as well as in its frame cell.
+    def_weight: Vec<u64>,
+    def_seen: Vec<bool>,
+    def_noreg: Vec<bool>,
+    scan_depth: u64,
+    // The locals kept in callee-saved registers: `slot_reg[slot]` is the register, or 0. The function saves each register
+    // it uses in a frame cell on entry and restores it on every return (`saved_regs`, `saved_cells`).
+    slot_reg: Vec<u64>,
+    saved_regs: Vec<u64>,
+    saved_cells: Vec<u64>,
     // Per expression: whether it is the element read of a `vector[index].field` whose value a builtin only borrows, so that
     // the field is lent in place and not cloned.
     lent: Vec<bool>,
@@ -455,6 +480,8 @@ pub struct Gen {
     tail_label: u64,
     // Whether the optimizations that need an analysis (constant propagation of locals, dead code) are switched off.
     no_opt: bool,
+    // RYN_REGPOISON: a local in a register gets a marker in its frame cell, not its value, so a read of the cell shows up as a wrong result.
+    poison: bool,
     symbols: bool,
 }
 
@@ -635,6 +662,9 @@ fun build_listing(input: ir::IrProgram, executable: bool, libc: bool, windows: b
         invalid_literal: 0,
         division_literal: 0,
         write_label: 0,
+        buffered: false,
+        stdout_symbol: 0,
+        flush_label: 0,
         map_hash_scalar: 0,
         map_hash_string: 0,
         key_base: 0,
@@ -690,7 +720,7 @@ fun build_listing(input: ir::IrProgram, executable: bool, libc: bool, windows: b
         span_end: 0,
         failed_start: 0,
         failed_end: 0,
-        rt: rt::Labels { malloc: 0, free: 0, realloc: 0, calloc: 0, memcpy: 0, memmove: 0, strlen: 0, fopen: 0, fseek: 0, ftell: 0, fread: 0, fwrite: 0, fclose: 0, strerror: 0, errno_location: 0, putchar: 0, chmod: 0, rename: 0, unlink: 0, getpid: 0, sigreturn: 0, live_allocations: 0, live_bytes: 0, state: 0 },
+        rt: rt::Labels { malloc: 0, free: 0, realloc: 0, calloc: 0, memcpy: 0, memmove: 0, strlen: 0, fopen: 0, fseek: 0, ftell: 0, fread: 0, fwrite: 0, fclose: 0, strerror: 0, errno_location: 0, putchar: 0, chmod: 0, rename: 0, unlink: 0, getpid: 0, sigreturn: 0, live_allocations: 0, live_bytes: 0, state: 0, flush: 0 },
         enum_clone_ids: Vec(),
         enum_clone_labels: Vec(),
         glue_kinds: Vec(),
@@ -734,6 +764,10 @@ fun build_listing(input: ir::IrProgram, executable: bool, libc: bool, windows: b
         inline_slots: Vec(),
         inline_cells: Vec(),
         inline_nodes: 0,
+        inline_limit: 32,
+        inline_locals: false,
+        inline_exits: Vec(),
+        inline_kinds: Vec(),
         const_state: Vec(),
         const_bits: Vec(),
         def_count: Vec(),
@@ -741,11 +775,19 @@ fun build_listing(input: ir::IrProgram, executable: bool, libc: bool, windows: b
         def_bad: Vec(),
         def_addressed: Vec(),
         def_reads: Vec(),
+        def_weight: Vec(),
+        def_seen: Vec(),
+        def_noreg: Vec(),
+        scan_depth: 0,
+        slot_reg: Vec(),
+        saved_regs: Vec(),
+        saved_cells: Vec(),
         lent: Vec(),
         cur_function: 0,
         tail_ok: false,
         tail_label: 0,
         no_opt: !env::get("RYN_NO_OPT").is_empty(),
+        poison: !env::get("RYN_REGPOISON").is_empty(),
         symbols: !env::get("RYN_SYMBOLS").is_empty(),
     }
     // Symbol 0 is the entry point `main`, which the C runtime calls; its size is set when the object is made.
@@ -868,6 +910,13 @@ fun build_listing(input: ir::IrProgram, executable: bool, libc: bool, windows: b
         gen.win_state = state
         gen.win_names = winrt::api_names()
         gen.win_symbols = symbols
+    }
+    // The buffer of standard output, after the Windows state (there is none for Windows).
+    when !gen.windows && !gen.no_opt {
+        gen.buffered = true
+        gen.stdout_symbol = gen.symbol(String("ryn_stdout"), elf::Where::BSS, 16 + rt::state_size() + 16 + gen.windows_state_size(), gen.stdout_state_size(), false)
+        gen.flush_label = asm.new_label()
+        gen.rt.flush = gen.flush_label
     }
     // The entry counters of the functions, after the Windows state, and the label of the routine that writes them at exit.
     when gen.profiling {
@@ -1316,8 +1365,114 @@ extend Gen {
         when main_function.return_type.is_none() {
             asm.mov_ri(x64::Reg::RAX, 0)
         }
+        when self.buffered {
+            asm.push(x64::Reg::RAX)
+            asm.call_label(self.flush_label)
+            asm.pop(x64::Reg::RAX)
+        }
         asm.mov_rr(x64::Reg::RSP, x64::Reg::RBP)
         asm.pop(x64::Reg::RBP)
+        asm.ret()
+    }
+
+    // The write routine of a buffered standard output: the bytes at rsi, of length rdx, are added to the buffer, which is written
+    // out first when they do not fit, and a write too long for the buffer goes at once. The first call finds out whether
+    // standard output is a terminal (`ioctl TCGETS`), which is not buffered. Keeps rdi, rsi and rdx; clobbers rax, rcx, r11.
+    fun emit_buffered_write(mut self, asm: &mut x64::Asm) {
+        known := asm.new_label()
+        direct := asm.new_label()
+        make_room := asm.new_label()
+        append := asm.new_label()
+        done := asm.new_label()
+        buffered_mode := asm.new_label()
+        asm.bind(self.write_label)
+        asm.push(x64::Reg::RDI)
+        asm.push(x64::Reg::RSI)
+        asm.push(x64::Reg::RDX)
+        asm.lea_symbol(x64::Reg::R11, self.stdout_symbol)
+        asm.load(8, false, x64::Reg::RAX, x64::Reg::R11, 0)
+        asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
+        asm.jcc(x64::Cc::NOT_EQUAL, known)
+        // Not known yet: a terminal answers TCGETS with 0, anything else with an error.
+        asm.alu_ri(5, x64::Reg::RSP, 64)
+        asm.mov_ri(x64::Reg::RDI, 1)
+        asm.mov_ri(x64::Reg::RSI, 21505)
+        asm.mov_rr(x64::Reg::RDX, x64::Reg::RSP)
+        asm.mov_ri(x64::Reg::RAX, 16)
+        asm.syscall()
+        asm.alu_ri(0, x64::Reg::RSP, 64)
+        asm.mov_ri(x64::Reg::RCX, 1)
+        asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
+        asm.jcc(x64::Cc::NOT_EQUAL, buffered_mode)
+        asm.mov_ri(x64::Reg::RCX, 2)
+        asm.bind(buffered_mode)
+        asm.lea_symbol(x64::Reg::R11, self.stdout_symbol)
+        asm.store(8, x64::Reg::RCX, x64::Reg::R11, 0)
+        asm.mov_rr(x64::Reg::RAX, x64::Reg::RCX)
+        asm.bind(known)
+        asm.load(8, false, x64::Reg::RSI, x64::Reg::RSP, 8)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 0)
+        asm.alu_ri(7, x64::Reg::RAX, 2)
+        asm.jcc(x64::Cc::EQUAL, direct)
+        asm.load(8, false, x64::Reg::RCX, x64::Reg::R11, 8)
+        asm.lea(x64::Reg::RAX, x64::Reg::RCX, 0)
+        asm.alu_rr(1, x64::Reg::RAX, x64::Reg::RDX)
+        asm.alu_ri(7, x64::Reg::RAX, 65536)
+        asm.jcc(x64::Cc::ABOVE, make_room)
+        asm.bind(append)
+        asm.store(8, x64::Reg::RAX, x64::Reg::R11, 8)
+        asm.lea(x64::Reg::RDI, x64::Reg::R11, 16)
+        asm.alu_rr(1, x64::Reg::RDI, x64::Reg::RCX)
+        asm.mov_rr(x64::Reg::RCX, x64::Reg::RDX)
+        asm.rep_movsb()
+        asm.jmp(done)
+        asm.bind(make_room)
+        asm.call_label(self.flush_label)
+        asm.lea_symbol(x64::Reg::R11, self.stdout_symbol)
+        asm.alu_ri(7, x64::Reg::RDX, 65536)
+        asm.jcc(x64::Cc::ABOVE, direct)
+        asm.mov_ri(x64::Reg::RCX, 0)
+        asm.mov_rr(x64::Reg::RAX, x64::Reg::RDX)
+        asm.jmp(append)
+        asm.bind(direct)
+        asm.mov_ri(x64::Reg::RDI, 1)
+        asm.mov_ri(x64::Reg::RAX, 1)
+        asm.syscall()
+        asm.bind(done)
+        asm.pop(x64::Reg::RDX)
+        asm.pop(x64::Reg::RSI)
+        asm.pop(x64::Reg::RDI)
+        asm.ret()
+    }
+
+    // The routine that writes out the buffer of standard output. Keeps rdi, rsi and rdx; clobbers rax, rcx, r11.
+    fun emit_flush(mut self, asm: &mut x64::Asm) {
+        out := asm.new_label()
+        again := asm.new_label()
+        asm.bind(self.flush_label)
+        asm.push(x64::Reg::RDI)
+        asm.push(x64::Reg::RSI)
+        asm.push(x64::Reg::RDX)
+        asm.lea_symbol(x64::Reg::R11, self.stdout_symbol)
+        asm.load(8, false, x64::Reg::RDX, x64::Reg::R11, 8)
+        asm.test_rr(x64::Reg::RDX, x64::Reg::RDX)
+        asm.jcc(x64::Cc::EQUAL, out)
+        asm.mov_ri(x64::Reg::RAX, 0)
+        asm.store(8, x64::Reg::RAX, x64::Reg::R11, 8)
+        asm.lea(x64::Reg::RSI, x64::Reg::R11, 16)
+        asm.bind(again)
+        asm.mov_ri(x64::Reg::RDI, 1)
+        asm.mov_ri(x64::Reg::RAX, 1)
+        asm.syscall()
+        asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
+        asm.jcc(x64::Cc::LESS_EQUAL, out)
+        asm.alu_rr(1, x64::Reg::RSI, x64::Reg::RAX)
+        asm.alu_rr(41, x64::Reg::RDX, x64::Reg::RAX)
+        asm.jcc(x64::Cc::NOT_EQUAL, again)
+        asm.bind(out)
+        asm.pop(x64::Reg::RDX)
+        asm.pop(x64::Reg::RSI)
+        asm.pop(x64::Reg::RDI)
         asm.ret()
     }
 
@@ -1325,12 +1480,18 @@ extend Gen {
     // signed and boolean values in rax, each followed by nothing (the newline is written by the statement).
     fun runtime(mut self, asm: &mut x64::Asm) {
         self.map_routines(asm)
-        when asm.is_pending(self.write_label) {
+        when asm.is_pending(self.write_label) && !self.buffered {
             asm.bind(self.write_label)
             asm.mov_ri(x64::Reg::RDI, 1)
             asm.mov_ri(x64::Reg::RAX, 1)
             asm.syscall()
             asm.ret()
+        }
+        when asm.is_pending(self.write_label) && self.buffered {
+            self.emit_buffered_write(asm)
+        }
+        when self.buffered && asm.is_pending(self.flush_label) {
+            self.emit_flush(asm)
         }
 
         // Digits are written backwards into a 32-byte buffer on the stack, from its last byte.
@@ -1386,6 +1547,7 @@ extend Gen {
         when asm.is_pending(self.index_error_label) {
             self.index_literal = self.literal(String("Ryn runtime error: array index is out of bounds\n"))
             asm.bind(self.index_error_label)
+            self.flush_stdout(asm)
             asm.lea_symbol(x64::Reg::RSI, self.literal_symbols[self.index_literal])
             asm.mov_ri(x64::Reg::RDX, self.literal_lengths[self.index_literal])
             asm.mov_ri(x64::Reg::RDI, 2)
@@ -1400,6 +1562,7 @@ extend Gen {
         when asm.is_pending(self.division_error_label) {
             self.division_literal = self.literal(String("Ryn runtime error: integer division or remainder by zero\n"))
             asm.bind(self.division_error_label)
+            self.flush_stdout(asm)
             asm.lea_symbol(x64::Reg::RSI, self.literal_symbols[self.division_literal])
             asm.mov_ri(x64::Reg::RDX, self.literal_lengths[self.division_literal])
             asm.mov_ri(x64::Reg::RDI, 2)
@@ -1412,6 +1575,11 @@ extend Gen {
 
         when asm.is_pending(self.handler_label) {
             asm.bind(self.handler_label)
+            asm.push(x64::Reg::RSI)
+            asm.push(x64::Reg::RDX)
+            self.flush_stdout(asm)
+            asm.pop(x64::Reg::RDX)
+            asm.pop(x64::Reg::RSI)
             asm.load(8, false, x64::Reg::RAX, x64::Reg::RSI, 16)
             asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 160)
             asm.mov_rr(x64::Reg::R8, x64::Reg::RAX)
@@ -1497,31 +1665,11 @@ extend Gen {
         // The frame holds the locals and the scratch cells; its size is patched in once the body is generated.
         asm.alu_ri(5, x64::Reg::RSP, 0)
         frame_at := asm.code.len() - 4
-        // Scratch owners may be live on an early return or absent on another branch.
-        // Zero the whole frame before loading parameters, including scratch cells allocated below.
-        asm.mov_rr(x64::Reg::RDI, x64::Reg::RSP)
-        asm.mov_ri(x64::Reg::RAX, 0)
-        asm.mov_ri(x64::Reg::RCX, 0)
-        asm.alu_ri(0, x64::Reg::RCX, 0)
-        zero_at := asm.code.len() - 4
-        // A frame of at most 256 bytes is zeroed by a counted loop of qword stores: the fixed startup cost of `rep stosb`
-        // dominates a frame of a few cells. A larger frame keeps `rep stosb`. Both leave RCX at 0 and RDI at the frame end.
-        zero_done := asm.new_label()
-        zero_top := asm.new_label()
-        zero_wide := asm.new_label()
-        asm.alu_ri(7, x64::Reg::RCX, 256)
-        asm.jcc(x64::Cc::ABOVE, zero_wide)
-        asm.test_rr(x64::Reg::RCX, x64::Reg::RCX)
-        asm.jcc(x64::Cc::EQUAL, zero_done)
-        asm.bind(zero_top)
-        asm.store(8, x64::Reg::RAX, x64::Reg::RDI, 0)
-        asm.alu_ri(0, x64::Reg::RDI, 8)
-        asm.alu_ri(5, x64::Reg::RCX, 8)
-        asm.jcc(x64::Cc::NOT_EQUAL, zero_top)
-        asm.jmp(zero_done)
-        asm.bind(zero_wide)
-        asm.rep_stosb()
-        asm.bind(zero_done)
+        // Scratch owners may be live on an early return or absent on another branch, so a function that has owners zeroes its
+        // whole frame before the parameters are loaded: the code for it is written after the function (see `zero_frame`),
+        // and these five bytes jump to it, or stay a `nop` when there is nothing to zero.
+        zero_slot := asm.code.len()
+        asm.nop5()
         self.scratch_base = definition.local_types.len()
         self.regions_base = Vec()
         self.regions_type = Vec()
@@ -1536,6 +1684,7 @@ extend Gen {
         self.collect_regions(definition.statements.clone())
         self.scan_definitions(definition.statements.clone(), definition.parameters.clone(), definition.local_types.len(), definition.addressed_slot_types.clone())
         self.scratch_used = 0
+        self.assign_registers(asm, definition.local_types.len())
         self.shadow_slots = Vec()
         self.shadow_images = Vec()
         self.shadow_ids = Vec()
@@ -1573,6 +1722,22 @@ extend Gen {
         self.result_cells = returned_cells
         mut argument: u64 = 0
         pair = 0
+        // A function whose parameters are single cells receives them in registers: each goes to its frame cell, and to its
+        // own register when it has one.
+        when self.reg_args(index) {
+            while pair < definition.parameters.len() / 2 {
+                base := definition.parameters[pair * 2]
+                mut held: u64 = 0
+                when self.slot_reg.len() > base {
+                    held = self.slot_reg[base]
+                }
+                self.write_cell(asm, 8, arg_register(pair), base, held)
+                when self.slot_reg.len() > base && self.slot_reg[base] != 0 {
+                    asm.mov_rr(self.slot_reg[base], arg_register(pair))
+                }
+                pair += 1
+            }
+        }
         while pair < definition.parameters.len() / 2 {
             base := definition.parameters[pair * 2]
             cells := self.cells_of(definition.parameters[pair * 2 + 1])
@@ -1580,6 +1745,9 @@ extend Gen {
             while cell < cells {
                 asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, (16 + 8 * (total - 1 - argument)) as i64)
                 asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(base + cell))
+                when self.slot_reg.len() > base + cell && self.slot_reg[base + cell] != 0 {
+                    asm.mov_rr(self.slot_reg[base + cell], x64::Reg::RAX)
+                }
                 argument += 1
                 cell += 1
             }
@@ -1599,13 +1767,175 @@ extend Gen {
         self.def_bad = Vec()
         self.def_addressed = Vec()
         self.def_reads = Vec()
+        self.def_weight = Vec()
+        self.def_seen = Vec()
+        self.def_noreg = Vec()
         bytes := ((self.scratch_base + self.scratch_used) * 8 + 15) / 16 * 16
         asm.patch32(frame_at, bytes)
-        asm.patch32(zero_at, bytes)
-        asm.mov_rr(x64::Reg::RSP, x64::Reg::RBP)
-        asm.pop(x64::Reg::RBP)
-        asm.ret()
+        // The frame is zeroed so that an owner a branch never reached, or an early return skipped, drops nothing. A function
+        // with no owner, scratch owner or shadow cell has nothing to zero.
+        // Nothing follows a `return` that ends the body, so the leave that closes every other function is not written.
+        when self.no_opt || !self.ends_in_leave(definition.statements.clone()) {
+            self.leave(asm)
+        }
+        when self.no_opt || self.owner_slots.len() > 0 || self.shadow_slots.len() > 0 {
+            stub := asm.code.len()
+            self.zero_frame(asm, bytes)
+            asm.jmp_offset(zero_slot + 5)
+            asm.patch_jump(zero_slot, stub)
+        }
+        self.slot_reg = Vec()
+        self.saved_regs = Vec()
+        self.saved_cells = Vec()
         return true
+    }
+
+    // Chooses the locals that live in registers (r12 to r15, which nothing else in the generated code uses): the scalar
+    // locals that are only written by `let`s, assignments, loops and parameters, never addressed, and used most. Each
+    // gets a frame cell that saves the caller's value of its register.
+    fun assign_registers(mut self, asm: &mut x64::Asm, count: u64) {
+        self.slot_reg = Vec()
+        self.saved_regs = Vec()
+        self.saved_cells = Vec()
+        when self.no_opt {
+            return
+        }
+        mut slot: u64 = 0
+        while slot < count {
+            self.slot_reg.push(0)
+            slot += 1
+        }
+        mut chosen: u64 = 0
+        while chosen < 4 {
+            mut best: u64 = 0
+            mut best_weight: u64 = 3
+            slot = 0
+            while slot < count && slot < self.def_seen.len() {
+                when self.def_seen[slot] && !self.def_noreg[slot] && !self.def_addressed[slot] && self.slot_reg[slot] == 0 && self.def_weight[slot] > best_weight && !self.is_constant_slot(slot) {
+                    best = slot + 1
+                    best_weight = self.def_weight[slot]
+                }
+                slot += 1
+            }
+            when best == 0 {
+                return
+            }
+            register := 12 + chosen
+            cell := self.scratch(1)
+            self.slot_reg.set(best - 1, register)
+            self.saved_regs.push(register)
+            self.saved_cells.push(cell)
+            asm.store(8, register, x64::Reg::RBP, slot_disp(cell))
+            chosen += 1
+        }
+    }
+
+    // Whether a local is a constant for the whole function: defined once, by a `let` of a constant, and written no other way.
+    fun is_constant_slot(mut self, slot: u64) -> bool {
+        when slot >= self.def_count.len() || self.def_count[slot] != 1 || self.def_bad[slot] {
+            return false
+        }
+        return self.const_value(self.def_init[slot] - 1).is_some()
+    }
+
+    // The register that holds local `slot`, or 0.
+    fun reg_of(self, slot: u64) -> u64 {
+        when slot < self.slot_reg.len() && self.in_function && !self.inline_active {
+            return self.slot_reg[slot]
+        }
+        return 0
+    }
+
+    // The register of the local that expression `index` reads, or 0 when it is not a local in a register.
+    fun operand_reg(self, index: u64) -> u64 {
+        when self.no_opt || self.slot_reg.len() == 0 {
+            return 0
+        }
+        slot := choose self.program.exprs[index] {
+            ir::IrExpr::LocalRef(slot, ty, span) => Option::Some(slot),
+            _ => Option::None,
+        }
+        when slot.is_none() {
+            return 0
+        }
+        return self.reg_of(slot.unwrap())
+    }
+
+    // Reads the 8 bytes of cell `slot` into `dst`: from its register when it has one.
+    fun load_slot(mut self, asm: &mut x64::Asm, dst: u64, slot: u64) {
+        register := self.reg_of(slot)
+        when register != 0 {
+            asm.mov_rr(dst, register)
+        } else {
+            asm.load(8, false, dst, x64::Reg::RBP, slot_disp(slot))
+        }
+    }
+
+    // Writes `size` bytes of `source` to the frame cell of local `slot`, unless the local lives in a register: nothing reads the
+    // cell then, so it is not written (with RYN_REGPOISON it gets a marker, to prove that nothing reads it).
+    fun write_cell(mut self, asm: &mut x64::Asm, size: u64, source: u64, slot: u64, held: u64) {
+        when held != 0 {
+            when self.poison {
+                asm.mov_ri(x64::Reg::R10, 6510615555426900570)
+                asm.store(8, x64::Reg::R10, x64::Reg::RBP, slot_disp(slot))
+            }
+            return
+        }
+        asm.store(size, source, x64::Reg::RBP, slot_disp(slot))
+    }
+
+    // Writes rax to the 8 bytes of cell `slot`, and to its register.
+    fun store_slot(mut self, asm: &mut x64::Asm, slot: u64) {
+        self.write_cell(asm, 8, x64::Reg::RAX, slot, self.reg_of(slot))
+        register := self.reg_of(slot)
+        when register != 0 {
+            asm.mov_rr(register, x64::Reg::RAX)
+        }
+    }
+
+    // The end of a function: the caller's registers are restored, and the frame is left.
+    fun leave(mut self, asm: &mut x64::Asm) {
+        mut at: u64 = 0
+        while at < self.saved_regs.len() {
+            asm.load(8, false, self.saved_regs[at], x64::Reg::RBP, slot_disp(self.saved_cells[at]))
+            at += 1
+        }
+        asm.leave()
+        asm.ret()
+    }
+
+    // Zeroes the `bytes` of the frame from rsp, using only rax, r10 and r11 (and rdi and rcx, saved around `rep stosb`): the
+    // argument registers are live.
+    fun zero_frame(mut self, asm: &mut x64::Asm, bytes: u64) {
+        asm.mov_rr(x64::Reg::R10, x64::Reg::RSP)
+        asm.mov_ri(x64::Reg::RAX, 0)
+        asm.mov_ri(x64::Reg::R11, bytes)
+        // A frame of at most 256 bytes is zeroed by a counted loop of qword stores: the fixed startup cost of `rep stosb`
+        // dominates a frame of a few cells. A larger frame keeps `rep stosb`.
+        done := asm.new_label()
+        top := asm.new_label()
+        wide := asm.new_label()
+        when bytes > 256 {
+            asm.jmp(wide)
+        }
+        when bytes == 0 {
+            asm.jmp(done)
+        }
+        asm.bind(top)
+        asm.store(8, x64::Reg::RAX, x64::Reg::R10, 0)
+        asm.alu_ri(0, x64::Reg::R10, 8)
+        asm.alu_ri(5, x64::Reg::R11, 8)
+        asm.jcc(x64::Cc::NOT_EQUAL, top)
+        asm.jmp(done)
+        asm.bind(wide)
+        asm.push(x64::Reg::RDI)
+        asm.push(x64::Reg::RCX)
+        asm.mov_rr(x64::Reg::RDI, x64::Reg::R10)
+        asm.mov_rr(x64::Reg::RCX, x64::Reg::R11)
+        asm.rep_stosb()
+        asm.pop(x64::Reg::RCX)
+        asm.pop(x64::Reg::RDI)
+        asm.bind(done)
     }
 
     fun body(mut self, asm: &mut x64::Asm, statements: Vec<u64>) -> bool {
@@ -1639,6 +1969,10 @@ extend Gen {
         self.def_bad = Vec()
         self.def_addressed = Vec()
         self.def_reads = Vec()
+        self.def_weight = Vec()
+        self.def_seen = Vec()
+        self.def_noreg = Vec()
+        self.scan_depth = 0
         when self.no_opt {
             return
         }
@@ -1647,6 +1981,9 @@ extend Gen {
             self.def_count.push(0)
             self.def_init.push(0)
             self.def_reads.push(0)
+            self.def_weight.push(0)
+            self.def_seen.push(false)
+            self.def_noreg.push(slot < addressed.len() && addressed[slot].is_some())
             self.def_addressed.push(slot < addressed.len() && addressed[slot].is_some())
             self.def_bad.push(slot < addressed.len() && addressed[slot].is_some())
             slot += 1
@@ -1654,6 +1991,7 @@ extend Gen {
         mut pair: u64 = 0
         while pair < parameters.len() / 2 {
             self.def_bad_slot(parameters[pair * 2])
+            self.note_target(parameters[pair * 2], parameters[pair * 2 + 1])
             pair += 1
         }
         self.scan_statements(statements)
@@ -1675,8 +2013,8 @@ extend Gen {
     fun scan_statement(mut self, index: u64) -> bool {
         return choose self.program.stmts[index] {
             ir::IrStmt::BlockStmt(body) => self.scan_statements(body),
-            ir::IrStmt::LetStmt(slot, ty, value, span) => self.scan_let(slot, value),
-            ir::IrStmt::AssignStmt(slot, ty, value, span) => self.scan_write(slot, value, value),
+            ir::IrStmt::LetStmt(slot, ty, value, span) => self.scan_let(slot, ty, value),
+            ir::IrStmt::AssignStmt(slot, ty, value, span) => self.scan_assign(slot, ty, value),
             ir::IrStmt::ArrayAssignStmt(slot, element, length, at, value, span) => self.scan_write(slot, at, value),
             ir::IrStmt::DereferenceAssignStmt(pointer, ty, value) => self.scan_two(pointer, value),
             ir::IrStmt::FieldAssignStmt(slot, ty, value) => self.scan_write(slot, value, value),
@@ -1685,14 +2023,15 @@ extend Gen {
             ir::IrStmt::PrintTemplateStmt(parts) => self.scan_parts(parts),
             ir::IrStmt::CallStmt(target, arguments) => self.scan_expressions(arguments),
             ir::IrStmt::IfStmt(condition, then_body, else_body) => self.scan_branches(condition, then_body, else_body),
-            ir::IrStmt::WhileStmt(setup, condition, body) => self.scan_branches(condition, setup, body),
-            ir::IrStmt::ForStmt(slot, end_slot, ty, start, end, inclusive, body) => self.scan_for(slot, end_slot, start, end, body),
+            ir::IrStmt::WhileStmt(setup, condition, body) => self.scan_loop(condition, setup, body),
+            ir::IrStmt::ForStmt(slot, end_slot, ty, start, end, inclusive, body) => self.scan_for(slot, end_slot, ty, start, end, body),
             ir::IrStmt::ReturnStmt(value) => self.scan_optional(value),
             _ => true,
         }
     }
 
-    fun scan_let(mut self, slot: u64, value: u64) -> bool {
+    fun scan_let(mut self, slot: u64, ty: u64, value: u64) -> bool {
+        self.note_target(slot, ty)
         when slot < self.def_count.len() {
             self.def_count.set(slot, self.def_count[slot] + 1)
             self.def_init.set(slot, value + 1)
@@ -1703,6 +2042,7 @@ extend Gen {
     // A write of `slot`; `first` and `second` are the expressions it evaluates (the same one twice is scanned twice).
     fun scan_write(mut self, slot: u64, first: u64, second: u64) -> bool {
         self.def_bad_slot(slot)
+        self.no_register(slot, 1)
         self.scan_expression(first)
         when second != first {
             self.scan_expression(second)
@@ -1740,11 +2080,77 @@ extend Gen {
         return self.scan_statements(second)
     }
 
-    fun scan_for(mut self, slot: u64, end_slot: u64, start: u64, end: u64, body: Vec<u64>) -> bool {
+    fun scan_for(mut self, slot: u64, end_slot: u64, ty: u64, start: u64, end: u64, body: Vec<u64>) -> bool {
         self.def_bad_slot(slot)
         self.def_bad_slot(end_slot)
         self.scan_two(start, end)
-        return self.scan_statements(body)
+        self.scan_depth += 1
+        // The counter and the bound are read, and the counter written, in every iteration.
+        self.note_target(slot, ty)
+        self.note_target(slot, ty)
+        self.note_target(end_slot, ty)
+        self.scan_statements(body)
+        self.scan_depth -= 1
+        return true
+    }
+
+    fun scan_assign(mut self, slot: u64, ty: u64, value: u64) -> bool {
+        self.note_target(slot, ty)
+        return self.scan_write_value(slot, value)
+    }
+
+    fun scan_write_value(mut self, slot: u64, value: u64) -> bool {
+        self.def_bad_slot(slot)
+        return self.scan_expression(value)
+    }
+
+    // A `while`: its condition, setup and body run once per iteration.
+    fun scan_loop(mut self, condition: u64, setup: Vec<u64>, body: Vec<u64>) -> bool {
+        self.scan_depth += 1
+        self.scan_expression(condition)
+        self.scan_statements(setup)
+        self.scan_statements(body)
+        self.scan_depth -= 1
+        return true
+    }
+
+    // How much one use of a local weighs: 1 outside a loop, 8 inside one, 64 inside two (and no more than that).
+    fun use_weight(self) -> u64 {
+        mut weight: u64 = 1
+        mut level: u64 = 0
+        while level < self.scan_depth && level < 3 {
+            weight = weight * 8
+            level += 1
+        }
+        return weight
+    }
+
+    // `slot` is the target of a `let`, an assignment, a loop or a parameter of type `ty`. A scalar target is a candidate for
+    // a register; any other type takes its cells (the cells of a structure are written by field, not as a scalar).
+    fun note_target(mut self, slot: u64, ty: u64) {
+        when slot >= self.def_noreg.len() {
+            return
+        }
+        when self.plain_word(ty) && self.value_width(ty) <= 8 && !self.is_float(ty) {
+            self.def_seen.set(slot, true)
+            self.def_weight.set(slot, self.def_weight[slot] + self.use_weight())
+        } else {
+            mut cells := self.cells_of(ty)
+            when cells == 0 {
+                cells = 1
+            }
+            self.no_register(slot, cells)
+        }
+    }
+
+    fun no_register(mut self, slot: u64, cells: u64) {
+        mut at: u64 = 0
+        while at < cells {
+            when slot + at < self.def_noreg.len() {
+                self.def_noreg.set(slot + at, true)
+            }
+            at += 1
+        }
     }
 
     fun scan_expressions(mut self, values: Vec<u64>) -> bool {
@@ -1789,6 +2195,7 @@ extend Gen {
     fun scan_read(mut self, slot: u64) -> bool {
         when slot < self.def_reads.len() {
             self.def_reads.set(slot, self.def_reads[slot] + 1)
+            self.def_weight.set(slot, self.def_weight[slot] + self.use_weight())
         }
         return true
     }
@@ -1815,12 +2222,18 @@ extend Gen {
         }
         return choose self.program.exprs[index] {
             ir::IrExpr::LocalRef(slot, ty, span) => self.is_stable_local(slot, ty),
-            ir::IrExpr::Binary(op, left, right, ty) => op != "Div" && op != "Rem" && self.plain_word(ty) && self.cannot_fail(left) && self.cannot_fail(right),
+            ir::IrExpr::Binary(op, left, right, ty) => (op != "Div" && op != "Rem" || self.nonzero_constant(right)) && self.plain_word(ty) && self.cannot_fail(left) && self.cannot_fail(right),
             ir::IrExpr::Negate(value, ty) => self.plain_word(ty) && self.cannot_fail(value),
             ir::IrExpr::Not(value) => self.cannot_fail(value),
             ir::IrExpr::BitNot(value, ty) => self.plain_word(ty) && self.cannot_fail(value),
             _ => false,
         }
+    }
+
+    // Whether an expression is a constant other than zero: dividing by it cannot fail.
+    fun nonzero_constant(mut self, index: u64) -> bool {
+        known := self.const_value(index)
+        return known.is_some() && known.unwrap() != 0
     }
 
     fun plain_word(self, ty: u64) -> bool {
@@ -1830,6 +2243,7 @@ extend Gen {
 
     fun scan_address(mut self, slot: u64) -> bool {
         self.def_bad_slot(slot)
+        self.no_register(slot, 1)
         return true
     }
 
@@ -1850,6 +2264,7 @@ extend Gen {
             mut at: u64 = 0
             while at < self.program.arms[arm].bindings.len() {
                 self.def_bad_slot(self.program.arms[arm].bindings[at])
+                self.no_register(self.program.arms[arm].bindings[at], 1)
                 at += 3
             }
             self.scan_expression(self.program.arms[arm].body)
@@ -1877,8 +2292,8 @@ extend Gen {
         return choose self.program.stmts[index] {
             ir::IrStmt::BlockStmt(body) => self.body(asm, body),
             ir::IrStmt::DropStmt(slots, types) => self.drops(asm, slots, types),
-            ir::IrStmt::LetStmt(slot, ty, value, span) => self.let_statement(asm, value, slot, ty),
-            ir::IrStmt::AssignStmt(slot, ty, value, span) => self.assign_value(asm, value, slot, ty),
+            ir::IrStmt::LetStmt(slot, ty, value, span) => self.let_statement(asm, value, self.stmt_slot(slot), ty),
+            ir::IrStmt::AssignStmt(slot, ty, value, span) => self.assign_value(asm, value, self.stmt_slot(slot), ty),
             ir::IrStmt::PrintStmt(value, ty) => self.echo_statement(asm, value, ty),
             ir::IrStmt::PrintTemplateStmt(parts) => self.template(asm, parts),
             ir::IrStmt::CallStmt(target, arguments) => self.call_statement(asm, target, arguments),
@@ -3182,6 +3597,32 @@ extend Gen {
 
     // The routines of the freestanding runtime, with the text `strerror` gives for the common errors.
     // The zero-filled bytes only a Windows image has: the exception handler's state.
+    // The mode, the length and the bytes of the standard output buffer.
+    fun stdout_state_size(self) -> u64 {
+        when !self.windows && !self.no_opt {
+            return 65552
+        }
+        return 0
+    }
+
+    // Writes out what standard output holds, when it is buffered. Keeps rdi, rsi and rdx.
+    fun flush_stdout(self, asm: &mut x64::Asm) {
+        when self.buffered {
+            asm.call_label(self.flush_label)
+        }
+    }
+
+    // Writes the bytes at rsi, of length rdx, to standard output: into the buffer, or at once.
+    fun write_stdout(self, asm: &mut x64::Asm) {
+        when self.buffered {
+            asm.call_label(self.write_label)
+            return
+        }
+        asm.mov_ri(x64::Reg::RDI, 1)
+        asm.mov_ri(x64::Reg::RAX, 1)
+        asm.syscall()
+    }
+
     fun windows_state_size(self) -> u64 {
         when self.windows {
             return 16
@@ -3521,9 +3962,7 @@ extend Gen {
         asm.alu_ri(5, x64::Reg::RSP, 8)
         self.encode_char(asm)
         asm.mov_rr(x64::Reg::RSI, x64::Reg::RSP)
-        asm.mov_ri(x64::Reg::RDI, 1)
-        asm.mov_ri(x64::Reg::RAX, 1)
-        asm.syscall()
+        self.write_stdout(asm)
         asm.alu_ri(0, x64::Reg::RSP, 8)
     }
 
@@ -3940,17 +4379,22 @@ extend Gen {
             }
             return self.body(asm, else_body)
         }
-        when !self.expr(asm, condition) {
-            return false
+        selected := self.select_assignment(asm, condition, then_body.clone(), else_body.clone())
+        when selected.is_some() {
+            return selected.unwrap()
         }
         otherwise := asm.new_label()
         end := asm.new_label()
-        asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
-        asm.jcc(x64::Cc::EQUAL, otherwise)
-        when !self.body(asm, then_body) {
+        when !self.branch(asm, condition, otherwise, false) {
             return false
         }
-        asm.jmp(end)
+        when !self.body(asm, then_body.clone()) {
+            return false
+        }
+        // A `then` that ends in `return`, `break` or `continue`, and an absent `else`, need no jump over the `else`.
+        when self.no_opt || !(self.is_empty_body(else_body.clone()) || self.ends_in_leave(then_body.clone())) {
+            asm.jmp(end)
+        }
         asm.bind(otherwise)
         when !self.body(asm, else_body) {
             return false
@@ -3959,18 +4403,414 @@ extend Gen {
         return true
     }
 
-    fun while_statement(mut self, asm: &mut x64::Asm, setup: Vec<u64>, condition: u64, body: Vec<u64>) -> bool {
-        top := asm.new_label()
-        end := asm.new_label()
-        asm.bind(top)
-        when !self.body(asm, setup) {
+    // The one assignment of a list of statements (the empty drops of its scopes do not count), or None.
+    fun single_assignment(self, statements: Vec<u64>) -> Option<u64> {
+        mut found: Option<u64> = Option::None
+        for statement in statements {
+            assigns := choose self.program.stmts[statement] {
+                ir::IrStmt::AssignStmt(slot, ty, value, span) => true,
+                _ => false,
+            }
+            empty := choose self.program.stmts[statement] {
+                ir::IrStmt::DropStmt(slots, types) => slots.len() == 0,
+                _ => false,
+            }
+            when assigns {
+                when found.is_some() {
+                    return Option::None
+                }
+                found = Option::Some(statement)
+            } else when !empty {
+                return Option::None
+            }
+        }
+        return found
+    }
+
+    // The number of nodes of an integer expression of constants, locals and operators, or 99 for any other expression.
+    fun expression_nodes(self, index: u64) -> u64 {
+        return choose self.program.exprs[index] {
+            ir::IrExpr::IntegerLit(text, ty) => 1,
+            ir::IrExpr::BoolLit(value) => 1,
+            ir::IrExpr::CharLit(scalar) => 1,
+            ir::IrExpr::LocalRef(slot, ty, span) => 1,
+            ir::IrExpr::Binary(op, left, right, ty) => 1 + self.expression_nodes(left) + self.expression_nodes(right),
+            ir::IrExpr::Negate(value, ty) => 1 + self.expression_nodes(value),
+            ir::IrExpr::Not(value) => 1 + self.expression_nodes(value),
+            ir::IrExpr::BitNot(value, ty) => 1 + self.expression_nodes(value),
+            _ => 99,
+        }
+    }
+
+    // `when c { x = a } else { x = b }` (or with no `else`) of an integer local, where `c` is a comparison and `a`, `b` and the
+    // operands of `c` are small expressions that cannot fail: both values are computed (r9 and r8), and a conditional move
+    // picks one, so that a condition that is hard to predict costs no mispredicted jump. None when it is not that shape.
+    fun select_assignment(mut self, asm: &mut x64::Asm, condition: u64, then_body: Vec<u64>, else_body: Vec<u64>) -> Option<bool> {
+        when self.no_opt || self.inline_active {
+            return Option::None
+        }
+        then_assign := self.single_assignment(then_body)
+        when then_assign.is_none() {
+            return Option::None
+        }
+        else_assign := self.single_assignment(else_body.clone())
+        when else_assign.is_none() && !self.is_empty_body(else_body) {
+            return Option::None
+        }
+        slot := choose self.program.stmts[then_assign.unwrap()] {
+            ir::IrStmt::AssignStmt(slot, ty, value, span) => slot,
+            _ => 0,
+        }
+        ty := choose self.program.stmts[then_assign.unwrap()] {
+            ir::IrStmt::AssignStmt(slot, ty, value, span) => ty,
+            _ => 0,
+        }
+        then_value := choose self.program.stmts[then_assign.unwrap()] {
+            ir::IrStmt::AssignStmt(slot, ty, value, span) => value,
+            _ => 0,
+        }
+        mut else_value: u64 = 0
+        when else_assign.is_some() {
+            else_slot := choose self.program.stmts[else_assign.unwrap()] {
+                ir::IrStmt::AssignStmt(slot, ty, value, span) => slot,
+                _ => 0,
+            }
+            else_value = choose self.program.stmts[else_assign.unwrap()] {
+                ir::IrStmt::AssignStmt(slot, ty, value, span) => value,
+                _ => 0,
+            }
+            when else_slot != slot {
+                return Option::None
+            }
+        }
+        word := self.word(ty)
+        when !(is_integer_word(word.clone()) || word == "Bool" || word == "Char") || width_of(word.clone()) == 0 || self.is_float(ty) {
+            return Option::None
+        }
+        when !self.is_stable_local(slot, ty) || !self.cannot_fail(then_value) || self.expression_nodes(then_value) > 7 {
+            return Option::None
+        }
+        when else_assign.is_some() && (!self.cannot_fail(else_value) || self.expression_nodes(else_value) > 7) {
+            return Option::None
+        }
+        op := choose self.program.exprs[condition] {
+            ir::IrExpr::Binary(op, left, right, cty) => op,
+            _ => String(""),
+        }
+        left := choose self.program.exprs[condition] {
+            ir::IrExpr::Binary(op, left, right, cty) => left,
+            _ => 0,
+        }
+        right := choose self.program.exprs[condition] {
+            ir::IrExpr::Binary(op, left, right, cty) => right,
+            _ => 0,
+        }
+        compared := choose self.program.exprs[condition] {
+            ir::IrExpr::Binary(op, left, right, cty) => cty,
+            _ => 0,
+        }
+        when op != "Eq" && op != "Ne" && op != "Lt" && op != "Le" && op != "Gt" && op != "Ge" {
+            return Option::None
+        }
+        compared_word := self.word(compared)
+        when !(is_integer_word(compared_word.clone()) || compared_word == "Bool" || compared_word == "Char") || width_of(compared_word.clone()) == 0 || self.is_float(compared) {
+            return Option::None
+        }
+        when !self.cannot_fail(left) || !self.cannot_fail(right) || self.expression_nodes(left) > 7 || self.expression_nodes(right) > 7 {
+            return Option::None
+        }
+        // What the local holds when the condition is false: the `else` value, or its present value.
+        when else_assign.is_some() {
+            when !self.expr(asm, else_value) {
+                return Option::Some(false)
+            }
+        } else {
+            when !self.local(asm, slot, ty) {
+                return Option::Some(false)
+            }
+        }
+        asm.mov_rr(x64::Reg::R8, x64::Reg::RAX)
+        when !self.expr(asm, then_value) {
+            return Option::Some(false)
+        }
+        asm.mov_rr(x64::Reg::R9, x64::Reg::RAX)
+        when !self.compare_flags(asm, op.clone(), left, right) {
+            return Option::Some(false)
+        }
+        asm.cmov(comparison_condition(op, is_signed_word(compared_word)), x64::Reg::R8, x64::Reg::R9)
+        asm.mov_rr(x64::Reg::RAX, x64::Reg::R8)
+        register := self.reg_of(slot)
+        when register != 0 {
+            self.write_cell(asm, 8, x64::Reg::RAX, slot, register)
+            asm.mov_rr(register, x64::Reg::RAX)
+        } else {
+            self.store_cell(asm, ty, x64::Reg::RAX, x64::Reg::RBP, slot_disp(slot))
+        }
+        return Option::Some(true)
+    }
+
+    // Whether a list of statements generates nothing: it has no statement, or only blocks of such lists.
+    fun is_empty_body(self, statements: Vec<u64>) -> bool {
+        for statement in statements {
+            nested := choose self.program.stmts[statement] {
+                ir::IrStmt::BlockStmt(inner) => Option::Some(inner),
+                _ => Option::None,
+            }
+            when nested.is_none() || !self.is_empty_body(nested.unwrap()) {
+                return false
+            }
+        }
+        return true
+    }
+
+    // Whether the last statement of a list is a `return`, `break` or `continue`, so that control never falls off its end.
+    fun ends_in_leave(self, statements: Vec<u64>) -> bool {
+        when statements.len() == 0 {
             return false
+        }
+        return self.leaves_the_list(statements[statements.len() - 1])
+    }
+
+    // Jumps to `target` when the condition is `when_true` (or false, when it is not), and falls through otherwise. A
+    // comparison of integers is one `cmp` and one conditional jump; `!`, `&&` and `||` become jumps; anything else is
+    // evaluated to a bool and tested.
+    fun branch(mut self, asm: &mut x64::Asm, condition: u64, target: u64, when_true: bool) -> bool {
+        when !self.no_opt {
+            known := self.const_value(condition)
+            when known.is_some() {
+                when (known.unwrap() != 0) == when_true {
+                    asm.jmp(target)
+                }
+                return true
+            }
+            fused := self.branch_fused(asm, condition, target, when_true)
+            when fused.is_some() {
+                return fused.unwrap()
+            }
         }
         when !self.expr(asm, condition) {
             return false
         }
         asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
-        asm.jcc(x64::Cc::EQUAL, end)
+        when when_true {
+            asm.jcc(x64::Cc::NOT_EQUAL, target)
+        } else {
+            asm.jcc(x64::Cc::EQUAL, target)
+        }
+        return true
+    }
+
+    // `branch` for the conditions that need no bool: `None` for any other.
+    fun branch_fused(mut self, asm: &mut x64::Asm, condition: u64, target: u64, when_true: bool) -> Option<bool> {
+        negated := choose self.program.exprs[condition] {
+            ir::IrExpr::Not(inner) => Option::Some(inner),
+            _ => Option::None,
+        }
+        when negated.is_some() {
+            return Option::Some(self.branch(asm, negated.unwrap(), target, !when_true))
+        }
+        op := choose self.program.exprs[condition] {
+            ir::IrExpr::Binary(op, left, right, ty) => op,
+            _ => String(""),
+        }
+        left := choose self.program.exprs[condition] {
+            ir::IrExpr::Binary(op, left, right, ty) => left,
+            _ => 0,
+        }
+        right := choose self.program.exprs[condition] {
+            ir::IrExpr::Binary(op, left, right, ty) => right,
+            _ => 0,
+        }
+        ty := choose self.program.exprs[condition] {
+            ir::IrExpr::Binary(op, left, right, ty) => ty,
+            _ => 0,
+        }
+        when op == "And" || op == "Or" {
+            // `a && b` jumps when false, and `a || b` jumps when true, as soon as either side decides it.
+            when (op == "And") == !when_true {
+                when !self.branch(asm, left, target, when_true) {
+                    return Option::Some(false)
+                }
+                return Option::Some(self.branch(asm, right, target, when_true))
+            }
+            skip := asm.new_label()
+            when !self.branch(asm, left, skip, !when_true) {
+                return Option::Some(false)
+            }
+            ok := self.branch(asm, right, target, when_true)
+            asm.bind(skip)
+            return Option::Some(ok)
+        }
+        when op != "Eq" && op != "Ne" && op != "Lt" && op != "Le" && op != "Gt" && op != "Ge" {
+            return Option::None
+        }
+        word := self.word(ty)
+        when !(is_integer_word(word.clone()) || word == "Bool" || word == "Char") || width_of(word.clone()) == 0 {
+            return Option::None
+        }
+        when self.is_float(ty) || self.struct_of(ty).is_some() || self.is_string(ty) || self.is_str(ty) || self.is_raw_pointer(ty) {
+            return Option::None
+        }
+        when !self.compare_flags(asm, op.clone(), left, right) {
+            return Option::Some(false)
+        }
+        condition_code := comparison_condition(op, is_signed_word(word))
+        when when_true {
+            asm.jcc(condition_code, target)
+        } else {
+            asm.jcc(inverse_condition(condition_code), target)
+        }
+        return Option::Some(true)
+    }
+
+    // `test` of the bits that `value` keeps when it is `x & mask` or `x % 2^k` (mask or 2^k a constant that fits an immediate):
+    // sets the zero flag when they are all clear. None when `value` is not one of these.
+    fun low_bits_test(mut self, asm: &mut x64::Asm, value: u64) -> Option<bool> {
+        op := choose self.program.exprs[value] {
+            ir::IrExpr::Binary(op, left, right, ty) => op,
+            _ => String(""),
+        }
+        operand := choose self.program.exprs[value] {
+            ir::IrExpr::Binary(op, left, right, ty) => left,
+            _ => 0,
+        }
+        constant := choose self.program.exprs[value] {
+            ir::IrExpr::Binary(op, left, right, ty) => right,
+            _ => 0,
+        }
+        ty := choose self.program.exprs[value] {
+            ir::IrExpr::Binary(op, left, right, bty) => bty,
+            _ => 0,
+        }
+        when op != "BitAnd" && op != "Rem" {
+            return Option::None
+        }
+        word := self.word(ty)
+        when !is_integer_word(word.clone()) || self.is_float(ty) {
+            return Option::None
+        }
+        known := self.const_value(constant)
+        when known.is_none() {
+            return Option::None
+        }
+        mut mask: u64 = known.unwrap()
+        when op == "Rem" {
+            // x % 2^k is zero exactly when the low k bits are: for a signed x too.
+            when mask < 2 || power_exponent(mask) == 64 {
+                return Option::None
+            }
+            mask = mask - 1
+        }
+        when mask == 0 || mask > 2147483647 {
+            return Option::None
+        }
+        register := self.operand_reg(operand)
+        when register != 0 {
+            asm.test_ri(register, mask as i64)
+            return Option::Some(true)
+        }
+        when !self.expr(asm, operand) {
+            return Option::Some(false)
+        }
+        asm.test_ri(x64::Reg::RAX, mask as i64)
+        return Option::Some(true)
+    }
+
+    // Leaves the flags of `left cmp right` set, without making a bool of them. A local in a register is compared in place.
+    fun compare_flags(mut self, asm: &mut x64::Asm, op: String, left: u64, right: u64) -> bool {
+        left_register := self.operand_reg(left)
+        immediate := self.immediate_operand(op.clone(), right)
+        // `x & mask` or `x % 2^k` against zero (equal or not) is one `test`: the flags of the bits are the answer.
+        when immediate.is_some() && immediate.unwrap() == 0 && (op == "Eq" || op == "Ne") {
+            tested := self.low_bits_test(asm, left)
+            when tested.is_some() {
+                return tested.unwrap()
+            }
+        }
+        when immediate.is_some() {
+            when left_register != 0 {
+                asm.alu_ri(7, left_register, immediate.unwrap() as i64)
+                return true
+            }
+            when !self.expr(asm, left) {
+                return false
+            }
+            asm.alu_ri(7, x64::Reg::RAX, immediate.unwrap() as i64)
+            return true
+        }
+        mut right_register := self.operand_reg(right)
+        when left_register != 0 && (right_register != 0 || self.is_stable_operand(right)) {
+            when right_register == 0 {
+                self.load_stable_operand(asm, right, x64::Reg::RCX)
+                right_register = x64::Reg::RCX
+            }
+            asm.alu_rr(57, left_register, right_register)
+            return true
+        }
+        when self.is_stable_operand(left) && !self.is_stable_operand(right) {
+            when !self.expr(asm, right) {
+                return false
+            }
+            asm.mov_rr(x64::Reg::RCX, x64::Reg::RAX)
+            self.load_stable_operand(asm, left, x64::Reg::RAX)
+            asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RCX)
+            return true
+        }
+        when !self.expr(asm, left) {
+            return false
+        }
+        when !self.is_stable_operand(right) {
+            asm.push(x64::Reg::RAX)
+            when !self.expr(asm, right) {
+                return false
+            }
+            asm.mov_rr(x64::Reg::RCX, x64::Reg::RAX)
+            asm.pop(x64::Reg::RAX)
+            asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RCX)
+            return true
+        }
+        when right_register != 0 {
+            asm.alu_rr(57, x64::Reg::RAX, right_register)
+        } else {
+            self.load_stable_operand(asm, right, x64::Reg::RCX)
+            asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RCX)
+        }
+        return true
+    }
+
+    fun while_statement(mut self, asm: &mut x64::Asm, setup: Vec<u64>, condition: u64, body: Vec<u64>) -> bool {
+        top := asm.new_label()
+        end := asm.new_label()
+        // The test is at the bottom, so that an iteration takes one jump, not two: the loop is entered by a jump to the test.
+        when !self.no_opt {
+            start := asm.new_label()
+            asm.jmp(top)
+            asm.bind(start)
+            self.breaks.push(end)
+            self.continues.push(top)
+            let_ok := self.body(asm, body)
+            self.breaks.pop()
+            self.continues.pop()
+            when !let_ok {
+                return false
+            }
+            asm.bind(top)
+            when !self.body(asm, setup) {
+                return false
+            }
+            when !self.branch(asm, condition, start, true) {
+                return false
+            }
+            asm.bind(end)
+            return true
+        }
+        asm.bind(top)
+        when !self.body(asm, setup) {
+            return false
+        }
+        when !self.branch(asm, condition, end, false) {
+            return false
+        }
         self.breaks.push(end)
         self.continues.push(top)
         let_ok := self.body(asm, body)
@@ -3990,11 +4830,11 @@ extend Gen {
         when !self.expr(asm, start) {
             return false
         }
-        asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(slot))
+        self.store_slot(asm, slot)
         when !self.expr(asm, end) {
             return false
         }
-        asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(end_slot))
+        self.store_slot(asm, end_slot)
         signed := is_signed_word(self.word(ty))
         mut stays: u64 = x64::Cc::BELOW_EQUAL
         when signed {
@@ -4009,9 +4849,38 @@ extend Gen {
         top := asm.new_label()
         step := asm.new_label()
         end_label := asm.new_label()
+        // The test is at the bottom (see `while_statement`); the loop is entered by a jump to it.
+        when !self.no_opt {
+            body_top := asm.new_label()
+            asm.jmp(top)
+            asm.bind(body_top)
+            self.breaks.push(end_label)
+            self.continues.push(step)
+            let_ok := self.body(asm, body)
+            self.breaks.pop()
+            self.continues.pop()
+            when !let_ok {
+                return false
+            }
+            asm.bind(step)
+            // `..=` ends after the iteration that reaches `end`, before the counter would step past it.
+            when inclusive {
+                self.compare_slots(asm, slot, end_slot)
+                asm.jcc(x64::Cc::EQUAL, end_label)
+            }
+            self.load_slot(asm, x64::Reg::RAX, slot)
+            asm.alu_ri(0, x64::Reg::RAX, 1)
+            self.normalize(asm, self.word(ty))
+            self.store_slot(asm, slot)
+            asm.bind(top)
+            self.compare_slots(asm, slot, end_slot)
+            asm.jcc(stays, body_top)
+            asm.bind(end_label)
+            return true
+        }
         asm.bind(top)
-        asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, slot_disp(slot))
-        asm.load(8, false, x64::Reg::RCX, x64::Reg::RBP, slot_disp(end_slot))
+        self.load_slot(asm, x64::Reg::RAX, slot)
+        self.load_slot(asm, x64::Reg::RCX, end_slot)
         asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RCX)
         asm.jcc(negated_condition(stays), end_label)
         self.breaks.push(end_label)
@@ -4023,21 +4892,33 @@ extend Gen {
             return false
         }
         asm.bind(step)
-        // `..=` ends after the iteration that reaches `end`, before the counter would step past it.
         when inclusive {
-            asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, slot_disp(slot))
-            asm.load(8, false, x64::Reg::RCX, x64::Reg::RBP, slot_disp(end_slot))
+            self.load_slot(asm, x64::Reg::RAX, slot)
+            self.load_slot(asm, x64::Reg::RCX, end_slot)
             asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RCX)
             asm.jcc(x64::Cc::EQUAL, end_label)
         }
-        asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, slot_disp(slot))
+        self.load_slot(asm, x64::Reg::RAX, slot)
         asm.alu_ri(0, x64::Reg::RAX, 1)
         step_word := self.word(ty)
         self.normalize(asm, step_word)
-        asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(slot))
+        self.store_slot(asm, slot)
         asm.jmp(top)
         asm.bind(end_label)
         return true
+    }
+
+    // Sets the flags of the 8 bytes of cell `a` against those of cell `b`, from registers when they have them.
+    fun compare_slots(mut self, asm: &mut x64::Asm, a: u64, b: u64) {
+        first := self.reg_of(a)
+        second := self.reg_of(b)
+        when first != 0 && second != 0 {
+            asm.alu_rr(57, first, second)
+            return
+        }
+        self.load_slot(asm, x64::Reg::RAX, a)
+        self.load_slot(asm, x64::Reg::RCX, b)
+        asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RCX)
     }
 
     fun jump_to(mut self, asm: &mut x64::Asm, is_break: bool) -> bool {
@@ -4133,13 +5014,21 @@ extend Gen {
         while position > 0 {
             position -= 1
             asm.pop(x64::Reg::RAX)
-            asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(parameters[position * 2]))
+            self.store_slot(asm, parameters[position * 2])
         }
         asm.jmp(self.tail_label)
         return Option::Some(true)
     }
 
     fun return_statement(mut self, asm: &mut x64::Asm, value: Option<u64>) -> bool {
+        // In a body inlined as statements, a `return` leaves the body, not the function.
+        when self.inline_exits.len() > 0 {
+            when value.is_some() && !self.expr(asm, value.unwrap()) {
+                return false
+            }
+            asm.jmp(self.inline_exits[self.inline_exits.len() - 1])
+            return true
+        }
         when value.is_some() {
             tail := self.tail_call(asm, value.unwrap())
             when tail.is_some() {
@@ -4167,9 +5056,7 @@ extend Gen {
                 asm.pop(x64::Reg::RAX)
             }
         }
-        asm.mov_rr(x64::Reg::RSP, x64::Reg::RBP)
-        asm.pop(x64::Reg::RBP)
-        asm.ret()
+        self.leave(asm)
         return true
     }
 
@@ -4300,8 +5187,114 @@ extend Gen {
     // `std::math` builtins, which take their operands from `expr` as well. Nothing in the body is a destructor or a
     // structure, so no drop, move or borrow of the callee needs a frame of its own.
     fun inline_function(mut self, id: u64, count: u64) -> bool {
+        return self.inline_kind(id, count) != 0
+    }
+
+    // How a call of function `id` is inlined: 1 for a body that is one `return`, 2 for a small body of statements (`let`,
+    // assignment, `if` and `return` of scalars, with every path ending in a `return`), 0 for no inlining.
+    fun inline_kind(mut self, id: u64, count: u64) -> u64 {
+        when self.inline_kinds.len() == 0 {
+            mut at: u64 = 0
+            while at < self.program.functions.len() {
+                self.inline_kinds.push(9)
+                at += 1
+            }
+        }
+        when self.inline_kinds[id] != 9 {
+            return self.inline_kinds[id]
+        }
+        mut kind: u64 = 0
         self.inline_nodes = 0
-        return self.inline_callee(id, count)
+        self.inline_limit = 32
+        self.inline_locals = false
+        when self.inline_callee(id, count) {
+            kind = 1
+        } else when !self.no_opt && self.inline_statements_callee(id, count) {
+            kind = 2
+        }
+        self.inline_kinds.set(id, kind)
+        return kind
+    }
+
+    // The check of kind 2: scalar parameters (at most four) and locals (at most eight), no owned value and no address taken,
+    // and a body of at most 40 nodes whose every path returns a scalar.
+    fun inline_statements_callee(mut self, id: u64, count: u64) -> bool {
+        definition := self.program.functions[id]
+        when definition.external_symbol.is_some() || definition.return_type.is_none() || definition.statements.len() == 0 {
+            return false
+        }
+        when definition.parameters.len() / 2 != count || count > 4 || definition.local_types.len() > 8 {
+            return false
+        }
+        when !self.inline_cell_type(definition.return_type.unwrap()) {
+            return false
+        }
+        mut at: u64 = 0
+        while at < definition.parameters.len() / 2 {
+            when !self.inline_cell_type(definition.parameters[at * 2 + 1]) {
+                return false
+            }
+            at += 1
+        }
+        for owned in definition.owned_slot_types {
+            when owned.is_some() {
+                return false
+            }
+        }
+        for addressed in definition.addressed_slot_types {
+            when addressed.is_some() {
+                return false
+            }
+        }
+        self.inline_nodes = 0
+        self.inline_limit = 40
+        self.inline_locals = true
+        ok := self.inline_statements_ok(definition.statements.clone(), id) && self.always_returns(definition.statements.clone())
+        self.inline_locals = false
+        self.inline_limit = 32
+        return ok
+    }
+
+    fun inline_statements_ok(mut self, statements: Vec<u64>, function: u64) -> bool {
+        for statement in statements {
+            self.inline_nodes += 1
+            ok := choose self.program.stmts[statement] {
+                ir::IrStmt::LetStmt(slot, ty, value, span) => self.inline_cell_type(ty) && self.inline_ok(value, function),
+                ir::IrStmt::AssignStmt(slot, ty, value, span) => self.inline_cell_type(ty) && self.inline_ok(value, function),
+                ir::IrStmt::IfStmt(condition, then_body, else_body) => self.inline_ok(condition, function) && self.inline_statements_ok(then_body, function) && self.inline_statements_ok(else_body, function),
+                ir::IrStmt::ReturnStmt(value) => value.is_some() && self.inline_ok(value.unwrap(), function),
+                ir::IrStmt::DropStmt(slots, types) => slots.len() == 0,
+                _ => false,
+            }
+            when !ok {
+                return false
+            }
+        }
+        return true
+    }
+
+    // Whether every path through a list of statements ends in a `return` of a value.
+    fun always_returns(self, statements: Vec<u64>) -> bool {
+        // A scope that ends drops nothing here, so the empty drops after the last statement do not count.
+        mut last: u64 = statements.len()
+        while last > 0 {
+            empty_drop := choose self.program.stmts[statements[last - 1]] {
+                ir::IrStmt::DropStmt(slots, types) => slots.len() == 0,
+                _ => false,
+            }
+            when !empty_drop {
+                break
+            }
+            last -= 1
+        }
+        when last == 0 {
+            return false
+        }
+        return choose self.program.stmts[statements[last - 1]] {
+            ir::IrStmt::ReturnStmt(value) => value.is_some(),
+            ir::IrStmt::IfStmt(condition, then_body, else_body) => self.always_returns(then_body) && self.always_returns(else_body),
+            _ => false,
+        }
     }
 
     // The check of `inline_function` for function `id` and its body; a body that calls leaves is checked with them, and the
@@ -4352,7 +5345,7 @@ extend Gen {
     // builtins read their operands through `expr`, its locals are parameters, and it has at most 32 nodes.
     fun inline_ok(mut self, index: u64, function: u64) -> bool {
         self.inline_nodes += 1
-        when self.inline_nodes > 32 {
+        when self.inline_nodes > self.inline_limit {
             return false
         }
         return choose self.program.exprs[index] {
@@ -4360,7 +5353,7 @@ extend Gen {
             ir::IrExpr::FloatLit(bits, ty) => true,
             ir::IrExpr::BoolLit(value) => true,
             ir::IrExpr::CharLit(scalar) => true,
-            ir::IrExpr::LocalRef(slot, ty, span) => self.is_parameter(function, slot) && self.inline_cell_type(ty),
+            ir::IrExpr::LocalRef(slot, ty, span) => (self.is_parameter(function, slot) || (self.inline_locals && slot < self.program.functions[function].local_types.len())) && self.inline_cell_type(ty),
             ir::IrExpr::Binary(op, left, right, ty) => self.inline_ok(left, function) && self.inline_ok(right, function),
             ir::IrExpr::Negate(value, ty) => self.inline_ok(value, function),
             ir::IrExpr::Not(value) => self.inline_ok(value, function),
@@ -4439,12 +5432,152 @@ extend Gen {
         return true
     }
 
+    // A call of a function inlined as statements: the arguments go to scratch cells as for `call_inline`, every other local of
+    // the body gets a scratch cell too, and the body is generated here with its `return`s jumping to the end, which leaves
+    // the result in rax.
+    fun call_inline_statements(mut self, asm: &mut x64::Asm, id: u64, arguments: Vec<u64>) -> bool {
+        definition := self.program.functions[id]
+        mut cells: Vec<u64> = Vec()
+        for argument in arguments.clone() {
+            cell := self.scratch(1)
+            when !self.expr(asm, argument) {
+                return false
+            }
+            asm.store(8, x64::Reg::RAX, x64::Reg::RBP, slot_disp(cell))
+            cells.push(cell)
+        }
+        mapped := self.inline_slots.len()
+        mut slot: u64 = 0
+        while slot < definition.local_types.len() {
+            mut cell: u64 = 0
+            mut found: bool = false
+            mut position: u64 = 0
+            while position < cells.len() {
+                when definition.parameters[position * 2] == slot {
+                    cell = cells[position]
+                    found = true
+                }
+                position += 1
+            }
+            when !found {
+                cell = self.scratch(1)
+            }
+            self.inline_slots.push(slot)
+            self.inline_cells.push(cell)
+            slot += 1
+        }
+        was_active := self.inline_active
+        self.inline_active = true
+        exit := asm.new_label()
+        self.inline_exits.push(exit)
+        when self.shadow_slots.len() > 0 {
+            self.sync_shadows(asm, false)
+        }
+        when !self.body(asm, definition.statements.clone()) {
+            return false
+        }
+        asm.bind(exit)
+        self.inline_exits.pop()
+        when self.shadow_slots.len() > 0 {
+            asm.push(x64::Reg::RAX)
+            self.sync_shadows(asm, true)
+            asm.pop(x64::Reg::RAX)
+        }
+        self.inline_active = was_active
+        while self.inline_slots.len() > mapped {
+            self.inline_slots.pop()
+            self.inline_cells.pop()
+        }
+        return true
+    }
+
+    // The frame cell that statement `slot` of the code being generated writes: a local of the function, or, in a body that is
+    // inlined as statements, the scratch cell of that local.
+    fun stmt_slot(self, slot: u64) -> u64 {
+        when self.inline_exits.len() > 0 {
+            found := self.frame_slot(slot)
+            when found.is_some() {
+                return found.unwrap()
+            }
+        }
+        return slot
+    }
+
     // Calls function `id` with the arguments, which are pushed in order and then loaded into the argument registers
     // from the last. The result is in rax, or for a string or structure, on the stack in the order of a pushed value.
+    // Whether the arguments of calls of function `id` travel in registers (rdi, rsi, rdx, rcx, r8, r9, in order), not on
+    // the stack: at most six parameters, each one cell, and a result that is not a string or structure (which the callee
+    // writes above the stack arguments). The float helpers of the runtime are called from generated code that pushes.
+    fun reg_args(self, id: u64) -> bool {
+        when self.no_opt || id == self.native_float_format || id == self.native_float_parse {
+            return false
+        }
+        definition := self.program.functions[id]
+        count := definition.parameters.len() / 2
+        when definition.external_symbol.is_some() || count == 0 || count > 6 {
+            return false
+        }
+        when definition.return_type.is_some() && self.aggregate_cells(definition.return_type.unwrap()) > 0 {
+            return false
+        }
+        mut pair: u64 = 0
+        while pair < count {
+            ty := definition.parameters[pair * 2 + 1]
+            when self.cells_of(ty) != 1 || !self.is_cell(ty) || self.is_handle_struct(ty) {
+                return false
+            }
+            pair += 1
+        }
+        return true
+    }
+
+    // A call of a function that takes its arguments in registers: each is evaluated in order, the last one stays in rax, and
+    // the others are popped into their registers just before the call. Nothing is left on the stack.
+    fun call_in_registers(mut self, asm: &mut x64::Asm, id: u64, arguments: Vec<u64>) -> bool {
+        count := arguments.len()
+        last_in_rax := self.shadow_slots.len() == 0
+        mut position: u64 = 0
+        while position < count {
+            when !self.expr(asm, arguments[position]) {
+                return false
+            }
+            when position + 1 < count || !last_in_rax {
+                asm.push(x64::Reg::RAX)
+            }
+            position += 1
+        }
+        // A `repr(C)` local whose address was given out is kept in its C layout by a copy, packed before the call.
+        when self.shadow_slots.len() > 0 {
+            self.sync_shadows(asm, false)
+        }
+        mut at: u64 = count
+        when last_in_rax {
+            asm.mov_rr(arg_register(count - 1), x64::Reg::RAX)
+            at = count - 1
+        }
+        while at > 0 {
+            at -= 1
+            asm.pop(arg_register(at))
+        }
+        asm.call_label(self.labels[id])
+        when self.shadow_slots.len() > 0 {
+            asm.push(x64::Reg::RAX)
+            self.sync_shadows(asm, true)
+            asm.pop(x64::Reg::RAX)
+        }
+        return true
+    }
+
     fun call(mut self, asm: &mut x64::Asm, id: u64, arguments: Vec<u64>) -> bool {
         // A leaf function is inlined: its body is generated here, so the function itself is not generated for this call.
-        when self.in_function && self.inline_function(id, arguments.len()) {
-            return self.call_inline(asm, id, arguments)
+        when self.in_function {
+            kind := self.inline_kind(id, arguments.len())
+            when kind == 1 {
+                return self.call_inline(asm, id, arguments)
+            }
+            when kind == 2 {
+                return self.call_inline_statements(asm, id, arguments)
+            }
         }
         self.needed.set(id, true)
         callee := self.program.functions[id]
@@ -4453,6 +5586,9 @@ extend Gen {
         }
         when arguments.len() != callee.parameters.len() / 2 {
             return self.fail("a call with another number of arguments")
+        }
+        when self.reg_args(id) {
+            return self.call_in_registers(asm, id, arguments)
         }
         // A string or structure result gets its cells first, above the arguments, where the callee writes them.
         mut reserved: u64 = 0
@@ -5288,6 +6424,21 @@ extend Gen {
 
     // `reg *= bytes`: the byte offset of an element, through r11.
     fun scale_bytes(self, asm: &mut x64::Asm, reg: u64, bytes: u64) {
+        when !self.no_opt && bytes > 0 && bytes % 2 == 0 || bytes == 1 {
+            // A power of two is a shift; the loop finds its exponent.
+            mut power: u64 = 1
+            mut exponent: u64 = 0
+            while power < bytes {
+                power = power * 2
+                exponent += 1
+            }
+            when power == bytes && !self.no_opt {
+                when exponent > 0 {
+                    asm.shift_ri(4, reg, exponent)
+                }
+                return
+            }
+        }
         asm.mov_ri(x64::Reg::R11, bytes)
         asm.imul_rr(reg, x64::Reg::R11)
     }
@@ -5837,6 +6988,7 @@ extend Gen {
     // Writes a message and a newline to standard error and exits with status 1, as the runtime does for a failed check.
     fun fail_exit(mut self, asm: &mut x64::Asm, text: String) {
         index := self.literal(text)
+        self.flush_stdout(asm)
         asm.lea_symbol(x64::Reg::RSI, self.literal_symbols[index])
         asm.mov_ri(x64::Reg::RDX, self.literal_lengths[index])
         asm.mov_ri(x64::Reg::RDI, 2)
@@ -5863,6 +7015,36 @@ extend Gen {
     // `set(index, value)`: the element at index is replaced; an index past the length fails.
     fun vec_set(mut self, asm: &mut x64::Asm, element: u64, vec: u64, index: u64, value: u64) -> bool {
         cells := self.cells_of(element)
+        // An element of one cell with nothing to drop, and an index that is a constant or a local: the header, the value and
+        // the index meet in registers, with nothing pushed.
+        when !self.no_opt && cells == 1 && self.is_cell(element) && !self.is_str(element) && !self.has_owners(element) && self.is_stable_operand(index) {
+            when !self.expr(asm, vec) {
+                return false
+            }
+            when self.is_stable_operand(value) {
+                asm.mov_rr(x64::Reg::RDX, x64::Reg::RAX)
+                self.load_stable_operand(asm, value, x64::Reg::R9)
+            } else {
+                asm.push(x64::Reg::RAX)
+                when !self.expr(asm, value) {
+                    return false
+                }
+                asm.mov_rr(x64::Reg::R9, x64::Reg::RAX)
+                asm.pop(x64::Reg::RDX)
+            }
+            self.load_stable_operand(asm, index, x64::Reg::RCX)
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, 8)
+            asm.alu_rr(57, x64::Reg::RCX, x64::Reg::RDI)
+            in_range := asm.new_label()
+            asm.jcc(x64::Cc::BELOW, in_range)
+            self.fail_exit(asm, String("Ryn runtime error: Vec index is out of bounds\n"))
+            asm.bind(in_range)
+            asm.shift_ri(4, x64::Reg::RCX, 3)
+            asm.load(8, false, x64::Reg::RDI, x64::Reg::RDX, 0)
+            asm.alu_rr(1, x64::Reg::RCX, x64::Reg::RDI)
+            asm.store(8, x64::Reg::R9, x64::Reg::RCX, 0)
+            return true
+        }
         when !self.expr(asm, vec) {
             return false
         }
@@ -6016,18 +7198,28 @@ extend Gen {
         when !self.expr(asm, vec) {
             return false
         }
-        asm.push(x64::Reg::RAX)
-        when !self.expr(asm, index) {
-            return false
+        // An index that is a constant or a local nothing else can change is read after the vector, so the vector need not wait
+        // on the stack while it is computed.
+        direct := self.is_stable_operand(index)
+        when direct {
+            asm.mov_rr(x64::Reg::RDX, x64::Reg::RAX)
+            self.load_stable_operand(asm, index, x64::Reg::RAX)
+        } else {
+            asm.push(x64::Reg::RAX)
+            when !self.expr(asm, index) {
+                return false
+            }
+            asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 0)
         }
-        asm.load(8, false, x64::Reg::RDX, x64::Reg::RSP, 0)
         asm.load(8, false, x64::Reg::RCX, x64::Reg::RDX, 8)
         asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RCX)
         asm.jcc(x64::Cc::ABOVE_EQUAL, self.index_error_label)
         asm.load(8, false, x64::Reg::RSI, x64::Reg::RDX, 0)
         self.scale_bytes(asm, x64::Reg::RAX, 8 * cells)
         asm.alu_rr(1, x64::Reg::RSI, x64::Reg::RAX)
-        asm.alu_ri(0, x64::Reg::RSP, 8)
+        when !direct {
+            asm.alu_ri(0, x64::Reg::RSP, 8)
+        }
         owned := self.owned_cells(element)
         mut copies: Vec<u64> = Vec()
         when owned.is_some() {
@@ -9496,6 +10688,7 @@ extend Gen {
 
     // Writes the bytes at rsi, of length rdx, to standard error.
     fun stderr_bytes(self, asm: &mut x64::Asm) {
+        self.flush_stdout(asm)
         asm.mov_ri(x64::Reg::RDI, 2)
         asm.mov_ri(x64::Reg::RAX, 1)
         asm.syscall()
@@ -10024,6 +11217,11 @@ extend Gen {
         index := self.literal(text.clone())
         asm.lea_symbol(x64::Reg::RSI, self.literal_symbols[index])
         asm.mov_ri(x64::Reg::RDX, self.literal_lengths[index])
+        when descriptor == 1 {
+            self.write_stdout(asm)
+            return
+        }
+        self.flush_stdout(asm)
         asm.mov_ri(x64::Reg::RDI, descriptor)
         asm.mov_ri(x64::Reg::RAX, 1)
         asm.syscall()
@@ -10032,6 +11230,7 @@ extend Gen {
     // The failure exit: the owners of the function are dropped, as a return does, and the process exits with status 1.
     fun exit_failure(mut self, asm: &mut x64::Asm) {
         self.drop_owners(asm)
+        self.flush_stdout(asm)
         asm.mov_ri(x64::Reg::RDI, 1)
         asm.mov_ri(x64::Reg::RAX, 231)
         asm.syscall()
@@ -10047,7 +11246,21 @@ extend Gen {
     }
 
     fun system_call(mut self, asm: &mut x64::Asm, op: String, arguments: Vec<u64>) -> bool {
-        when op == "FlushStdout" || op == "FlushStderr" {
+        when op == "FlushStdout" {
+            self.flush_stdout(asm)
+            return true
+        }
+        when op == "FlushStderr" {
+            return true
+        }
+        // A program that starts a thread writes standard output at once from then on: the buffer has no lock.
+        when op == "StdoutDirect" {
+            when self.buffered {
+                asm.call_label(self.flush_label)
+                asm.lea_symbol(x64::Reg::R11, self.stdout_symbol)
+                asm.mov_ri(x64::Reg::RAX, 2)
+                asm.store(8, x64::Reg::RAX, x64::Reg::R11, 0)
+            }
             return true
         }
         when op == "Exit" && arguments.len() == 1 {
@@ -10058,6 +11271,7 @@ extend Gen {
             asm.push(x64::Reg::RAX)
             self.drop_owners(asm)
             asm.pop(x64::Reg::RDI)
+            self.flush_stdout(asm)
             asm.mov_ri(x64::Reg::RAX, 231)
             asm.syscall()
             return true
@@ -10169,12 +11383,13 @@ extend Gen {
             asm.load(8, false, x64::Reg::RDX, x64::Reg::RBP, slot_disp(source.unwrap() + 1))
         }
         when op == "WriteStderr" {
+            self.flush_stdout(asm)
             asm.mov_ri(x64::Reg::RDI, 2)
+            asm.mov_ri(x64::Reg::RAX, 1)
+            asm.syscall()
         } else {
-            asm.mov_ri(x64::Reg::RDI, 1)
+            self.write_stdout(asm)
         }
-        asm.mov_ri(x64::Reg::RAX, 1)
-        asm.syscall()
         return true
     }
 
@@ -12129,6 +13344,14 @@ extend Gen {
                     return self.fail("a function pointer to a function with a result of this type")
                 }
             }
+            // The parameters were pushed in order; a function that takes them in registers gets them from the stack.
+            when self.reg_args(self.thunk_functions[at]) {
+                mut moved: u64 = definition.parameters.len() / 2
+                while moved > 0 {
+                    moved -= 1
+                    asm.pop(arg_register(moved))
+                }
+            }
             asm.call_label(self.labels[self.thunk_functions[at]])
             when definition.return_type.is_some() {
                 when self.is_sse(definition.return_type.unwrap()) {
@@ -12661,14 +13884,85 @@ extend Gen {
             asm.mov_ri(x64::Reg::RCX, divisor)
             return Option::Some(self.division(asm, op == "Div", true, word))
         }
-        asm.mov_ri(x64::Reg::RCX, divisor)
-        asm.cqo()
-        asm.unary(7, x64::Reg::RCX)
-        when op == "Rem" {
-            asm.mov_rr(x64::Reg::RAX, x64::Reg::RDX)
+        // A divisor of 1 leaves the value, or no remainder.
+        when signed == 1 {
+            when op == "Rem" {
+                asm.mov_ri(x64::Reg::RAX, 0)
+            }
+            return Option::Some(true)
         }
+        // Any other divisor: the quotient is the high half of x * m, corrected (Hacker's Delight, signed magic numbers).
+        self.signed_by_magic(asm, op == "Div", divisor)
         self.normalize(asm, word)
         return Option::Some(true)
+    }
+
+    // rax = rax / d or rax % d for a signed d that is not 0, 1, -1 or a positive power of two: clobbers rcx and rdx. The
+    // multiplier m and the shift s are found at compile time (the divisor is `d` as 64 bits); then
+    // q = ((x * m) >> 64, plus or minus x when m and d differ in sign) >> s, plus 1 when that is negative.
+    fun signed_by_magic(mut self, asm: &mut x64::Asm, quotient: bool, d: u64) {
+        two63: u64 = 9223372036854775808
+        negative := d >= two63
+        mut magnitude: u64 = d
+        when negative {
+            magnitude = (0 as u64) - d
+        }
+        mut t: u64 = two63
+        when negative {
+            t = two63 + 1
+        }
+        anc := t - 1 - t % magnitude
+        mut p: u64 = 63
+        mut q1: u64 = two63 / anc
+        mut r1: u64 = two63 - q1 * anc
+        mut q2: u64 = two63 / magnitude
+        mut r2: u64 = two63 - q2 * magnitude
+        mut again: bool = true
+        while again {
+            p += 1
+            q1 = q1 * 2
+            r1 = r1 * 2
+            when r1 >= anc {
+                q1 += 1
+                r1 -= anc
+            }
+            q2 = q2 * 2
+            r2 = r2 * 2
+            when r2 >= magnitude {
+                q2 += 1
+                r2 -= magnitude
+            }
+            delta := magnitude - r2
+            again = q1 < delta || (q1 == delta && r1 == 0)
+        }
+        mut multiplier: u64 = q2 + 1
+        when negative {
+            multiplier = (0 as u64) - multiplier
+        }
+        shift := p - 64
+        asm.mov_rr(x64::Reg::RCX, x64::Reg::RAX)
+        asm.mov_ri(x64::Reg::RAX, multiplier)
+        asm.unary(5, x64::Reg::RCX)
+        when !negative && multiplier >= two63 {
+            asm.alu_rr(1, x64::Reg::RDX, x64::Reg::RCX)
+        }
+        when negative && multiplier < two63 {
+            asm.alu_rr(41, x64::Reg::RDX, x64::Reg::RCX)
+        }
+        when shift > 0 {
+            asm.shift_ri(7, x64::Reg::RDX, shift)
+        }
+        asm.mov_rr(x64::Reg::RAX, x64::Reg::RDX)
+        asm.shift_ri(5, x64::Reg::RAX, 63)
+        asm.alu_rr(1, x64::Reg::RDX, x64::Reg::RAX)
+        when quotient {
+            asm.mov_rr(x64::Reg::RAX, x64::Reg::RDX)
+            return
+        }
+        asm.mov_ri(x64::Reg::RAX, d)
+        asm.imul_rr(x64::Reg::RDX, x64::Reg::RAX)
+        asm.alu_rr(41, x64::Reg::RCX, x64::Reg::RDX)
+        asm.mov_rr(x64::Reg::RAX, x64::Reg::RCX)
     }
 
     // rax = rax / d or rax % d for an unsigned d that is not 1 and not a power of two: clobbers rcx and rdx.
@@ -12909,9 +14203,7 @@ extend Gen {
         }
         self.drop_owners(asm)
         asm.pop(x64::Reg::RAX)
-        asm.mov_rr(x64::Reg::RSP, x64::Reg::RBP)
-        asm.pop(x64::Reg::RBP)
-        asm.ret()
+        self.leave(asm)
         asm.bind(succeeded)
         return true
     }
@@ -12990,6 +14282,11 @@ extend Gen {
         }
         when self.is_handle_struct(ty) {
             asm.load(8, false, x64::Reg::RAX, x64::Reg::RBP, slot_disp(cell_slot.unwrap()))
+            return true
+        }
+        register := self.reg_of(cell_slot.unwrap())
+        when register != 0 {
+            asm.mov_rr(x64::Reg::RAX, register)
             return true
         }
         return self.load_cell(asm, ty, x64::Reg::RBP, slot_disp(cell_slot.unwrap()))
@@ -13090,10 +14387,74 @@ extend Gen {
         when !self.is_cell(ty) {
             return self.fail("a value of this type")
         }
+        // `x = x op y` of a 64-bit local in a register is one instruction on the register.
+        register := self.reg_of(base)
+        when register != 0 && self.update_in_place(asm, value, base, ty, register) {
+            return true
+        }
         when !self.expr(asm, value) {
             return false
         }
-        return self.store_cell(asm, ty, x64::Reg::RAX, x64::Reg::RBP, slot_disp(base))
+        when register == 0 {
+            return self.store_cell(asm, ty, x64::Reg::RAX, x64::Reg::RBP, slot_disp(base))
+        }
+        self.write_cell(asm, 8, x64::Reg::RAX, base, register)
+        asm.mov_rr(register, x64::Reg::RAX)
+        return true
+    }
+
+    // `x = x op y` where `x` lives in `register`, has 64 bits, and `op` is add, subtract, and, or or xor, with `y` a constant
+    // or a local nothing else changes: `op register, y`, and the frame cell follows. False when it is not that shape.
+    fun update_in_place(mut self, asm: &mut x64::Asm, value: u64, base: u64, ty: u64, register: u64) -> bool {
+        when self.value_width(ty) != 8 || self.no_opt {
+            return false
+        }
+        op := choose self.program.exprs[value] {
+            ir::IrExpr::Binary(op, left, right, bty) => op,
+            _ => String(""),
+        }
+        left := choose self.program.exprs[value] {
+            ir::IrExpr::Binary(op, left, right, bty) => left,
+            _ => 0,
+        }
+        right := choose self.program.exprs[value] {
+            ir::IrExpr::Binary(op, left, right, bty) => right,
+            _ => 0,
+        }
+        when op != "Add" && op != "Sub" && op != "BitAnd" && op != "BitOr" && op != "BitXor" {
+            return false
+        }
+        when self.operand_reg(left) != register {
+            return false
+        }
+        mut extension: u64 = 0
+        mut opcode: u64 = 1
+        when op == "Sub" {
+            extension = 5
+            opcode = 41
+        } else when op == "BitAnd" {
+            extension = 4
+            opcode = 33
+        } else when op == "BitOr" {
+            extension = 1
+            opcode = 9
+        } else when op == "BitXor" {
+            extension = 6
+            opcode = 49
+        }
+        immediate := self.immediate_operand(op.clone(), right)
+        when immediate.is_some() {
+            asm.alu_ri(extension, register, immediate.unwrap() as i64)
+        } else when self.operand_reg(right) != 0 {
+            asm.alu_rr(opcode, register, self.operand_reg(right))
+        } else when self.is_stable_operand(right) {
+            self.load_stable_operand(asm, right, x64::Reg::RCX)
+            asm.alu_rr(opcode, register, x64::Reg::RCX)
+        } else {
+            return false
+        }
+        self.write_cell(asm, 8, register, base, register)
+        return true
     }
 
     fun store_str(mut self, asm: &mut x64::Asm, value: u64, base: u64) -> bool {
@@ -13545,6 +14906,10 @@ extend Gen {
 
     // The first cell of a local place: a structure local, or a field of one, which the frame holds at its offset.
     fun place_of(self, index: u64) -> Option<u64> {
+        // A local that lives in a register is not a place: it is read as a value, not from its cells.
+        when self.operand_reg(index) != 0 {
+            return Option::None
+        }
         return choose self.program.exprs[index] {
             ir::IrExpr::LocalRef(slot, ty, span) => self.frame_slot(slot),
             ir::IrExpr::FieldRead(value, id, field, ty, span) => self.field_place(value, id, field),
@@ -14127,6 +15492,11 @@ extend Gen {
             _ => 0,
         }
         self.note_expression(index)
+        register := self.reg_of(self.frame_slot(slot).unwrap())
+        when register != 0 {
+            asm.mov_rr(reg, register)
+            return
+        }
         asm.load(self.value_width(ty), is_signed_word(self.word(ty)), reg, x64::Reg::RBP, slot_disp(self.frame_slot(slot).unwrap()))
     }
 
@@ -14172,11 +15542,24 @@ extend Gen {
         // A constant right operand that fits an immediate is part of the instruction.
         immediate := self.immediate_operand(op.clone(), right)
         when immediate.is_some() {
+            // A local in a register plus or minus a constant is one `lea`.
+            left_register := self.operand_reg(left)
+            when left_register != 0 && (op == "Add" || op == "Sub") && (immediate.unwrap() as i64) > (0 as i64) - 2147483647 {
+                mut offset := immediate.unwrap() as i64
+                when op == "Sub" {
+                    offset = (0 as i64) - offset
+                }
+                asm.lea(x64::Reg::RAX, left_register, offset)
+                self.normalize(asm, operand)
+                return true
+            }
             when !self.expr(asm, left) {
                 return false
             }
             return self.binary_immediate(asm, op, immediate.unwrap(), operand)
         }
+        // The register of the right operand: rcx, or the register of a local that lives in one.
+        mut right_register: u64 = x64::Reg::RCX
         // A left operand that is a constant or a local nothing else can change is read after the right one is evaluated, so
         // that it need not be kept on the stack meanwhile.
         when self.is_stable_operand(left) && !self.is_stable_operand(right) {
@@ -14189,35 +15572,46 @@ extend Gen {
             when !self.expr(asm, left) {
                 return false
             }
-            // A right operand that is a constant or a local is read into rcx directly, without the push and pop.
+            // A right operand that is a constant or a local is read into rcx directly, without the push and pop; a local in
+            // a register is the operand itself.
             when !self.is_stable_operand(right) {
                 asm.push(x64::Reg::RAX)
                 when !self.expr(asm, right) {
                     return false
                 }
-                asm.mov_rr(x64::Reg::RCX, x64::Reg::RAX)
-                asm.pop(x64::Reg::RAX)
+                // For an operator whose operands may swap, the left value is popped into rcx, and rax keeps the right.
+                when op == "Add" || op == "Mul" || op == "BitAnd" || op == "BitOr" || op == "BitXor" || op == "Eq" || op == "Ne" {
+                    asm.pop(x64::Reg::RCX)
+                } else {
+                    asm.mov_rr(x64::Reg::RCX, x64::Reg::RAX)
+                    asm.pop(x64::Reg::RAX)
+                }
             } else {
-                self.load_stable_operand(asm, right, x64::Reg::RCX)
+                register := self.operand_reg(right)
+                when register != 0 && op != "Div" && op != "Rem" && op != "ShiftLeft" && op != "ShiftRight" {
+                    right_register = register
+                } else {
+                    self.load_stable_operand(asm, right, x64::Reg::RCX)
+                }
             }
         }
         when op == "Eq" || op == "Ne" || op == "Lt" || op == "Le" || op == "Gt" || op == "Ge" {
-            asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RCX)
+            asm.alu_rr(57, x64::Reg::RAX, right_register)
             asm.setcc(comparison_condition(op, is_signed_word(operand.clone())), x64::Reg::RAX)
             return true
         }
         when op == "Add" {
-            asm.alu_rr(1, x64::Reg::RAX, x64::Reg::RCX)
+            asm.alu_rr(1, x64::Reg::RAX, right_register)
         } else when op == "Sub" {
-            asm.alu_rr(41, x64::Reg::RAX, x64::Reg::RCX)
+            asm.alu_rr(41, x64::Reg::RAX, right_register)
         } else when op == "Mul" {
-            asm.imul_rr(x64::Reg::RAX, x64::Reg::RCX)
+            asm.imul_rr(x64::Reg::RAX, right_register)
         } else when op == "BitAnd" {
-            asm.alu_rr(33, x64::Reg::RAX, x64::Reg::RCX)
+            asm.alu_rr(33, x64::Reg::RAX, right_register)
         } else when op == "BitOr" {
-            asm.alu_rr(9, x64::Reg::RAX, x64::Reg::RCX)
+            asm.alu_rr(9, x64::Reg::RAX, right_register)
         } else when op == "BitXor" {
-            asm.alu_rr(49, x64::Reg::RAX, x64::Reg::RCX)
+            asm.alu_rr(49, x64::Reg::RAX, right_register)
         } else when op == "Div" || op == "Rem" {
             return self.division(asm, op == "Div", is_signed_word(operand.clone()), operand)
         } else when op == "ShiftLeft" || op == "ShiftRight" {
@@ -14515,13 +15909,11 @@ extend Gen {
     }
 
     fun if_expression(mut self, asm: &mut x64::Asm, condition: u64, then_value: u64, else_value: u64) -> bool {
-        when !self.expr(asm, condition) {
-            return false
-        }
         otherwise := asm.new_label()
         end := asm.new_label()
-        asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
-        asm.jcc(x64::Cc::EQUAL, otherwise)
+        when !self.branch(asm, condition, otherwise, false) {
+            return false
+        }
         when !self.expr(asm, then_value) {
             return false
         }
@@ -14587,7 +15979,7 @@ extend Gen {
 extend Gen {
     // The offset of the entry counters in the zero-filled section: after the runtime state and the Windows state.
     fun profile_offset(self) -> u64 {
-        return 16 + rt::state_size() + 16 + self.windows_state_size()
+        return 16 + rt::state_size() + 16 + self.windows_state_size() + self.stdout_state_size()
     }
 
     // The size of the entry counters: one u64 for each function of the program, when the program is instrumented.
@@ -14598,13 +15990,13 @@ extend Gen {
         return 0
     }
 
-    // Adds one to the entry count of function `index`. Only RAX and RCX are used: the arguments of a function are on the
-    // stack, so no register holds a value at its entry.
+    // Adds one to the entry count of function `index`. Only R10 and R11 are used: a function may be entered with its
+    // arguments in the other registers.
     fun count_entry(self, asm: &mut x64::Asm, index: u64) {
-        asm.lea_symbol(x64::Reg::RAX, self.profile_symbol)
-        asm.load(8, false, x64::Reg::RCX, x64::Reg::RAX, (8 * index) as i64)
-        asm.alu_ri(0, x64::Reg::RCX, 1)
-        asm.store(8, x64::Reg::RCX, x64::Reg::RAX, (8 * index) as i64)
+        asm.lea_symbol(x64::Reg::R10, self.profile_symbol)
+        asm.load(8, false, x64::Reg::R11, x64::Reg::R10, (8 * index) as i64)
+        asm.alu_ri(0, x64::Reg::R11, 1)
+        asm.store(8, x64::Reg::R11, x64::Reg::R10, (8 * index) as i64)
     }
 
     // The order in which the functions are generated. Without a profile it is the program's order. With one, the functions
@@ -14848,6 +16240,14 @@ fun min_bits(word: String) -> u64 {
 }
 
 // The condition code of a comparison, for signed or unsigned operands.
+// The condition code that is true exactly when `condition_code` is false: the codes come in pairs that differ in bit 0.
+fun inverse_condition(condition_code: u64) -> u64 {
+    when condition_code % 2 == 0 {
+        return condition_code + 1
+    }
+    return condition_code - 1
+}
+
 fun comparison_condition(op: String, signed: bool) -> u64 {
     when op == "Eq" {
         return x64::Cc::EQUAL

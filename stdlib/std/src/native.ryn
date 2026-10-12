@@ -632,6 +632,7 @@ pub fun __rt_filesystem_file_write(handle: *u8, data_given: str) -> bool {
     when open_descriptor(handle) < 0 {
         return false
     }
+    __io_stdout_flush()
     text := String(data_given)
     when text.len() == 0 {
         return true
@@ -1120,6 +1121,8 @@ pub fun __rt_system_yield_thread() {
 
 // Reads standard input to its end.
 pub fun __rt_system_read_stdin() -> String {
+    // What the program has written is out before it waits for input.
+    __io_stdout_flush()
     chunk: u64 = 65536
     buffer := malloc(chunk)
     mut text := String("")
@@ -1144,6 +1147,7 @@ pub fun __rt_system_read_stdin() -> String {
 
 // Reads one line of standard input, a byte at a time so that nothing after it is consumed, without its line ending.
 pub fun __rt_system_read_stdin_line() -> String {
+    __io_stdout_flush()
     buffer := malloc(1)
     mut collected := malloc(256)
     mut capacity: u64 = 256
@@ -1192,6 +1196,8 @@ pub fun __rt_system_read_stdin_line() -> String {
 }
 
 fun write_all(descriptor: i32, text: String) {
+    // What the program wrote with `echo` is out first.
+    __io_stdout_flush()
     buffer := c_text(text.clone())
     mut written: u64 = 0
     while written < text.len() {
@@ -1295,6 +1301,8 @@ fun exit_status_of(status: i32) -> i32 {
 }
 
 fun run_program(program: String, arguments: Vec<String>) -> i32 {
+    // The child inherits standard output, and a forked copy of the buffer would write it twice.
+    __io_stdout_flush()
     count := arguments.len()
     // The argument vector: the program, its arguments, and a null pointer.
     vector := malloc(8 * (count + 2))
@@ -1503,6 +1511,7 @@ pub fun __rt_system_process_spawn(handle: *u8) -> bool {
     when (handle as u64) == 0 || word64_of(handle, 40) != 0 {
         return false
     }
+    __io_stdout_flush()
     program := word64_of(handle, 0) as u64 as *u8
     arguments := word64_of(handle, 8) as u64 as *u8
     keys := word64_of(handle, 16) as u64 as *u8
@@ -1814,6 +1823,8 @@ extern "C" fun pthread_join(thread: u64, result: *u8) -> i32;
 extern "C" fun pthread_detach(thread: u64) -> i32;
 
 pub fun __rt_system_thread_spawn(worker: extern "C" fun()) -> *u8 {
+    // The buffer of standard output has no lock: from now on it is written at once.
+    __io_stdout_direct()
     record := malloc(24)
     when pthread_create(record, 0 as *u8, worker as *u8, 0 as *u8) != 0 {
         free(record)

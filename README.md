@@ -13,11 +13,15 @@ own sources, and the tree contains no Rust.
 
 <p align="center"><img src="assets/compile-time.gif" alt="Compile times of ryn build" width="700"></p>
 
-Compile times in the animation are medians of real runs on one machine (`rync` built by a `rync` of this tree, 0.1.9; the animation is typed, not a recording).
+<p align="center"><img src="assets/versus.gif" alt="Ryn, Rust and C++ on the same programs: build time, run time, size and assembly" width="800"></p>
+
+The second animation puts Ryn next to `rustc -O` and `g++ -O2` on the same programs, with the assembly of one loop: Ryn starts faster, is smaller and builds a large program 5 times faster, and is 1.3 to 4 times slower on compute-bound code (the numbers are in [docs/native-performance.md](docs/native-performance.md), the programs in [`benches/versus`](benches/versus)).
+
+Compile times in the animation are medians of real runs on one machine (`rync` built by a `rync` of this tree, 0.1.10; the animation is typed, not a recording).
 
 ## Status
 
-The latest release is [0.1.9](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.9), "Performance Revolution" (see the changelog); [0.1.8](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.8) was the one before; [0.1.7](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.7) was "Native Power & Benchmarks" and [0.1.6](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.6) was "Native First".
+The latest release is [0.1.10](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.10), "Faster code, buffered output" (see the changelog); [0.1.9](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.9) was "Performance Revolution"; [0.1.8](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.8) was the one before; [0.1.7](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.7) was "Native Power & Benchmarks" and [0.1.6](https://github.com/rynlanguage/Ryn/releases/tag/v0.1.6) was "Native First".
 
 - The whole toolchain is written in Ryn: the `ryn` command, the native compiler `rync` (lexer, parser,
   analysis, code generator, ELF and PE writers) and the runtime. There is no Rust code in the tree and no Cargo

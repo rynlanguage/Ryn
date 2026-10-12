@@ -1,0 +1,227 @@
+// test: run
+// out: 21
+// out: 15
+// out: 42
+// out: 90
+// out: 165
+// out: 273
+// out: 420
+// out: 10
+// out: 20
+// out: 30
+// out: 420
+// out: 1
+// out: 2
+// out: 3
+// out: 4
+// out: 5
+// out: 6
+// out: 7
+// out: 579
+// out: 1
+// out: 2
+// out: 3
+// out: 4
+// out: 5
+// out: 6
+// out: 7
+// out: 714
+// out: 16000120000
+// out: 410
+// out: 256
+// out: 11
+// out: 19
+// out: 19
+// out: 9
+// out: 61
+// out: true
+// out: true
+// out: false
+// out: 46368
+// out: 729
+// out: 71775
+// out: 51
+// out: 50
+// A function with up to six one-cell parameters takes them in registers, any other on the stack; both give the same results,
+// whatever the arguments are made of: calls, side effects, narrow integers, bools, chars, floats, references.
+fun note(n: i64) -> i64 {
+    echo n
+    return n
+}
+
+fun weigh1(a: i64) -> i64 {
+    mut total: i64 = 0
+    mut i: i64 = 0
+    while i < 3 {
+        total += a * 1
+        i += 1
+    }
+    return total
+}
+
+fun weigh2(a: i64, b: i64) -> i64 {
+    mut total: i64 = 0
+    mut i: i64 = 0
+    while i < 3 {
+        total += a * 1 + b * 2
+        i += 1
+    }
+    return total
+}
+
+fun weigh3(a: i64, b: i64, c: i64) -> i64 {
+    mut total: i64 = 0
+    mut i: i64 = 0
+    while i < 3 {
+        total += a * 1 + b * 2 + c * 3
+        i += 1
+    }
+    return total
+}
+
+fun weigh4(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    mut total: i64 = 0
+    mut i: i64 = 0
+    while i < 3 {
+        total += a * 1 + b * 2 + c * 3 + d * 4
+        i += 1
+    }
+    return total
+}
+
+fun weigh5(a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
+    mut total: i64 = 0
+    mut i: i64 = 0
+    while i < 3 {
+        total += a * 1 + b * 2 + c * 3 + d * 4 + e * 5
+        i += 1
+    }
+    return total
+}
+
+fun weigh6(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
+    mut total: i64 = 0
+    mut i: i64 = 0
+    while i < 3 {
+        total += a * 1 + b * 2 + c * 3 + d * 4 + e * 5 + f * 6
+        i += 1
+    }
+    return total
+}
+
+// Seven parameters: the stack convention.
+fun weigh7(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64) -> i64 {
+    mut total: i64 = 0
+    mut i: i64 = 0
+    while i < 3 {
+        total += a * 1 + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7
+        i += 1
+    }
+    return total
+}
+
+fun narrow(a: u8, b: i8, c: u16, d: i16, e: u32, f: i32) -> i64 {
+    mut total: i64 = 0
+    mut i: i64 = 0
+    while i < 2 {
+        total += (a as i64) + (b as i64) * 2 + (c as i64) * 3 + (d as i64) * 4 + (e as i64) * 5 + (f as i64) * 6
+        i += 1
+    }
+    return total
+}
+
+fun kinds(flag: bool, letter: char, ratio: f64, small: f32, count: u64) -> i64 {
+    mut total: i64 = 0
+    mut i: i64 = 0
+    while i < 2 {
+        when flag {
+            total += 100
+        }
+        total += (letter as i64) + (ratio * 10.0) as i64 + (small * 4.0) as i64 + count as i64
+        i += 1
+    }
+    return total
+}
+
+fun bump(counter: &mut i64, step: i64) -> i64 {
+    mut i: i64 = 0
+    while i < 2 {
+        *counter = *counter + step
+        i += 1
+    }
+    return *counter
+}
+
+fun ackermann(m: i64, n: i64) -> i64 {
+    when m == 0 {
+        return n + 1
+    }
+    when n == 0 {
+        return ackermann(m - 1, 1)
+    }
+    return ackermann(m - 1, ackermann(m, n - 1))
+}
+
+fun is_even(n: i64) -> bool {
+    when n == 0 {
+        return true
+    }
+    return is_odd(n - 1)
+}
+
+fun is_odd(n: i64) -> bool {
+    when n == 0 {
+        return false
+    }
+    return is_even(n - 1)
+}
+
+fun fib(n: i64) -> i64 {
+    when n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fun main() {
+    echo weigh1(7)
+    echo weigh2(1, 2)
+    echo weigh3(1, 2, 3)
+    echo weigh4(1, 2, 3, 4)
+    echo weigh5(1, 2, 3, 4, 5)
+    echo weigh6(1, 2, 3, 4, 5, 6)
+    echo weigh7(1, 2, 3, 4, 5, 6, 7)
+    // Arguments are evaluated in order, once, whatever they call.
+    echo weigh3(note(10), note(20), note(30))
+    echo weigh6(note(1), weigh2(note(2), note(3)), note(4), weigh1(note(5)), note(6), note(7))
+    echo weigh7(note(1), note(2), note(3), note(4), note(5), note(6), weigh1(note(7)))
+    echo narrow(200, 0 - 100, 60000, 0 - 30000, 4000000000, 0 - 2000000000)
+    echo kinds(true, 'A', 2.5, 1.5, 9)
+    echo kinds(false, 'z', 0.5, 0.25, 0)
+    mut counter: i64 = 5
+    echo bump(&mut counter, 3)
+    echo bump(&mut counter, 4)
+    echo counter
+    echo ackermann(2, 3)
+    echo ackermann(3, 3)
+    echo is_even(100)
+    echo is_odd(77)
+    echo is_even(7)
+    echo fib(24)
+    // A call's result is an argument of the next call.
+    echo weigh2(weigh2(weigh1(1), weigh1(2)), weigh2(weigh1(3), weigh1(4)))
+    // Calls in a loop leave the registers of the caller alone.
+    mut sum: i64 = 0
+    mut left: i64 = 1
+    mut right: i64 = 100
+    mut step: i64 = 0
+    while step < 50 {
+        sum += weigh2(left, right) + weigh3(step, left, right)
+        left += 1
+        right -= 1
+        step += 1
+    }
+    echo sum
+    echo left
+    echo right
+}

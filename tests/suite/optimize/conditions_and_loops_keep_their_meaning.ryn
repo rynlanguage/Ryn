@@ -1,0 +1,253 @@
+// test: run
+// out: 1
+// out: 3
+// out: or
+// out: 5
+// out: 6
+// out: 7
+// out: else
+// out: 8
+// out: 9
+// out: 10
+// out: mixed
+// out: 11
+// out: 12
+// out: negated
+// out: 13
+// out: 14
+// out: 15
+// out: true
+// out: 16
+// out: 17
+// out: 2
+// out: 35
+// out: 44
+// out: 26
+// out: 35
+// out: 44
+// out: 35
+// out: 26
+// out: 44
+// out: 35
+// out: 251
+// out: 4
+// out: 147
+// out: 380
+// out: 1515
+// out: -6
+// out: 15
+// out: 6
+// out: 56
+// out: 97
+// A comparison is one compare and one jump, `&&`, `||` and `!` are jumps, and a loop tests at its bottom. The order in which
+// operands run, the signedness of each comparison and the edges of every loop form are kept.
+fun note(tag: i64, value: bool) -> bool {
+    echo tag
+    return value
+}
+
+fun conditions() {
+    // Short circuit: the second operand runs only when the first does not decide.
+    when note(1, false) && note(2, true) {
+        echo "wrong"
+    }
+    when note(3, true) || note(4, true) {
+        echo "or"
+    }
+    when note(5, true) && note(6, true) && note(7, false) {
+        echo "wrong"
+    } else {
+        echo "else"
+    }
+    when !note(8, false) && (note(9, false) || note(10, true)) {
+        echo "mixed"
+    }
+    when !(note(11, true) && !note(12, true)) {
+        echo "negated"
+    }
+    value := note(13, true) && note(14, false) || note(15, true)
+    echo value
+    other := when note(16, false) || note(17, false) { 1 } else { 2 }
+    echo other
+}
+
+fun compare_signed(a: i64, b: i64) -> i64 {
+    mut mask: i64 = 0
+    when a < b {
+        mask += 1
+    }
+    when a <= b {
+        mask += 2
+    }
+    when a > b {
+        mask += 4
+    }
+    when a >= b {
+        mask += 8
+    }
+    when a == b {
+        mask += 16
+    }
+    when a != b {
+        mask += 32
+    }
+    return mask
+}
+
+fun compare_unsigned(a: u64, b: u64) -> i64 {
+    mut mask: i64 = 0
+    when a < b {
+        mask += 1
+    }
+    when a <= b {
+        mask += 2
+    }
+    when a > b {
+        mask += 4
+    }
+    when a >= b {
+        mask += 8
+    }
+    when a == b {
+        mask += 16
+    }
+    when a != b {
+        mask += 32
+    }
+    return mask
+}
+
+fun compare_narrow(a: i8, b: i8, c: u8, d: u8, e: i16, f: u16, g: i32, h: u32) -> i64 {
+    mut mask: i64 = 0
+    when a < b {
+        mask += 1
+    }
+    when c < d {
+        mask += 2
+    }
+    when e > 0 - 1 {
+        mask += 4
+    }
+    when f > 40000 {
+        mask += 8
+    }
+    when g < 0 {
+        mask += 16
+    }
+    when h >= 4000000000 {
+        mask += 32
+    }
+    when a == (0 - 127) - 1 {
+        mask += 64
+    }
+    when d == 255 {
+        mask += 128
+    }
+    return mask
+}
+
+fun loops() {
+    // A loop whose condition is false at the start never runs.
+    mut never: i64 = 0
+    while never > 5 {
+        echo "wrong"
+        never += 1
+    }
+    for k in 5..5 {
+        echo "wrong"
+    }
+    for k in 9..3 {
+        echo "wrong"
+    }
+    // `break` and `continue`.
+    mut total: i64 = 0
+    mut n: i64 = 0
+    while n < 100 {
+        n += 1
+        when n % 3 == 0 {
+            continue
+        }
+        when n > 20 {
+            break
+        }
+        total += n
+    }
+    echo total
+    mut inner: i64 = 0
+    for i in 1..8 {
+        when i == 3 {
+            continue
+        }
+        for j in i..8 {
+            when j == 6 {
+                break
+            }
+            inner += i * 10 + j
+        }
+    }
+    echo inner
+    // Ranges at the edge of their type.
+    mut ups: i64 = 0
+    for b in 250..=255 as u8 {
+        ups += b as i64
+    }
+    echo ups
+    mut downs: i64 = 0
+    for s in (0 - 3)..=(0 - 1) as i8 {
+        downs += s as i64
+    }
+    echo downs
+    mut wide: i64 = 0
+    for w in 4294967290..=4294967295 as u32 {
+        wide += (w as i64) - 4294967290
+    }
+    echo wide
+    mut count: i64 = 0
+    for big in 18446744073709551610..=18446744073709551615 as u64 {
+        count += 1
+    }
+    echo count
+    // `while true` and a loop that ends by a return.
+    mut spin: i64 = 0
+    while true {
+        spin += 7
+        when spin > 50 {
+            break
+        }
+    }
+    echo spin
+}
+
+fun search(limit: i64) -> i64 {
+    for i in 2..limit {
+        mut divisor: i64 = 2
+        mut composite: bool = false
+        while divisor * divisor <= i && !composite {
+            when i % divisor == 0 {
+                composite = true
+            }
+            divisor += 1
+        }
+        when !composite && i > 90 {
+            return i
+        }
+    }
+    return 0
+}
+
+fun main() {
+    conditions()
+    echo compare_signed(0 - 5, 3)
+    echo compare_signed(3, 0 - 5)
+    echo compare_signed(7, 7)
+    echo compare_signed(0 - 9223372036854775807 - 1, 9223372036854775807)
+    echo compare_unsigned(5, 3)
+    echo compare_unsigned(3, 5)
+    echo compare_unsigned(9, 9)
+    echo compare_unsigned(18446744073709551615, 1)
+    echo compare_unsigned(0, 18446744073709551615)
+    echo compare_narrow((0 - 127) - 1, 127, 200, 255, 0 - 5, 50000, 0 - 70000, 4100000000)
+    echo compare_narrow(1, 0 - 1, 255, 3, 5, 100, 70000, 7)
+    loops()
+    echo search(200)
+}

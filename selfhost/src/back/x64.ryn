@@ -20,6 +20,10 @@ extend Reg {
     pub const R9: u64 = 9
     pub const R10: u64 = 10
     pub const R11: u64 = 11
+    pub const R12: u64 = 12
+    pub const R13: u64 = 13
+    pub const R14: u64 = 14
+    pub const R15: u64 = 15
 }
 
 // Condition codes, as the low nibble of the `jcc`, `setcc`, and `cmovcc` opcodes.
@@ -622,6 +626,17 @@ extend Asm {
         self.rr(b, a)
     }
 
+    // `test reg, imm32` at 64 bits (the immediate is sign-extended).
+    pub fun test_ri(mut self, reg: u64, value: i64) {
+        when self.listing {
+            self.note(inst2(String("test"), reg_name(reg), String(value)))
+        }
+        self.rex(1, 0, reg, false)
+        self.b(247)
+        self.rr(0, reg)
+        self.s32(value)
+    }
+
     // `setcc al` followed by a zero extension into `dst`.
     pub fun setcc(mut self, condition: u64, dst: u64) {
         when self.listing {
@@ -1030,6 +1045,41 @@ extend Asm {
         self.rex(0, 0, reg, false)
         self.b(255)
         self.rr(2, reg)
+    }
+
+    // `leave`: `mov rsp, rbp` and `pop rbp`.
+    pub fun leave(mut self) {
+        when self.listing {
+            self.note(inst0(String("leave")))
+        }
+        self.b(201)
+    }
+
+    // A `nop` of five bytes: the room of a jump that is written later with `patch_jump`.
+    pub fun nop5(mut self) {
+        when self.listing {
+            self.note(inst0(String("nop")))
+        }
+        self.b(15)
+        self.b(31)
+        self.b(68)
+        self.b(0)
+        self.b(0)
+    }
+
+    // `jmp` to an offset that is already emitted, with no label.
+    pub fun jmp_offset(mut self, target: u64) {
+        when self.listing {
+            self.note(inst1(String("jmp"), String(target)))
+        }
+        self.b(233)
+        self.s32((target as i64) - ((self.code.len() + 4) as i64))
+    }
+
+    // Overwrites the five bytes at `at` with a `jmp` to the offset `target`, which lies after them.
+    pub fun patch_jump(mut self, at: u64, target: u64) {
+        self.code.set(at, 233 as u8)
+        self.patch32(at + 1, target - (at + 5))
     }
 
     pub fun ret(mut self) {

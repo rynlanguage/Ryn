@@ -67,6 +67,7 @@ extend JoinHandle {
     // Starts `routine(argument)` on a new thread. The routine receives the argument and returns a pointer (or null).
     // `is_started` is false when the operating system could not create the thread.
     pub fun spawn(routine: extern "C" fun(*u8) -> *u8, argument: *u8) -> JoinHandle {
+        __io_stdout_direct()
         record := block(24 as u64)
         when pointer_is_null(record) {
             return JoinHandle { record: record }
