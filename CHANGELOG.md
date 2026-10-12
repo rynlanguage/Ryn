@@ -5,6 +5,11 @@ All notable changes to Ryn are recorded here. The format follows
 sequence: minor releases may change language details while the compiler is pre-1.0.
 
 ## [0.1.13] — 2026-10-12 — Registers, AArch64, variadic C calls, sugar and gamedev
+- FFI: `&name` and `&mut name` of a local are passed as the local's address to a pointer parameter (`*T`) of an
+  `extern "C"` function, also when it is called through an `extern "C"` function pointer (Vulkan loader functions from
+  `load_symbol`). `time(&value)` and `frexp(x, &mut exponent)` write the result into the local. Before, these were
+  `unsupported: argument type`. Ordinary Ryn functions are unchanged. Tests: `tests/suite/ffi/ref_argument_*`,
+  `repr_c_struct_reference_and_out_pointer`, `vulkan_loader_through_a_function_pointer`.
 
 - `extern "C" fun printf(format: *u8, ...) -> i32;`: `...` after the named parameters of an `extern "C"` function. Call
   it with any number of variable arguments: integers of any width, `f64` and raw pointers are passed as they are; an

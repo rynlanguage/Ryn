@@ -1,0 +1,28 @@
+// test: run
+// out: 4
+// out: -9
+// out: 2
+// out: true
+// `frexp` writes a 32-bit C int through `&mut`: a positive and a negative exponent read back correctly from the 8-byte
+// local, `time(null)` is a null pointer argument, and the loop keeps the local's value across calls.
+extern "C" fun frexp(x: f64, e: *i32) -> f64;
+extern "C" fun time(t: *i64) -> i64;
+
+fun main() {
+    mut exponent: i32 = 0
+    frexp(8.0, &mut exponent)
+    echo exponent
+    mut small: i32 = 0
+    frexp(0.001, &mut small)
+    echo small
+    when time(null) > 0 { echo 2 } else { echo 0 }
+    mut total: i64 = 0
+    mut e: i32 = 0
+    mut k: i64 = 0
+    while k < 3 {
+        frexp(8.0, &e)
+        total += e as i64
+        k += 1
+    }
+    echo total == 12
+}

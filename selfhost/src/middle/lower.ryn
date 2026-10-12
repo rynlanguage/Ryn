@@ -76,6 +76,8 @@ pub struct Signature {
     public: bool,
     // `...` after the parameters of an `extern "C"` function: the arguments after `params` are C's variable arguments.
     variadic: bool,
+    // An `extern "C"` function: a reference to a local passed for a pointer parameter is passed as its address.
+    external: bool,
     module: String,
     // The parameter that a function returns, when it returns a reference from one parameter.
     return_param: Option<u64>,
@@ -1774,6 +1776,12 @@ fun map_parts(ty: String) -> Option<Vec<String>> {
 }
 
 // The parameter words and result word ("" for none) of a `FunctionPointer` word.
+// Whether a function pointer type is an `extern "C"` one: its last word is 1 (see `function_pointer_type`).
+fun function_pointer_is_external(ty: String) -> bool {
+    tokens := ty.split(" ")
+    return tokens[tokens.len() - 1] == "1"
+}
+
 fun function_pointer_parts(ty: String) -> Option<Vec<String>> {
     when !ty.starts_with("FunctionPointer ") {
         return Option::None
@@ -5677,6 +5685,32 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
     }
 
     // Checks the argument list against a signature and lowers each argument to its parameter type.
+    // `&name` or `&mut name` of a local (not a raw pointer).
+    fun is_local_reference(self, index: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::AddressOfE(mutable, raw, inner, span) => !raw && self.names_a_local(inner),
+            _ => false,
+        }
+    }
+
+    fun names_a_local(self, index: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::NameRef(name, name_span) => true,
+            _ => false,
+        }
+    }
+
+    // The address of the local of a `&name` argument, lowered as `&raw mut name` (or `&raw name`) for the pointer parameter.
+    fun reference_as_raw(mut self, index: u64) -> Result<Lowered, String> {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::AddressOfE(mutable, raw, inner, span) => choose self.program.exprs[inner] {
+                ast::ExprTree::NameRef(name, name_span) => self.address_of_local(name, mutable, true, span, name_span),
+                _ => Result::Err(address_operand_error(span.start, span.end)),
+            },
+            _ => Result::Err(unsupported("reference argument")),
+        }
+    }
+
     fun arguments(mut self, id: u64, name: String, arguments: Vec<u64>) -> Result<Vec<String>, String> {
         params := self.signatures[id].params.clone()
         variadic := self.signatures[id].variadic
@@ -5690,6 +5724,17 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
             // An argument after the named parameters of a variadic C function (see `variadic_argument`).
             when position >= params.len() {
                 lowered.push(self.variadic_argument(name.clone(), arguments[position])?)
+                position += 1
+                continue
+            }
+            // A reference to a local passed for a pointer parameter of a C function is passed as the local's address, which
+            // the C function writes through for the duration of the call (System V: a pointer is one 64-bit argument).
+            when self.signatures[id].external && params[position].starts_with("RawPointer ") && self.is_local_reference(arguments[position]) {
+                value := self.reference_as_raw(arguments[position])?
+                when value.ty != params[position] {
+                    return Result::Err(unsupported("argument type"))
+                }
+                lowered.push(value.text)
                 position += 1
                 continue
             }
@@ -7811,7 +7856,7 @@ extend Lowering {
                 main_index = position
             }
             returned := self.returned_parameter(definition.body.clone(), definition.return_value, definition.parameters.clone(), ret.clone())
-            signatures.push(Signature { name: key, params: params, ret: ret, public: definition.public, variadic: definition.variadic, module: definition.module_path.clone(), return_param: returned })
+            signatures.push(Signature { name: key, params: params, ret: ret, public: definition.public, variadic: definition.variadic, external: definition.extern_c, module: definition.module_path.clone(), return_param: returned })
             position += 1
         }
         when main_index == count {
@@ -7834,7 +7879,7 @@ extend Lowering {
                 mut clone_params: Vec<String> = Vec()
                 clone_params.push(self_type)
                 known_keys.insert(clone_key.clone(), signatures.len())
-                signatures.push(Signature { name: clone_key, params: clone_params, ret: struct_word(derive_index), public: true, variadic: false, module: self.structs[derive_index].module_path.clone(), return_param: Option::None })
+                signatures.push(Signature { name: clone_key, params: clone_params, ret: struct_word(derive_index), public: true, variadic: false, external: false, module: self.structs[derive_index].module_path.clone(), return_param: Option::None })
                 clone_structs.push(derive_index)
             }
             derive_index += 1
@@ -10080,6 +10125,7 @@ extend Lowering {
         found := self.find(name)?
         local := self.locals[found]
         sigwords := function_pointer_parts(local.ty.clone()).unwrap()
+        external := function_pointer_is_external(local.ty.clone())
         when arguments.len() + 1 != sigwords.len() {
             return Result::Err(unsupported("function pointer argument count"))
         }
@@ -10090,6 +10136,16 @@ extend Lowering {
         tokens.push(join(words5(String("Local"), num(local.slot), local.ty.clone(), num(span.start), num(span.end))))
         mut position: u64 = 0
         while position < arguments.len() {
+            // A reference to a local for a pointer parameter of a C function is passed as the local's address.
+            when external && sigwords[position].starts_with("RawPointer ") && self.is_local_reference(arguments[position]) {
+                address := self.reference_as_raw(arguments[position])?
+                when address.ty != sigwords[position] {
+                    return Result::Err(unsupported("function pointer argument type"))
+                }
+                tokens.push(address.text)
+                position += 1
+                continue
+            }
             value := self.moved_expression(arguments[position], sigwords[position].clone())?
             when value.ty != sigwords[position] {
                 return Result::Err(unsupported("function pointer argument type"))
