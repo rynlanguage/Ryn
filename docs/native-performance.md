@@ -237,6 +237,55 @@ inlined and no longer counts its entries, so the profile test (`tools/tests/test
 Not done: a register allocator for temporaries, loop-invariant code motion, a flat hash table, vector elements narrower than 8 bytes,
 and recursion unrolling.
 
+### Hash map, loops and structures (fifth pass, 0.1.11)
+
+The fifth pass took the three items that were left from the audit of the fourth (a better register allocator, bounds checks
+and loop-invariant work, scalar replacement) and the biggest gap in the table above, the hash map, which was profiled on its own.
+`RYN_NO_OPT=1` switches the code-generation items off; the map is a library change and stays.
+
+| Item | State | What exists |
+|---|---|---|
+| Hash map | **Done** | The map was a table of chains with one node per entry: `malloc` and a cache miss per insert, two cache misses per lookup. It is now a compact dictionary, like the one of CPython: an array of entries (hash, key, value, contiguous) and an open-addressed array of 16-byte slots (hash, entry offset) probed linearly. A lookup compares the hash stored in the slot before it touches the key. Removal moves the last entry into the hole (swap-remove) and shifts the slots back, so there are no tombstones. The scalar hash is a multiply by the golden-ratio constant and an xor-shift. 2 000 000 inserts and lookups: 0.78 s before, 0.35 s now (Rust 0.30 s, C++ 0.36 s). Iteration (`keys`, `values`) still sorts by hash, so the order of keys changed with the hash function; the order was never specified, and the one test that pinned it (`test_map_keys_and_values_iterate_with_clone_and_drop_glue`) has the new order. |
+| Global register allocation | **Done** | The four registers `r12` to `r15` were given to the four most used locals of a function for all of it. They are now given by live range: the scan records where each local is first and last used (a local used inside a loop lives to the end of the loop, a parameter lives for the whole function), and two locals whose ranges do not meet share a register, so a function can keep more than four locals in registers. A local that a deferred statement uses lives for the whole function. A function with more than four live locals at one point still keeps the least used in memory. The change is correct (suite, bootstrap, poison) but gave no large measured change on its own: the programs measured here use at most four locals at a time. |
+| Bounds-check elimination | **Done for counted loops** | In `while i < v.len() { ... }` and `for i in 0..v.len() { ... }`, `v[i]` and `v.set(i, x)` read the vector without the check when `v` and `i` are plain locals (their address is never taken), the body does not change the length of `v` (any use of `v` but reading its length and elements and setting an element ends the proof), and `i` is not written in the body except by one step `i = i + c` at the top level, after which the proof stops. A signed counter needs a constant start of at least 0. Anything else keeps its check, and `tests/suite/optimize/bounds_check_stays_*` checks that it does. The sieve is not helped: its loops test `j <= n`, which says nothing about the length of the vector. |
+| Loop-invariant work | **Partly** | With the check gone, `v[i]` of a scalar vector is `mov rdx, [header]; mov rax, [rdx + i*8]` (the data pointer and the index meet in an addressing mode), `v.set(i, x)` and `v.push(x)` of a scalar do the same and keep the value in a register, and the failure of `set` jumps to one routine at the end of the program instead of being written inside the loop. The header and the data pointer are still loaded in each iteration: hoisting them out of the loop needs to know that nothing in the body can reallocate the vector, which the proof above does not give for a `push`. |
+| Register operations | **Done** | `x = x op y` of a 64-bit local in a register is one instruction on the register for `+ - * & \| ^`, `x / 2^k` (unsigned), `x * 2^k` and shifts by a constant, whatever `y` is (the old form needed a constant or a local). `3*x + c`, `5*x + c` and `9*x + c` are one `lea`. A call argument that is a constant, a local or `register + constant` goes straight into its argument register (`lea rdi, [r12-1]`) instead of through `rax`, and `x = cond ? a : b` writes the register from the `cmov` result. |
+| Scalar replacement | **Done for structures of scalars** | A local structure whose fields are all integers, bools or chars, that is built by a struct literal and only ever read and written field by field, is replaced by one scalar local per field, and the fields get registers like any local. If the structure is read as a whole (passed, copied, returned, printed), assigned as a whole, or its address or a field's address is taken, all its cells stay in memory. `RYN_REGPOISON=1` proves, for the suite and the bootstrap, that nothing reads a cell whose field lives in a register. A loop that updates three fields of a local structure 400 million times: 0.51 s before, 0.21 s now. |
+| Build of a small program | **Done** | Every program was compiled together with `std::native`, the runtime written in Ryn (2700 lines): the loader parsed and decoded it to look for imports, and then every phase read it again, although the lowering is lazy and `hello` reaches none of it. Without it a `hello` builds in 11 ms, with it 105 ms. The loader now takes the module as text (it has no imports and no public alias), and a program under 120 KB of source gets the module with every `__rt_` function that it does not seem to use cut down to its header and a body the lowering rejects (a function is kept when a word of the program matches its name, and the functions that those call are kept). If the lowering reaches a cut function the whole front end runs again with the module as it is, so the result is the same; `RYN_PRUNE_STRESS=1` cuts everything it can, to test that, and the suite passes with it. `hello` now builds in 24 ms (Rust 60, C++ 42). |
+| Base case before the frame | **Done** | `when p <op> constant { return p-or-constant }` as the first statement of a function whose parameters arrive in registers is tested and returned before `push rbp`: 4 instructions instead of 12 for the 62 % of the calls of `fib` that are base cases, and the body does not test it again unless the function has a self tail call. `fib(40)` 0.66 s to 0.50 s. |
+| Escape analysis | **Not implemented** | Stack allocation of a `Vec`, `String` or `Box` that does not leave the function needs the drops, the moves and the hundred places that read a frame cell directly to know about a header that is not on the heap; there is no intermediate representation to do it on, so it was not started. A scalar structure that does not escape is covered by the scalar replacement above. |
+
+Run time, same machine and method as the table above (medians of 5 runs; `rustc 1.99 -O`, `g++ 16.2 -O2`):
+
+| Program | Ryn 0.1.10 | Ryn 0.1.11 | Rust | C++ |
+|---|---|---|---|---|
+| `fib(40)`, run | 0.67 s | 0.50 s | 0.33 s | 0.17 s |
+| `collatz`, run | 0.56 s | 0.36 s | 0.46 s | 0.34 s |
+| sieve of 20 000 000, run | 0.39 s | 0.39 s | 0.14 s | 0.12 s |
+| hash map of 2 000 000 keys, run | 0.78 s | 0.35 s | 0.30 s | 0.36 s |
+| sum of a 4 000 000 element `Vec<i64>`, 20 passes (`while k < v.len()`), run | 0.129 s | 0.103 s | 0.063 s | 0.086 s |
+| 1 000 000 lines of `echo` to a pipe, run | 0.037 s | 0.038 s | 0.48 s | 0.072 s |
+| 3000 functions (42 000 lines), build | 2.5 s | 2.6 s | 16.4 s | 14.1 s |
+| `hello`, build | 0.105 s | 0.024 s | 0.060 s | 0.042 s |
+
+`collatz` is now faster than `rustc -O` (the halving is one `shr` of the register, `3*x+1` one `lea`, and the choice between
+them one `cmov` that writes the register), and the hash map is on the level of `g++` and 15 % behind `rustc`. `fib` and the sieve did
+not move: `fib` is bound by the call and the frame (`push rbp`, the save of `r12`, the `leave`), which a frame-pointer-free
+convention would change, and the sieve is bound by memory (20 000 000 cells of 8 bytes, 160 MB, against 20 MB in C++), which only
+a narrower vector element changes; the instruction count of its loops fell, the time did not.
+
+Checked: 702 of 702 tests of `tests/suite/` with the compiler built by the committed seed and with its own stage2, also with
+`RYN_REGPOISON=1`; `tools/bootstrap-native.sh` gives stage2 == stage3 (sha256), also with `RYN_REGPOISON=1`; every new test gives
+the same output with `RYN_NO_OPT=1`. New tests in `tests/suite/optimize/`: `loops_over_a_vector_skip_the_bounds_check`,
+`bounds_check_stays_when_the_loop_does_not_prove_it`, `bounds_check_stays_when_the_vector_is_cleared`,
+`register_updates_shifts_and_scaled_adds_keep_their_meaning`, `structure_fields_live_in_registers_when_the_structure_stays_local`;
+in `tests/suite/collections/`: `map_matches_a_vector_model`, which runs 30 000 random inserts, replacements, removals and lookups of integer
+and `String` keys against a model made of two vectors and compares them after every step.
+
+Not done: stack allocation of non-escaping heap values, a register allocator for temporaries, hoisting the header and data
+pointer of a vector out of a loop, vector elements narrower than 8 bytes (`Vec<u8>` is 8 times larger than in C++), a
+frame without `rbp`, shrink-wrapping (saving `r12` only on the path that needs it), and recursion unrolling.
+
 ### Not integrated
 
 Reading `vector[index].field` in place (a prototype in the `perf/0.1.8` worktree) made the code generator miscompile

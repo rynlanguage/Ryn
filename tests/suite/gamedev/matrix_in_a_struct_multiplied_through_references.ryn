@@ -1,0 +1,56 @@
+// test: run
+// out: 5
+// out: 2
+// out: 10
+// out: 8
+// out: 5
+// out: 0
+// A [f32; 16] in a struct is read and written through self and references with no heap; nested arrays are checked per dimension.
+struct Mat4 { m: [f32; 16] }
+extend Mat4 {
+    fun identity() -> Mat4 {
+        mut r := Mat4 { m: [0.0; 16] }
+        r.m[0] = 1.0
+        r.m[5] = 1.0
+        r.m[10] = 1.0
+        r.m[15] = 1.0
+        return r
+    }
+    fun mul(self, o: Mat4) -> Mat4 {
+        mut r := Mat4 { m: [0.0; 16] }
+        for i in 0..4 {
+            for j in 0..4 {
+                mut s: f32 = 0.0
+                for k in 0..4 {
+                    s += self.m[i * 4 + k] * o.m[k * 4 + j]
+                }
+                r.m[i * 4 + j] = s
+            }
+        }
+        return r
+    }
+}
+fun sum(a: [f32; 4]) -> f32 {
+    mut t: f32 = 0.0
+    for x in a { t += x }
+    return t
+}
+fun make() -> [i32; 3] {
+    return [7, 8, 9]
+}
+fun main() {
+    mut a := Mat4::identity()
+    a.m[3] = 5.0
+    b := a * Mat4::identity()
+    echo b.m[3]
+    echo b.m[0] + b.m[15]
+    v: [f32; 4] = [1.0, 2.0, 3.0, 4.0]
+    echo sum(v)
+    w := make()
+    echo w[1]
+    mut grid: [[i32; 3]; 2] = [[0; 3]; 2]
+    grid[1][2] = 5
+    echo grid[1][2]
+    pts: [f32; 16] = [0.0; 16]
+    echo pts[3]
+}

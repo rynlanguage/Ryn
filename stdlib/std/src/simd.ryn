@@ -3450,3 +3450,660 @@ pub fun add_f32(dst: *f32, a: *f32, b: *f32, count: u64) {
         __simd_fused_add_f32(0, dst as *u8, a as *u8, b as *u8, count)
     }
 }
+pub struct F32x16 { pub hi: F32x8, pub lo: F32x8 }
+extend F32x16 {    pub fun splat(value: f32) -> F32x16 {
+        return F32x16 { hi: F32x8::splat(value), lo: F32x8::splat(value) }
+    }
+
+    pub fun load(address: *u8) -> F32x16 {
+        return F32x16 { hi: F32x8::load(lane_address(address, 32 as u64)), lo: F32x8::load(address) }
+    }
+
+    pub fun store(self, address: *u8) {
+        self.lo.store(address)
+        self.hi.store(lane_address(address, 32 as u64))
+    }
+
+    // The lane `index` (lane 0 is the lowest address).
+    pub fun get(self, index: u64) -> f32 {
+        when index < 8 as u64 {
+            return self.lo.get(index)
+        }
+        return self.hi.get(index - 8 as u64)
+    }
+
+    // A copy with lane `index` replaced by `value`.
+    pub fun with(self, index: u64, value: f32) -> F32x16 {
+        when index < 8 as u64 {
+            return F32x16 { hi: self.hi, lo: self.lo.with(index, value) }
+        }
+        return F32x16 { hi: self.hi.with(index - 8 as u64, value), lo: self.lo }
+    }
+
+    // The lanes of `other` where bit i of `mask` is set, the lanes of `self` elsewhere.
+    pub fun blend(self, other: F32x16, mask: u16) -> F32x16 {
+        mut out := F32x16 { hi: self.hi, lo: self.lo }
+        mut at: u64 = 0
+        while at < 16 as u64 {
+            when ((mask as u64) >> (at as u32)) & 1 == 1 {
+                out = out.with(at, other.get(at))
+            }
+            at += 1
+        }
+        return out
+    }
+
+    // bit i is the top bit of lane i
+    pub fun movemask(self) -> u16 {
+        return (self.lo.movemask() | (self.hi.movemask() << (8 as u32))) as u16
+    }
+
+    pub fun any(self) -> bool {
+        return self.movemask() != 0
+    }
+
+    pub fun all(self) -> bool {
+        return self.movemask() == 65535
+    }
+
+    // The lanes added from lane 0 to the last one, as the scalar loop does.
+    pub fun sum(self) -> f32 {
+        mut total: f32 = 0.0
+        mut at: u64 = 0
+        while at < 16 as u64 {
+            total = total + self.get(at)
+            at += 1
+        }
+        return total
+    }
+    pub fun eq(self, rhs: F32x16) -> u16 {
+        return (self.lo.eq(rhs.lo).movemask() | (self.hi.eq(rhs.hi).movemask() << (8 as u32))) as u16
+    }
+    pub fun ne(self, rhs: F32x16) -> u16 {
+        return (self.lo.ne(rhs.lo).movemask() | (self.hi.ne(rhs.hi).movemask() << (8 as u32))) as u16
+    }
+    pub fun lt(self, rhs: F32x16) -> u16 {
+        return (self.lo.lt(rhs.lo).movemask() | (self.hi.lt(rhs.hi).movemask() << (8 as u32))) as u16
+    }
+    pub fun le(self, rhs: F32x16) -> u16 {
+        return (self.lo.le(rhs.lo).movemask() | (self.hi.le(rhs.hi).movemask() << (8 as u32))) as u16
+    }
+    pub fun gt(self, rhs: F32x16) -> u16 {
+        return (self.lo.gt(rhs.lo).movemask() | (self.hi.gt(rhs.hi).movemask() << (8 as u32))) as u16
+    }
+    pub fun ge(self, rhs: F32x16) -> u16 {
+        return (self.lo.ge(rhs.lo).movemask() | (self.hi.ge(rhs.hi).movemask() << (8 as u32))) as u16
+    }
+    pub fun add(self, rhs: F32x16) -> F32x16 {
+        when cpu::has_avx512f() {
+            mut a := F32x16 { hi: self.hi, lo: self.lo }
+            mut b := F32x16 { hi: rhs.hi, lo: rhs.lo }
+            mut out := F32x16 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(8476672, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return F32x16 { hi: self.hi.add(rhs.hi), lo: self.lo.add(rhs.lo) }
+    }
+    pub fun sub(self, rhs: F32x16) -> F32x16 {
+        when cpu::has_avx512f() {
+            mut a := F32x16 { hi: self.hi, lo: self.lo }
+            mut b := F32x16 { hi: rhs.hi, lo: rhs.lo }
+            mut out := F32x16 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(8477696, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return F32x16 { hi: self.hi.sub(rhs.hi), lo: self.lo.sub(rhs.lo) }
+    }
+    pub fun mul(self, rhs: F32x16) -> F32x16 {
+        when cpu::has_avx512f() {
+            mut a := F32x16 { hi: self.hi, lo: self.lo }
+            mut b := F32x16 { hi: rhs.hi, lo: rhs.lo }
+            mut out := F32x16 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(8476928, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return F32x16 { hi: self.hi.mul(rhs.hi), lo: self.lo.mul(rhs.lo) }
+    }
+    pub fun div(self, rhs: F32x16) -> F32x16 {
+        when cpu::has_avx512f() {
+            mut a := F32x16 { hi: self.hi, lo: self.lo }
+            mut b := F32x16 { hi: rhs.hi, lo: rhs.lo }
+            mut out := F32x16 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(8478208, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return F32x16 { hi: self.hi.div(rhs.hi), lo: self.lo.div(rhs.lo) }
+    }
+    pub fun min(self, rhs: F32x16) -> F32x16 {
+        when cpu::has_avx512f() {
+            mut a := F32x16 { hi: self.hi, lo: self.lo }
+            mut b := F32x16 { hi: rhs.hi, lo: rhs.lo }
+            mut out := F32x16 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(8477952, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return F32x16 { hi: self.hi.min(rhs.hi), lo: self.lo.min(rhs.lo) }
+    }
+    pub fun max(self, rhs: F32x16) -> F32x16 {
+        when cpu::has_avx512f() {
+            mut a := F32x16 { hi: self.hi, lo: self.lo }
+            mut b := F32x16 { hi: rhs.hi, lo: rhs.lo }
+            mut out := F32x16 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(8478464, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return F32x16 { hi: self.hi.max(rhs.hi), lo: self.lo.max(rhs.lo) }
+    }
+    pub fun neg(self) -> F32x16 {
+        return F32x16 { hi: self.hi.neg(), lo: self.lo.neg() }
+    }
+    pub fun abs(self) -> F32x16 {
+        return F32x16 { hi: self.hi.abs(), lo: self.lo.abs() }
+    }
+    pub fun sqrt(self) -> F32x16 {
+        return F32x16 { hi: self.hi.sqrt(), lo: self.lo.sqrt() }
+    }
+}
+pub struct F64x8 { pub hi: F64x4, pub lo: F64x4 }
+extend F64x8 {    pub fun splat(value: f64) -> F64x8 {
+        return F64x8 { hi: F64x4::splat(value), lo: F64x4::splat(value) }
+    }
+
+    pub fun load(address: *u8) -> F64x8 {
+        return F64x8 { hi: F64x4::load(lane_address(address, 32 as u64)), lo: F64x4::load(address) }
+    }
+
+    pub fun store(self, address: *u8) {
+        self.lo.store(address)
+        self.hi.store(lane_address(address, 32 as u64))
+    }
+
+    // The lane `index` (lane 0 is the lowest address).
+    pub fun get(self, index: u64) -> f64 {
+        when index < 4 as u64 {
+            return self.lo.get(index)
+        }
+        return self.hi.get(index - 4 as u64)
+    }
+
+    // A copy with lane `index` replaced by `value`.
+    pub fun with(self, index: u64, value: f64) -> F64x8 {
+        when index < 4 as u64 {
+            return F64x8 { hi: self.hi, lo: self.lo.with(index, value) }
+        }
+        return F64x8 { hi: self.hi.with(index - 4 as u64, value), lo: self.lo }
+    }
+
+    // The lanes of `other` where bit i of `mask` is set, the lanes of `self` elsewhere.
+    pub fun blend(self, other: F64x8, mask: u8) -> F64x8 {
+        mut out := F64x8 { hi: self.hi, lo: self.lo }
+        mut at: u64 = 0
+        while at < 8 as u64 {
+            when ((mask as u64) >> (at as u32)) & 1 == 1 {
+                out = out.with(at, other.get(at))
+            }
+            at += 1
+        }
+        return out
+    }
+
+    // bit i is the top bit of lane i
+    pub fun movemask(self) -> u8 {
+        return (self.lo.movemask() | (self.hi.movemask() << (4 as u32))) as u8
+    }
+
+    pub fun any(self) -> bool {
+        return self.movemask() != 0
+    }
+
+    pub fun all(self) -> bool {
+        return self.movemask() == 255
+    }
+
+    // The lanes added from lane 0 to the last one, as the scalar loop does.
+    pub fun sum(self) -> f64 {
+        mut total: f64 = 0.0
+        mut at: u64 = 0
+        while at < 8 as u64 {
+            total = total + self.get(at)
+            at += 1
+        }
+        return total
+    }
+    pub fun eq(self, rhs: F64x8) -> u8 {
+        return (self.lo.eq(rhs.lo).movemask() | (self.hi.eq(rhs.hi).movemask() << (4 as u32))) as u8
+    }
+    pub fun ne(self, rhs: F64x8) -> u8 {
+        return (self.lo.ne(rhs.lo).movemask() | (self.hi.ne(rhs.hi).movemask() << (4 as u32))) as u8
+    }
+    pub fun lt(self, rhs: F64x8) -> u8 {
+        return (self.lo.lt(rhs.lo).movemask() | (self.hi.lt(rhs.hi).movemask() << (4 as u32))) as u8
+    }
+    pub fun le(self, rhs: F64x8) -> u8 {
+        return (self.lo.le(rhs.lo).movemask() | (self.hi.le(rhs.hi).movemask() << (4 as u32))) as u8
+    }
+    pub fun gt(self, rhs: F64x8) -> u8 {
+        return (self.lo.gt(rhs.lo).movemask() | (self.hi.gt(rhs.hi).movemask() << (4 as u32))) as u8
+    }
+    pub fun ge(self, rhs: F64x8) -> u8 {
+        return (self.lo.ge(rhs.lo).movemask() | (self.hi.ge(rhs.hi).movemask() << (4 as u32))) as u8
+    }
+    pub fun add(self, rhs: F64x8) -> F64x8 {
+        when cpu::has_avx512f() {
+            mut a := F64x8 { hi: self.hi, lo: self.lo }
+            mut b := F64x8 { hi: rhs.hi, lo: rhs.lo }
+            mut out := F64x8 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(12933120, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return F64x8 { hi: self.hi.add(rhs.hi), lo: self.lo.add(rhs.lo) }
+    }
+    pub fun sub(self, rhs: F64x8) -> F64x8 {
+        when cpu::has_avx512f() {
+            mut a := F64x8 { hi: self.hi, lo: self.lo }
+            mut b := F64x8 { hi: rhs.hi, lo: rhs.lo }
+            mut out := F64x8 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(12934144, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return F64x8 { hi: self.hi.sub(rhs.hi), lo: self.lo.sub(rhs.lo) }
+    }
+    pub fun mul(self, rhs: F64x8) -> F64x8 {
+        when cpu::has_avx512f() {
+            mut a := F64x8 { hi: self.hi, lo: self.lo }
+            mut b := F64x8 { hi: rhs.hi, lo: rhs.lo }
+            mut out := F64x8 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(12933376, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return F64x8 { hi: self.hi.mul(rhs.hi), lo: self.lo.mul(rhs.lo) }
+    }
+    pub fun div(self, rhs: F64x8) -> F64x8 {
+        when cpu::has_avx512f() {
+            mut a := F64x8 { hi: self.hi, lo: self.lo }
+            mut b := F64x8 { hi: rhs.hi, lo: rhs.lo }
+            mut out := F64x8 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(12934656, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return F64x8 { hi: self.hi.div(rhs.hi), lo: self.lo.div(rhs.lo) }
+    }
+    pub fun min(self, rhs: F64x8) -> F64x8 {
+        when cpu::has_avx512f() {
+            mut a := F64x8 { hi: self.hi, lo: self.lo }
+            mut b := F64x8 { hi: rhs.hi, lo: rhs.lo }
+            mut out := F64x8 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(12934400, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return F64x8 { hi: self.hi.min(rhs.hi), lo: self.lo.min(rhs.lo) }
+    }
+    pub fun max(self, rhs: F64x8) -> F64x8 {
+        when cpu::has_avx512f() {
+            mut a := F64x8 { hi: self.hi, lo: self.lo }
+            mut b := F64x8 { hi: rhs.hi, lo: rhs.lo }
+            mut out := F64x8 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(12934912, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return F64x8 { hi: self.hi.max(rhs.hi), lo: self.lo.max(rhs.lo) }
+    }
+    pub fun neg(self) -> F64x8 {
+        return F64x8 { hi: self.hi.neg(), lo: self.lo.neg() }
+    }
+    pub fun abs(self) -> F64x8 {
+        return F64x8 { hi: self.hi.abs(), lo: self.lo.abs() }
+    }
+    pub fun sqrt(self) -> F64x8 {
+        return F64x8 { hi: self.hi.sqrt(), lo: self.lo.sqrt() }
+    }
+}
+pub struct I32x16 { pub hi: I32x8, pub lo: I32x8 }
+extend I32x16 {    pub fun splat(value: i32) -> I32x16 {
+        return I32x16 { hi: I32x8::splat(value), lo: I32x8::splat(value) }
+    }
+
+    pub fun load(address: *u8) -> I32x16 {
+        return I32x16 { hi: I32x8::load(lane_address(address, 32 as u64)), lo: I32x8::load(address) }
+    }
+
+    pub fun store(self, address: *u8) {
+        self.lo.store(address)
+        self.hi.store(lane_address(address, 32 as u64))
+    }
+
+    // The lane `index` (lane 0 is the lowest address).
+    pub fun get(self, index: u64) -> i32 {
+        when index < 8 as u64 {
+            return self.lo.get(index)
+        }
+        return self.hi.get(index - 8 as u64)
+    }
+
+    // A copy with lane `index` replaced by `value`.
+    pub fun with(self, index: u64, value: i32) -> I32x16 {
+        when index < 8 as u64 {
+            return I32x16 { hi: self.hi, lo: self.lo.with(index, value) }
+        }
+        return I32x16 { hi: self.hi.with(index - 8 as u64, value), lo: self.lo }
+    }
+
+    // The lanes of `other` where bit i of `mask` is set, the lanes of `self` elsewhere.
+    pub fun blend(self, other: I32x16, mask: u16) -> I32x16 {
+        mut out := I32x16 { hi: self.hi, lo: self.lo }
+        mut at: u64 = 0
+        while at < 16 as u64 {
+            when ((mask as u64) >> (at as u32)) & 1 == 1 {
+                out = out.with(at, other.get(at))
+            }
+            at += 1
+        }
+        return out
+    }
+
+    // bit i is the top bit of lane i
+    pub fun movemask(self) -> u16 {
+        return (self.lo.movemask() | (self.hi.movemask() << (8 as u32))) as u16
+    }
+
+    pub fun any(self) -> bool {
+        return self.movemask() != 0
+    }
+
+    pub fun all(self) -> bool {
+        return self.movemask() == 65535
+    }
+
+    // The lanes added from lane 0 to the last one, as the scalar loop does.
+    pub fun sum(self) -> i32 {
+        mut total: i32 = 0
+        mut at: u64 = 0
+        while at < 16 as u64 {
+            total = total + self.get(at)
+            at += 1
+        }
+        return total
+    }
+    pub fun eq(self, rhs: I32x16) -> u16 {
+        return (self.lo.eq(rhs.lo).movemask() | (self.hi.eq(rhs.hi).movemask() << (8 as u32))) as u16
+    }
+    pub fun ne(self, rhs: I32x16) -> u16 {
+        return (self.lo.ne(rhs.lo).movemask() | (self.hi.ne(rhs.hi).movemask() << (8 as u32))) as u16
+    }
+    pub fun lt(self, rhs: I32x16) -> u16 {
+        return (self.lo.lt(rhs.lo).movemask() | (self.hi.lt(rhs.hi).movemask() << (8 as u32))) as u16
+    }
+    pub fun le(self, rhs: I32x16) -> u16 {
+        return (self.lo.le(rhs.lo).movemask() | (self.hi.le(rhs.hi).movemask() << (8 as u32))) as u16
+    }
+    pub fun gt(self, rhs: I32x16) -> u16 {
+        return (self.lo.gt(rhs.lo).movemask() | (self.hi.gt(rhs.hi).movemask() << (8 as u32))) as u16
+    }
+    pub fun ge(self, rhs: I32x16) -> u16 {
+        return (self.lo.ge(rhs.lo).movemask() | (self.hi.ge(rhs.hi).movemask() << (8 as u32))) as u16
+    }
+    pub fun add(self, rhs: I32x16) -> I32x16 {
+        when cpu::has_avx512f() {
+            mut a := I32x16 { hi: self.hi, lo: self.lo }
+            mut b := I32x16 { hi: rhs.hi, lo: rhs.lo }
+            mut out := I32x16 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(8781312, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return I32x16 { hi: self.hi.add(rhs.hi), lo: self.lo.add(rhs.lo) }
+    }
+    pub fun sub(self, rhs: I32x16) -> I32x16 {
+        when cpu::has_avx512f() {
+            mut a := I32x16 { hi: self.hi, lo: self.lo }
+            mut b := I32x16 { hi: rhs.hi, lo: rhs.lo }
+            mut out := I32x16 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(8780288, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return I32x16 { hi: self.hi.sub(rhs.hi), lo: self.lo.sub(rhs.lo) }
+    }
+    pub fun mul(self, rhs: I32x16) -> I32x16 {
+        when cpu::has_avx512f() {
+            mut a := I32x16 { hi: self.hi, lo: self.lo }
+            mut b := I32x16 { hi: rhs.hi, lo: rhs.lo }
+            mut out := I32x16 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(8798208, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return I32x16 { hi: self.hi.mul(rhs.hi), lo: self.lo.mul(rhs.lo) }
+    }
+    pub fun bit_and(self, rhs: I32x16) -> I32x16 {
+        when cpu::has_avx512f() {
+            mut a := I32x16 { hi: self.hi, lo: self.lo }
+            mut b := I32x16 { hi: rhs.hi, lo: rhs.lo }
+            mut out := I32x16 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(8772352, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return I32x16 { hi: self.hi.bit_and(rhs.hi), lo: self.lo.bit_and(rhs.lo) }
+    }
+    pub fun bit_or(self, rhs: I32x16) -> I32x16 {
+        when cpu::has_avx512f() {
+            mut a := I32x16 { hi: self.hi, lo: self.lo }
+            mut b := I32x16 { hi: rhs.hi, lo: rhs.lo }
+            mut out := I32x16 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(8776448, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return I32x16 { hi: self.hi.bit_or(rhs.hi), lo: self.lo.bit_or(rhs.lo) }
+    }
+    pub fun bit_xor(self, rhs: I32x16) -> I32x16 {
+        when cpu::has_avx512f() {
+            mut a := I32x16 { hi: self.hi, lo: self.lo }
+            mut b := I32x16 { hi: rhs.hi, lo: rhs.lo }
+            mut out := I32x16 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(8777472, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return I32x16 { hi: self.hi.bit_xor(rhs.hi), lo: self.lo.bit_xor(rhs.lo) }
+    }
+}
+pub struct I64x8 { pub hi: I64x4, pub lo: I64x4 }
+extend I64x8 {    pub fun splat(value: i64) -> I64x8 {
+        return I64x8 { hi: I64x4::splat(value), lo: I64x4::splat(value) }
+    }
+
+    pub fun load(address: *u8) -> I64x8 {
+        return I64x8 { hi: I64x4::load(lane_address(address, 32 as u64)), lo: I64x4::load(address) }
+    }
+
+    pub fun store(self, address: *u8) {
+        self.lo.store(address)
+        self.hi.store(lane_address(address, 32 as u64))
+    }
+
+    // The lane `index` (lane 0 is the lowest address).
+    pub fun get(self, index: u64) -> i64 {
+        when index < 4 as u64 {
+            return self.lo.get(index)
+        }
+        return self.hi.get(index - 4 as u64)
+    }
+
+    // A copy with lane `index` replaced by `value`.
+    pub fun with(self, index: u64, value: i64) -> I64x8 {
+        when index < 4 as u64 {
+            return I64x8 { hi: self.hi, lo: self.lo.with(index, value) }
+        }
+        return I64x8 { hi: self.hi.with(index - 4 as u64, value), lo: self.lo }
+    }
+
+    // The lanes of `other` where bit i of `mask` is set, the lanes of `self` elsewhere.
+    pub fun blend(self, other: I64x8, mask: u8) -> I64x8 {
+        mut out := I64x8 { hi: self.hi, lo: self.lo }
+        mut at: u64 = 0
+        while at < 8 as u64 {
+            when ((mask as u64) >> (at as u32)) & 1 == 1 {
+                out = out.with(at, other.get(at))
+            }
+            at += 1
+        }
+        return out
+    }
+
+    // bit i is the top bit of lane i
+    pub fun movemask(self) -> u8 {
+        return (self.lo.movemask() | (self.hi.movemask() << (4 as u32))) as u8
+    }
+
+    pub fun any(self) -> bool {
+        return self.movemask() != 0
+    }
+
+    pub fun all(self) -> bool {
+        return self.movemask() == 255
+    }
+
+    // The lanes added from lane 0 to the last one, as the scalar loop does.
+    pub fun sum(self) -> i64 {
+        mut total: i64 = 0
+        mut at: u64 = 0
+        while at < 8 as u64 {
+            total = total + self.get(at)
+            at += 1
+        }
+        return total
+    }
+    pub fun eq(self, rhs: I64x8) -> u8 {
+        return (self.lo.eq(rhs.lo).movemask() | (self.hi.eq(rhs.hi).movemask() << (4 as u32))) as u8
+    }
+    pub fun ne(self, rhs: I64x8) -> u8 {
+        return (self.lo.ne(rhs.lo).movemask() | (self.hi.ne(rhs.hi).movemask() << (4 as u32))) as u8
+    }
+    pub fun lt(self, rhs: I64x8) -> u8 {
+        return (self.lo.lt(rhs.lo).movemask() | (self.hi.lt(rhs.hi).movemask() << (4 as u32))) as u8
+    }
+    pub fun le(self, rhs: I64x8) -> u8 {
+        return (self.lo.le(rhs.lo).movemask() | (self.hi.le(rhs.hi).movemask() << (4 as u32))) as u8
+    }
+    pub fun gt(self, rhs: I64x8) -> u8 {
+        return (self.lo.gt(rhs.lo).movemask() | (self.hi.gt(rhs.hi).movemask() << (4 as u32))) as u8
+    }
+    pub fun ge(self, rhs: I64x8) -> u8 {
+        return (self.lo.ge(rhs.lo).movemask() | (self.hi.ge(rhs.hi).movemask() << (4 as u32))) as u8
+    }
+    pub fun add(self, rhs: I64x8) -> I64x8 {
+        when cpu::has_avx512f() {
+            mut a := I64x8 { hi: self.hi, lo: self.lo }
+            mut b := I64x8 { hi: rhs.hi, lo: rhs.lo }
+            mut out := I64x8 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(12964864, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return I64x8 { hi: self.hi.add(rhs.hi), lo: self.lo.add(rhs.lo) }
+    }
+    pub fun sub(self, rhs: I64x8) -> I64x8 {
+        when cpu::has_avx512f() {
+            mut a := I64x8 { hi: self.hi, lo: self.lo }
+            mut b := I64x8 { hi: rhs.hi, lo: rhs.lo }
+            mut out := I64x8 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(12974848, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return I64x8 { hi: self.hi.sub(rhs.hi), lo: self.lo.sub(rhs.lo) }
+    }
+    pub fun bit_and(self, rhs: I64x8) -> I64x8 {
+        when cpu::has_avx512f() {
+            mut a := I64x8 { hi: self.hi, lo: self.lo }
+            mut b := I64x8 { hi: rhs.hi, lo: rhs.lo }
+            mut out := I64x8 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(12966656, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return I64x8 { hi: self.hi.bit_and(rhs.hi), lo: self.lo.bit_and(rhs.lo) }
+    }
+    pub fun bit_or(self, rhs: I64x8) -> I64x8 {
+        when cpu::has_avx512f() {
+            mut a := I64x8 { hi: self.hi, lo: self.lo }
+            mut b := I64x8 { hi: rhs.hi, lo: rhs.lo }
+            mut out := I64x8 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(12970752, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return I64x8 { hi: self.hi.bit_or(rhs.hi), lo: self.lo.bit_or(rhs.lo) }
+    }
+    pub fun bit_xor(self, rhs: I64x8) -> I64x8 {
+        when cpu::has_avx512f() {
+            mut a := I64x8 { hi: self.hi, lo: self.lo }
+            mut b := I64x8 { hi: rhs.hi, lo: rhs.lo }
+            mut out := I64x8 { hi: self.hi, lo: self.lo }
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin(12971776, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }
+        return I64x8 { hi: self.hi.bit_xor(rhs.hi), lo: self.lo.bit_xor(rhs.lo) }
+    }
+}

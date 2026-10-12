@@ -30,6 +30,7 @@ use middle::lower
 use middle::comptime
 use middle::desugar
 use back::gen
+use back::arm64
 use driver::report
 use driver::manifest
 use std::fs
@@ -207,6 +208,24 @@ extend Loader {
         return Result::Err(message)
     }
 
+    // Loads the runtime module. It imports nothing and declares no public alias, which `load` would find by parsing its 2700
+    // lines (a quarter of the build of a small program); the front end parses it once, later. A module that does either is
+    // loaded as any other.
+    fun load_runtime(mut self, file: String, module_path: String, source_root: String) -> bool {
+        read := read_file_result(file.clone())
+        when read.is_err() || !env::get("RYN_NO_PRUNE").is_empty() {
+            return self.load(file, module_path, source_root)
+        }
+        text := read.unwrap()
+        when text.starts_with("use ") || text.find("\nuse ").is_some() || text.find("pub type").is_some() {
+            return self.load(file, module_path, source_root)
+        }
+        self.found_files.push(file.clone())
+        self.found_modules.push(module_path.clone())
+        self.units.push(Unit { path: file, module_path: module_path, text: text, alias_names: Vec(), alias_parameters: Vec(), alias_types: Vec(), import_paths: Vec(), import_locals: Vec() })
+        return true
+    }
+
     // Loads the module in `file` after every module it imports, so that the modules are in dependency order.
     fun load(mut self, file: String, module_path: String, source_root: String) -> bool {
         mut seen: u64 = 0
@@ -274,7 +293,7 @@ extend Loader {
             }
             return false
         }
-        text := read.unwrap()
+        text := rync_expand_bitflags(read.unwrap())
         parsed_text := parser::parse(text.clone(), true)
         parsed := rync_after_ok(parsed_text.clone())
         when parsed.is_none() {
@@ -631,10 +650,452 @@ fun rync_tick(label: str, since: f64) -> f64 {
     return now
 }
 
+// ---------------------------------------------------------------------------------------------------------------- the runtime module
+// Every program is compiled with `std::native`, the runtime written in Ryn: 2700 lines that all the phases before the code
+// generator read, although a program reaches few of its functions (hello world reaches none) and the lowering is lazy. So the
+// functions the program may reach are kept, and the other `__rt_` functions keep their header and get a body that the lowering
+// rejects; if the lowering reaches one of them anyway, the whole front end runs again with the module as it is.
+
+fun rync_ident_byte(byte: u64) -> bool {
+    return (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+}
+
+// Every identifier of `text`.
+fun rync_words_of(text: String) -> Vec<String> {
+    mut words: Vec<String> = Vec()
+    mut at: u64 = 0
+    while at < text.len() {
+        when rync_ident_byte(text.byte_at(at) as u64) {
+            mut end := at + 1
+            while end < text.len() && rync_ident_byte(text.byte_at(end) as u64) {
+                end += 1
+            }
+            words.push(text.slice(at, end))
+            at = end
+        } else {
+            at += 1
+        }
+    }
+    return words
+}
+
+// The name of the function a header line `fun name(` or `pub fun name(` declares, or an empty string.
+fun rync_function_name(line: String) -> String {
+    mut at: u64 = 0
+    when line.starts_with("pub fun ") {
+        at = 8
+    } else when line.starts_with("fun ") {
+        at = 4
+    } else {
+        return String("")
+    }
+    mut end := at
+    while end < line.len() && rync_ident_byte(line.byte_at(end) as u64) {
+        end += 1
+    }
+    return line.slice(at, end)
+}
+
+// The module text with the functions the program does not use cut down. `words` holds the identifiers of every other module
+// of the program.
+fun rync_prune_runtime(runtime: String, words: Map<String, bool>) -> String {
+    mut starts: Vec<u64> = Vec()
+    mut header_ends: Vec<u64> = Vec()
+    mut ends: Vec<u64> = Vec()
+    mut names: Vec<String> = Vec()
+    mut at: u64 = 0
+    while at < runtime.len() {
+        mut line_end := at
+        while line_end < runtime.len() && (runtime.byte_at(line_end) as u64) != 10 {
+            line_end += 1
+        }
+        // Only a line that starts with `fun` or `pub fun` can start a function, so the rest is not copied.
+        mut name := String("")
+        when (runtime.byte_at(at) as u64) == 102 || (runtime.byte_at(at) as u64) == 112 {
+            name = rync_function_name(runtime.slice(at, line_end))
+        }
+        when !name.is_empty() {
+            // The function ends at the next line that is a closing brace alone.
+            mut cursor := line_end + 1
+            mut done: bool = false
+            while cursor < runtime.len() && !done {
+                mut next_end := cursor
+                while next_end < runtime.len() && (runtime.byte_at(next_end) as u64) != 10 {
+                    next_end += 1
+                }
+                when next_end == cursor + 1 && (runtime.byte_at(cursor) as u64) == 125 {
+                    done = true
+                }
+                cursor = next_end + 1
+            }
+            starts.push(at)
+            header_ends.push(line_end)
+            ends.push(cursor)
+            names.push(name)
+            at = cursor
+        } else {
+            at = line_end + 1
+        }
+    }
+    // The words that are needed: those of the program, those of the text outside the functions, and, closing over the
+    // functions that are kept, those of their bodies.
+    mut needed: Map<String, bool> = Map<String, bool>()
+    for word in words.keys() {
+        needed.insert(word, true)
+    }
+    mut outside := String("")
+    mut position: u64 = 0
+    mut item: u64 = 0
+    while item <= starts.len() {
+        mut stop := runtime.len()
+        when item < starts.len() {
+            stop = starts[item]
+        }
+        when stop > position {
+            outside.append(runtime.slice(position, stop))
+        }
+        when item < starts.len() {
+            position = ends[item]
+        }
+        item += 1
+    }
+    for word in rync_words_of(outside.clone()) {
+        needed.insert(word, true)
+    }
+    // The lowering calls this one by name, for a `char` in an interpolated string.
+    needed.insert(String("__char_string"), true)
+    // Printing is syntax, not a call of the operation's name.
+    when words.contains_key(String("print")) || words.contains_key(String("println")) || words.contains_key(String("echo")) || words.contains_key(String("io")) {
+        needed.insert(String("__rt_system_write_stdout"), true)
+    }
+    when words.contains_key(String("eprint")) || words.contains_key(String("eprintln")) || words.contains_key(String("io")) {
+        needed.insert(String("__rt_system_write_stderr"), true)
+    }
+    mut keep: Vec<bool> = Vec()
+    mut at_item: u64 = 0
+    while at_item < names.len() {
+        keep.push(false)
+        at_item += 1
+    }
+    mut changed: bool = true
+    while changed {
+        changed = false
+        mut it: u64 = 0
+        while it < names.len() {
+            when !keep[it] {
+                mut wanted: bool = needed.contains_key(names[it].clone())
+                // A runtime function `__rt_<group>_<operation>` is likely to be used when the program has the operation's name.
+                when !wanted && names[it].starts_with("__rt_") {
+                    rest := names[it].slice(5, names[it].len())
+                    mut cut: u64 = 0
+                    while cut < rest.len() && (rest.byte_at(cut) as u64) != 95 {
+                        cut += 1
+                    }
+                    when cut + 1 < rest.len() && words.contains_key(rest.slice(cut + 1, rest.len())) {
+                        wanted = true
+                    }
+                    // Or any word of the operation's name (`file`, `dir`, `env`, `args`).
+                    mut word_start: u64 = cut + 1
+                    mut scan: u64 = cut + 1
+                    while !wanted && scan <= rest.len() {
+                        when scan == rest.len() || (rest.byte_at(scan) as u64) == 95 {
+                            when scan - word_start >= 3 && words.contains_key(rest.slice(word_start, scan)) {
+                                wanted = true
+                            }
+                            word_start = scan + 1
+                        }
+                        scan += 1
+                    }
+                }
+                when wanted {
+                    keep.set(it, true)
+                    changed = true
+                    for word in rync_words_of(runtime.slice(starts[it], ends[it])) {
+                        needed.insert(word, true)
+                    }
+                }
+            }
+            it += 1
+        }
+    }
+    mut out := outside
+    mut every: u64 = 0
+    while every < names.len() {
+        when keep[every] {
+            out.append(runtime.slice(starts[every], ends[every]))
+        } else when names[every].starts_with("__rt_") {
+            out.append(runtime.slice(starts[every], header_ends[every]))
+            out.append("\n    __ryn_pruned_runtime()\n}\n")
+        }
+        every += 1
+    }
+    return out
+}
+
+// Cutting the runtime down saves some 80 ms; reading the words of a large program costs more than that (a second for the
+// compiler itself), so only a program of modest size is cut down for.
+fun rync_prune_worthwhile(units: Vec<Unit>) -> bool {
+    mut bytes: u64 = 0
+    for unit in units {
+        when unit.module_path != "std::native" {
+            bytes += unit.text.len()
+        }
+    }
+    return bytes < 120000
+}
+
+// The units with the runtime module cut down to what the other modules may use.
+fun rync_pruned_units(units: Vec<Unit>) -> Vec<Unit> {
+    mut words: Map<String, bool> = Map<String, bool>()
+    mut native: u64 = units.len()
+    mut at: u64 = 0
+    while at < units.len() {
+        when units[at].module_path == "std::native" {
+            native = at
+        } else when env::get("RYN_PRUNE_STRESS").is_empty() {
+            for word in rync_words_of(units[at].text.clone()) {
+                words.insert(word, true)
+            }
+        }
+        at += 1
+    }
+    mut pruned: Vec<Unit> = units
+    when native < pruned.len() {
+        mut unit := pruned[native]
+        unit.text = rync_prune_runtime(unit.text.clone(), words)
+        pruned.set(native, unit)
+    }
+    return pruned
+}
+
+// ------------------------------------------------------------------------------------------------------------------ bitflags
+// `bitflags Name: u32 { A = 1, B = 2, AB = A | B, C }` declares a structure with one `bits` field, a constant per flag
+// (`Name::A`), the operators `|`, `&`, `^`, `-` and `!` as methods (so `|=` works), and `empty`, `all`, `from_bits`, `contains`,
+// `intersects`, `is_empty`, `insert`, `remove`, `toggle` and `set`. It is written out as ordinary Ryn at the end of the file,
+// and the declaration itself is blanked, so that the positions of everything else in the file stay where they were.
+
+fun rync_flag_entries(body: String) -> Vec<String> {
+    // The entries of a flag list, comments removed, split at commas and line ends.
+    mut entries: Vec<String> = Vec()
+    mut current := String("")
+    mut at: u64 = 0
+    while at < body.len() {
+        byte := body.byte_at(at) as u64
+        when byte == 47 && at + 1 < body.len() && (body.byte_at(at + 1) as u64) == 47 {
+            while at < body.len() && (body.byte_at(at) as u64) != 10 {
+                at += 1
+            }
+        } else when byte == 44 || byte == 10 {
+            trimmed := current.trim()
+            when !trimmed.is_empty() {
+                entries.push(trimmed)
+            }
+            current = String("")
+            at += 1
+        } else {
+            current.push(char_from_u32(byte as u32))
+            at += 1
+        }
+    }
+    trimmed := current.trim()
+    when !trimmed.is_empty() {
+        entries.push(trimmed)
+    }
+    return entries
+}
+
+// `expression` with each of the names `flags` replaced by its constant `__<name>_<flag>`.
+fun rync_flag_expression(expression: String, owner: String, flags: Vec<String>) -> String {
+    mut out := String("")
+    mut at: u64 = 0
+    while at < expression.len() {
+        when rync_ident_byte(expression.byte_at(at) as u64) {
+            mut end := at + 1
+            while end < expression.len() && rync_ident_byte(expression.byte_at(end) as u64) {
+                end += 1
+            }
+            word := expression.slice(at, end)
+            mut known: bool = false
+            for flag in flags.clone() {
+                when flag == word {
+                    known = true
+                }
+            }
+            when known {
+                out.append("__")
+                out.append(owner.clone())
+                out.append("_")
+            }
+            out.append(word)
+            at = end
+        } else {
+            out.push(char_from_u32((expression.byte_at(at) as u64) as u32))
+            at += 1
+        }
+    }
+    return out
+}
+
+fun rync_flag_source(name: String, ty: String, entries: Vec<String>) -> String {
+    mut names: Vec<String> = Vec()
+    mut out := String("\n")
+    mut position: u64 = 0
+    for entry in entries.clone() {
+        equals := entry.find("=")
+        mut flag := entry.clone()
+        mut value := String("")
+        when equals.is_some() {
+            flag = entry.slice(0, equals.unwrap()).trim()
+            value = rync_flag_expression(entry.slice(equals.unwrap() + 1, entry.len()).trim(), name.clone(), names.clone())
+        } else {
+            value = String("1 << ")
+            value.append(String(position))
+        }
+        out.append("const __")
+        out.append(name.clone())
+        out.append("_")
+        out.append(flag.clone())
+        out.append(": ")
+        out.append(ty.clone())
+        out.append(" = ")
+        out.append(value)
+        out.append("\n")
+        names.push(flag)
+        position += 1
+    }
+    out.append("pub struct ")
+    out.append(name.clone())
+    out.append(" { pub bits: ")
+    out.append(ty.clone())
+    out.append(" }\nextend ")
+    out.append(name.clone())
+    out.append(" {\n")
+    mut every := String("0")
+    for flag in names.clone() {
+        mut constant := String("__")
+        constant.append(name.clone())
+        constant.append("_")
+        constant.append(flag.clone())
+        out.append("    pub const ")
+        out.append(flag)
+        out.append(": ")
+        out.append(name.clone())
+        out.append(" = ")
+        out.append(name.clone())
+        out.append(" { bits: ")
+        out.append(constant.clone())
+        out.append(" }\n")
+        every.append(" | ")
+        every.append(constant)
+    }
+    mut methods := String("")
+    methods.append("    pub fun empty() -> NAME { return NAME { bits: 0 } }\n")
+    methods.append("    pub fun all() -> NAME { return NAME { bits: EVERY } }\n")
+    methods.append("    pub fun from_bits(bits: TYPE) -> NAME { return NAME { bits: bits } }\n")
+    methods.append("    pub fun contains(self, other: NAME) -> bool { return (self.bits & other.bits) == other.bits }\n")
+    methods.append("    pub fun intersects(self, other: NAME) -> bool { return (self.bits & other.bits) != 0 }\n")
+    methods.append("    pub fun is_empty(self) -> bool { return self.bits == 0 }\n")
+    methods.append("    pub fun is_all(self) -> bool { return self.bits == (EVERY) }\n")
+    methods.append("    pub fun insert(mut self, other: NAME) { self.bits = self.bits | other.bits }\n")
+    methods.append("    pub fun remove(mut self, other: NAME) { self.bits = self.bits & ~other.bits }\n")
+    methods.append("    pub fun toggle(mut self, other: NAME) { self.bits = self.bits ^ other.bits }\n")
+    methods.append("    pub fun set(mut self, other: NAME, on: bool) {\n        when on {\n            self.bits = self.bits | other.bits\n        } else {\n            self.bits = self.bits & ~other.bits\n        }\n    }\n")
+    methods.append("    pub fun bitor(self, other: NAME) -> NAME { return NAME { bits: self.bits | other.bits } }\n")
+    methods.append("    pub fun bitand(self, other: NAME) -> NAME { return NAME { bits: self.bits & other.bits } }\n")
+    methods.append("    pub fun bitxor(self, other: NAME) -> NAME { return NAME { bits: self.bits ^ other.bits } }\n")
+    methods.append("    pub fun sub(self, other: NAME) -> NAME { return NAME { bits: self.bits & ~other.bits } }\n")
+    methods.append("    pub fun not(self) -> NAME { return NAME { bits: (EVERY) & ~self.bits } }\n")
+    methods.append("    pub fun eq(self, other: NAME) -> bool { return self.bits == other.bits }\n")
+    methods.append("}\n")
+    out.append(rync_replace_all(rync_replace_all(rync_replace_all(methods, "NAME", name), "TYPE", ty), "EVERY", every))
+    return out
+}
+
+fun rync_replace_all(text: String, from: str, with: String) -> String {
+    mut out := String("")
+    mut at: u64 = 0
+    while at < text.len() {
+        when text.slice(at, text.len()).starts_with(from) {
+            out.append(with.clone())
+            at += from.len()
+        } else {
+            out.push(char_from_u32((text.byte_at(at) as u64) as u32))
+            at += 1
+        }
+    }
+    return out
+}
+
+// The text with every `bitflags` declaration blanked and written out as Ryn after the last line.
+fun rync_expand_bitflags(text: String) -> String {
+    when text.find("bitflags ").is_none() {
+        return text
+    }
+    mut kept := String("")
+    mut generated := String("")
+    mut at: u64 = 0
+    while at < text.len() {
+        mut line_end := at
+        while line_end < text.len() && (text.byte_at(line_end) as u64) != 10 {
+            line_end += 1
+        }
+        line := text.slice(at, line_end)
+        when line.starts_with("bitflags ") {
+            // The declaration runs to the line that closes its braces.
+            mut item_end := line_end
+            mut depth: u64 = 0
+            mut opened: bool = false
+            mut cursor := at
+            while cursor < text.len() && (!opened || depth > 0) {
+                byte := text.byte_at(cursor) as u64
+                when byte == 123 {
+                    depth += 1
+                    opened = true
+                } else when byte == 125 && depth > 0 {
+                    depth -= 1
+                }
+                cursor += 1
+            }
+            item_end = cursor
+            item := text.slice(at, item_end)
+            open := item.find("{")
+            colon := item.find(":")
+            when open.is_some() && colon.is_some() && colon.unwrap() < open.unwrap() {
+                name := item.slice(9, colon.unwrap()).trim()
+                ty := item.slice(colon.unwrap() + 1, open.unwrap()).trim()
+                body := item.slice(open.unwrap() + 1, item.len() - 1)
+                generated.append(rync_flag_source(name, ty, rync_flag_entries(body)))
+                // Blank it, keeping the line ends.
+                mut blank := at
+                while blank < item_end {
+                    when (text.byte_at(blank) as u64) == 10 {
+                        kept.push('\n')
+                    } else {
+                        kept.push(' ')
+                    }
+                    blank += 1
+                }
+                at = item_end
+            } else {
+                kept.append(line)
+                at = line_end
+            }
+        } else {
+            kept.append(line)
+            at = line_end
+        }
+        when at < text.len() && (text.byte_at(at) as u64) == 10 {
+            kept.push('\n')
+            at += 1
+        }
+    }
+    kept.append(generated)
+    return kept
+}
+
 // The program from its entry file through the typed IR. `recovering` reports every syntax error of a file without modules.
-fun rync_frontend(loader: Loader, recovering: bool) -> Result<Compiled, Failure> {
+fun rync_frontend(units: Vec<Unit>, recovering: bool) -> Result<Compiled, Failure> {
     mut clock := time::monotonic()
-    units := loader.units
     single := units.len() == 1 && units[0].import_paths.is_empty()
     mut compilation := Compilation { units: units.clone(), segments: Vec(), single: true, joined: String("") }
     mut text := units[0].text.clone()
@@ -809,10 +1270,12 @@ fun main() -> i32 {
     mut seen_command := false
     // The target is the system the compiler runs on, unless `--target` names the other.
     mut windows := system::os() == "windows"
+    // `--target aarch64-linux` selects the AArch64 backend, which makes a Linux executable for ARM64.
+    mut arm64 := false
     while position < arg_count() {
         word := String(arg(position))
         when word == "--version" || word == "-V" {
-            echo "rync 0.1.10"
+            echo "rync 0.1.13"
             return 0
         }
         when word == "--help" || word == "-h" {
@@ -836,7 +1299,7 @@ fun main() -> i32 {
             when architecture != "x86-64" && architecture != "x86_64" && architecture != "amd64" {
                 mut message := String("error[R0910]: unsupported architecture `")
                 message.append(architecture)
-                message.append("`: the native compiler has an x86-64 backend only (there is no ARM64 backend, so no NEON code)")
+                message.append("`: the listing is x86-64 only; build an ARM64 executable with --target aarch64-linux")
                 return rync_fail(message, 2)
             }
             position += 2
@@ -846,8 +1309,13 @@ fun main() -> i32 {
             target := String(arg(position + 1))
             when target == "windows" || target == "x86_64-windows" {
                 windows = true
+                arm64 = false
             } else when target == "linux" || target == "x86_64-linux" {
                 windows = false
+                arm64 = false
+            } else when target == "aarch64-linux" || target == "aarch64" {
+                windows = false
+                arm64 = true
             } else {
                 return rync_fail(rync_usage(), 2)
             }
@@ -938,7 +1406,7 @@ fun main() -> i32 {
     mut runtime_file := std_root
     runtime_file.append("/native.ryn")
     when file_exists(runtime_file.clone()) {
-        when !loader.load(runtime_file, String("std::native"), loader.std_root.clone()) {
+        when !loader.load_runtime(runtime_file, String("std::native"), loader.std_root.clone()) {
             return rync_fail(loader.error.clone(), 1)
         }
     }
@@ -953,7 +1421,15 @@ fun main() -> i32 {
         }
     }
     loaded_files := loader.found_files.clone()
-    analyzed := rync_frontend(loader, checking)
+    mut analyzed: Result<Compiled, Failure> = Result::Err(Failure { text: String(""), status: 1 })
+    when !checking && !windows && env::get("RYN_NO_PRUNE").is_empty() && rync_prune_worthwhile(loader.units.clone()) {
+        analyzed = rync_frontend(rync_pruned_units(loader.units.clone()), false)
+        when analyzed.is_err() {
+            analyzed = rync_frontend(loader.units.clone(), false)
+        }
+    } else {
+        analyzed = rync_frontend(loader.units.clone(), checking)
+    }
     when analyzed.is_err() {
         failure := analyzed.unwrap_err()
         return rync_fail(failure.text, failure.status)
@@ -997,8 +1473,24 @@ fun main() -> i32 {
             profile_text = read_profile.unwrap()
         }
     }
+    // `RYN_DUMP_IR=<path>` writes the IR text of the program, for debugging the code generators.
+    dump_path := env::get("RYN_DUMP_IR")
+    when !dump_path.is_empty() {
+        mut dump: Vec<u8> = Vec()
+        mut at: u64 = 0
+        while at < compiled.ir_text.len() {
+            dump.push(compiled.ir_text.byte_at(at))
+            at += 1
+        }
+        rync_write_file(dump_path, dump)
+    }
     mut linked: Result<Vec<u8>, String> = Result::Err(String(""))
-    when !profile_out.is_empty() || !profile_text.is_empty() {
+    when arm64 && (!profile_out.is_empty() || !profile_text.is_empty()) {
+        return rync_fail(String("error[R0910]: profiling is not available for the AArch64 target"), 2)
+    }
+    when arm64 {
+        linked = arm64::generate_executable_text(compiled.ir_text.clone())
+    } else when !profile_out.is_empty() || !profile_text.is_empty() {
         linked = gen::generate_profiled(compiled.ir_text.clone(), windows, profile_out.clone(), profile_text)
     } else {
         linked = gen::generate_for_target(compiled.ir_text.clone(), windows)

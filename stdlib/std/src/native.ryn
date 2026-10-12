@@ -2673,3 +2673,10 @@ pub fun __rt_system_random_range(low: f64, high: f64) -> f64 {
     }
     return low + __rt_system_random() * (high - low)
 }
+
+// The text of one character: what `"{c}"` writes for a `char` (the lowering calls it by name; the pruning keeps it).
+pub fun __char_string(value: char) -> String {
+    mut text := String()
+    text.push(value)
+    return text
+}

@@ -1,0 +1,180 @@
+// MMX: 64-bit vectors in the MMX registers. A value is a `Mmx` holding 64 bits; its lanes are in memory order, lane 0 in
+// the lowest bits. Every operation loads both operands into mm0 and mm1, runs one MMX instruction, stores the result and
+// then clears the MMX state with `emms`, so the x87 unit (which MMX aliases) is free again after the call, as the System V
+// convention requires. The operation codes are literals: the generator (`gen.ryn`, `MmxBin`) reads them, so they are
+// spelled out here, computed as opcode * 256 + 65536 (map 1 = 0F, no prefix).
+//
+// Requires an x86-64 processor with MMX (every processor since 1997). The program may use these operations on any x86-64
+// Linux or Windows executable.
+
+pub struct Mmx { pub bits: u64 }
+
+extend Mmx {
+    // A vector of two 32-bit lanes, `lo` in lane 0.
+    pub fun from_i32(lo: i32, hi: i32) -> Mmx {
+        return Mmx { bits: ((lo as u32) as u64) | (((hi as u32) as u64) << (32 as u32)) }
+    }
+
+    // The 32-bit signed lane `index` (0 or 1).
+    pub fun lane_i32(self, index: u64) -> i32 {
+        return (((self.bits >> ((index * 32) as u32)) & 4294967295) as u32) as i32
+    }
+
+    pub fun from_bits(bits: u64) -> Mmx {
+        return Mmx { bits: bits }
+    }
+    // paddb: 8-bit lanes, wrapping.
+    pub fun add_i8(self, rhs: Mmx) -> Mmx {
+        mut a := Mmx { bits: self.bits }
+        mut b := Mmx { bits: rhs.bits }
+        mut out := Mmx { bits: 0 }
+        pa := &raw mut a
+        pb := &raw mut b
+        po := &raw mut out
+        __mmx_bin(130048, po as *u8, pa as *u8, pb as *u8)
+        return out
+    }
+    // paddw: 16-bit lanes, wrapping.
+    pub fun add_i16(self, rhs: Mmx) -> Mmx {
+        mut a := Mmx { bits: self.bits }
+        mut b := Mmx { bits: rhs.bits }
+        mut out := Mmx { bits: 0 }
+        pa := &raw mut a
+        pb := &raw mut b
+        po := &raw mut out
+        __mmx_bin(130304, po as *u8, pa as *u8, pb as *u8)
+        return out
+    }
+    // paddd: 32-bit lanes, wrapping.
+    pub fun add_i32(self, rhs: Mmx) -> Mmx {
+        mut a := Mmx { bits: self.bits }
+        mut b := Mmx { bits: rhs.bits }
+        mut out := Mmx { bits: 0 }
+        pa := &raw mut a
+        pb := &raw mut b
+        po := &raw mut out
+        __mmx_bin(130560, po as *u8, pa as *u8, pb as *u8)
+        return out
+    }
+    // paddq: the 64-bit lane, wrapping.
+    pub fun add_i64(self, rhs: Mmx) -> Mmx {
+        mut a := Mmx { bits: self.bits }
+        mut b := Mmx { bits: rhs.bits }
+        mut out := Mmx { bits: 0 }
+        pa := &raw mut a
+        pb := &raw mut b
+        po := &raw mut out
+        __mmx_bin(119808, po as *u8, pa as *u8, pb as *u8)
+        return out
+    }
+    // psubb: 8-bit lanes, wrapping.
+    pub fun sub_i8(self, rhs: Mmx) -> Mmx {
+        mut a := Mmx { bits: self.bits }
+        mut b := Mmx { bits: rhs.bits }
+        mut out := Mmx { bits: 0 }
+        pa := &raw mut a
+        pb := &raw mut b
+        po := &raw mut out
+        __mmx_bin(129024, po as *u8, pa as *u8, pb as *u8)
+        return out
+    }
+    // psubw: 16-bit lanes, wrapping.
+    pub fun sub_i16(self, rhs: Mmx) -> Mmx {
+        mut a := Mmx { bits: self.bits }
+        mut b := Mmx { bits: rhs.bits }
+        mut out := Mmx { bits: 0 }
+        pa := &raw mut a
+        pb := &raw mut b
+        po := &raw mut out
+        __mmx_bin(129280, po as *u8, pa as *u8, pb as *u8)
+        return out
+    }
+    // psubd: 32-bit lanes, wrapping.
+    pub fun sub_i32(self, rhs: Mmx) -> Mmx {
+        mut a := Mmx { bits: self.bits }
+        mut b := Mmx { bits: rhs.bits }
+        mut out := Mmx { bits: 0 }
+        pa := &raw mut a
+        pb := &raw mut b
+        po := &raw mut out
+        __mmx_bin(129536, po as *u8, pa as *u8, pb as *u8)
+        return out
+    }
+    // psubq: the 64-bit lane, wrapping.
+    pub fun sub_i64(self, rhs: Mmx) -> Mmx {
+        mut a := Mmx { bits: self.bits }
+        mut b := Mmx { bits: rhs.bits }
+        mut out := Mmx { bits: 0 }
+        pa := &raw mut a
+        pb := &raw mut b
+        po := &raw mut out
+        __mmx_bin(129792, po as *u8, pa as *u8, pb as *u8)
+        return out
+    }
+    // pmullw: 16-bit lanes, the low 16 bits of each product.
+    pub fun mul_i16(self, rhs: Mmx) -> Mmx {
+        mut a := Mmx { bits: self.bits }
+        mut b := Mmx { bits: rhs.bits }
+        mut out := Mmx { bits: 0 }
+        pa := &raw mut a
+        pb := &raw mut b
+        po := &raw mut out
+        __mmx_bin(120064, po as *u8, pa as *u8, pb as *u8)
+        return out
+    }
+    // pcmpeqd: 32-bit lanes: all bits set where equal, else zero.
+    pub fun eq_i32(self, rhs: Mmx) -> Mmx {
+        mut a := Mmx { bits: self.bits }
+        mut b := Mmx { bits: rhs.bits }
+        mut out := Mmx { bits: 0 }
+        pa := &raw mut a
+        pb := &raw mut b
+        po := &raw mut out
+        __mmx_bin(95744, po as *u8, pa as *u8, pb as *u8)
+        return out
+    }
+    // pcmpgtd: 32-bit signed lanes: all bits set where the left one is greater, else zero.
+    pub fun gt_i32(self, rhs: Mmx) -> Mmx {
+        mut a := Mmx { bits: self.bits }
+        mut b := Mmx { bits: rhs.bits }
+        mut out := Mmx { bits: 0 }
+        pa := &raw mut a
+        pb := &raw mut b
+        po := &raw mut out
+        __mmx_bin(91648, po as *u8, pa as *u8, pb as *u8)
+        return out
+    }
+    // pand: the 64 bits.
+    pub fun bit_and(self, rhs: Mmx) -> Mmx {
+        mut a := Mmx { bits: self.bits }
+        mut b := Mmx { bits: rhs.bits }
+        mut out := Mmx { bits: 0 }
+        pa := &raw mut a
+        pb := &raw mut b
+        po := &raw mut out
+        __mmx_bin(121600, po as *u8, pa as *u8, pb as *u8)
+        return out
+    }
+    // por: the 64 bits.
+    pub fun bit_or(self, rhs: Mmx) -> Mmx {
+        mut a := Mmx { bits: self.bits }
+        mut b := Mmx { bits: rhs.bits }
+        mut out := Mmx { bits: 0 }
+        pa := &raw mut a
+        pb := &raw mut b
+        po := &raw mut out
+        __mmx_bin(125696, po as *u8, pa as *u8, pb as *u8)
+        return out
+    }
+    // pxor: the 64 bits.
+    pub fun bit_xor(self, rhs: Mmx) -> Mmx {
+        mut a := Mmx { bits: self.bits }
+        mut b := Mmx { bits: rhs.bits }
+        mut out := Mmx { bits: 0 }
+        pa := &raw mut a
+        pb := &raw mut b
+        po := &raw mut out
+        __mmx_bin(126720, po as *u8, pa as *u8, pb as *u8)
+        return out
+    }
+}

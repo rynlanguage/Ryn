@@ -1,0 +1,20 @@
+// test: run
+// out: 34
+// out: 11
+// out: 6
+// out: 6
+// Array patterns in a declaration, nested in tuples and structure patterns.
+struct P { x: i32, y: i32 }
+fun main() {
+    arr: [i32; 3] = [4, 5, 6]
+    [a, b, c] := arr
+    echo a + b * c
+    [mut m, _, n] := arr
+    m += 1
+    echo m + n
+    pair: [P; 2] = [P { x: 1, y: 2 }, P { x: 3, y: 4 }]
+    [P { x: p0, y }, P { x: p1 }] := pair
+    echo p0 + y + p1
+    (s, [t, u]) := (1, [2, 3])
+    echo s + t + u
+}

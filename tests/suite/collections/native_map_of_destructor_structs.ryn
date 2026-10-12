@@ -13,7 +13,7 @@
 // out: 9
 // exit: 0
 // A map of structs with a destructor takes its values in a box: a replaced value is dropped when it is replaced, a removed
-// value when it is removed, and `clear` drops the rest in the order of their hashes.
+// value when it is removed, and `clear` drops the rest in the order of its entries (the order of insertion, but for the last entry taking the place of a removed one).
 #[drop(release)]
 struct Resource {
     handle: *i32,

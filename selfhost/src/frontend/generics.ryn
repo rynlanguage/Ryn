@@ -198,6 +198,7 @@ struct StmtNode {
 struct FunctionNode {
     name: String,
     extern_c: bool,
+    variadic: bool,
     has_symbol: bool,
     symbol: String,
     type_params: Vec<String>,
@@ -873,6 +874,7 @@ extend Tree {
         mut function := FunctionNode {
             name: self.string(),
             extern_c: false,
+            variadic: false,
             has_symbol: false,
             symbol: String(),
             type_params: Vec<String>(),
@@ -893,6 +895,7 @@ extend Tree {
             end: 0
         }
         function.extern_c = self.boolean()
+        function.variadic = self.boolean()
         when self.present() {
             function.has_symbol = true
             function.symbol = self.string()
@@ -1637,6 +1640,7 @@ extend Tree {
         mut out := String("\n")
         out.append(enc_str(function.name.clone()))
         out.append(enc_bool(function.extern_c))
+        out.append(enc_bool(function.variadic))
         when function.has_symbol {
             out.append(word("+"))
             out.append(enc_str(function.symbol.clone()))

@@ -6,7 +6,7 @@ usage: tools/gen-simd.py            (writes the file next to the standard librar
 The file is generated so that the instruction codes stay in one table. A code is the literal first argument of the
 `__simd_*` builtins; selfhost/src/back/gen.ryn (`simd_call`) decodes it:
     bits 0-7 immediate, 8-15 opcode, 16-17 map (1 = 0F, 2 = 0F 38, 3 = 0F 3A), 18-19 prefix (1 = 66, 2 = F3, 3 = F2),
-    bit 20 immediate present, bit 21 VEX.256 form (AVX2), bit 22 VEX.W.
+    bit 20 immediate present, bit 21 VEX.256 form (AVX2), bit 22 VEX.W, bit 23 EVEX.512 form (AVX-512F).
 """
 from pathlib import Path
 
@@ -133,6 +133,148 @@ pub fun add_f32(dst: *f32, a: *f32, b: *f32, count: u64) {{
     }}
 }}
 '''
+
+
+
+# 512-bit types. A vector is two 256-bit halves: `lo` holds the lower 32 bytes (declared last, so it sits at the lower address
+# and the lanes stay in memory order). Operations run on the halves through the 256-bit methods, which is what a processor
+# without AVX-512F does. When `std::cpu` reports AVX-512F, arithmetic runs on one zmm register through EVEX instead
+# (`__simd_bin` with bit 23 set). Comparisons give a bit mask (`u16` for 16 lanes, `u8` for 8) instead of a vector.
+WIDE512 = [
+    # name, lane type, lanes, half type, kind, lane bytes
+    ("F32x16", "f32", 16, "F32x8", "f32", 4),
+    ("F64x8", "f64", 8, "F64x4", "f64", 8),
+    ("I32x16", "i32", 16, "I32x8", "i32", 4),
+    ("I64x8", "i64", 8, "I64x4", "i64", 8),
+]
+
+# EVEX codes of the binary operations: (pp, opcode, map, wide). The float ones use the lane type's W bit, the integer ones
+# are the 512-bit forms of the SSE2/AVX2 instructions (`vpaddd` ...); integer multiply of 32-bit lanes is `vpmulld`.
+EVEX_BIN = {
+    "f32": {"add": (0, 0x58, 1, 0), "sub": (0, 0x5C, 1, 0), "mul": (0, 0x59, 1, 0), "div": (0, 0x5E, 1, 0),
+            "min": (0, 0x5D, 1, 0), "max": (0, 0x5F, 1, 0)},
+    "f64": {"add": (1, 0x58, 1, 1), "sub": (1, 0x5C, 1, 1), "mul": (1, 0x59, 1, 1), "div": (1, 0x5E, 1, 1),
+            "min": (1, 0x5D, 1, 1), "max": (1, 0x5F, 1, 1)},
+    "i32": {"add": (1, 0xFE, 1, 0), "sub": (1, 0xFA, 1, 0), "mul": (1, 0x40, 2, 0), "bit_and": (1, 0xDB, 1, 0),
+            "bit_or": (1, 0xEB, 1, 0), "bit_xor": (1, 0xEF, 1, 0)},
+    "i64": {"add": (1, 0xD4, 1, 1), "sub": (1, 0xFB, 1, 1), "bit_and": (1, 0xDB, 1, 1),
+            "bit_or": (1, 0xEB, 1, 1), "bit_xor": (1, 0xEF, 1, 1)},
+}
+
+
+def zcode(pp, opcode, map=1, wide=0):
+    """The code of a 512-bit EVEX operation (bit 23)."""
+    return code(pp, opcode, map) | (wide << 22) | (1 << 23)
+
+
+def build512():
+    out = []
+    for name, lane, n, half, kind, w in WIDE512:
+        h = n // 2
+        unsigned_top = "u16" if n == 16 else "u8"
+        mask_bits = (1 << n) - 1
+        zero_lane = "0.0" if kind.startswith("f") else "0"
+        out.append(f"pub struct {name} {{ pub hi: {half}, pub lo: {half} }}\n")
+        out.append(f"extend {name} {{")
+        out.append(f"""    pub fun splat(value: {lane}) -> {name} {{
+        return {name} {{ hi: {half}::splat(value), lo: {half}::splat(value) }}
+    }}
+
+    pub fun load(address: *u8) -> {name} {{
+        return {name} {{ hi: {half}::load(lane_address(address, {h * w} as u64)), lo: {half}::load(address) }}
+    }}
+
+    pub fun store(self, address: *u8) {{
+        self.lo.store(address)
+        self.hi.store(lane_address(address, {h * w} as u64))
+    }}
+
+    // The lane `index` (lane 0 is the lowest address).
+    pub fun get(self, index: u64) -> {lane} {{
+        when index < {h} as u64 {{
+            return self.lo.get(index)
+        }}
+        return self.hi.get(index - {h} as u64)
+    }}
+
+    // A copy with lane `index` replaced by `value`.
+    pub fun with(self, index: u64, value: {lane}) -> {name} {{
+        when index < {h} as u64 {{
+            return {name} {{ hi: self.hi, lo: self.lo.with(index, value) }}
+        }}
+        return {name} {{ hi: self.hi.with(index - {h} as u64, value), lo: self.lo }}
+    }}
+
+    // The lanes of `other` where bit i of `mask` is set, the lanes of `self` elsewhere.
+    pub fun blend(self, other: {name}, mask: {unsigned_top}) -> {name} {{
+        mut out := {name} {{ hi: self.hi, lo: self.lo }}
+        mut at: u64 = 0
+        while at < {n} as u64 {{
+            when ((mask as u64) >> (at as u32)) & 1 == 1 {{
+                out = out.with(at, other.get(at))
+            }}
+            at += 1
+        }}
+        return out
+    }}
+
+    // bit i is the top bit of lane i
+    pub fun movemask(self) -> {unsigned_top} {{
+        return (self.lo.movemask() | (self.hi.movemask() << ({h} as u32))) as {unsigned_top}
+    }}
+
+    pub fun any(self) -> bool {{
+        return self.movemask() != 0
+    }}
+
+    pub fun all(self) -> bool {{
+        return self.movemask() == {mask_bits}
+    }}
+
+    // The lanes added from lane 0 to the last one, as the scalar loop does.
+    pub fun sum(self) -> {lane} {{
+        mut total: {lane} = {zero_lane}
+        mut at: u64 = 0
+        while at < {n} as u64 {{
+            total = total + self.get(at)
+            at += 1
+        }}
+        return total
+    }}
+""")
+        # comparisons: the mask of the lanes where the relation holds
+        for method in ("eq", "ne", "lt", "le", "gt", "ge"):
+            out.append(f"""    pub fun {method}(self, rhs: {name}) -> {unsigned_top} {{
+        return (self.lo.{method}(rhs.lo).movemask() | (self.hi.{method}(rhs.hi).movemask() << ({h} as u32))) as {unsigned_top}
+    }}
+""")
+        # binary arithmetic: EVEX when AVX-512F, the halves otherwise
+        table = EVEX_BIN[kind]
+        for method, (pp, opc, mp, wide) in table.items():
+            half_method = method
+            evex = zcode(pp, opc, mp, wide)
+            out.append(f"""    pub fun {method}(self, rhs: {name}) -> {name} {{
+        when cpu::has_avx512f() {{
+            mut a := {name} {{ hi: self.hi, lo: self.lo }}
+            mut b := {name} {{ hi: rhs.hi, lo: rhs.lo }}
+            mut out := {name} {{ hi: self.hi, lo: self.lo }}
+            pa := &raw mut a
+            pb := &raw mut b
+            po := &raw mut out
+            __simd_bin({evex}, po as *u8, pa as *u8, pb as *u8)
+            return out
+        }}
+        return {name} {{ hi: self.hi.{half_method}(rhs.hi), lo: self.lo.{half_method}(rhs.lo) }}
+    }}
+""")
+        if kind.startswith("f"):
+            for method in ("neg", "abs", "sqrt"):
+                out.append(f"""    pub fun {method}(self) -> {name} {{
+        return {name} {{ hi: self.hi.{method}(), lo: self.lo.{method}() }}
+    }}
+""")
+        out.append("}\n")
+    return "".join(out)
 
 
 def build():
@@ -586,6 +728,7 @@ def build():
 }}
 """)
     out.append(fused())
+    out.append(build512())
     return "".join(out)
 
 

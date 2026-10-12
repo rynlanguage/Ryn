@@ -1,0 +1,39 @@
+// test: run
+// target: linux
+// out: 11
+// out: 22
+// out: 9
+// out: 18
+// out: 128
+// out: -1
+// out: 0
+// out: -1
+// out: 0
+// out: 1000
+// out: 3
+// out: 1
+// MMX: each operation loads its operands into mm0 and mm1 and ends with emms, so floating point code between operations works.
+use std::mmx
+fun main() {
+    x := mmx::Mmx::from_i32(1, 2)
+    y := mmx::Mmx::from_i32(10, 20)
+    echo x.add_i32(y).lane_i32(0)
+    echo x.add_i32(y).lane_i32(1)
+    echo y.sub_i32(x).lane_i32(0)
+    echo y.sub_i32(x).lane_i32(1)
+    echo mmx::Mmx::from_bits(127).add_i8(mmx::Mmx::from_bits(1)).bits
+    echo mmx::Mmx::from_i32(3, 4).eq_i32(mmx::Mmx::from_i32(3, 5)).lane_i32(0)
+    echo mmx::Mmx::from_i32(3, 4).eq_i32(mmx::Mmx::from_i32(3, 5)).lane_i32(1)
+    echo mmx::Mmx::from_i32(-1, 5).gt_i32(mmx::Mmx::from_i32(-2, 9)).lane_i32(0)
+    echo mmx::Mmx::from_i32(-1, 5).gt_i32(mmx::Mmx::from_i32(-2, 9)).lane_i32(1)
+    mut total := mmx::Mmx::from_i32(0, 0)
+    mut count: u64 = 0
+    while count < 1000 {
+        total = total.add_i32(mmx::Mmx::from_i32(1, 0))
+        count += 1
+    }
+    echo total.lane_i32(0)
+    echo mmx::Mmx::from_bits(7).bit_xor(mmx::Mmx::from_bits(4)).bits
+    scale := 1.5 * 2.0
+    when scale == 3.0 { echo 1 } else { echo 0 }
+}

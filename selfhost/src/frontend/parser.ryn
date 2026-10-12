@@ -223,6 +223,8 @@ struct Parser {
     // True while parsing a `when`/`while`/`for` header or a `when`-expression
     // condition, where `Name {` starts the controlled block, not a literal.
     condition_context: bool,
+    // A `when` guard of a `choose` arm is followed by `=>`, which is not a lambda arrow there.
+    no_lambda: bool,
     // Functions produced by the most recent `extend` block.
     pending_methods: String,
     pending_method_count: u64,
@@ -336,6 +338,18 @@ fun tuple_field_name(index: u64) -> String {
 
 // `parent.field` as an encoded field access whose spans cover `start..end`.
 fun destructure_field_code(parent: String, field: String, start: u64, end: u64) -> String {
+    // An element of an array pattern is named `[index]`.
+    when field.starts_with("[") {
+        mut element := word("Index")
+        element.append(word("Name"))
+        element.append(enc_str(parent))
+        element.append(enc_span(start, end))
+        element.append(word("Int"))
+        element.append(enc_uint(field.slice(1, field.len()).try_parse::<u64>().unwrap_or(0)))
+        element.append(enc_span(start, end))
+        element.append(enc_span(start, end))
+        return element
+    }
     mut code := word("Field")
     code.append(word("Name"))
     code.append(enc_str(parent))
@@ -565,6 +579,30 @@ extend Parser {
         }
         when self.kind_at(self.at + 1) == lexer::Tk::IDENT && self.kind_at(self.at + 2) == lexer::Tk::COLON {
             return !self.condition_context || !self.typed_declaration_after_colon(self.at + 2)
+        }
+        // `Player { name, hp: 3 }`: a field named alone takes the variable of that name.
+        when self.kind_at(self.at + 1) == lexer::Tk::IDENT && self.kind_at(self.at + 2) == lexer::Tk::COMMA {
+            return !self.condition_context
+        }
+        when self.kind_at(self.at + 1) == lexer::Tk::IDENT && self.kind_at(self.at + 2) == lexer::Tk::RBRACE {
+            return !self.condition_context && self.shorthand_single_field_ok()
+        }
+        return false
+    }
+
+    // `Name { field }` is a structure literal when the name is a structure declared before (a block `{ value }` after a bare
+    // name is not).
+    fun shorthand_single_field_ok(self) -> bool {
+        return self.kind_at(self.at - 1) == lexer::Tk::IDENT && self.peek_kind() == lexer::Tk::LBRACE && self.structure_named_before(self.texts[self.tokens[self.at - 1].text].clone())
+    }
+
+    fun structure_named_before(self, name: String) -> bool {
+        mut at: u64 = 0
+        while at + 1 < self.at {
+            when self.tokens[at].kind == lexer::Tk::STRUCT && self.tokens[at + 1].kind == lexer::Tk::IDENT && self.texts[self.tokens[at + 1].text] == name {
+                return true
+            }
+            at += 1
         }
         return false
     }
@@ -2349,6 +2387,7 @@ extend Parser {
         mut out := String("\n")
         out.append(enc_str(self.qualified_declaration_name(qualified)))
         out.append(enc_bool(false))
+        out.append(enc_bool(false))
         out.append(enc_none())
         out.append(enc_uint(0))
         out.append(enc_uint(0))
@@ -2381,6 +2420,7 @@ extend Parser {
         }
         mut out := String("\n")
         out.append(enc_str(self.qualified_declaration_name(name.text)))
+        out.append(enc_bool(false))
         out.append(enc_bool(false))
         out.append(enc_some(enc_str(String("$const"))))
         out.append(enc_uint(0))
@@ -2949,8 +2989,26 @@ extend Parser {
         self.expect(lexer::Tk::LPAREN, "expected `(` after function name")?
         mut parameters := String()
         mut parameter_count: u64 = 0
+        mut variadic := false
         when self.peek_kind() != lexer::Tk::RPAREN {
             while self.peek_kind() != lexer::Tk::RPAREN && self.peek_kind() != lexer::Tk::EOF {
+                // `...` ends the parameters of an `extern "C"` function: the arguments after the named ones are C's variable
+                // arguments, checked where the function is called.
+                when self.peek_kind() == lexer::Tk::DOT_DOT {
+                    when !extern_c {
+                        return Result::Err(self.error("`...` is only allowed in an `extern \"C\"` function"))
+                    }
+                    when parameter_count == 0 {
+                        return Result::Err(self.error("a variadic function needs a named parameter before `...`"))
+                    }
+                    self.skip()
+                    self.expect(lexer::Tk::DOT, "expected `...`")?
+                    when self.peek_kind() != lexer::Tk::RPAREN {
+                        return Result::Err(self.error("`...` must be the last parameter"))
+                    }
+                    variadic = true
+                    break
+                }
                 parameter_start := self.at
                 parameter := self.function_parameter(has_self, receiver)
                 when parameter.is_err() {
@@ -2987,6 +3045,7 @@ extend Parser {
         mut head := String("\n")
         head.append(enc_str(name))
         head.append(enc_bool(extern_c))
+        head.append(enc_bool(variadic))
         when self.peek_kind() == lexer::Tk::FAT_ARROW {
             when extern_c {
                 return Result::Err(self.error("`extern \"C\"` functions cannot have a body"))
@@ -3100,7 +3159,7 @@ extend Parser {
             || kind == lexer::Tk::CONTINUE || kind == lexer::Tk::RETURN || kind == lexer::Tk::STAR {
             return true
         }
-        when self.unsafe_block_start() || self.field_assignment_start() || self.short_declaration_start() || self.index_assignment_start() {
+        when self.unsafe_block_start() || self.field_assignment_start() || self.short_declaration_start() || self.index_assignment_start() || self.place_assignment_start() {
             return true
         }
         next := self.kind_at(self.at + 1)
@@ -3160,6 +3219,26 @@ extend Parser {
             }
             return Option::None
         }
+        when kind == lexer::Tk::LBRACKET {
+            // An array pattern `[a, b, c]`.
+            mut at := index + 1
+            while true {
+                end := self.destructure_pattern_end(at)
+                when end.is_none() {
+                    return Option::None
+                }
+                at = end.unwrap()
+                after := self.kind_at(at)
+                when after == lexer::Tk::COMMA {
+                    at += 1
+                } else when after == lexer::Tk::RBRACKET {
+                    return Option::Some(at + 1)
+                } else {
+                    return Option::None
+                }
+            }
+            return Option::None
+        }
         when kind == lexer::Tk::LPAREN {
             mut at := index + 1
             mut count: u64 = 0
@@ -3187,7 +3266,7 @@ extend Parser {
     // A tuple or structure pattern followed by `:=` at a statement start.
     fun destructure_declaration_start(self) -> bool {
         kind := self.peek_kind()
-        compound := kind == lexer::Tk::LPAREN || (kind == lexer::Tk::IDENT && self.kind_at(self.at + 1) == lexer::Tk::LBRACE)
+        compound := kind == lexer::Tk::LPAREN || kind == lexer::Tk::LBRACKET || (kind == lexer::Tk::IDENT && self.kind_at(self.at + 1) == lexer::Tk::LBRACE)
         when !compound {
             return false
         }
@@ -3204,7 +3283,25 @@ extend Parser {
     fun destructure_body(mut self, temporary: String) -> Result<PatternBody, lexer::Diag> {
         mut group := StatementGroup { code: String(), count: 0 }
         mut annotation := enc_none()
-        when self.peek_kind() == lexer::Tk::LPAREN {
+        when self.peek_kind() == lexer::Tk::LBRACKET {
+            self.skip()
+            mut index: u64 = 0
+            mut more := true
+            while more {
+                mut place := String("[")
+                place.append(String(index))
+                element := self.destructure_element(temporary.clone(), place)?
+                group.code.append(element.code)
+                group.count += element.count
+                index += 1
+                when self.peek_kind() == lexer::Tk::COMMA {
+                    self.skip()
+                } else {
+                    more = false
+                }
+            }
+            self.expect(lexer::Tk::RBRACKET, "expected `]` after array destructuring names")?
+        } else when self.peek_kind() == lexer::Tk::LPAREN {
             self.skip()
             mut index: u64 = 0
             mut more := true
@@ -3271,7 +3368,7 @@ extend Parser {
     fun destructure_element(mut self, parent: String, field: String) -> Result<StatementGroup, lexer::Diag> {
         start := self.peek().start
         kind := self.peek_kind()
-        nested := kind == lexer::Tk::LPAREN || (kind == lexer::Tk::IDENT && self.kind_at(self.at + 1) == lexer::Tk::LBRACE)
+        nested := kind == lexer::Tk::LPAREN || kind == lexer::Tk::LBRACKET || (kind == lexer::Tk::IDENT && self.kind_at(self.at + 1) == lexer::Tk::LBRACE)
         when nested {
             temporary := destructure_temporary_name(start)
             body := self.destructure_body(temporary.clone())?
@@ -3464,6 +3561,123 @@ extend Parser {
         return false
     }
 
+    // `name.field[i] = value`, `name[i][j] op= value`: a place made of fields of a local and then indices, assigned.
+    fun place_assignment_start(self) -> bool {
+        when self.peek_kind() != lexer::Tk::IDENT {
+            return false
+        }
+        mut at := self.at + 1
+        mut indexed := false
+        while true {
+            kind := self.kind_at(at)
+            when kind == lexer::Tk::DOT && self.kind_at(at + 1) == lexer::Tk::IDENT && !indexed {
+                at += 2
+            } else when kind == lexer::Tk::LBRACKET {
+                mut depth: u64 = 0
+                mut close := at
+                mut found := false
+                while close < self.tokens.len() && !found {
+                    inner := self.kind_at(close)
+                    when inner == lexer::Tk::LBRACKET {
+                        depth += 1
+                    } else when inner == lexer::Tk::RBRACKET {
+                        depth -= 1
+                        when depth == 0 {
+                            found = true
+                        }
+                    } else when inner == lexer::Tk::EOF || inner == lexer::Tk::RBRACE {
+                        return false
+                    }
+                    when !found {
+                        close += 1
+                    }
+                }
+                when !found {
+                    return false
+                }
+                at = close + 1
+                indexed = true
+            } else {
+                break
+            }
+        }
+        return indexed && is_assignment_kind(self.kind_at(at))
+    }
+
+    fun place_assignment(mut self) -> Result<String, lexer::Diag> {
+        name := self.ident("expected variable name")?
+        mut path := name.text.clone()
+        mut place := word("Name")
+        place.append(enc_str(name.text.clone()))
+        place.append(enc_span(name.start, name.end))
+        mut indices := Vec<String>()
+        mut codes := String()
+        while self.peek_kind() == lexer::Tk::DOT || self.peek_kind() == lexer::Tk::LBRACKET {
+            when self.peek_kind() == lexer::Tk::DOT {
+                self.skip()
+                field := self.ident("expected field name")?
+                path.push('.')
+                path.append(field.text.clone())
+                mut access := word("Field")
+                access.append(place)
+                access.append(enc_str(field.text))
+                access.append(enc_span(field.start, field.end))
+                access.append(enc_span(field.start, field.end))
+                place = access
+            } else {
+                self.skip()
+                index := self.expression(0)?
+                self.expect(lexer::Tk::RBRACKET, "expected `]` after array index")?
+                indices.push(index.code.clone())
+                mut element := word("Index")
+                element.append(place)
+                element.append(index.code)
+                element.append(enc_span(name.start, index.end))
+                place = element
+            }
+        }
+        operator := self.next()
+        value := self.expression(0)?
+        mut stored := value.code.clone()
+        when operator.kind != lexer::Tk::EQUAL {
+            op := compound_op_name(operator.kind)
+            when op == "" {
+                return Result::Err(lexer::diag("R0010", String("expected an assignment operator"), operator.start, operator.end))
+            }
+            // `place op= value` reads the element again to compute the new one, so the indices must not have effects.
+            for index in indices.clone() {
+                when index.find("Call").is_some() || index.find("Method").is_some() {
+                    return Result::Err(lexer::diag("R0010", String("the index of a compound assignment cannot contain a call"), operator.start, operator.end))
+                }
+            }
+            mut combined := word("Binary")
+            combined.append(word(op))
+            combined.append(place)
+            combined.append(value.code)
+            combined.append(enc_span(name.start, value.end))
+            stored = combined
+        }
+        mut position := String()
+        when indices.len() == 1 {
+            position = indices[0].clone()
+        } else {
+            mut items := String()
+            for index in indices.clone() {
+                items.append(index)
+            }
+            position = word("Tuple")
+            position.append(enc_list(indices.len(), items))
+            position.append(enc_span(name.start, value.end))
+        }
+        mut out := String("\n")
+        out.append(word("IndexAssign"))
+        out.append(enc_str(path))
+        out.append(position)
+        out.append(stored)
+        out.append(enc_span(name.start, value.end))
+        return Result::Ok(out)
+    }
+
     fun statement(mut self) -> Result<String, lexer::Diag> {
         kind := self.peek_kind()
         next := self.kind_at(self.at + 1)
@@ -3478,6 +3692,9 @@ extend Parser {
         }
         when kind == lexer::Tk::IDENT && self.index_assignment_start() {
             return self.index_assignment()
+        }
+        when kind == lexer::Tk::IDENT && self.place_assignment_start() {
+            return self.place_assignment()
         }
         when kind == lexer::Tk::ECHO {
             return self.echo_statement()
@@ -3744,8 +3961,15 @@ extend Parser {
 
     fun defer_statement(mut self) -> Result<String, lexer::Diag> {
         start := self.next().start
-        self.expect(lexer::Tk::LBRACE, "expected `{` after `defer`")?
-        body := self.block_statements_after_open()?
+        // `defer statement` is `defer { statement }`.
+        mut body := String()
+        when self.peek_kind() == lexer::Tk::LBRACE {
+            self.skip()
+            body = self.block_statements_after_open()?
+        } else {
+            group := self.statement_group()?
+            body = enc_list(group.count, group.code)
+        }
         mut out := String("\n")
         out.append(word("Defer"))
         out.append(body)
@@ -4183,6 +4407,23 @@ extend Parser {
         mut count: u64 = 0
         while true {
             field := self.ident("expected field name in structure literal")?
+            when self.peek_kind() == lexer::Tk::COMMA || self.peek_kind() == lexer::Tk::RBRACE {
+                // The shorthand `name`: the variable of the same name.
+                code.append(enc_str(field.text.clone()))
+                code.append(word("Name"))
+                code.append(enc_str(field.text))
+                code.append(enc_span(field.start, field.end))
+                code.append(enc_span(field.start, field.end))
+                count += 1
+                when self.peek_kind() == lexer::Tk::COMMA {
+                    self.skip()
+                    when self.peek_kind() == lexer::Tk::RBRACE || (path_literal && self.peek_kind() == lexer::Tk::EOF) {
+                        break
+                    }
+                    continue
+                }
+                break
+            }
             self.expect(lexer::Tk::COLON, "expected `:` after structure literal field")?
             value := self.expression(0)?
             code.append(enc_str(field.text))
@@ -4302,6 +4543,16 @@ extend Parser {
 
     fun struct_literal_field(mut self) -> Result<String, lexer::Diag> {
         field := self.ident("expected field name in structure literal")?
+        // `Player { name, hp }`: a field with no `:` takes the variable of the same name.
+        when self.peek_kind() == lexer::Tk::COMMA || self.peek_kind() == lexer::Tk::RBRACE {
+            mut name_code := word("Name")
+            name_code.append(enc_str(field.text.clone()))
+            name_code.append(enc_span(field.start, field.end))
+            mut shorthand := enc_str(field.text)
+            shorthand.append(name_code)
+            shorthand.append(enc_span(field.start, field.end))
+            return Result::Ok(shorthand)
+        }
         self.expect(lexer::Tk::COLON, "expected `:` after structure literal field")?
         value := self.expression(0)?
         mut code := enc_str(field.text)
@@ -4339,7 +4590,142 @@ extend Parser {
         return Result::Ok(result)
     }
 
+    // Whether a lambda starts here: `name =>`, `() =>`, `(a, b) =>` or `(a: T, b: U) =>`.
+    fun lambda_ahead(self) -> bool {
+        when self.no_lambda {
+            return false
+        }
+        kind := self.peek_kind()
+        when kind == lexer::Tk::IDENT {
+            return self.kind_at(self.at + 1) == lexer::Tk::FAT_ARROW
+        }
+        when kind != lexer::Tk::LPAREN {
+            return false
+        }
+        mut at := self.at + 1
+        when self.kind_at(at) == lexer::Tk::RPAREN {
+            return self.kind_at(at + 1) == lexer::Tk::FAT_ARROW
+        }
+        while true {
+            when self.kind_at(at) != lexer::Tk::IDENT {
+                return false
+            }
+            at += 1
+            when self.kind_at(at) == lexer::Tk::COLON {
+                // A type: skip to the `,` or `)` that ends it, through nested brackets.
+                mut depth: u64 = 0
+                at += 1
+                while at < self.tokens.len() {
+                    inner := self.kind_at(at)
+                    when inner == lexer::Tk::LPAREN || inner == lexer::Tk::LBRACKET || inner == lexer::Tk::LESS {
+                        depth += 1
+                    } else when (inner == lexer::Tk::RPAREN || inner == lexer::Tk::RBRACKET || inner == lexer::Tk::GREATER) && depth > 0 {
+                        depth -= 1
+                    } else when depth == 0 && (inner == lexer::Tk::COMMA || inner == lexer::Tk::RPAREN) {
+                        break
+                    } else when inner == lexer::Tk::EOF || inner == lexer::Tk::RBRACE {
+                        return false
+                    }
+                    at += 1
+                }
+            }
+            when self.kind_at(at) == lexer::Tk::COMMA {
+                at += 1
+            } else when self.kind_at(at) == lexer::Tk::RPAREN {
+                return self.kind_at(at + 1) == lexer::Tk::FAT_ARROW
+            } else {
+                return false
+            }
+        }
+        return false
+    }
+
+    // `x => value`, `(a, b) => value`, `(a: T, b: U) => value`. With every parameter typed, the lambda is lifted into a function
+    // `__lambda_<position>` with the value as its result, and stands for that function; with a parameter whose type is left
+    // out, it is the call `$lambda("a,b", value)`, which the lowering expands where it knows the types (`v.map(x => x * 2)`).
+    fun lambda_expression(mut self) -> Result<Expr, lexer::Diag> {
+        start := self.peek().start
+        mut names := Vec<String>()
+        mut typed := Vec<String>()
+        mut all_typed := true
+        when self.peek_kind() == lexer::Tk::IDENT {
+            names.push((self.ident("expected parameter name")?).text)
+            all_typed = false
+        } else {
+            self.skip()
+            while self.peek_kind() != lexer::Tk::RPAREN {
+                when self.kind_at(self.at + 1) == lexer::Tk::COLON {
+                    name := self.texts[self.tokens[self.at].text].clone()
+                    typed.push(self.parameter_with_type()?)
+                    names.push(name)
+                } else {
+                    names.push((self.ident("expected parameter name")?).text)
+                    all_typed = false
+                }
+                when self.peek_kind() == lexer::Tk::COMMA {
+                    self.skip()
+                }
+            }
+            self.expect(lexer::Tk::RPAREN, "expected `)` after lambda parameters")?
+        }
+        self.expect(lexer::Tk::FAT_ARROW, "expected `=>` after lambda parameters")?
+        when self.peek_kind() == lexer::Tk::LBRACE {
+            return Result::Err(self.error("a lambda is one expression: write `=> value`, or declare a function"))
+        }
+        value := self.expression(0)?
+        end := value.end
+        when all_typed {
+            mut name := String("__lambda_")
+            name.append(String(start))
+            mut head := String("\n")
+            head.append(enc_str(self.qualified_declaration_name(name.clone())))
+            head.append(enc_bool(false))
+            head.append(enc_bool(false))
+            head.append(enc_none())
+            head.append(enc_strings(Vec<String>()))
+            head.append(enc_list(0, String()))
+            head.append(enc_bool(false))
+            head.append(enc_text(""))
+            mut parameters := String()
+            for parameter in typed.clone() {
+                parameters.append(parameter)
+            }
+            head.append(enc_list(typed.len(), parameters))
+            head.append(enc_none())
+            head.append(enc_uint(0))
+            head.append(enc_some(value.code.clone()))
+            head.append(enc_span(start, end))
+            self.generated_methods.append(head)
+            self.generated_method_count += 1
+            mut reference := word("Name")
+            reference.append(enc_str(name))
+            reference.append(enc_span(start, end))
+            return Result::Ok(plain_expr(reference, start, end))
+        }
+        mut list := String()
+        for name in names.clone() {
+            when !list.is_empty() {
+                list.push(',')
+            }
+            list.append(name)
+        }
+        mut text := word("Str")
+        text.append(enc_str(list))
+        text.append(enc_span(start, start))
+        mut arguments := text
+        arguments.append(value.code.clone())
+        mut call := word("Call")
+        call.append(enc_str(String("$lambda")))
+        call.append(enc_uint(0))
+        call.append(enc_list(2, arguments))
+        call.append(enc_span(start, end))
+        return Result::Ok(plain_expr(call, start, end))
+    }
+
     fun expression_inner(mut self, min_precedence: u64) -> Result<Expr, lexer::Diag> {
+        when self.lambda_ahead() {
+            return self.lambda_expression()
+        }
         token := self.next()
         kind := token.kind
         start := token.start
@@ -4538,6 +4924,10 @@ extend Parser {
         mut postfix_depth: u64 = 0
         while true {
             kind := self.peek_kind()
+            // `[a, b] := value` on the next line starts a statement; it is not an index of the expression before it.
+            when kind == lexer::Tk::LBRACKET && self.destructure_declaration_start() {
+                break
+            }
             when kind == lexer::Tk::LBRACKET {
                 when postfix_depth >= Limits::EXPRESSION_DEPTH {
                     return Result::Err(self.nesting_error("indexing"))
@@ -4911,7 +5301,7 @@ extend Parser {
         when kind == lexer::Tk::LPAREN || kind == lexer::Tk::STRING {
             return true
         }
-        return kind == lexer::Tk::IDENT && (self.kind_at(self.at + 1) == lexer::Tk::LBRACE || self.kind_at(self.at + 1) == lexer::Tk::FAT_ARROW)
+        return kind == lexer::Tk::IDENT && (self.kind_at(self.at + 1) == lexer::Tk::LBRACE || self.kind_at(self.at + 1) == lexer::Tk::FAT_ARROW || self.kind_at(self.at + 1) == lexer::Tk::WHEN)
     }
 
     // Whether the next tokens spell an integer, character or boolean literal pattern.
@@ -4955,11 +5345,40 @@ extend Parser {
         return Result::Ok(text)
     }
 
+    // Whether the next token is `..` or `..=`.
+    fun range_ahead(self) -> bool {
+        return self.peek_kind() == lexer::Tk::DOT_DOT || self.peek_kind() == lexer::Tk::DOT_DOT_EQUAL
+    }
+
+    // The rest of a range pattern after its lower bound (`low` is its text, empty when there is none): `..`, then an upper
+    // bound if a literal follows. The text is `low..high` or `low..=high`.
+    fun range_pattern_text(mut self, low: String) -> Result<String, lexer::Diag> {
+        mut text := low
+        when self.peek_kind() == lexer::Tk::DOT_DOT_EQUAL {
+            self.skip()
+            text.append("..=")
+        } else {
+            self.skip()
+            text.append("..")
+        }
+        when self.literal_pattern_ahead() {
+            text.append(self.literal_pattern_text()?)
+        }
+        return Result::Ok(text)
+    }
+
     // One payload position of a variant pattern: a binding name, `_`, a literal, or a nested
     // `Enum::Variant(...)` pattern. Anything but a plain name is canonical pattern text.
     fun sub_pattern(mut self) -> Result<String, lexer::Diag> {
+        when self.range_ahead() {
+            return self.range_pattern_text(String())
+        }
         when self.literal_pattern_ahead() {
-            return self.literal_pattern_text()
+            literal := self.literal_pattern_text()?
+            when self.range_ahead() {
+                return self.range_pattern_text(literal)
+            }
+            return Result::Ok(literal)
         }
         when self.peek_kind() == lexer::Tk::STRING {
             token := self.next()
@@ -5060,11 +5479,23 @@ extend Parser {
             pattern.append(enc_none())
             pattern.append(enc_none())
             pattern.append(enc_uint(0))
+        } else when self.range_ahead() {
+            text := self.range_pattern_text(String())?
+            pattern.append(enc_some(enc_str(String("$pat"))))
+            pattern.append(enc_some(enc_str(text)))
+            pattern.append(enc_uint(0))
         } else when self.literal_pattern_ahead() {
             literal := self.literal_pattern_text()?
-            pattern.append(enc_some(enc_str(String("$lit"))))
-            pattern.append(enc_some(enc_str(literal)))
-            pattern.append(enc_uint(0))
+            when self.range_ahead() {
+                text := self.range_pattern_text(literal)?
+                pattern.append(enc_some(enc_str(String("$pat"))))
+                pattern.append(enc_some(enc_str(text)))
+                pattern.append(enc_uint(0))
+            } else {
+                pattern.append(enc_some(enc_str(String("$lit"))))
+                pattern.append(enc_some(enc_str(literal)))
+                pattern.append(enc_uint(0))
+            }
         } else when self.compound_pattern_ahead() {
             text := self.sub_pattern()?
             pattern.append(enc_some(enc_str(String("$pat"))))
@@ -5124,10 +5555,33 @@ extend Parser {
             pattern.append(enc_some(enc_str(variant)))
             pattern.append(enc_strings(bindings))
         }
+        // `pattern when condition => body`: the body is written as `$guard(condition, body)` and the pattern compiler
+        // takes it apart again.
+        mut guard := String()
+        mut guarded := false
+        when self.peek_kind() == lexer::Tk::WHEN {
+            self.skip()
+            self.no_lambda = true
+            parsed_guard := self.expression(0)
+            self.no_lambda = false
+            guard = (parsed_guard?).code
+            guarded = true
+        }
         self.expect(lexer::Tk::FAT_ARROW, "expected `=>` after choose pattern")?
         body := self.expression(0)?
         arm.append(pattern)
-        arm.append(body.code)
+        when guarded {
+            mut call := word("Call")
+            call.append(enc_str(String("$guard")))
+            call.append(enc_uint(0))
+            call.append(enc_uint(2))
+            call.append(guard)
+            call.append(body.code)
+            call.append(enc_span(arm_token.start, self.prev_end()))
+            arm.append(call)
+        } else {
+            arm.append(body.code)
+        }
         arm.append(enc_span(arm_token.start, self.prev_end()))
         return Result::Ok(arm)
     }
@@ -5310,7 +5764,8 @@ pub fun parse(source: String, recovering: bool) -> String {
         brace_consumed: false,
         closing_consumed: false,
         closing_end: 0,
-        condition_context: false
+        condition_context: false,
+        no_lambda: false
     }
     result := parser.program()
     when result.is_ok() {

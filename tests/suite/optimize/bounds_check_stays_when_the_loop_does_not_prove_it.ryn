@@ -1,0 +1,25 @@
+// test: run
+// out: 6
+// exit: 1
+// err: array index is out of bounds
+// The loop test proves the index only until the index is stepped: a read after the step is still
+// checked.
+fun main() {
+    mut v: Vec<i64> = Vec()
+    v.push(1)
+    v.push(2)
+    v.push(3)
+    mut total: i64 = 0
+    mut k: u64 = 0
+    while k < v.len() {
+        total += v[k]
+        k += 1
+    }
+    echo total
+    mut j: u64 = 0
+    while j < v.len() {
+        j += 1
+        total += v[j]
+    }
+    echo total
+}

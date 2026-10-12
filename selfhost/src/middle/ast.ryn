@@ -124,6 +124,8 @@ pub struct Parameter {
 pub struct Function {
     pub name: String,
     pub extern_c: bool,
+    // `...` after the named parameters of an `extern "C"` function: C's variable arguments.
+    pub variadic: bool,
     pub external_symbol: Option<String>,
     pub type_parameters: Vec<String>,
     pub type_parameter_bounds: Vec<u64>,
@@ -771,6 +773,7 @@ extend Decoder {
     fun function(mut self) -> Result<u64, String> {
         name := self.string()?
         extern_c := self.boolean()?
+        variadic := self.boolean()?
         external_symbol := self.optional_string()?
         type_parameters := self.strings()?
         bounds := self.bound_list()?
@@ -785,6 +788,7 @@ extend Decoder {
         self.function_defs.push(Function {
             name: name,
             extern_c: extern_c,
+            variadic: variadic,
             external_symbol: external_symbol,
             type_parameters: type_parameters,
             type_parameter_bounds: bounds,
@@ -1662,6 +1666,7 @@ extend Writer {
         definition := self.program.function_defs[index]
         self.string(definition.name)
         self.boolean(definition.extern_c)
+        self.boolean(definition.variadic)
         self.optional_string(definition.external_symbol)
         self.strings(definition.type_parameters)
         self.bound_list(definition.type_parameter_bounds)

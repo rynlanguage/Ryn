@@ -84,6 +84,7 @@ fun builtin_rows() -> Vec<String> {
     rows.push(String("__cpu_xgetbv;System XGetBv;U64;U64"))
     rows.push(String("__cpu_cell;System CpuCell;;RawPointer U8"))
     rows.push(String("__simd_bin;System SimdBin;U64,RawPointer U8,RawPointer U8,RawPointer U8;"))
+    rows.push(String("__mmx_bin;System MmxBin;U64,RawPointer U8,RawPointer U8,RawPointer U8;"))
     rows.push(String("__simd_un;System SimdUn;U64,RawPointer U8,RawPointer U8;"))
     rows.push(String("__simd_mask;System SimdMask;U64,RawPointer U8;U64"))
     rows.push(String("__simd_copy;System SimdCopy;U64,RawPointer U8,RawPointer U8,U64;"))

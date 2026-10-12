@@ -1,0 +1,25 @@
+// test: run
+// out: true
+// out: true
+// out: false
+// out: true
+// out: 16
+// lt, le, gt, ge and shl methods give <, <=, >, >= and << on a structure.
+struct Ver { n: i32 }
+extend Ver {
+    fun lt(self, o: Ver) -> bool { return self.n < o.n }
+    fun le(self, o: Ver) -> bool { return self.n <= o.n }
+    fun gt(self, o: Ver) -> bool { return self.n > o.n }
+    fun ge(self, o: Ver) -> bool { return self.n >= o.n }
+    fun shl(self, k: u32) -> Ver { return Ver { n: self.n << k } }
+}
+fun main() {
+    a := Ver { n: 1 }
+    b := Ver { n: 2 }
+    echo a < b
+    echo a <= a
+    echo a > b
+    echo b >= a
+    c := b << 3
+    echo c.n
+}

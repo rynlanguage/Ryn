@@ -1,0 +1,9 @@
+// test: fail
+// code: R0010
+// `...` belongs to C functions; a Ryn function takes its parameters by name and type.
+fun sum(first: i32, ...) -> i32 {
+    return first
+}
+fun main() {
+    echo sum(1)
+}

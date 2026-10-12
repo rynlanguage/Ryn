@@ -1,0 +1,9 @@
+// test: fail
+// code: R0270
+// A Ryn string is not a C pointer, so it cannot be a variable argument.
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun printf(format: *u8, ...) -> i32;
+fun main() {
+    buffer := malloc(8 as u64)
+    printf(buffer, "text")
+}

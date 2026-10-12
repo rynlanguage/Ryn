@@ -1,0 +1,28 @@
+// test: run
+// out: 16
+// out: 12
+// out: 100
+// out: 7
+// out: 0
+// out: 1
+// out: 2
+// Literal range bounds take the integer type the loop variable is used as; arrays can be iterated.
+fun twice(x: u8) -> u8 { return x * 2 }
+fun main() {
+    mut s: u64 = 0
+    for i in 0..5 { s += i }
+    for i in 1..=3 { s += i }
+    echo s
+    mut b: u8 = 0
+    for i in 0..4 { b += twice(i) }
+    echo b
+    v: [i32; 4] = [10, 20, 30, 40]
+    mut t: i32 = 0
+    for k in 0..4 { t += v[k] }
+    echo t
+    n: u16 = 7
+    mut c: u32 = 0
+    for j in 0..10 { when j < n { c += 1 } }
+    echo c
+    for q in 0..3 { echo q }
+}

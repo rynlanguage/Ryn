@@ -1,0 +1,59 @@
+// test: run
+// out: 100
+// out: 200
+// out: 250
+// out: 60
+// out: 7
+// out: 0
+// out: 1000
+// out: 6
+// out: 0
+// out: 16
+// out: 1
+// out: 1
+// out: 2
+// out: 3
+// Integer and character ranges (`a..=b`, `a..b`, `..=b`), and `when` guards that fall through to the next arm, in `choose`.
+enum Shape { Circle(i32), Square(i32), Dot }
+fun classify(n: i32) -> i32 {
+    return choose n {
+        0 => 100,
+        1..=5 => 200,
+        6..10 => 250,
+        x when x > 50 => x,
+        ..=-1 => 7,
+        _ => 0,
+    }
+}
+fun area(s: Shape) -> i32 {
+    return choose s {
+        Shape::Circle(r) when r > 10 => 1000,
+        Shape::Circle(r) => r * 3,
+        Shape::Square(a) when a == 0 => 0,
+        Shape::Square(a) => a * a,
+        Shape::Dot => 1,
+    }
+}
+fun grade(c: char) -> i32 {
+    return choose c {
+        'a'..='f' => 1,
+        'g'..='z' => 2,
+        _ => 3,
+    }
+}
+fun main() {
+    echo classify(0)
+    echo classify(3)
+    echo classify(8)
+    echo classify(60)
+    echo classify(0 - 4)
+    echo classify(20)
+    echo area(Shape::Circle(20))
+    echo area(Shape::Circle(2))
+    echo area(Shape::Square(0))
+    echo area(Shape::Square(4))
+    echo area(Shape::Dot)
+    echo grade('c')
+    echo grade('x')
+    echo grade('Q')
+}

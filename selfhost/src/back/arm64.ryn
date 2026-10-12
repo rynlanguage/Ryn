@@ -1,0 +1,1290 @@
+// A lightweight AArch64 backend for Linux (`rync --target aarch64-linux`). It takes the IR text that the x86-64 backend
+// takes and writes a static ELF executable for AArch64 (e_machine 183). The program calls the Linux system calls directly:
+// there is no C library, no runtime shim and no buffering, so output is written as it is produced.
+//
+// The subset is small, and every other construct is refused with an error that names it, so a program is either compiled
+// as the x86-64 backend would run it or not at all:
+//   functions with up to eight parameters and integer, `bool` locals, parameters and results
+//   statements: block, let, assign, if, while, for over a range, break, continue, return, a call of a function, echo of
+//   an integer or a `bool`
+//   expressions: integer and bool literals, locals, + - * / % & | ^ << >>, comparisons, unary - ! ~, casts between
+//   integers, `if` expressions and calls of functions
+//
+// The code is stack based: a local lives in the frame, an expression leaves its value in x0, and a temporary is pushed in
+// a 16-byte unit so that sp stays 16-byte aligned, which Linux checks at EL0. Integers are kept canonical in 64-bit
+// registers, sign-extended for signed types and zero-extended otherwise, as gen.ryn keeps them. Comparisons and right
+// shifts use the 64-bit instructions, and a narrower result is normalized after each arithmetic operation.
+//
+// Division by zero prints the x86-64 backend's message to standard error and exits with status 1. A signed quotient of the
+// smallest value by -1 is the smallest value after normalization, and the remainder is zero, as on x86-64. A shift count at
+// or above the width gives zero, or all ones for a signed right shift of a negative value.
+//
+// The encodings are checked against llvm-mc (tools/tests/test_arm64_run.py runs the programs under Unicorn).
+
+use middle::ir
+
+// The movz/movk/... bases of the instructions. Each is the encoding with every register and immediate field zero; the
+// register fields are added by the functions below. The values were computed from the A64 field layout and checked with
+// llvm-mc (see docs/arm64-backend.md).
+const OP_MOVZ: u64 = 3531603968
+const OP_MOVK: u64 = 4068474880
+const OP_MOV: u64 = 2852127712
+const OP_ADD: u64 = 2332033024
+const OP_SUB: u64 = 3405774848
+const OP_MUL: u64 = 2600500224
+const OP_SDIV: u64 = 2596277248
+const OP_UDIV: u64 = 2596276224
+const OP_MSUB: u64 = 2600501248
+const OP_AND: u64 = 2315255808
+const OP_ORR: u64 = 2852126720
+const OP_EOR: u64 = 3388997632
+const OP_MVN: u64 = 2854224864
+const OP_NEG: u64 = 3405775840
+const OP_LSL: u64 = 2596282368
+const OP_LSR: u64 = 2596283392
+const OP_ASR: u64 = 2596284416
+const OP_CMP: u64 = 3942645791
+const OP_CSET: u64 = 2594113504
+const OP_SUBI: u64 = 3506438144
+const OP_ADDI: u64 = 2432696320
+const OP_STR: u64 = 4177526784
+const OP_LDR: u64 = 4181721088
+const OP_PUSH: u64 = 4162785248
+const OP_POP: u64 = 4165011424
+const OP_STP_FRAME: u64 = 2847898621
+const OP_LDP_FRAME: u64 = 2831252477
+const OP_FP_FROM_SP: u64 = 2432697341
+const OP_SP_FROM_FP: u64 = 2432697279
+const OP_SUB_SP: u64 = 3506439167
+const OP_RET: u64 = 3596551104
+const OP_SVC0: u64 = 3556769793
+const OP_B: u64 = 335544320
+const OP_BL: u64 = 2483027968
+const OP_BCOND: u64 = 1409286144
+const OP_CBZ: u64 = 3019898880
+const OP_CBNZ: u64 = 3036676096
+const OP_ADR: u64 = 268435456
+const OP_SXTB: u64 = 2470452224
+const OP_SXTH: u64 = 2470460416
+const OP_SXTW: u64 = 2470476800
+const OP_UXTB: u64 = 3544194048
+const OP_UXTH: u64 = 3544202240
+const OP_UXTW: u64 = 3544218624
+const OP_STRB: u64 = 956301312
+
+// The text the driver reports for a program the backend refuses.
+fun refused(what: String) -> String {
+    mut text := String("the AArch64 backend does not handle ")
+    text.append(what)
+    text.append(" yet")
+    return text
+}
+
+fun is_integer_word(word: String) -> bool {
+    return word == "I8" || word == "I16" || word == "I32" || word == "I64" || word == "U8" || word == "U16" || word == "U32" || word == "U64"
+}
+
+fun is_signed_word(word: String) -> bool {
+    return word == "I8" || word == "I16" || word == "I32" || word == "I64"
+}
+
+// A local, parameter or result of the subset: an integer or a `bool`.
+fun is_scalar_word(word: String) -> bool {
+    return is_integer_word(word.clone()) || word == "Bool"
+}
+
+fun width_bits(word: String) -> u64 {
+    when word == "I8" || word == "U8" {
+        return 8
+    } else when word == "I16" || word == "U16" {
+        return 16
+    } else when word == "I32" || word == "U32" {
+        return 32
+    }
+    return 64
+}
+
+// The value of an integer literal as gen.ryn reads it: an optional minus sign and decimal digits.
+fun literal_value(text: String) -> u64 {
+    mut negative := false
+    mut at: u64 = 0
+    when text.len() > 0 && text.byte_at(0) == 45 {
+        negative = true
+        at = 1
+    }
+    mut value: u64 = 0
+    while at < text.len() {
+        value = value * 10 + ((text.byte_at(at) - 48) as u64)
+        at += 1
+    }
+    when negative {
+        return (0 as u64) - value
+    }
+    return value
+}
+
+// A label: a code label is a byte position in the code; a data label is an offset in the data, which follows the code.
+pub struct Label {
+    bound: bool,
+    data: bool,
+    position: u64,
+}
+
+// A word of code that takes the displacement to `label`: kind 0 is `b` and `bl` (imm26, in words), 1 is `b.cond` and
+// 2 is `cbz` and `cbnz` (imm19, in words), 3 is `adr` (imm21, in bytes).
+pub struct Fixup {
+    word: u64,
+    label: u64,
+    kind: u64,
+}
+
+// The code and the data of a program, with its labels.
+pub struct Arm {
+    words: Vec<u64>,
+    labels: Vec<Label>,
+    fixups: Vec<Fixup>,
+    data: Vec<u8>,
+}
+
+pub fun new_arm() -> Arm {
+    return Arm { words: Vec(), labels: Vec(), fixups: Vec(), data: Vec() }
+}
+
+extend Arm {
+    pub fun emit(mut self, word: u64) {
+        self.words.push(word & 4294967295)
+    }
+
+    pub fun here(self) -> u64 {
+        return self.words.len() * 4
+    }
+
+    pub fun new_label(mut self) -> u64 {
+        self.labels.push(Label { bound: false, data: false, position: 0 })
+        return self.labels.len() - 1
+    }
+
+    pub fun bind(mut self, label: u64) {
+        self.labels.set(label, Label { bound: true, data: false, position: self.here() })
+    }
+
+    // A data label for the bytes of `text`, which the data holds from an 8-byte boundary.
+    pub fun data_label(mut self, text: String) -> u64 {
+        while self.data.len() % 8 != 0 {
+            self.data.push(0)
+        }
+        offset := self.data.len()
+        mut at: u64 = 0
+        while at < text.len() {
+            self.data.push(text.byte_at(at))
+            at += 1
+        }
+        self.labels.push(Label { bound: true, data: true, position: offset })
+        return self.labels.len() - 1
+    }
+
+    // A data label for `count` zero bytes: a cell the program writes while it runs.
+    pub fun zero_label(mut self, count: u64) -> u64 {
+        while self.data.len() % 8 != 0 {
+            self.data.push(0)
+        }
+        offset := self.data.len()
+        mut at: u64 = 0
+        while at < count {
+            self.data.push(0)
+            at += 1
+        }
+        self.labels.push(Label { bound: true, data: true, position: offset })
+        return self.labels.len() - 1
+    }
+
+    // Marks the instruction just emitted as one that refers to `label`.
+    pub fun fixup(mut self, kind: u64, label: u64) {
+        self.fixups.push(Fixup { word: self.words.len() - 1, label: label, kind: kind })
+    }
+
+    // Resolves every fixup, then returns the code followed by the data.
+    pub fun finish(mut self) -> Result<Vec<u8>, String> {
+        code_end := self.here()
+        for fixup in self.fixups.clone() {
+            when !self.labels[fixup.label].bound {
+                return Result::Err(String("a branch to a label that is never bound"))
+            }
+            found := self.labels[fixup.label]
+            mut target: u64 = found.position
+            when found.data {
+                target = code_end + found.position
+            }
+            here := fixup.word * 4
+            delta: i64 = (target as i64) - (here as i64)
+            when fixup.kind == 3 {
+                field := (delta as u64) & 2097151
+                word := self.words[fixup.word]
+                self.words.set(fixup.word, word | (((field & 3) as u64) << (29 as u32)) | (((field >> (2 as u32)) & 524287) << (5 as u32)))
+            } else {
+                when delta % 4 != 0 {
+                    return Result::Err(String("a branch to an unaligned position"))
+                }
+                steps: i64 = delta / 4
+                when fixup.kind == 0 {
+                    when steps >= 33554432 || steps < (0 as i64) - 33554432 {
+                        return Result::Err(String("a branch out of range"))
+                    }
+                    word := self.words[fixup.word]
+                    self.words.set(fixup.word, word | ((steps as u64) & 67108863))
+                } else {
+                    when steps >= 262144 || steps < (0 as i64) - 262144 {
+                        return Result::Err(String("a conditional branch out of range"))
+                    }
+                    word := self.words[fixup.word]
+                    self.words.set(fixup.word, word | (((steps as u64) & 524287) << (5 as u32)))
+                }
+            }
+        }
+        mut out: Vec<u8> = Vec()
+        for word in self.words.clone() {
+            out.push((word & 255) as u8)
+            out.push(((word >> (8 as u32)) & 255) as u8)
+            out.push(((word >> (16 as u32)) & 255) as u8)
+            out.push(((word >> (24 as u32)) & 255) as u8)
+        }
+        for byte in self.data.clone() {
+            out.push(byte)
+        }
+        return Result::Ok(out)
+    }
+}
+
+// --- instruction words: the base plus the register and immediate fields ---
+
+fun movz(rd: u64, imm: u64, hw: u64) -> u64 {
+    return OP_MOVZ | (hw << (21 as u32)) | (imm << (5 as u32)) | rd
+}
+
+fun movk(rd: u64, imm: u64, hw: u64) -> u64 {
+    return OP_MOVK | (hw << (21 as u32)) | (imm << (5 as u32)) | rd
+}
+
+// rd = rm
+fun mov_rr(rd: u64, rm: u64) -> u64 {
+    return OP_MOV | (rm << (16 as u32)) | rd
+}
+
+fun arith_rrr(base: u64, rd: u64, rn: u64, rm: u64) -> u64 {
+    return base | (rm << (16 as u32)) | (rn << (5 as u32)) | rd
+}
+
+// rd = ra - rn * rm
+fun msub_rrrr(rd: u64, rn: u64, rm: u64, ra: u64) -> u64 {
+    return OP_MSUB | (rm << (16 as u32)) | (ra << (10 as u32)) | (rn << (5 as u32)) | rd
+}
+
+// rd = ~rm
+fun mvn_rr(rd: u64, rm: u64) -> u64 {
+    return OP_MVN | (rm << (16 as u32)) | rd
+}
+
+// rd = 0 - rm
+fun neg_rr(rd: u64, rm: u64) -> u64 {
+    return OP_NEG | (rm << (16 as u32)) | rd
+}
+
+// `cmp rn, rm`
+fun cmp_rr(rn: u64, rm: u64) -> u64 {
+    return OP_CMP | (rm << (16 as u32)) | (rn << (5 as u32))
+}
+
+// rd = 1 when the condition holds, else 0 (csinc rd, xzr, xzr, inverted condition)
+fun cset(rd: u64, cond: u64) -> u64 {
+    return OP_CSET | ((cond ^ 1) << (12 as u32)) | rd
+}
+
+// `sub rd, rn, #imm` and `add rd, rn, #imm`, with imm below 4096. Register 31 is sp here.
+fun sub_ri(rd: u64, rn: u64, imm: u64) -> u64 {
+    return OP_SUBI | (imm << (10 as u32)) | (rn << (5 as u32)) | rd
+}
+
+fun add_ri(rd: u64, rn: u64, imm: u64) -> u64 {
+    return OP_ADDI | (imm << (10 as u32)) | (rn << (5 as u32)) | rd
+}
+
+// `str rt, [rn]` and `ldr rt, [rn]`
+fun store_at(rt: u64, rn: u64) -> u64 {
+    return OP_STR | (rn << (5 as u32)) | rt
+}
+
+fun load_at(rt: u64, rn: u64) -> u64 {
+    return OP_LDR | (rn << (5 as u32)) | rt
+}
+
+// The distance below the frame pointer of frame slot `slot`: the cell is at x29 - 8 * (slot + 1).
+fun slot_address(slot: u64) -> u64 {
+    return 8 * (slot + 1)
+}
+
+// The sign or zero extension of x0 that brings a narrower integer to its width (0 for a 64-bit or `bool` value).
+fun normalize_word(word: String) -> u64 {
+    when word == "I8" {
+        return OP_SXTB
+    } else when word == "I16" {
+        return OP_SXTH
+    } else when word == "I32" {
+        return OP_SXTW
+    } else when word == "U8" {
+        return OP_UXTB
+    } else when word == "U16" {
+        return OP_UXTH
+    } else when word == "U32" {
+        return OP_UXTW
+    }
+    return 0
+}
+
+// The bytes of a frame of `slots` 8-byte cells, rounded up to 16 (sp stays aligned).
+fun frame_size(slots: u64) -> u64 {
+    mut bytes: u64 = 8 * slots
+    while bytes % 16 != 0 {
+        bytes += 8
+    }
+    return bytes
+}
+
+// The code generator. `program` is the decoded IR; the functions are generated from `main` on, when they are called.
+pub struct Gen64 {
+    program: ir::IrProgram,
+    func_labels: Vec<u64>,
+    // The function being generated, and the label after its parameters are stored (a self tail call jumps there).
+    current: u64,
+    body: u64,
+    // The cell that holds the lowest stack address a function may reach, and the overflow routine.
+    stack_cell: u64,
+    overflow_label: u64,
+    queued: Vec<bool>,
+    pending: Vec<u64>,
+    epilogue: u64,
+    loop_top: u64,
+    loop_end: u64,
+    print_label: u64,
+    division_label: u64,
+    newline_label: u64,
+    true_label: u64,
+    false_label: u64,
+    reason: String,
+}
+
+extend Gen64 {
+    // Records why the program is refused and returns false.
+    fun fail(mut self, what: String) -> bool {
+        self.reason = refused(what)
+        return false
+    }
+
+    fun word(self, ty: u64) -> String {
+        return choose self.program.types[ty] {
+            ir::IrTy::Scalar(word) => word,
+            _ => String(),
+        }
+    }
+
+    // A call of the function `id`: a function generated later, the first time it is called.
+    fun need(mut self, id: u64) {
+        when !self.queued[id] {
+            self.queued.set(id, true)
+            self.pending.push(id)
+        }
+    }
+
+    // Pushes the value of each argument (a 16-byte unit each), pops them into x0 to x(n-1) and calls the function.
+    fun call(mut self, asm: &mut Arm, id: u64, arguments: Vec<u64>) -> bool {
+        when arguments.len() > 8 {
+            return self.fail(String("a call with more than eight arguments"))
+        }
+        when self.program.functions[id].parameters.len() / 2 != arguments.len() {
+            return self.fail(String("a call with the wrong number of arguments"))
+        }
+        for argument in arguments.clone() {
+            when !self.expr(asm, argument) {
+                return false
+            }
+            asm.emit(OP_PUSH)
+        }
+        mut at: u64 = arguments.len()
+        while at > 0 {
+            at -= 1
+            asm.emit(OP_POP | at)
+        }
+        self.need(id)
+        asm.emit(OP_BL)
+        asm.fixup(0, self.func_labels[id])
+        return true
+    }
+
+    // Loads and stores of the frame slot `slot`, through x9.
+    fun load_slot(self, asm: &mut Arm, slot: u64) -> bool {
+        when slot_address(slot) > 4088 {
+            return self.fail(String("a frame with more than 511 slots"))
+        }
+        asm.emit(sub_ri(9, 29, slot_address(slot)))
+        asm.emit(load_at(0, 9))
+        return true
+    }
+
+    fun store_slot(self, asm: &mut Arm, slot: u64) -> bool {
+        when slot_address(slot) > 4088 {
+            return self.fail(String("a frame with more than 511 slots"))
+        }
+        asm.emit(sub_ri(9, 29, slot_address(slot)))
+        asm.emit(store_at(0, 9))
+        return true
+    }
+
+    // Loads the 64-bit constant `value` into x`reg` with movz and movk.
+    fun constant(self, asm: &mut Arm, reg: u64, value: u64) {
+        mut hw: u64 = 0
+        mut first := true
+        while hw < 4 {
+            chunk := (value >> ((hw * 16) as u32)) & 65535
+            when chunk != 0 || (hw == 0 && value == 0) {
+                when first {
+                    asm.emit(movz(reg, chunk, hw))
+                    first = false
+                } else {
+                    asm.emit(movk(reg, chunk, hw))
+                }
+            }
+            hw += 1
+        }
+    }
+
+    // Brings a value in x0 to its width: sign- or zero-extension of the low bits of a narrower integer.
+    fun normalize(self, asm: &mut Arm, word: String) {
+        when word == "Bool" || width_bits(word.clone()) == 64 {
+            return
+        }
+        asm.emit(normalize_word(word))
+    }
+
+    fun expr(mut self, asm: &mut Arm, index: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ir::IrExpr::IntegerLit(text, ty) => self.integer(asm, text, ty),
+            ir::IrExpr::BoolLit(value) => self.boolean(asm, value),
+            ir::IrExpr::LocalRef(slot, ty, span) => self.local(asm, slot, ty),
+            ir::IrExpr::Binary(op, left, right, ty) => self.binary(asm, op, left, right, ty),
+            ir::IrExpr::Negate(value, ty) => self.unary(asm, value, ty, 0),
+            ir::IrExpr::BitNot(value, ty) => self.unary(asm, value, ty, 1),
+            ir::IrExpr::Not(value) => self.logical_not(asm, value),
+            ir::IrExpr::CastExpr(value, source, target) => self.cast(asm, value, source, target),
+            ir::IrExpr::IfExpr(condition, yes, no, ty) => self.if_value(asm, condition, yes, no),
+            ir::IrExpr::CallExpr(target, arguments, ty) => self.call_value(asm, target, arguments),
+            _ => self.fail(String("an expression of this kind")),
+        }
+    }
+
+    fun integer(mut self, asm: &mut Arm, text: String, ty: u64) -> bool {
+        when !is_integer_word(self.word(ty)) {
+            return self.fail(String("an integer literal of this type"))
+        }
+        self.constant(asm, 0, literal_value(text))
+        return true
+    }
+
+    fun boolean(mut self, asm: &mut Arm, value: bool) -> bool {
+        when value {
+            asm.emit(movz(0, 1, 0))
+        } else {
+            asm.emit(movz(0, 0, 0))
+        }
+        return true
+    }
+
+    fun local(mut self, asm: &mut Arm, slot: u64, ty: u64) -> bool {
+        when !is_scalar_word(self.word(ty)) {
+            return self.fail(String("a local of this type"))
+        }
+        return self.load_slot(asm, slot)
+    }
+
+    // Pops the value pushed by a left operand into x0, with the right operand in x1.
+    fun operands(mut self, asm: &mut Arm, left: u64, right: u64) -> bool {
+        when !self.expr(asm, left) {
+            return false
+        }
+        asm.emit(OP_PUSH)
+        when !self.expr(asm, right) {
+            return false
+        }
+        asm.emit(mov_rr(1, 0))
+        asm.emit(OP_POP)
+        return true
+    }
+
+    fun binary(mut self, asm: &mut Arm, op: String, left: u64, right: u64, ty: u64) -> bool {
+        word := self.word(ty)
+        when !is_scalar_word(word.clone()) {
+            return self.fail(String("an operation on this type"))
+        }
+        when !self.operands(asm, left, right) {
+            return false
+        }
+        signed := is_signed_word(word.clone())
+        when op == "Add" {
+            asm.emit(arith_rrr(OP_ADD, 0, 0, 1))
+        } else when op == "Sub" {
+            asm.emit(arith_rrr(OP_SUB, 0, 0, 1))
+        } else when op == "Mul" {
+            asm.emit(arith_rrr(OP_MUL, 0, 0, 1))
+        } else when op == "BitAnd" {
+            asm.emit(arith_rrr(OP_AND, 0, 0, 1))
+        } else when op == "BitOr" {
+            asm.emit(arith_rrr(OP_ORR, 0, 0, 1))
+        } else when op == "BitXor" {
+            asm.emit(arith_rrr(OP_EOR, 0, 0, 1))
+        } else when op == "Div" || op == "Rem" {
+            asm.emit(cbz_to(1))
+            asm.fixup(2, self.division_label)
+            when signed {
+                asm.emit(arith_rrr(OP_SDIV, 2, 0, 1))
+            } else {
+                asm.emit(arith_rrr(OP_UDIV, 2, 0, 1))
+            }
+            when op == "Div" {
+                asm.emit(mov_rr(0, 2))
+            } else {
+                asm.emit(msub_rrrr(0, 2, 1, 0))
+            }
+        } else when op == "ShiftLeft" || op == "ShiftRight" {
+            return self.shift(asm, op == "ShiftLeft", signed, word)
+        } else when op == "Eq" || op == "Ne" || op == "Lt" || op == "Le" || op == "Gt" || op == "Ge" {
+            asm.emit(cmp_rr(0, 1))
+            mut cond: u64 = 0
+            when op == "Eq" {
+                cond = 0
+            } else when op == "Ne" {
+                cond = 1
+            } else when op == "Lt" {
+                cond = 11
+            } else when op == "Le" {
+                cond = 13
+            } else when op == "Gt" {
+                cond = 12
+            } else {
+                cond = 10
+            }
+            when !signed {
+                // The unsigned conditions: lo, ls, hi and hs.
+                when op == "Lt" {
+                    cond = 3
+                } else when op == "Le" {
+                    cond = 9
+                } else when op == "Gt" {
+                    cond = 8
+                } else when op == "Ge" {
+                    cond = 2
+                }
+            }
+            asm.emit(cset(0, cond))
+            return true
+        } else {
+            mut what := String("the operator ")
+            what.append(op)
+            return self.fail(what)
+        }
+        self.normalize(asm, word)
+        return true
+    }
+
+        // A shift of x0 by x1 at a width: a count at or above the width gives zero, or all ones for a signed right shift of a negative value.
+    fun shift(mut self, asm: &mut Arm, left: bool, signed: bool, word: String) -> bool {
+        bits := width_bits(word.clone())
+        out_of_range := asm.new_label()
+        done := asm.new_label()
+        self.constant(asm, 2, bits)
+        asm.emit(cmp_rr(1, 2))
+        asm.emit(bcond(2))
+        asm.fixup(1, out_of_range)
+        when left {
+            asm.emit(arith_rrr(OP_LSL, 0, 0, 1))
+            self.normalize(asm, word.clone())
+        } else when signed {
+            asm.emit(arith_rrr(OP_ASR, 0, 0, 1))
+        } else {
+            asm.emit(arith_rrr(OP_LSR, 0, 0, 1))
+        }
+        asm.emit(OP_B)
+        asm.fixup(0, done)
+        asm.bind(out_of_range)
+        when !left && signed {
+            // A negative value shifted right by a count at or above the width is all ones; otherwise zero.
+            zero := asm.new_label()
+            asm.emit(cmp_rr(0, 31))
+            asm.emit(bcond(10))
+            asm.fixup(1, zero)
+            asm.emit(mvn_rr(0, 31))
+            asm.emit(OP_B)
+            asm.fixup(0, done)
+            asm.bind(zero)
+        }
+        asm.emit(movz(0, 0, 0))
+        asm.bind(done)
+        return true
+    }
+
+    // The unary operations: negation (kind 0) and bitwise not (kind 1), both normalized to the width.
+    fun unary(mut self, asm: &mut Arm, value: u64, ty: u64, kind: u64) -> bool {
+        word := self.word(ty)
+        when !is_integer_word(word.clone()) {
+            return self.fail(String("a unary operation on this type"))
+        }
+        when !self.expr(asm, value) {
+            return false
+        }
+        when kind == 0 {
+            asm.emit(neg_rr(0, 0))
+        } else {
+            asm.emit(mvn_rr(0, 0))
+        }
+        self.normalize(asm, word)
+        return true
+    }
+
+    fun logical_not(mut self, asm: &mut Arm, value: u64) -> bool {
+        when !self.expr(asm, value) {
+            return false
+        }
+        asm.emit(movz(1, 1, 0))
+        asm.emit(arith_rrr(OP_EOR, 0, 0, 1))
+        return true
+    }
+
+    fun cast(mut self, asm: &mut Arm, value: u64, source: u64, target: u64) -> bool {
+        from := self.word(source)
+        to := self.word(target)
+        when !is_scalar_word(from.clone()) || !is_integer_word(to.clone()) {
+            return self.fail(String("a cast between these types"))
+        }
+        when !self.expr(asm, value) {
+            return false
+        }
+        self.normalize(asm, to)
+        return true
+    }
+
+    // `if c { a } else { b }` as a value: each branch leaves its value in x0.
+    fun if_value(mut self, asm: &mut Arm, condition: u64, yes: u64, no: u64) -> bool {
+        otherwise := asm.new_label()
+        done := asm.new_label()
+        when !self.expr(asm, condition) {
+            return false
+        }
+        asm.emit(cbz_to(0))
+        asm.fixup(2, otherwise)
+        when !self.expr(asm, yes) {
+            return false
+        }
+        asm.emit(OP_B)
+        asm.fixup(0, done)
+        asm.bind(otherwise)
+        when !self.expr(asm, no) {
+            return false
+        }
+        asm.bind(done)
+        return true
+    }
+
+    fun call_value(mut self, asm: &mut Arm, target: ir::CallTarget, arguments: Vec<u64>) -> bool {
+        return choose target {
+            ir::CallTarget::Func(id) => self.call(asm, id, arguments),
+            _ => self.fail(String("a call of this kind")),
+        }
+    }
+
+    fun statements(mut self, asm: &mut Arm, indices: Vec<u64>) -> bool {
+        for index in indices {
+            when !self.stmt(asm, index) {
+                return false
+            }
+        }
+        return true
+    }
+
+    fun stmt(mut self, asm: &mut Arm, index: u64) -> bool {
+        return choose self.program.stmts[index] {
+            ir::IrStmt::BlockStmt(body) => self.statements(asm, body),
+            ir::IrStmt::DropStmt(slots, types) => self.drop_statement(slots),
+            ir::IrStmt::LetStmt(slot, ty, value, span) => self.assign(asm, slot, ty, value),
+            ir::IrStmt::AssignStmt(slot, ty, value, span) => self.assign(asm, slot, ty, value),
+            ir::IrStmt::PrintStmt(value, ty) => self.print_statement(asm, value, ty),
+            ir::IrStmt::CallStmt(target, arguments) => self.call_statement(asm, target, arguments),
+            ir::IrStmt::IfStmt(condition, then_body, else_body) => self.if_statement(asm, condition, then_body, else_body),
+            ir::IrStmt::WhileStmt(setup, condition, body) => self.while_statement(asm, setup, condition, body),
+            ir::IrStmt::ForStmt(slot, end_slot, ty, start, end, inclusive, body) => self.for_statement(asm, slot, end_slot, ty, start, end, inclusive, body),
+            ir::IrStmt::BreakStmt => self.jump(asm, true),
+            ir::IrStmt::ContinueStmt => self.jump(asm, false),
+            ir::IrStmt::ReturnStmt(value) => self.return_statement(asm, value),
+            _ => self.fail(String("a statement of this kind")),
+        }
+    }
+
+    // The drop at the end of a scope: nothing to do unless a local owns memory, which the subset refuses.
+    fun drop_statement(mut self, slots: Vec<u64>) -> bool {
+        when slots.len() > 0 {
+            return self.fail(String("the drop of an owned local"))
+        }
+        return true
+    }
+
+    fun assign(mut self, asm: &mut Arm, slot: u64, ty: u64, value: u64) -> bool {
+        when !is_scalar_word(self.word(ty)) {
+            return self.fail(String("a local of this type"))
+        }
+        when !self.expr(asm, value) {
+            return false
+        }
+        return self.store_slot(asm, slot)
+    }
+
+    fun call_statement(mut self, asm: &mut Arm, target: ir::CallTarget, arguments: Vec<u64>) -> bool {
+        return choose target {
+            ir::CallTarget::Func(id) => self.call(asm, id, arguments),
+            _ => self.fail(String("a call of this kind")),
+        }
+    }
+
+    fun if_statement(mut self, asm: &mut Arm, condition: u64, then_body: Vec<u64>, else_body: Vec<u64>) -> bool {
+        otherwise := asm.new_label()
+        done := asm.new_label()
+        when !self.expr(asm, condition) {
+            return false
+        }
+        asm.emit(cbz_to(0))
+        asm.fixup(2, otherwise)
+        when !self.statements(asm, then_body) {
+            return false
+        }
+        asm.emit(OP_B)
+        asm.fixup(0, done)
+        asm.bind(otherwise)
+        when !self.statements(asm, else_body) {
+            return false
+        }
+        asm.bind(done)
+        return true
+    }
+
+    fun while_statement(mut self, asm: &mut Arm, setup: Vec<u64>, condition: u64, body: Vec<u64>) -> bool {
+        top := asm.new_label()
+        end := asm.new_label()
+        saved_top := self.loop_top
+        saved_end := self.loop_end
+        asm.bind(top)
+        when !self.statements(asm, setup) {
+            return false
+        }
+        when !self.expr(asm, condition) {
+            return false
+        }
+        asm.emit(cbz_to(0))
+        asm.fixup(2, end)
+        self.loop_top = top
+        self.loop_end = end
+        when !self.statements(asm, body) {
+            return false
+        }
+        self.loop_top = saved_top
+        self.loop_end = saved_end
+        asm.emit(OP_B)
+        asm.fixup(0, top)
+        asm.bind(end)
+        return true
+    }
+
+    // `for slot in start..end` (or `..=`): the counter and the end are frame slots; `continue` goes to the increment.
+    fun for_statement(mut self, asm: &mut Arm, slot: u64, end_slot: u64, ty: u64, start: u64, end: u64, inclusive: bool, body: Vec<u64>) -> bool {
+        word := self.word(ty)
+        when !is_integer_word(word.clone()) {
+            return self.fail(String("a range over this type"))
+        }
+        top := asm.new_label()
+        increment := asm.new_label()
+        finished := asm.new_label()
+        when !self.expr(asm, start) {
+            return false
+        }
+        when !self.store_slot(asm, slot) {
+            return false
+        }
+        when !self.expr(asm, end) {
+            return false
+        }
+        when !self.store_slot(asm, end_slot) {
+            return false
+        }
+        saved_top := self.loop_top
+        saved_end := self.loop_end
+        asm.bind(top)
+        when !self.load_slot(asm, slot) {
+            return false
+        }
+        asm.emit(mov_rr(2, 0))
+        when !self.load_slot(asm, end_slot) {
+            return false
+        }
+        asm.emit(mov_rr(1, 0))
+        asm.emit(mov_rr(0, 2))
+        asm.emit(cmp_rr(0, 1))
+        signed := is_signed_word(word.clone())
+        mut cond: u64 = 10
+        when inclusive && signed {
+            cond = 12
+        } else when inclusive {
+            cond = 8
+        } else when signed {
+            cond = 10
+        } else {
+            cond = 2
+        }
+        asm.emit(bcond(cond))
+        asm.fixup(1, finished)
+        self.loop_top = increment
+        self.loop_end = finished
+        when !self.statements(asm, body) {
+            return false
+        }
+        self.loop_top = saved_top
+        self.loop_end = saved_end
+        asm.bind(increment)
+        when !self.load_slot(asm, slot) {
+            return false
+        }
+        asm.emit(movz(1, 1, 0))
+        asm.emit(arith_rrr(OP_ADD, 0, 0, 1))
+        when !self.store_slot(asm, slot) {
+            return false
+        }
+        asm.emit(OP_B)
+        asm.fixup(0, top)
+        asm.bind(finished)
+        return true
+    }
+
+    // `return f(args)` where f is the function being generated: the arguments replace the parameters and the body restarts,
+    // as the x86-64 backend does, so the call takes no stack.
+    fun is_self_call(self, index: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ir::IrExpr::CallExpr(ir::CallTarget::Func(id), arguments, ty) => id == self.current,
+            _ => false,
+        }
+    }
+
+    fun tail_call(mut self, asm: &mut Arm, index: u64) -> bool {
+        arguments := choose self.program.exprs[index] {
+            ir::IrExpr::CallExpr(target, values, ty) => values,
+            _ => Vec(),
+        }
+        when arguments.len() != self.program.functions[self.current].parameters.len() / 2 {
+            return self.fail(String("a call with the wrong number of arguments"))
+        }
+        for argument in arguments.clone() {
+            when !self.expr(asm, argument) {
+                return false
+            }
+            asm.emit(OP_PUSH)
+        }
+        mut at: u64 = arguments.len()
+        while at > 0 {
+            at -= 1
+            asm.emit(OP_POP | at)
+        }
+        mut store: u64 = 0
+        while store < arguments.len() {
+            asm.emit(sub_ri(9, 29, slot_address(self.program.functions[self.current].parameters[store * 2])))
+            asm.emit(store_at(store, 9))
+            store += 1
+        }
+        asm.emit(OP_B)
+        asm.fixup(0, self.body)
+        return true
+    }
+
+    fun jump(mut self, asm: &mut Arm, is_break: bool) -> bool {
+        when is_break {
+            asm.emit(OP_B)
+            asm.fixup(0, self.loop_end)
+        } else {
+            asm.emit(OP_B)
+            asm.fixup(0, self.loop_top)
+        }
+        return true
+    }
+
+    fun return_statement(mut self, asm: &mut Arm, value: Option<u64>) -> bool {
+        when value.is_some() && self.is_self_call(value.unwrap()) {
+            return self.tail_call(asm, value.unwrap())
+        }
+        when value.is_some() {
+            when !self.expr(asm, value.unwrap()) {
+                return false
+            }
+        }
+        asm.emit(OP_B)
+        asm.fixup(0, self.epilogue)
+        return true
+    }
+
+    // `echo value`: an integer in decimal, a `bool` as `true` or `false`, and a newline.
+    fun print_statement(mut self, asm: &mut Arm, value: u64, ty: u64) -> bool {
+        word := self.word(ty)
+        when !is_scalar_word(word.clone()) {
+            return self.fail(String("an echo of this type"))
+        }
+        when !self.expr(asm, value) {
+            return false
+        }
+        when word == "Bool" {
+            is_false := asm.new_label()
+            done := asm.new_label()
+            asm.emit(cbz_to(0))
+            asm.fixup(2, is_false)
+            asm.emit(OP_ADR | 1)
+            asm.fixup(3, self.true_label)
+            asm.emit(movz(2, 4, 0))
+            asm.emit(OP_B)
+            asm.fixup(0, done)
+            asm.bind(is_false)
+            asm.emit(OP_ADR | 1)
+            asm.fixup(3, self.false_label)
+            asm.emit(movz(2, 5, 0))
+            asm.bind(done)
+            asm.emit(movz(0, 1, 0))
+            asm.emit(movz(8, 64, 0))
+            asm.emit(OP_SVC0)
+        } else {
+            asm.emit(movz(1, when_signed(word), 0))
+            asm.emit(OP_BL)
+            asm.fixup(0, self.print_label)
+        }
+        asm.emit(OP_ADR | 1)
+        asm.fixup(3, self.newline_label)
+        asm.emit(movz(2, 1, 0))
+        asm.emit(movz(0, 1, 0))
+        asm.emit(movz(8, 64, 0))
+        asm.emit(OP_SVC0)
+        return true
+    }
+}
+
+// 1 for a signed integer word, else 0: the flag `print_integer` reads in x1.
+fun when_signed(word: String) -> u64 {
+    when is_signed_word(word) {
+        return 1
+    }
+    return 0
+}
+
+// `cbz x<reg>` with a zero displacement, to be fixed up by the caller.
+fun cbz_to(reg: u64) -> u64 {
+    return OP_CBZ | reg
+}
+
+// `b.cond` with a zero displacement, to be fixed up by the caller.
+fun bcond(cond: u64) -> u64 {
+    return OP_BCOND | cond
+}
+
+// The routine `print_integer`: writes the decimal digits of x0 (with a minus sign for a negative value when x1 is 1) to
+// standard output, without a newline. Its frame is 32 bytes, which keeps sp aligned.
+fun emit_print_integer(asm: &mut Arm, start: u64) {
+    asm.bind(start)
+    asm.emit(sub_ri(31, 31, 32))
+    asm.emit(add_ri(4, 31, 32))
+    asm.emit(movz(3, 0, 0))
+    unsigned := asm.new_label()
+    digits := asm.new_label()
+    no_sign := asm.new_label()
+    asm.emit(cbz_to(1))
+    asm.fixup(2, unsigned)
+    asm.emit(cmp_rr(0, 31))
+    asm.emit(bcond(10))
+    asm.fixup(1, unsigned)
+    asm.emit(neg_rr(0, 0))
+    asm.emit(movz(3, 1, 0))
+    asm.bind(unsigned)
+    asm.emit(mov_rr(2, 0))
+    asm.bind(digits)
+    asm.emit(movz(6, 10, 0))
+    asm.emit(arith_rrr(OP_UDIV, 7, 2, 6))
+    asm.emit(msub_rrrr(8, 7, 6, 2))
+    asm.emit(add_ri(8, 8, 48))
+    asm.emit(sub_ri(4, 4, 1))
+    asm.emit(OP_STRB | (4 << (5 as u32)) | 8)
+    asm.emit(mov_rr(2, 7))
+    asm.emit(OP_CBNZ | 2)
+    asm.fixup(2, digits)
+    asm.emit(cbz_to(3))
+    asm.fixup(2, no_sign)
+    asm.emit(movz(8, 45, 0))
+    asm.emit(sub_ri(4, 4, 1))
+    asm.emit(OP_STRB | (4 << (5 as u32)) | 8)
+    asm.bind(no_sign)
+    asm.emit(movz(0, 1, 0))
+    asm.emit(mov_rr(1, 4))
+    asm.emit(add_ri(2, 31, 32))
+    asm.emit(arith_rrr(OP_SUB, 2, 2, 4))
+    asm.emit(movz(8, 64, 0))
+    asm.emit(OP_SVC0)
+    asm.emit(add_ri(31, 31, 32))
+    asm.emit(OP_RET)
+}
+
+// The division by zero: the message to standard error, and exit with status 1.
+fun emit_division_error(asm: &mut Arm, start: u64, message: u64, length: u64) {
+    asm.bind(start)
+    asm.emit(OP_ADR | 1)
+    asm.fixup(3, message)
+    asm.emit(movz(2, length, 0))
+    asm.emit(movz(0, 2, 0))
+    asm.emit(movz(8, 64, 0))
+    asm.emit(OP_SVC0)
+    asm.emit(movz(0, 1, 0))
+    asm.emit(movz(8, 93, 0))
+    asm.emit(OP_SVC0)
+}
+
+// The stack overflow: the message to standard error, and exit with status 1, as the x86-64 backend does.
+fun emit_overflow(asm: &mut Arm, start: u64, message: u64, length: u64) {
+    asm.bind(start)
+    asm.emit(OP_ADR | 1)
+    asm.fixup(3, message)
+    asm.emit(movz(2, length, 0))
+    asm.emit(movz(0, 2, 0))
+    asm.emit(movz(8, 64, 0))
+    asm.emit(OP_SVC0)
+    asm.emit(movz(0, 1, 0))
+    asm.emit(movz(8, 93, 0))
+    asm.emit(OP_SVC0)
+}
+
+// A function: its frame, its parameters from x0 to x7, and its body; the result is in x0.
+fun generate_function(gen: &mut Gen64, asm: &mut Arm, id: u64) -> bool {
+    definition := gen.program.functions[id]
+    when definition.external_symbol.is_some() {
+        return gen.fail(String("a foreign function"))
+    }
+    when definition.reference_return_parameter.is_some() {
+        return gen.fail(String("a function that returns a reference"))
+    }
+    mut owned: u64 = 0
+    while owned < definition.owned_slot_types.len() {
+        when definition.owned_slot_types[owned].is_some() {
+            return gen.fail(String("an owned local"))
+        }
+        owned += 1
+    }
+    mut addressed: u64 = 0
+    while addressed < definition.addressed_slot_types.len() {
+        when definition.addressed_slot_types[addressed].is_some() {
+            return gen.fail(String("an addressed local"))
+        }
+        addressed += 1
+    }
+    for word in definition.local_types.clone() {
+        when !is_scalar_word(word.clone()) {
+            mut what := String("a local of type ")
+            what.append(word)
+            return gen.fail(what)
+        }
+    }
+    when definition.parameters.len() / 2 > 8 {
+        return gen.fail(String("a function with more than eight parameters"))
+    }
+    mut parameter: u64 = 0
+    while parameter < definition.parameters.len() / 2 {
+        when !is_scalar_word(gen.word(definition.parameters[parameter * 2 + 1])) {
+            return gen.fail(String("a parameter of this type"))
+        }
+        parameter += 1
+    }
+    when definition.return_type.is_some() && !is_scalar_word(gen.word(definition.return_type.unwrap())) {
+        return gen.fail(String("a result of this type"))
+    }
+    when definition.local_types.len() > 511 {
+        return gen.fail(String("a function with more than 511 locals"))
+    }
+    gen.epilogue = asm.new_label()
+    gen.current = id
+    gen.body = asm.new_label()
+    asm.bind(gen.func_labels[id])
+    asm.emit(OP_STP_FRAME)
+    asm.emit(OP_FP_FROM_SP)
+    // The stack guard: the stack pointer must stay above the limit (see `generate_start`).
+    asm.emit(OP_ADR | 9)
+    asm.fixup(3, gen.stack_cell)
+    asm.emit(load_at(10, 9))
+    asm.emit(add_ri(9, 31, 0))
+    asm.emit(cmp_rr(9, 10))
+    asm.emit(bcond(3))
+    asm.fixup(1, gen.overflow_label)
+    frame := frame_size(definition.local_types.len())
+    when frame > 0 {
+        asm.emit(OP_SUB_SP | (frame << (10 as u32)))
+    }
+    mut store_index: u64 = 0
+    while store_index < definition.parameters.len() / 2 {
+        when slot_address(definition.parameters[store_index * 2]) > 4088 {
+            return gen.fail(String("a frame with more than 511 slots"))
+        }
+        asm.emit(sub_ri(9, 29, slot_address(definition.parameters[store_index * 2])))
+        asm.emit(store_at(store_index, 9))
+        store_index += 1
+    }
+    asm.bind(gen.body)
+    when !gen.statements(asm, definition.statements.clone()) {
+        return false
+    }
+    when definition.return_value.is_some() {
+        when !gen.expr(asm, definition.return_value.unwrap()) {
+            return false
+        }
+    }
+    asm.bind(gen.epilogue)
+    asm.emit(OP_SP_FROM_FP)
+    asm.emit(OP_LDP_FRAME)
+    asm.emit(OP_RET)
+    return true
+}
+
+// The program's start: `main` is called, and its result (an i32 or any integer, as the process status) ends the process.
+fun generate_start(gen: &mut Gen64, asm: &mut Arm, main: u64) {
+    asm.emit(add_ri(10, 31, 0))
+    gen.constant(asm, 11, 7340032)
+    asm.emit(arith_rrr(OP_SUB, 10, 10, 11))
+    asm.emit(OP_ADR | 9)
+    asm.fixup(3, gen.stack_cell)
+    asm.emit(store_at(10, 9))
+    asm.emit(OP_BL)
+    asm.fixup(0, gen.func_labels[main])
+    when gen.program.functions[main].return_type.is_none() {
+        asm.emit(movz(0, 0, 0))
+    }
+    asm.emit(movz(8, 93, 0))
+    asm.emit(OP_SVC0)
+}
+
+pub fun generate_executable_text(text: String) -> Result<Vec<u8>, String> {
+    decoded := ir::decode_ir(text)
+    when decoded.is_err() {
+        return Result::Err(String("the IR text cannot be read"))
+    }
+    return generate(decoded.unwrap())
+}
+
+// The ELF executable of a program: one loadable segment at 0x400000, read and executed, holding the headers, the code and
+// the data. The entry point is the first instruction, which calls `main`.
+pub fun generate(program: ir::IrProgram) -> Result<Vec<u8>, String> {
+    functions := program.functions.len()
+    mut gen := Gen64 { program: program, func_labels: Vec(), current: 0, body: 0, stack_cell: 0, overflow_label: 0, queued: Vec(), pending: Vec(), epilogue: 0, loop_top: 0, loop_end: 0, print_label: 0, division_label: 0, newline_label: 0, true_label: 0, false_label: 0, reason: String() }
+    mut asm := new_arm()
+    mut position: u64 = 0
+    while position < functions {
+        gen.func_labels.push(asm.new_label())
+        gen.queued.push(false)
+        position += 1
+    }
+    gen.stack_cell = asm.zero_label(8)
+    gen.overflow_label = asm.new_label()
+    gen.print_label = asm.new_label()
+    gen.division_label = asm.new_label()
+    gen.newline_label = asm.data_label(String("\n"))
+    gen.true_label = asm.data_label(String("true"))
+    gen.false_label = asm.data_label(String("false"))
+    division_text := String("Ryn runtime error: integer division or remainder by zero\n")
+    division_length := division_text.len()
+    division_message := asm.data_label(division_text)
+    main := program.main_index
+    when main >= functions {
+        return Result::Err(String("a program without main"))
+    }
+    gen.need(main)
+    generate_start(&mut gen, &mut asm, main)
+    mut head: u64 = 0
+    while head < gen.pending.len() {
+        id := gen.pending[head]
+        head += 1
+        when !generate_function(&mut gen, &mut asm, id) {
+            return Result::Err(gen.reason)
+        }
+    }
+    emit_print_integer(&mut asm, gen.print_label)
+    emit_division_error(&mut asm, gen.division_label, division_message, division_length)
+    overflow_text := String("Ryn runtime error: stack overflow (recursion is too deep)\n")
+    overflow_length := overflow_text.len()
+    overflow_message := asm.data_label(overflow_text)
+    emit_overflow(&mut asm, gen.overflow_label, overflow_message, overflow_length)
+    code := asm.finish()
+    when code.is_err() {
+        return Result::Err(code.unwrap_err())
+    }
+    return Result::Ok(elf_image(code.unwrap()))
+}
+
+// Appends the little-endian bytes of a value of 2, 4 or 8 bytes to `out` and returns it.
+fun put16(out: Vec<u8>, value: u64) -> Vec<u8> {
+    mut bytes := out
+    bytes.push((value & 255) as u8)
+    bytes.push(((value >> (8 as u32)) & 255) as u8)
+    return bytes
+}
+
+fun put32(out: Vec<u8>, value: u64) -> Vec<u8> {
+    mut bytes := put16(out, value & 65535)
+    return put16(bytes, (value >> (16 as u32)) & 65535)
+}
+
+fun put64(out: Vec<u8>, value: u64) -> Vec<u8> {
+    mut bytes := put32(out, value & 4294967295)
+    return put32(bytes, (value >> (32 as u32)) & 4294967295)
+}
+
+// The ELF64 header and one program header, followed by the image of the code and the data.
+fun elf_image(image: Vec<u8>) -> Vec<u8> {
+    base: u64 = 4194304
+    header_size: u64 = 120
+    total: u64 = header_size + image.len()
+    mut out: Vec<u8> = Vec()
+    out.push(127)
+    out.push(69)
+    out.push(76)
+    out.push(70)
+    out.push(2)
+    out.push(1)
+    out.push(1)
+    out.push(0)
+    while out.len() < 16 {
+        out.push(0)
+    }
+    out = put16(out, 2)
+    out = put16(out, 183)
+    out = put32(out, 1)
+    out = put64(out, base + header_size)
+    out = put64(out, 64)
+    out = put64(out, 0)
+    out = put32(out, 0)
+    out = put16(out, 64)
+    out = put16(out, 56)
+    out = put16(out, 1)
+    out = put16(out, 64)
+    out = put16(out, 0)
+    out = put16(out, 0)
+    out = put32(out, 1)
+    out = put32(out, 7)
+    out = put64(out, 0)
+    out = put64(out, base)
+    out = put64(out, base)
+    out = put64(out, total)
+    out = put64(out, total)
+    out = put64(out, 65536)
+    for byte in image {
+        out.push(byte)
+    }
+    return out
+}

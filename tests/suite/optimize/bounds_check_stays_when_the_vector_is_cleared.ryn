@@ -1,0 +1,17 @@
+// test: run
+// exit: 1
+// err: array index is out of bounds
+// A body that empties the vector keeps the check on the read that follows: the loop test no longer says anything about it.
+fun main() {
+    mut v: Vec<i64> = Vec()
+    v.push(1)
+    v.push(2)
+    mut total: i64 = 0
+    mut k: u64 = 0
+    while k < v.len() {
+        v.clear()
+        total += v[k]
+        k += 1
+    }
+    echo total
+}
