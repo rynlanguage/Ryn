@@ -1,0 +1,9 @@
+// test: fail
+// code: R0271
+// A pointer into a local array is only passed to an extern "C" function: it is not stored (the array's bytes are packed for
+// the call only).
+fun main() {
+    buf: [u8; 4] = [1, 2, 3, 4]
+    p := &buf[1]
+    echo 1
+}

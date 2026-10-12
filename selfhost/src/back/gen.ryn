@@ -349,6 +349,9 @@ pub struct Gen {
     // The `repr(C)` locals whose address was taken in the function being generated: the slot, the scratch cells that hold its
     // C layout, and its structure. The layout is brought up to date before a foreign call, and read back after it.
     shadow_slots: Vec<u64>,
+    // The array elements a C call is given pointers into: six words each (the array slot, the element width, whether it is
+    // signed, the length, the buffer slot and whether it is mutable), copied back after the call.
+    ffi_copies: Vec<u64>,
     shadow_images: Vec<u64>,
     shadow_ids: Vec<u64>,
     // The enums whose values are copied by a routine of their own, and its labels.
@@ -515,6 +518,33 @@ fun true_literal() -> u64 {
 
 fun false_literal() -> u64 {
     return 2
+}
+
+// The width in bytes of an array element that a C call may point into (0 for the others): integers and bool.
+fun ffi_width_of(word: String) -> u64 {
+    when word == "U8" || word == "I8" || word == "Bool" {
+        return 1
+    } else when word == "U16" || word == "I16" {
+        return 2
+    } else when word == "U32" || word == "I32" {
+        return 4
+    } else when word == "U64" || word == "I64" {
+        return 8
+    }
+    return 0
+}
+
+fun ffi_signed_word(word: String) -> bool {
+    return word == "I8" || word == "I16" || word == "I32" || word == "I64"
+}
+
+// The cells of a frame buffer that hold `length` elements of `width` bytes.
+fun ffi_cells(length: u64, width: u64) -> u64 {
+    cells := (length * width + 7) / 8
+    when cells == 0 {
+        return 1
+    }
+    return cells
 }
 
 // The name of an MMX instruction by its opcode (the `MmxBin` operations of std::mmx).
@@ -755,6 +785,7 @@ fun build_listing(input: ir::IrProgram, executable: bool, libc: bool, windows: b
         find_label: 0,
         copy_ty_id: 0,
         shadow_slots: Vec(),
+        ffi_copies: Vec(),
         shadow_images: Vec(),
         shadow_ids: Vec(),
         freestanding: false,
@@ -1225,6 +1256,7 @@ extend Gen {
             ir::IrExpr::Not(value) => String("a logical not"),
             ir::IrExpr::BitNot(value, ty) => String("a bitwise not"),
             ir::IrExpr::FunctionAddress(function, ty) => String("a function address"),
+            ir::IrExpr::FfiArray(array, element, length, index, mutable) => String("a pointer into an array"),
             ir::IrExpr::CastExpr(value, source, target) => String("a cast"),
         }
     }
@@ -2664,6 +2696,7 @@ extend Gen {
             ir::IrExpr::Negate(value, ty) => self.scan_expression(value),
             ir::IrExpr::Not(value) => self.scan_expression(value),
             ir::IrExpr::BitNot(value, ty) => self.scan_expression(value),
+            ir::IrExpr::FfiArray(array, element, length, index, mutable) => self.scan_two(array, index),
             ir::IrExpr::CastExpr(value, source, target) => self.scan_expression(value),
             _ => true,
         }
@@ -5711,6 +5744,7 @@ extend Gen {
             ir::IrExpr::Negate(value, ty) => self.bce_expr_ok(value, vec, idx),
             ir::IrExpr::Not(value) => self.bce_expr_ok(value, vec, idx),
             ir::IrExpr::BitNot(value, ty) => self.bce_expr_ok(value, vec, idx),
+            ir::IrExpr::FfiArray(array, element, length, index, mutable) => self.bce_two_ok(array, index, vec, idx),
             ir::IrExpr::CastExpr(value, source, target) => self.bce_expr_ok(value, vec, idx),
             _ => false,
         }
@@ -6290,6 +6324,7 @@ extend Gen {
             ir::IrExpr::Negate(value, ty) => self.inline_ok(value, function),
             ir::IrExpr::Not(value) => self.inline_ok(value, function),
             ir::IrExpr::BitNot(value, ty) => self.inline_ok(value, function),
+            ir::IrExpr::FfiArray(array, element, length, index, mutable) => false,
             ir::IrExpr::CastExpr(value, source, target) => self.inline_ok(value, function),
             ir::IrExpr::IfExpr(condition, then_value, else_value, ty) => self.inline_ok(condition, function) && self.inline_ok(then_value, function) && self.inline_ok(else_value, function),
             ir::IrExpr::ReferenceFieldRead(pointer, id, field, ty, span, borrowed) => self.inline_cell_type(ty) && self.inline_ok(pointer, function),
@@ -13501,6 +13536,8 @@ extend Gen {
         when arguments.len() > parameters.len() / 2 && self.windows {
             return self.fail("a variadic C call on Windows")
         }
+        outer_copies := self.ffi_copies.clone()
+        self.ffi_copies = Vec()
         // A `ryn_` shim belongs to the runtime; one the native compiler does not provide would not resolve when it runs.
         when name.starts_with("ryn_") && !rt_provides(name.clone()) {
             return self.fail("a runtime shim that the native compiler does not provide")
@@ -13545,6 +13582,8 @@ extend Gen {
         }
         // A Windows program reaches the operating system through the emulated system calls (`write`, `read`, `open`,
         // `close`) or the scalar functions of the C runtime library (`ucrtbase.dll`), called with the Windows convention.
+        mine := self.ffi_copies.clone()
+        self.ffi_copies = outer_copies
         windows_call := self.windows && self.freestanding && !rt_provides(name.clone()) && !ffi_helpers::is_helper(name.clone())
         system_number := windows_system_number(name.clone())
         when windows_call && system_number == 0 {
@@ -13553,6 +13592,7 @@ extend Gen {
             when !self.windows_import_call(asm, name.clone(), types) {
                 return false
             }
+            self.ffi_copy_back(asm, mine.clone())
             return self.finish_c_call(asm, result)
         }
         when !self.load_c_arguments(asm, types) {
@@ -13597,12 +13637,85 @@ extend Gen {
             asm.mov_ri(x64::Reg::RAX, vector_registers)
             self.aligned_call(asm, name)
         }
+        self.ffi_copy_back(asm, mine.clone())
         return self.finish_c_call(asm, result)
+    }
+
+    // A pointer to element `index` of the local array `array`, for a C call (see `FfiArray` in ir.ryn). The elements are
+    // packed, one `width`-byte element each, into a frame buffer that the call reads and, when the pointer is mutable, the
+    // copy-back after the call writes into the array's cells. The index is checked against the length.
+    fun ffi_array(mut self, asm: &mut x64::Asm, array: u64, element: u64, length: u64, index: u64, mutable: bool) -> bool {
+        slot := self.array_local_of(array)
+        when slot.is_none() {
+            return self.fail("a pointer into an array that is not a local")
+        }
+        word := self.word(element)
+        width := ffi_width_of(word.clone())
+        when width == 0 || length == 0 {
+            return self.fail("a pointer into an array of this element type")
+        }
+        cells := ffi_cells(length, width)
+        buffer := self.scratch(cells)
+        when !self.expr(asm, index) {
+            return false
+        }
+        asm.mov_ri(x64::Reg::RDX, length)
+        asm.alu_rr(57, x64::Reg::RAX, x64::Reg::RDX)
+        asm.jcc(x64::Cc::ABOVE_EQUAL, self.index_error_label)
+        asm.push(x64::Reg::RAX)
+        // Element k of the array is the cell at 8 * k above the lowest address of the array (see `array_as_slice`).
+        asm.lea(x64::Reg::R10, x64::Reg::RBP, slot_disp(slot.unwrap() + length - 1))
+        asm.lea(x64::Reg::RCX, x64::Reg::RBP, slot_disp(buffer + cells - 1))
+        mut k: u64 = 0
+        while k < length {
+            asm.load(8, false, x64::Reg::R11, x64::Reg::R10, (k * 8) as i64)
+            asm.store(width, x64::Reg::R11, x64::Reg::RCX, (k * width) as i64)
+            k += 1
+        }
+        asm.pop(x64::Reg::RAX)
+        self.scale_bytes(asm, x64::Reg::RAX, width)
+        asm.alu_rr(1, x64::Reg::RAX, x64::Reg::RCX)
+        mut flag: u64 = 0
+        when mutable {
+            flag = 1
+        }
+        mut signed: u64 = 0
+        when ffi_signed_word(word) {
+            signed = 1
+        }
+        self.ffi_copies.push(slot.unwrap())
+        self.ffi_copies.push(width)
+        self.ffi_copies.push(signed)
+        self.ffi_copies.push(length)
+        self.ffi_copies.push(buffer)
+        self.ffi_copies.push(flag)
+        return true
+    }
+
+    // Writes the elements of the mutable buffers of a finished C call back into their arrays (six words per entry).
+    fun ffi_copy_back(mut self, asm: &mut x64::Asm, entries: Vec<u64>) {
+        mut at: u64 = 0
+        while at + 6 <= entries.len() {
+            when entries[at + 5] == 1 {
+                width := entries[at + 1]
+                length := entries[at + 3]
+                asm.lea(x64::Reg::R10, x64::Reg::RBP, slot_disp(entries[at] + length - 1))
+                asm.lea(x64::Reg::RCX, x64::Reg::RBP, slot_disp(entries[at + 4] + ffi_cells(length, width) - 1))
+                mut k: u64 = 0
+                while k < length {
+                    asm.load(width, entries[at + 2] == 1, x64::Reg::R11, x64::Reg::RCX, (k * width) as i64)
+                    asm.store(8, x64::Reg::R11, x64::Reg::R10, (k * 8) as i64)
+                    k += 1
+                }
+            }
+            at += 6
+        }
     }
 
     // The type of a variable argument: lowering wraps it in a cast to its own type.
     fun variadic_type(self, argument: u64) -> Option<u64> {
         return choose self.program.exprs[argument] {
+            ir::IrExpr::FfiArray(array, element, length, index, mutable) => Option::None,
             ir::IrExpr::CastExpr(value, source, target) => Option::Some(target),
             _ => Option::None,
         }
@@ -15083,6 +15196,7 @@ extend Gen {
             ir::IrExpr::Negate(value, ty) => self.const_negate(value, ty),
             ir::IrExpr::Not(value) => self.const_not(value),
             ir::IrExpr::BitNot(value, ty) => self.const_bit_not(value, ty),
+            ir::IrExpr::FfiArray(array, element, length, index, mutable) => Option::None,
             ir::IrExpr::CastExpr(value, source, target) => self.const_cast(value, target),
             _ => Option::None,
         }
@@ -15464,6 +15578,7 @@ extend Gen {
             ir::IrExpr::Negate(value, ty) => self.negate(asm, value, ty),
             ir::IrExpr::Not(value) => self.not(asm, value),
             ir::IrExpr::BitNot(value, ty) => self.bit_not(asm, value, ty),
+            ir::IrExpr::FfiArray(array, element, length, index, mutable) => self.ffi_array(asm, array, element, length, index, mutable),
             ir::IrExpr::CastExpr(value, source, target) => self.cast(asm, value, source, target),
             ir::IrExpr::CallExpr(target, arguments, ty) => self.call_or_lent_element(asm, index, target, arguments, ty),
             ir::IrExpr::IfExpr(condition, then_value, else_value, ty) => self.if_expression(asm, condition, then_value, else_value),
@@ -16045,6 +16160,7 @@ extend Gen {
             ir::IrExpr::CharLit(scalar) => true,
             ir::IrExpr::LocalRef(slot, ty, span) => true,
             ir::IrExpr::MoveRef(slot, ty) => true,
+            ir::IrExpr::FfiArray(array, element, length, index, mutable) => false,
             ir::IrExpr::CastExpr(inner, source, target) => self.is_pure(inner),
             ir::IrExpr::StructValue(id, fields, values) => self.all_pure(values),
             ir::IrExpr::FieldRead(inner, id, field, ty, span) => self.is_pure(inner),

@@ -5685,6 +5685,93 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
     }
 
     // Checks the argument list against a signature and lowers each argument to its parameter type.
+    // `&a[i]` or `&mut a[i]` (not a raw pointer) of an element of a local array.
+    fun is_array_element_reference(self, index: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::AddressOfE(mutable, raw, inner, span) => !raw && self.is_array_index(inner),
+            _ => false,
+        }
+    }
+
+    fun is_array_index(self, index: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::IndexE(base, position, index_span) => self.names_a_local(base),
+            _ => false,
+        }
+    }
+
+    // The name, and the start and end of the name, of a local named by an expression (empty and 0 for other expressions).
+    fun local_name_of(self, index: u64) -> String {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::NameRef(name, name_span) => name,
+            _ => String(),
+        }
+    }
+
+    fun local_name_start(self, index: u64) -> u64 {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::NameRef(name, name_span) => name_span.start,
+            _ => 0,
+        }
+    }
+
+    fun local_name_end(self, index: u64) -> u64 {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::NameRef(name, name_span) => name_span.end,
+            _ => 0,
+        }
+    }
+
+    // The pointer to element `i` of a local array as an argument: an `FfiArray` expression, of the pointer type of the
+    // parameter. A mutable pointer needs a `mut` array, as a mutable reference does.
+    fun array_element_argument(mut self, index: u64) -> Result<Lowered, String> {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::AddressOfE(mutable, raw, inner, span) => choose self.program.exprs[inner] {
+                ast::ExprTree::IndexE(base, position, index_span) => self.array_element_pointer(base, position, mutable, span),
+                _ => Result::Err(address_operand_error(span.start, span.end)),
+            },
+            _ => Result::Err(unsupported("reference argument")),
+        }
+    }
+
+    fun array_element_pointer(mut self, base: u64, position: u64, mutable: bool, span: ast::Span) -> Result<Lowered, String> {
+        when mutable {
+            local_name := self.local_name_of(base)
+            found := self.find(local_name)?
+            when !self.locals[found].mutable {
+                start := self.local_name_start(base)
+                end := self.local_name_end(base)
+                return Result::Err(diagnostic("R0206", start, end, String("cannot create a mutable reference to an immutable binding"), String("declare the value with `mut` before borrowing it mutably")))
+            }
+        }
+        array := self.expression(base, String(""))?
+        parts := array_parts(array.ty.clone())
+        when parts.is_none() {
+            return Result::Err(unsupported("address of an element of this type"))
+        }
+        fields := parts.unwrap()
+        element := fields[0].clone()
+        when !(is_integer_word(element.clone()) || element == "Bool") {
+            return Result::Err(unsupported("a pointer into an array of this element type"))
+        }
+        length := array_length_of(fields)
+        when length == 0 {
+            return Result::Err(unsupported("a pointer into an empty array"))
+        }
+        at := self.expression(position, String(""))?
+        when !is_integer_word(at.ty.clone()) {
+            return Result::Err(unsupported("index type"))
+        }
+        mut pointer := String("RawPointer ")
+        pointer.append(element.clone())
+        mut flag := String("0")
+        when mutable {
+            flag = String("1")
+        }
+        text := join(words6(String("FfiArray"), array.text, element, num(length), at.text, flag))
+        return Result::Ok(Lowered { text: text, ty: pointer })
+    }
+
     // `&name` or `&mut name` of a local (not a raw pointer).
     fun is_local_reference(self, index: u64) -> bool {
         return choose self.program.exprs[index] {
@@ -5724,6 +5811,17 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
             // An argument after the named parameters of a variadic C function (see `variadic_argument`).
             when position >= params.len() {
                 lowered.push(self.variadic_argument(name.clone(), arguments[position])?)
+                position += 1
+                continue
+            }
+            // A pointer to an element of a local array for a pointer parameter of a C function: the array is packed for the call
+            // and its elements are copied back after it when the pointer is mutable (see `ffi_array` in the generator).
+            when self.signatures[id].external && params[position].starts_with("RawPointer ") && self.is_array_element_reference(arguments[position]) {
+                value := self.array_element_argument(arguments[position])?
+                when value.ty != params[position] {
+                    return Result::Err(unsupported("argument type"))
+                }
+                lowered.push(value.text)
                 position += 1
                 continue
             }
@@ -9972,6 +10070,9 @@ extend Lowering {
     // `&slice[index]`: the address of an element of a borrowed slice.
     fun slice_element_address(mut self, slice: u64, position: u64, span: ast::Span) -> Result<Lowered, String> {
         base := self.expression(slice, String(""))?
+        when base.ty.starts_with("Array ") {
+            return Result::Err(diagnostic("R0271", span.start, span.end, String("a pointer into a local array is only passed to an extern \"C\" function"), String("pass `&array[index]` directly as an argument of an extern \"C\" function, or copy the element into a variable")))
+        }
         when !base.ty.starts_with("Slice ") {
             return Result::Err(unsupported("address of an element of this type"))
         }

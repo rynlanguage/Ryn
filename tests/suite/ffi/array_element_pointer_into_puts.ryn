@@ -1,0 +1,10 @@
+// test: run
+// out: Hell
+// `puts(&title[0])` gets the C string of a local array of bytes: the array's bytes are packed for the call, and the call
+// reads them from the element it is given. The array is read-only here, so nothing is copied back.
+extern "C" fun puts(text: *u8) -> i32;
+
+fun main() {
+    mut title: [u8; 5] = [72, 101, 108, 108, 0]
+    puts(&title[0])
+}

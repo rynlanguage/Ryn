@@ -5,6 +5,12 @@ All notable changes to Ryn are recorded here. The format follows
 sequence: minor releases may change language details while the compiler is pre-1.0.
 
 ## [0.1.13] — 2026-10-12 — Registers, AArch64, variadic C calls, sugar and gamedev
+- FFI pointers into arrays and C strings: `&array[index]` and `&mut array[index]` of a local array of integers or `bool`,
+  passed directly to an `extern "C"` function, give the function a pointer to that element. The elements are packed into
+  bytes for the call (`u8` is one byte), and a mutable pointer's elements are copied back after the call. The index is checked.
+  Elsewhere a pointer into a local array is `R0271`. New `std::cstring`: `CString::from_text(text)` owns a copy of a `str`
+  with a zero byte, freed by its destructor; `as_ptr()` gives the C string for the lifetime of the `CString`.
+  Tests: `tests/suite/ffi/array_element_pointer_*`, `cstring_title_for_glfw_create_window`.
 - FFI: `&name` and `&mut name` of a local are passed as the local's address to a pointer parameter (`*T`) of an
   `extern "C"` function, also when it is called through an `extern "C"` function pointer (Vulkan loader functions from
   `load_symbol`). `time(&value)` and `frexp(x, &mut exponent)` write the result into the local. Before, these were
