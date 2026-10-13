@@ -17590,6 +17590,9 @@ fun windows_system_number(name: String) -> u64 {
 
 // The import that a C function is called through in a Windows program.
 fun windows_import_name(name: String) -> String {
+    when name == "GetAsyncKeyState" {
+        return String("user32!GetAsyncKeyState")
+    }
     first := name.byte_at(0) as u64
     when first >= 65 && first <= 90 {
         mut kernel := String("kernel32!")

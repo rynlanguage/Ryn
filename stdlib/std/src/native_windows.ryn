@@ -18,6 +18,101 @@ extern "C" fun SetHandleInformation(handle: *u8, mask: u32, flags: u32) -> i32;
 extern "C" fun GetStdHandle(which: u32) -> *u8;
 extern "C" fun MultiByteToWideChar(code_page: u32, flags: u32, text: *u8, length: i32, wide: *u8, capacity: i32) -> i32;
 extern "C" fun Sleep(milliseconds: u32);
+extern "C" fun GetAsyncKeyState(key: i32) -> i16;
+
+// Keyboard polling uses the high bit only. Windows' low "pressed since last call" bit is shared with other processes.
+// Keep the same down/pressed/released layout as the Linux runtime, and latch edges until their query consumes them.
+fun keyboard_state() -> *u8 {
+    cell := __runtime_cell()
+    existing := word64_at(cell, 0)
+    when existing != 0 { return existing as *u8 }
+    state := zeroed(384)
+    set_word64_at(cell, 0, state as u64)
+    return state
+}
+
+fun windows_key_code(key: u32) -> i32 {
+    when key >= 1 && key <= 26 { return (key + 64) as i32 }
+    when key >= 27 && key <= 36 { return (key + 21) as i32 }
+    when key >= 64 && key <= 75 { return (key + 48) as i32 }
+    when key >= 87 && key <= 96 { return (key + 9) as i32 }
+    return choose key {
+        37 => 32, 38 => 13, 39 => 27, 40 => 9, 41 => 8,
+        42 => 46, 43 => 45, 44 => 36, 45 => 35, 46 => 33, 47 => 34,
+        48 => 38, 49 => 40, 50 => 37, 51 => 39,
+        52 => 16, 53 => 160, 54 => 161,
+        55 => 17, 56 => 162, 57 => 163,
+        58 => 18, 59 => 164, 60 => 165,
+        61 => 20, 62 => 144, 63 => 145,
+        76 => 192, 77 => 189, 78 => 187, 79 => 219, 80 => 221,
+        81 => 220, 82 => 186, 83 => 222, 84 => 188, 85 => 190, 86 => 191,
+        97 => 107, 98 => 109, 99 => 106, 100 => 111, 101 => 110,
+        102 => 13, 103 => 44, 104 => 19, 105 => 93, 106 => 91, 107 => 92,
+        _ => 0,
+    }
+}
+
+fun keyboard_sample(state: *u8, key: u32, down: bool) {
+    index := key as u64
+    when index == 0 || index >= 108 { return }
+    was_down := byte_of(state, 32 + index) != 0
+    when down && !was_down {
+        slot := ((state as u64) + 140 + index) as *u8
+        *slot = 1 as u8
+    } else when !down && was_down {
+        slot := ((state as u64) + 248 + index) as *u8
+        *slot = 1 as u8
+    }
+    slot := ((state as u64) + 32 + index) as *u8
+    *slot = when down { 1 as u8 } else { 0 as u8 }
+}
+
+fun keyboard_poll(state: *u8) {
+    for key in 1..108 {
+        keyboard_sample(state, key as u32, GetAsyncKeyState(windows_key_code(key as u32)) < 0)
+    }
+}
+
+pub fun __rt_system_key_down(key: u32) -> bool {
+    when key == 0 || key >= 108 { return false }
+    state := keyboard_state()
+    keyboard_poll(state)
+    return byte_of(state, 32 + (key as u64)) != 0
+}
+
+fun keyboard_edge(key: u32, offset: u64) -> bool {
+    when key == 0 || key >= 108 { return false }
+    state := keyboard_state()
+    keyboard_poll(state)
+    slot := ((state as u64) + offset + (key as u64)) as *u8
+    found := *slot != 0
+    *slot = 0 as u8
+    return found
+}
+
+pub fun __rt_system_key_pressed(key: u32) -> bool {
+    return keyboard_edge(key, 140)
+}
+
+pub fun __rt_system_key_released(key: u32) -> bool {
+    return keyboard_edge(key, 248)
+}
+
+pub fun __rt_system_read_key() -> u32 {
+    state := keyboard_state()
+    while true {
+        keyboard_poll(state)
+        for key in 1..108 {
+            slot := ((state as u64) + 140 + (key as u64)) as *u8
+            when *slot != 0 {
+                *slot = 0 as u8
+                return key as u32
+            }
+        }
+        Sleep(4 as u32)
+    }
+    return 0
+}
 
 fun word64_at(pointer: *u8, offset: u64) -> u64 {
     cell := ((pointer as u64) + offset) as *u64

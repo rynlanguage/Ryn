@@ -67,8 +67,16 @@ reaches the system:
 What was verified, and how: nothing here was run on Windows itself. The programs were run under Wine 10 in a
 container (`podman`, image `ryn-wine`, `RYN_TEST_TARGET=windows tools/test-native-sources.py`), including the Windows
 `rync.exe` compiling programs under Wine (`RYN_TEST_WINE_COMPILER`). Not done yet: threads, sockets, dynamic libraries,
-keyboard input, callbacks from C (`qsort`), records passed to or returned from C, directory listing through C
+callbacks from C (`qsort`), records passed to or returned from C, directory listing through C
 functions, and a run on a real Windows machine.
+
+`std::keyboard` also has a Windows runtime: `key_down`, `key_pressed`, `key_released` and `read_key` sample
+`GetAsyncKeyState` from `user32.dll`, without opening Linux input devices or waiting for Enter. Pressed and released
+edges are latched per key and consumed by their respective queries; `read_key` waits in 4 ms steps for a pressed edge.
+Only the high (down) bit is used, as the low transition bit is unreliable across processes. Very short taps between
+polls can be missed. Queries observe the active desktop rather than console text input, and return no down state when
+Windows denies access to that desktop. On Windows `Enter` and `NumpadEnter` both map to `VK_RETURN`; OEM punctuation
+keys follow the Windows keyboard layout. See `examples/realtime_input` for a continuous loop.
 
 ## Float text and runtime ownership
 
