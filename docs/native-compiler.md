@@ -64,11 +64,11 @@ reaches the system:
   directories, time, the executable and temporary paths, the current directory.
 - Paths use `/` internally; `C:/...` counts as absolute.
 
-What was verified, and how: nothing here was run on Windows itself. The programs were run under Wine 10 in a
+The original cross-platform verification ran the programs under Wine 10 in a
 container (`podman`, image `ryn-wine`, `RYN_TEST_TARGET=windows tools/test-native-sources.py`), including the Windows
-`rync.exe` compiling programs under Wine (`RYN_TEST_WINE_COMPILER`). Not done yet: threads, sockets, dynamic libraries,
+`rync.exe` compiling programs under Wine (`RYN_TEST_WINE_COMPILER`). Not done yet: sockets,
 callbacks from C (`qsort`), records passed to or returned from C, directory listing through C
-functions, and a run on a real Windows machine.
+functions, and the complete language suite on a real Windows machine.
 
 `std::keyboard` also has a Windows runtime: `key_down`, `key_pressed`, `key_released` and `read_key` sample
 `GetAsyncKeyState` from `user32.dll`, without opening Linux input devices or waiting for Enter. Pressed and released
@@ -77,6 +77,18 @@ Only the high (down) bit is used, as the low transition bit is unreliable across
 polls can be missed. Queries observe the active desktop rather than console text input, and return no down state when
 Windows denies access to that desktop. On Windows `Enter` and `NumpadEnter` both map to `VK_RETURN`; OEM punctuation
 keys follow the Windows keyboard layout. See `examples/realtime_input` for a continuous loop.
+
+`std::thread::Thread` uses `CreateThread`, `WaitForSingleObject` and `CloseHandle` on Windows. Its worker still takes
+no arguments and returns no value. `join()` returns false for a null handle, a second join, an OS wait failure or a
+self-join; dropping a thread closes its OS handle without stopping its worker. The startup context belongs to the
+worker, independently of the owner. Windows malloc/free serialize their shared allocator state.
+
+`std::sync::Mutex`, `MutexGuard` and `lock_raw` use non-recursive exclusive SRW locks on Windows. `try_lock()` returns
+an unheld guard when the mutex is already locked; guards release the lock on scope exit, including `return`.
+Linux keeps pthread mutexes through the same runtime interface. The mutex must outlive all its guards and workers.
+`JoinHandle` (argument/result), `RwLock`, `Condvar`, `Barrier`, `Once` and `Local` are still Linux-only. Execution tests
+in `tools/tests/test_threads_windows.py` cover parallel allocations, handle cleanup, detached workers, creation
+failure, guard cleanup and four workers incrementing a plain counter under one mutex.
 
 ## Float text and runtime ownership
 

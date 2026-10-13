@@ -28,8 +28,8 @@ The latest release is [0.1.13](https://github.com/rynlanguage/Ryn/releases/tag/v
   build. The compiler is built from the committed seed (`bootstrap/rync-seed`) by `tools/bootstrap-native.sh`, which
   requires stage 2 and stage 3 to be byte-identical.
 - Linux x86-64 is the primary target. Windows x86-64 programs and the Windows `ryn.exe`/`rync.exe` are cross-compiled
-  by the same compiler; they have been run under Wine only, not on Windows itself, and threads and sockets
-  are not available there yet (see `docs/native-compiler.md`). Keyboard polling is supported on Windows through `user32`.
+  by the same compiler. Keyboard polling, `std::thread::Thread` and `std::sync::Mutex` have execution tests on Windows.
+  Sockets and the remaining `std::sync` primitives are not available there yet (see `docs/native-compiler.md`).
 - The Rust implementation and the Cranelift backend were removed in 0.1.6. They remain in the git history before
   commit `950e152`.
 - Ryn is experimental. It is not a general-purpose production language yet.

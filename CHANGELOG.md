@@ -5,6 +5,12 @@ All notable changes to Ryn are recorded here. The format follows
 sequence: minor releases may change language details while the compiler is pre-1.0.
 
 ## [0.1.13] — 2026-10-12 — Registers, AArch64, variadic C calls, sugar and gamedev
+
+- Windows threads and mutexes (2026-10-13): `std::thread::Thread` supports spawn/id/join/drop through Windows APIs,
+  with an independent worker startup context and synchronized allocator state. `std::sync::Mutex`, `MutexGuard`
+  and `lock_raw` use non-recursive exclusive SRW locks on Windows and pthread mutexes on Linux through a common
+  runtime interface. Six execution tests cover parallel allocation, cleanup, failed creation and mutex contention.
+  Other `std::sync` primitives, including `JoinHandle`, remain Linux-only.
 - FFI pointers into arrays and C strings: `&array[index]` and `&mut array[index]` of a local array of integers or `bool`,
   passed directly to an `extern "C"` function, give the function a pointer to that element. The elements are packed into
   bytes for the call (`u8` is one byte), and a mutable pointer's elements are copied back after the call. The index is checked.

@@ -1,4 +1,5 @@
-// Threads with data, and the synchronization primitives, on POSIX threads (Linux; not available for the Windows target).
+// Mutex and MutexGuard use the platform runtime (pthreads on Linux, exclusive SRW locks on Windows).
+// Threads with data and the remaining synchronization primitives below still use POSIX threads (Linux only).
 //
 // Every primitive owns a heap block that never moves (a `pthread_mutex_t` must not be copied), reached through one raw
 // pointer, and releases it when the owner goes out of scope. Guards unlock when they go out of scope. A primitive is shared
@@ -111,8 +112,7 @@ pub struct Mutex {
 
 fun release_mutex(mutex: Mutex) {
     when !pointer_is_null(mutex.handle) {
-        pthread_mutex_destroy(mutex.handle)
-        free(mutex.handle)
+        __sync_mutex_drop(mutex.handle)
     }
 }
 
@@ -123,20 +123,13 @@ pub struct MutexGuard {
 
 fun release_guard(guard: MutexGuard) {
     when !pointer_is_null(guard.handle) {
-        pthread_mutex_unlock(guard.handle)
+        __sync_mutex_unlock(guard.handle)
     }
 }
 
 extend Mutex {
     pub fun new() -> Mutex {
-        handle := block(64 as u64)
-        when pointer_is_null(handle) {
-            return Mutex { handle: handle }
-        }
-        when pthread_mutex_init(handle, 0 as *u8) != 0 {
-            free(handle)
-            return Mutex { handle: 0 as *u8 }
-        }
+        handle := __sync_mutex_new()
         return Mutex { handle: handle }
     }
 
@@ -158,7 +151,7 @@ extend Mutex {
         when pointer_is_null(self.handle) {
             return MutexGuard { handle: 0 as *u8 }
         }
-        when pthread_mutex_trylock(self.handle) != 0 {
+        when !__sync_mutex_try_lock(self.handle) {
             return MutexGuard { handle: 0 as *u8 }
         }
         return MutexGuard { handle: self.handle }
@@ -175,7 +168,7 @@ pub fun lock_raw(handle: *u8) -> MutexGuard {
     when pointer_is_null(handle) {
         return MutexGuard { handle: 0 as *u8 }
     }
-    when pthread_mutex_lock(handle) != 0 {
+    when !__sync_mutex_lock(handle) {
         return MutexGuard { handle: 0 as *u8 }
     }
     return MutexGuard { handle: handle }

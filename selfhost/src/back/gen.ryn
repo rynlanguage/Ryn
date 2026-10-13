@@ -4312,7 +4312,7 @@ extend Gen {
             unknown = self.c_literal(String("Unknown error"))
         }
         labels := self.rt.clone()
-        rt::emit(asm, &labels, numbers, texts, unknown)
+        rt::emit(asm, &labels, numbers, texts, unknown, self.windows)
     }
 
     // The symbol of a string literal followed by a zero byte.

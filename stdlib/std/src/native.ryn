@@ -1821,6 +1821,32 @@ pub fun __rt_system_process_capture_drop(capture: *u8) {
 extern "C" fun pthread_create(thread: *u8, attributes: *u8, routine: *u8, argument: *u8) -> i32;
 extern "C" fun pthread_join(thread: u64, result: *u8) -> i32;
 extern "C" fun pthread_detach(thread: u64) -> i32;
+extern "C" fun pthread_mutex_init(mutex: *u8, attributes: *u8) -> i32;
+extern "C" fun pthread_mutex_destroy(mutex: *u8) -> i32;
+extern "C" fun pthread_mutex_lock(mutex: *u8) -> i32;
+extern "C" fun pthread_mutex_trylock(mutex: *u8) -> i32;
+extern "C" fun pthread_mutex_unlock(mutex: *u8) -> i32;
+
+pub fun __rt_system_mutex_new() -> *u8 {
+    lock := malloc(64)
+    when lock == null { return null }
+    when pthread_mutex_init(lock, null) != 0 { free(lock) return null }
+    return lock
+}
+pub fun __rt_system_mutex_lock(lock: *u8) -> bool {
+    when lock == null { return false }
+    return pthread_mutex_lock(lock) == 0
+}
+pub fun __rt_system_mutex_try_lock(lock: *u8) -> bool {
+    when lock == null { return false }
+    return pthread_mutex_trylock(lock) == 0
+}
+pub fun __rt_system_mutex_unlock(lock: *u8) {
+    when lock != null { pthread_mutex_unlock(lock) }
+}
+pub fun __rt_system_mutex_drop(lock: *u8) {
+    when lock != null { pthread_mutex_destroy(lock) free(lock) }
+}
 
 pub fun __rt_system_thread_spawn(worker: extern "C" fun()) -> *u8 {
     // The buffer of standard output has no lock: from now on it is written at once.

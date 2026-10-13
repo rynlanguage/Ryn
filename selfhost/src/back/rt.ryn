@@ -58,10 +58,32 @@ fun list_head(asm: &mut x64::Asm) {
 
 // Writes every routine. `messages` pairs an `errno` value with the symbol of its zero-terminated text for `strerror`, and
 // `unknown` is the symbol of the text for the others.
-pub fun emit(asm: &mut x64::Asm, labels: &Labels, error_numbers: Vec<u64>, error_texts: Vec<u64>, unknown: u64) {
+// Windows threads share the allocator's bump pointer and free lists. Cell 24 is an xchg spinlock;
+// only malloc/free hold it, so realloc/calloc may call them without recursive locking.
+fun allocator_lock(asm: &mut x64::Asm, state: u64, locked: bool) {
+    when !locked { return }
+    asm.lea_symbol(x64::Reg::R10, state)
+    asm.lea(x64::Reg::R10, x64::Reg::R10, 24)
+    retry := asm.new_label()
+    asm.bind(retry)
+    asm.mov_ri(x64::Reg::RAX, 1)
+    asm.atomic_rmw(0, 8, x64::Reg::RAX, x64::Reg::R10)
+    asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
+    asm.jcc(x64::Cc::NOT_EQUAL, retry)
+}
+
+fun allocator_unlock(asm: &mut x64::Asm, state: u64, locked: bool) {
+    when !locked { return }
+    asm.lea_symbol(x64::Reg::R11, state)
+    asm.mov_ri(x64::Reg::R10, 0)
+    asm.store(8, x64::Reg::R10, x64::Reg::R11, 24)
+}
+
+pub fun emit(asm: &mut x64::Asm, labels: &Labels, error_numbers: Vec<u64>, error_texts: Vec<u64>, unknown: u64, locked: bool) {
     // malloc(rdi = size) -> rax
     when asm.is_pending(labels.malloc) {
         asm.bind(labels.malloc)
+        allocator_lock(asm, labels.state, locked)
         asm.mov_ri(x64::Reg::RAX, 16)
         asm.mov_ri(x64::Reg::RCX, 0)
         grow_class := asm.new_label()
@@ -90,6 +112,7 @@ pub fun emit(asm: &mut x64::Asm, labels: &Labels, error_numbers: Vec<u64>, error
         asm.store(8, x64::Reg::R9, x64::Reg::RDX, (0 as i64) - 8)
         account_allocation(asm)
         asm.mov_rr(x64::Reg::RAX, x64::Reg::RDX)
+        allocator_unlock(asm, labels.state, locked)
         asm.ret()
         // rax is the size of the block, rcx its class, r11 the state.
         asm.bind(bump)
@@ -110,6 +133,7 @@ pub fun emit(asm: &mut x64::Asm, labels: &Labels, error_numbers: Vec<u64>, error
         asm.lea(x64::Reg::RAX, x64::Reg::R9, (0 as i64) - 16)
         account_allocation(asm)
         asm.lea(x64::Reg::RAX, x64::Reg::R10, 16)
+        allocator_unlock(asm, labels.state, locked)
         asm.ret()
         // A new chunk: a megabyte, or the block's size rounded up to a page.
         asm.bind(out_of_chunk)
@@ -170,15 +194,18 @@ pub fun emit(asm: &mut x64::Asm, labels: &Labels, error_numbers: Vec<u64>, error
         asm.lea_symbol(x64::Reg::R11, labels.state)
         account_allocation(asm)
         asm.lea(x64::Reg::RAX, x64::Reg::R10, 16)
+        allocator_unlock(asm, labels.state, locked)
         asm.ret()
         asm.bind(failed)
         asm.mov_ri(x64::Reg::RAX, 0)
+        allocator_unlock(asm, labels.state, locked)
         asm.ret()
     }
 
     // free(rdi = block)
     when asm.is_pending(labels.free) {
         asm.bind(labels.free)
+        allocator_lock(asm, labels.state, locked)
         free_done := asm.new_label()
         asm.test_rr(x64::Reg::RDI, x64::Reg::RDI)
         asm.jcc(x64::Cc::EQUAL, free_done)
@@ -208,6 +235,7 @@ pub fun emit(asm: &mut x64::Asm, labels: &Labels, error_numbers: Vec<u64>, error
         asm.store(8, x64::Reg::RDX, x64::Reg::RDI, 0)
         asm.store(8, x64::Reg::RDI, x64::Reg::R8, 32)
         asm.bind(free_done)
+        allocator_unlock(asm, labels.state, locked)
         asm.ret()
 
         asm.bind(unmap)
@@ -226,6 +254,7 @@ pub fun emit(asm: &mut x64::Asm, labels: &Labels, error_numbers: Vec<u64>, error
         asm.alu_ri(5, x64::Reg::RDI, 16)
         asm.mov_ri(x64::Reg::RAX, 11)
         asm.syscall()
+        allocator_unlock(asm, labels.state, locked)
         asm.ret()
     }
 

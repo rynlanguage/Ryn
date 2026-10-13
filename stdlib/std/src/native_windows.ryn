@@ -18,6 +18,85 @@ extern "C" fun SetHandleInformation(handle: *u8, mask: u32, flags: u32) -> i32;
 extern "C" fun GetStdHandle(which: u32) -> *u8;
 extern "C" fun MultiByteToWideChar(code_page: u32, flags: u32, text: *u8, length: i32, wide: *u8, capacity: i32) -> i32;
 extern "C" fun Sleep(milliseconds: u32);
+extern "C" fun CreateThread(attributes: *u8, stack_size: u64, routine: *u8, argument: *u8, flags: u32, identifier: *u8) -> *u8;
+extern "C" fun GetCurrentThreadId() -> u32;
+extern "C" fun InitializeSRWLock(lock: *u8);
+extern "C" fun AcquireSRWLockExclusive(lock: *u8);
+extern "C" fun TryAcquireSRWLockExclusive(lock: *u8) -> u8;
+extern "C" fun ReleaseSRWLockExclusive(lock: *u8);
+
+pub fun __rt_system_mutex_new() -> *u8 {
+    lock := zeroed(8)
+    when lock != null { InitializeSRWLock(lock) }
+    return lock
+}
+
+pub fun __rt_system_mutex_lock(lock: *u8) -> bool {
+    when lock == null { return false }
+    AcquireSRWLockExclusive(lock)
+    return true
+}
+
+pub fun __rt_system_mutex_try_lock(lock: *u8) -> bool {
+    when lock == null { return false }
+    return TryAcquireSRWLockExclusive(lock) != 0
+}
+
+pub fun __rt_system_mutex_unlock(lock: *u8) {
+    when lock != null { ReleaseSRWLockExclusive(lock) }
+}
+
+pub fun __rt_system_mutex_drop(lock: *u8) {
+    // SRW locks have no destructor; the owner must outlive all guards and workers.
+    free(lock)
+}
+
+// The worker owns its separate startup context, so dropping the Thread never invalidates its argument.
+fun thread_start(context: *u8) -> u32 {
+    worker := word64_at(context, 0) as *u8 as extern "C" fun()
+    free(context)
+    worker()
+    return 0
+}
+
+pub fun __rt_system_thread_spawn(worker: extern "C" fun()) -> *u8 {
+    __io_stdout_direct()
+    record := zeroed(24)
+    when record == null { return null }
+    context := zeroed(8)
+    when context == null { free(record) return null }
+    set_word64_at(context, 0, worker as *u8 as u64)
+    routine: extern "C" fun(*u8) -> u32 = thread_start
+    identifier := ((record as u64) + 8) as *u8
+    handle := CreateThread(null, 0, routine as *u8, context, 0, identifier)
+    when handle == null {
+        free(context)
+        free(record)
+        return null
+    }
+    set_word64_at(record, 0, handle as u64)
+    return record
+}
+
+pub fun __rt_system_thread_join(record: *u8) -> bool {
+    when record == null { return false }
+    when word64_at(record, 16) != 0 { return false }
+    when word32_at(record, 8) == GetCurrentThreadId() { return false }
+    when WaitForSingleObject(word64_at(record, 0) as *u8, 4294967295 as u32) != 0 { return false }
+    set_word64_at(record, 16, 1)
+    return true
+}
+
+pub fun __rt_system_thread_id(record: *u8) -> u64 {
+    when record == null { return 0 }
+    return word32_at(record, 8) as u64
+}
+
+pub fun __rt_system_thread_drop(record: *u8) {
+    when record == null { return }
+    CloseHandle(word64_at(record, 0) as *u8)
+    free(record)
+}
 extern "C" fun GetAsyncKeyState(key: i32) -> i16;
 
 // Keyboard polling uses the high bit only. Windows' low "pressed since last call" bit is shared with other processes.
@@ -141,6 +220,7 @@ fun byte_of(pointer: *u8, offset: u64) -> u8 {
 
 fun zeroed(size: u64) -> *u8 {
     block := malloc(size)
+    when block == null { return null }
     mut at: u64 = 0
     while at < size {
         cell := ((block as u64) + at) as *u8
