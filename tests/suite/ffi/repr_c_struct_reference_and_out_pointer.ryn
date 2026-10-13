@@ -1,0 +1,38 @@
+// test: run
+// target: linux
+// out: 0
+// out: 1
+// out: 1
+// out: 42
+// out: 2
+// A `#[repr(C)]` structure passed by reference is written by `gettimeofday`; a `*(*u8)` out parameter (`strtol`'s end
+// pointer) receives the address of the first character that is not a digit, which is `2` bytes after "42x".
+#[repr(C)]
+struct Timeval {
+    sec: i64,
+    usec: i64
+}
+extern "C" fun gettimeofday(tv: *Timeval, tz: *u8) -> i32;
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun strtol(text: *u8, end: *(*u8), base: i32) -> i64;
+
+fun poke8(address: u64, value: u8) {
+    p := address as *u8
+    *p = value
+}
+
+fun main() {
+    mut tv := Timeval { sec: 0, usec: -1 }
+    echo gettimeofday(&tv, null)
+    when tv.sec > 1000000000 { echo 1 } else { echo 0 }
+    when tv.usec >= 0 { echo 1 } else { echo 0 }
+    text := malloc(8 as u64)
+    base := text as u64
+    poke8(base, 52 as u8)
+    poke8(base + 1 as u64, 50 as u8)
+    poke8(base + 2 as u64, 120 as u8)
+    poke8(base + 3 as u64, 0 as u8)
+    mut end: *u8 = null
+    echo strtol(text, &end, 10)
+    echo (end as u64) - base
+}

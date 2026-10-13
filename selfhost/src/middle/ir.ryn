@@ -82,6 +82,9 @@ pub enum IrExpr {
     BitNot(u64, u64),
     FunctionAddress(u64, u64),
     CastExpr(u64, u64, u64),
+    // A pointer to element `index` of a local array, for an extern "C" call: the array (an expression), the element type,
+    // its length, the index and whether the pointer is mutable (the elements are copied back after the call).
+    FfiArray(u64, u64, u64, u64, bool),
 }
 
 // Statement children are indices into `IrProgram.stmts`; bodies are `Vec<u64>`.
@@ -1072,6 +1075,14 @@ extend IrDecoder {
             target := self.ty()?
             return Result::Ok(self.push_expr(IrExpr::CastExpr(value, source, target)))
         }
+        when word == "FfiArray" {
+            array := self.expression()?
+            element := self.ty()?
+            length := self.uint()?
+            index := self.expression()?
+            mutable := self.boolean()?
+            return Result::Ok(self.push_expr(IrExpr::FfiArray(array, element, length, index, mutable)))
+        }
         return Result::Err(String("unknown expression"))
     }
 }
@@ -1422,6 +1433,7 @@ extend IrWriter {
             IrExpr::BitNot(value, ty) => self.emit_expr_bit_not(value, ty),
             IrExpr::FunctionAddress(function, ty) => self.emit_expr_function_address(function, ty),
             IrExpr::CastExpr(value, source, target) => self.emit_expr_cast_expr(value, source, target),
+            IrExpr::FfiArray(array, element, length, index, mutable) => self.emit_expr_ffi_array(array, element, length, index, mutable),
         }
     }
 }
@@ -2044,6 +2056,16 @@ extend IrWriter {
         self.expression(value)
         self.ty(source)
         self.ty(target)
+        return true
+    }
+
+    fun emit_expr_ffi_array(mut self, array: u64, element: u64, length: u64, index: u64, mutable: bool) -> bool {
+        self.word("FfiArray")
+        self.expression(array)
+        self.ty(element)
+        self.uint(length)
+        self.expression(index)
+        self.boolean(mutable)
         return true
     }
 

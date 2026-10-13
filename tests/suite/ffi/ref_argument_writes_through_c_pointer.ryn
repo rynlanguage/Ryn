@@ -1,0 +1,16 @@
+// test: run
+// target: linux
+// out: 1
+// out: 1
+// A `&value` argument for a `*T` parameter of an `extern "C"` function is the address of the local: the C function writes
+// the result into it, and the value read back is the one the C function stored.
+extern "C" fun time(t: *i64) -> i64;
+
+fun main() {
+    mut value: i64 = 0
+    result := time(&value)
+    when result > 1000000000 && result == value { echo 1 } else { echo 0 }
+    mut again: i64 = 0
+    time(&mut again)
+    when again > 1000000000 { echo 1 } else { echo 0 }
+}

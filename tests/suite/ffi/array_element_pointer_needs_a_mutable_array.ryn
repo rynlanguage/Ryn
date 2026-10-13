@@ -1,0 +1,9 @@
+// test: fail
+// code: R0206
+// A mutable pointer to an element needs a `mut` array, as a mutable reference does.
+extern "C" fun memset(dst: *u8, value: i32, count: u64) -> *u8;
+
+fun main() {
+    buf: [u8; 4] = [1, 2, 3, 4]
+    memset(&mut buf[1], 65, 2 as u64)
+}

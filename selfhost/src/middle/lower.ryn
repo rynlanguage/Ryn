@@ -76,6 +76,8 @@ pub struct Signature {
     public: bool,
     // `...` after the parameters of an `extern "C"` function: the arguments after `params` are C's variable arguments.
     variadic: bool,
+    // An `extern "C"` function: a reference to a local passed for a pointer parameter is passed as its address.
+    external: bool,
     module: String,
     // The parameter that a function returns, when it returns a reference from one parameter.
     return_param: Option<u64>,
@@ -618,10 +620,30 @@ fun operator_mismatch(op: String, left: String, right: String, left_span: ast::S
 
 // `R0230` for a path whose first part names no enum, at the expression's span.
 fun unknown_enum_error(name: String, start: u64, end: u64) -> String {
-    mut message := String("unknown enum `")
+    mut message := String("unknown type or enum `")
+    message.append(name.clone())
+    message.append("`")
+    mut help := String("declare `")
+    help.append(name)
+    help.append("` before using it, or import the module that declares it (for example `use std::simd`)")
+    return diagnostic("R0230", start, end, message, help)
+}
+
+// The unsupported error of a name that no enum, module or type declares. The statement that holds it turns it into a
+// located `R0230` (see `unknown_enum_statement`).
+fun unknown_enum_text(name: String) -> String {
+    mut message := String("unsupported: unknown enum `")
     message.append(name)
     message.append("`")
-    return diagnostic("R0230", start, end, message, String("declare the enum before constructing it"))
+    return message
+}
+
+// The `R0230` of an unknown enum name that reached a statement, at that statement's span.
+fun unknown_enum_statement(message: String, start: u64, end: u64) -> String {
+    prefix := "unsupported: unknown enum `".len()
+    close := last_index_of(message.clone(), String("`")).unwrap()
+    name := message.slice(prefix, close)
+    return unknown_enum_error(name, start, end)
 }
 
 // `R0230` for a path into a module whose module does not declare the item, at the expression's span.
@@ -1754,6 +1776,12 @@ fun map_parts(ty: String) -> Option<Vec<String>> {
 }
 
 // The parameter words and result word ("" for none) of a `FunctionPointer` word.
+// Whether a function pointer type is an `extern "C"` one: its last word is 1 (see `function_pointer_type`).
+fun function_pointer_is_external(ty: String) -> bool {
+    tokens := ty.split(" ")
+    return tokens[tokens.len() - 1] == "1"
+}
+
 fun function_pointer_parts(ty: String) -> Option<Vec<String>> {
     when !ty.starts_with("FunctionPointer ") {
         return Option::None
@@ -3549,6 +3577,26 @@ extend Lowering {
         self.pending_moves = pending
     }
 
+    // The `R0233` of an unsupported `Enum::Variant` message that reached a statement: the enum exists but has no such variant
+    // (for example a `choose` arm that names a variant of another enum). The variants are listed as help, as they are for
+    // an expression; an enum that cannot be found is reported as an unknown enum.
+    fun unknown_variant_statement(self, message: String, start: u64, end: u64) -> String {
+        prefix := "unsupported: unknown variant `".len()
+        close := last_index_of(message.clone(), String("`")).unwrap()
+        body := message.slice(prefix, close)
+        cut := last_index_of(body.clone(), String("::")).unwrap()
+        enum_name := body.slice(0, cut)
+        variant := body.slice(cut + 2, body.len())
+        mut index: u64 = 0
+        while index < self.enums.len() {
+            when self.enums[index].name == enum_name {
+                return unknown_variant_error(enum_name, variant, self.enums[index].variant_names.clone(), start, end)
+            }
+            index += 1
+        }
+        return unknown_enum_error(enum_name, start, end)
+    }
+
     fun enum_index(self, name: String) -> Result<u64, String> {
         mut id: u64 = 0
         while id < self.enums.len() {
@@ -3559,13 +3607,13 @@ extend Lowering {
         }
         aliased := self.named_word(name.clone())
         when aliased.is_ok() && enum_id_of(aliased.unwrap()).is_some() {
-            return Result::Ok(enum_id_of(self.named_word(name)?).unwrap())
+            return Result::Ok(enum_id_of(self.named_word(name.clone())?).unwrap())
         }
-        qualified := qualified_in(self.scope_path.clone(), name)
+        qualified := qualified_in(self.scope_path.clone(), name.clone())
         when !qualified.is_empty() {
             return self.enum_index(qualified)
         }
-        return Result::Err(unsupported("unknown enum"))
+        return Result::Err(unknown_enum_text(name.clone()))
     }
 
     fun enum_type(self, name: String) -> Result<String, String> {
@@ -3581,7 +3629,12 @@ extend Lowering {
             }
             variant += 1
         }
-        return Result::Err(unsupported("unknown variant"))
+        mut message := String("unsupported: unknown variant `")
+        message.append(self.enums[id].name.clone())
+        message.append("::")
+        message.append(name)
+        message.append("`")
+        return Result::Err(message)
     }
 
     // The index of a variant's first field among all the enum's fields.
@@ -3788,15 +3841,16 @@ extend Lowering {
                 ret := self.signatures[function.unwrap()].ret.clone()
                 return Result::Ok(Lowered { text: join(words5(String("Call"), String("Function"), num(function.unwrap()), String("0"), ret.clone())), ty: ret })
             }
-            // `R0230` for a name that is neither an enum nor a constant, at the expression's span. A lowercase
-            // name, or one with functions or structures under it, is a module.
-            when located && expression && name != "Option" && name != "Result" {
+            // `R0230` for a name that is neither an enum nor a constant, at the expression's span, whether the path is
+            // written as an expression or as a call. A lowercase name, or one with functions or structures under it, is a
+            // module.
+            when located && name != "Option" && name != "Result" {
                 when self.names_module(name.clone()) {
                     return Result::Err(unknown_module_item_error(name, variant_name, span.start, span.end))
                 }
                 return Result::Err(unknown_enum_error(name, span.start, span.end))
             }
-            return Result::Err(unsupported("unknown enum"))
+            return Result::Err(unknown_enum_text(name.clone()))
         }
         id := found.unwrap()
         variant_found := self.variant_index(id, variant_name.clone())
@@ -5631,6 +5685,119 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
     }
 
     // Checks the argument list against a signature and lowers each argument to its parameter type.
+    // `&a[i]` or `&mut a[i]` (not a raw pointer) of an element of a local array.
+    fun is_array_element_reference(self, index: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::AddressOfE(mutable, raw, inner, span) => !raw && self.is_array_index(inner),
+            _ => false,
+        }
+    }
+
+    fun is_array_index(self, index: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::IndexE(base, position, index_span) => self.names_a_local(base),
+            _ => false,
+        }
+    }
+
+    // The name, and the start and end of the name, of a local named by an expression (empty and 0 for other expressions).
+    fun local_name_of(self, index: u64) -> String {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::NameRef(name, name_span) => name,
+            _ => String(),
+        }
+    }
+
+    fun local_name_start(self, index: u64) -> u64 {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::NameRef(name, name_span) => name_span.start,
+            _ => 0,
+        }
+    }
+
+    fun local_name_end(self, index: u64) -> u64 {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::NameRef(name, name_span) => name_span.end,
+            _ => 0,
+        }
+    }
+
+    // The pointer to element `i` of a local array as an argument: an `FfiArray` expression, of the pointer type of the
+    // parameter. A mutable pointer needs a `mut` array, as a mutable reference does.
+    fun array_element_argument(mut self, index: u64) -> Result<Lowered, String> {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::AddressOfE(mutable, raw, inner, span) => choose self.program.exprs[inner] {
+                ast::ExprTree::IndexE(base, position, index_span) => self.array_element_pointer(base, position, mutable, span),
+                _ => Result::Err(address_operand_error(span.start, span.end)),
+            },
+            _ => Result::Err(unsupported("reference argument")),
+        }
+    }
+
+    fun array_element_pointer(mut self, base: u64, position: u64, mutable: bool, span: ast::Span) -> Result<Lowered, String> {
+        when mutable {
+            local_name := self.local_name_of(base)
+            found := self.find(local_name)?
+            when !self.locals[found].mutable {
+                start := self.local_name_start(base)
+                end := self.local_name_end(base)
+                return Result::Err(diagnostic("R0206", start, end, String("cannot create a mutable reference to an immutable binding"), String("declare the value with `mut` before borrowing it mutably")))
+            }
+        }
+        array := self.expression(base, String(""))?
+        parts := array_parts(array.ty.clone())
+        when parts.is_none() {
+            return Result::Err(unsupported("address of an element of this type"))
+        }
+        fields := parts.unwrap()
+        element := fields[0].clone()
+        when !(is_integer_word(element.clone()) || element == "Bool") {
+            return Result::Err(unsupported("a pointer into an array of this element type"))
+        }
+        length := array_length_of(fields)
+        when length == 0 {
+            return Result::Err(unsupported("a pointer into an empty array"))
+        }
+        at := self.expression(position, String(""))?
+        when !is_integer_word(at.ty.clone()) {
+            return Result::Err(unsupported("index type"))
+        }
+        mut pointer := String("RawPointer ")
+        pointer.append(element.clone())
+        mut flag := String("0")
+        when mutable {
+            flag = String("1")
+        }
+        text := join(words6(String("FfiArray"), array.text, element, num(length), at.text, flag))
+        return Result::Ok(Lowered { text: text, ty: pointer })
+    }
+
+    // `&name` or `&mut name` of a local (not a raw pointer).
+    fun is_local_reference(self, index: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::AddressOfE(mutable, raw, inner, span) => !raw && self.names_a_local(inner),
+            _ => false,
+        }
+    }
+
+    fun names_a_local(self, index: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::NameRef(name, name_span) => true,
+            _ => false,
+        }
+    }
+
+    // The address of the local of a `&name` argument, lowered as `&raw mut name` (or `&raw name`) for the pointer parameter.
+    fun reference_as_raw(mut self, index: u64) -> Result<Lowered, String> {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::AddressOfE(mutable, raw, inner, span) => choose self.program.exprs[inner] {
+                ast::ExprTree::NameRef(name, name_span) => self.address_of_local(name, mutable, true, span, name_span),
+                _ => Result::Err(address_operand_error(span.start, span.end)),
+            },
+            _ => Result::Err(unsupported("reference argument")),
+        }
+    }
+
     fun arguments(mut self, id: u64, name: String, arguments: Vec<u64>) -> Result<Vec<String>, String> {
         params := self.signatures[id].params.clone()
         variadic := self.signatures[id].variadic
@@ -5644,6 +5811,28 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
             // An argument after the named parameters of a variadic C function (see `variadic_argument`).
             when position >= params.len() {
                 lowered.push(self.variadic_argument(name.clone(), arguments[position])?)
+                position += 1
+                continue
+            }
+            // A pointer to an element of a local array for a pointer parameter of a C function: the array is packed for the call
+            // and its elements are copied back after it when the pointer is mutable (see `ffi_array` in the generator).
+            when self.signatures[id].external && params[position].starts_with("RawPointer ") && self.is_array_element_reference(arguments[position]) {
+                value := self.array_element_argument(arguments[position])?
+                when value.ty != params[position] {
+                    return Result::Err(unsupported("argument type"))
+                }
+                lowered.push(value.text)
+                position += 1
+                continue
+            }
+            // A reference to a local passed for a pointer parameter of a C function is passed as the local's address, which
+            // the C function writes through for the duration of the call (System V: a pointer is one 64-bit argument).
+            when self.signatures[id].external && params[position].starts_with("RawPointer ") && self.is_local_reference(arguments[position]) {
+                value := self.reference_as_raw(arguments[position])?
+                when value.ty != params[position] {
+                    return Result::Err(unsupported("argument type"))
+                }
+                lowered.push(value.text)
                 position += 1
                 continue
             }
@@ -6842,6 +7031,14 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
             when message.contains(" @ ") || message.starts_with("diagnostic ") {
                 return Result::Err(message)
             }
+            when message.starts_with("unsupported: unknown enum `") {
+                span := stmt_span(self.program.stmts[index])
+                return Result::Err(unknown_enum_statement(message, span.start, span.end))
+            }
+            when message.starts_with("unsupported: unknown variant `") {
+                span := stmt_span(self.program.stmts[index])
+                return Result::Err(self.unknown_variant_statement(message, span.start, span.end))
+            }
             mut located := message
             located.append(" @ ")
             located.append(self.current_function.clone())
@@ -7757,7 +7954,7 @@ extend Lowering {
                 main_index = position
             }
             returned := self.returned_parameter(definition.body.clone(), definition.return_value, definition.parameters.clone(), ret.clone())
-            signatures.push(Signature { name: key, params: params, ret: ret, public: definition.public, variadic: definition.variadic, module: definition.module_path.clone(), return_param: returned })
+            signatures.push(Signature { name: key, params: params, ret: ret, public: definition.public, variadic: definition.variadic, external: definition.extern_c, module: definition.module_path.clone(), return_param: returned })
             position += 1
         }
         when main_index == count {
@@ -7780,7 +7977,7 @@ extend Lowering {
                 mut clone_params: Vec<String> = Vec()
                 clone_params.push(self_type)
                 known_keys.insert(clone_key.clone(), signatures.len())
-                signatures.push(Signature { name: clone_key, params: clone_params, ret: struct_word(derive_index), public: true, variadic: false, module: self.structs[derive_index].module_path.clone(), return_param: Option::None })
+                signatures.push(Signature { name: clone_key, params: clone_params, ret: struct_word(derive_index), public: true, variadic: false, external: false, module: self.structs[derive_index].module_path.clone(), return_param: Option::None })
                 clone_structs.push(derive_index)
             }
             derive_index += 1
@@ -9873,6 +10070,9 @@ extend Lowering {
     // `&slice[index]`: the address of an element of a borrowed slice.
     fun slice_element_address(mut self, slice: u64, position: u64, span: ast::Span) -> Result<Lowered, String> {
         base := self.expression(slice, String(""))?
+        when base.ty.starts_with("Array ") {
+            return Result::Err(diagnostic("R0271", span.start, span.end, String("a pointer into a local array is only passed to an extern \"C\" function"), String("pass `&array[index]` directly as an argument of an extern \"C\" function, or copy the element into a variable")))
+        }
         when !base.ty.starts_with("Slice ") {
             return Result::Err(unsupported("address of an element of this type"))
         }
@@ -10026,6 +10226,7 @@ extend Lowering {
         found := self.find(name)?
         local := self.locals[found]
         sigwords := function_pointer_parts(local.ty.clone()).unwrap()
+        external := function_pointer_is_external(local.ty.clone())
         when arguments.len() + 1 != sigwords.len() {
             return Result::Err(unsupported("function pointer argument count"))
         }
@@ -10036,6 +10237,16 @@ extend Lowering {
         tokens.push(join(words5(String("Local"), num(local.slot), local.ty.clone(), num(span.start), num(span.end))))
         mut position: u64 = 0
         while position < arguments.len() {
+            // A reference to a local for a pointer parameter of a C function is passed as the local's address.
+            when external && sigwords[position].starts_with("RawPointer ") && self.is_local_reference(arguments[position]) {
+                address := self.reference_as_raw(arguments[position])?
+                when address.ty != sigwords[position] {
+                    return Result::Err(unsupported("function pointer argument type"))
+                }
+                tokens.push(address.text)
+                position += 1
+                continue
+            }
             value := self.moved_expression(arguments[position], sigwords[position].clone())?
             when value.ty != sigwords[position] {
                 return Result::Err(unsupported("function pointer argument type"))

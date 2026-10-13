@@ -5,6 +5,17 @@ All notable changes to Ryn are recorded here. The format follows
 sequence: minor releases may change language details while the compiler is pre-1.0.
 
 ## [0.1.13] — 2026-10-12 — Registers, AArch64, variadic C calls, sugar and gamedev
+- FFI pointers into arrays and C strings: `&array[index]` and `&mut array[index]` of a local array of integers or `bool`,
+  passed directly to an `extern "C"` function, give the function a pointer to that element. The elements are packed into
+  bytes for the call (`u8` is one byte), and a mutable pointer's elements are copied back after the call. The index is checked.
+  Elsewhere a pointer into a local array is `R0271`. New `std::cstring`: `CString::from_text(text)` owns a copy of a `str`
+  with a zero byte, freed by its destructor; `as_ptr()` gives the C string for the lifetime of the `CString`.
+  Tests: `tests/suite/ffi/array_element_pointer_*`, `cstring_title_for_glfw_create_window`.
+- FFI: `&name` and `&mut name` of a local are passed as the local's address to a pointer parameter (`*T`) of an
+  `extern "C"` function, also when it is called through an `extern "C"` function pointer (Vulkan loader functions from
+  `load_symbol`). `time(&value)` and `frexp(x, &mut exponent)` write the result into the local. Before, these were
+  `unsupported: argument type`. Ordinary Ryn functions are unchanged. Tests: `tests/suite/ffi/ref_argument_*`,
+  `repr_c_struct_reference_and_out_pointer`, `vulkan_loader_through_a_function_pointer`.
 
 - Windows keyboard hotfix (2026-10-13): `std::keyboard` uses `GetAsyncKeyState` from `user32.dll` for continuous
   key state, pressed/released edges and blocking `read_key`, without Linux `opendir` calls (R0905). Four Windows
@@ -34,6 +45,9 @@ sequence: minor releases may change language details while the compiler is pre-1
   Verified by encoding checks against llvm-mc and by running the suite's accepted programs under the Unicorn emulator:
   70 of 538 run programs are accepted, all match. See `docs/arm64-backend.md`.
 - `RYN_DUMP_IR=<path>` writes the IR text of a program (a debugging aid for the code generators).
+- Unknown types and enums: a path such as `Missing::make()`, `Missing::A` or a `choose` arm that names a variant of
+  another enum is reported as `R0230` (`unknown type or enum`) or `R0233` (no such variant) at the statement, with the
+  name and the help. Before, these showed the generic `unsupported: unknown enum` (R0905) without a name.
 
 ## [0.1.12] — released in 0.1.13 — Sugar Rush and GameDev Essentials
 

@@ -1,0 +1,21 @@
+// test: run
+// out: 10
+// out: 1
+// A `CString` gives GLFW the title as a C string through `as_ptr()`. GLFW needs `glfwInit` before a window can be created,
+// so `glfwCreateWindow` answers a null pointer here, whatever the machine's display. Without the GLFW library installed
+// there is no window function to call, and the program prints the same result.
+use std::cstring
+
+fun main() {
+    title := cstring::CString::from_text("ryn window")
+    echo title.byte_len()
+    lib := load_library("libglfw.so.3")
+    when pointer_is_null(lib) {
+        echo 1
+        return
+    }
+    symbol := load_symbol(lib, "glfwCreateWindow")
+    create := symbol as extern "C" fun(i32, i32, *u8, *u8, *u8) -> *u8
+    window := create(640, 480, title.as_ptr(), null, null)
+    when pointer_is_null(window) { echo 1 } else { echo 0 }
+}

@@ -1,0 +1,17 @@
+// test: run
+// out: 1
+// The Vulkan loader is loaded by name and `vkEnumerateInstanceExtensionProperties` is called through a function pointer with
+// `&count` for the `uint32_t*` out parameter. The program prints 1 when the call succeeds and reports instance extensions, or
+// when the loader is not installed on this machine (then there is nothing to call); it prints 0 if the call fails.
+fun main() {
+    lib := load_library("libvulkan.so.1")
+    when pointer_is_null(lib) {
+        echo 1
+        return
+    }
+    symbol := load_symbol(lib, "vkEnumerateInstanceExtensionProperties")
+    enumerate := symbol as extern "C" fun(*u8, *u32, *u8) -> i32
+    mut count: u32 = 0
+    result := enumerate(null, &count, null)
+    when result == 0 && count > 0 { echo 1 } else { echo 0 }
+}

@@ -1,0 +1,24 @@
+// test: run
+// out: 1
+// out: 65
+// out: 65
+// out: 4
+// out: -9
+// out: 7
+// `&mut buf[1]` is a pointer into a local array for `memset`: the two bytes it writes are copied back into the array's
+// elements. `frexp` writes a 32-bit int through `&mut nums[1]`: the element reads back with its sign (exponent -9).
+extern "C" fun memset(dst: *u8, value: i32, count: u64) -> *u8;
+extern "C" fun frexp(x: f64, e: *i32) -> f64;
+
+fun main() {
+    mut buf: [u8; 4] = [1, 2, 3, 4]
+    memset(&mut buf[1], 65, 2 as u64)
+    echo buf[0]
+    echo buf[1]
+    echo buf[2]
+    echo buf[3]
+    mut nums: [i32; 3] = [5, 6, 7]
+    frexp(0.001, &mut nums[1])
+    echo nums[1]
+    echo nums[2]
+}

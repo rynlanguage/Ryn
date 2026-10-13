@@ -1,0 +1,51 @@
+// C strings. A `CString` owns a copy of a text followed by a zero byte. The copy is in memory from `malloc`, and the
+// destructor frees it when the value goes out of scope, as for other resource handles, so a C function that is given
+// `as_ptr()` sees the bytes for as long as the `CString` lives: keep the `CString` in scope until the call returns (and
+// for as long as the C side uses the pointer).
+//
+//     text := CString::from_text("Hello")
+//     puts(text.as_ptr())
+
+extern "C" fun malloc(size: u64) -> *u8;
+extern "C" fun free(pointer: *u8);
+
+#[drop(free_cstring)]
+pub struct CString {
+    pub ptr: *u8,
+    pub len: u64
+}
+
+pub fun free_cstring(text: CString) {
+    free(text.ptr)
+}
+
+// Stores `value` at byte `offset` of the block at `base`.
+fun store_byte(base: *u8, offset: u64, value: u8) {
+    address := (base as u64 + offset) as *u8
+    *address = value
+}
+
+extend CString {
+    // A copy of `text`, with a zero byte after its last byte.
+    pub fun from_text(text: str) -> CString {
+        size := text.len()
+        block := malloc(size + 1)
+        mut at: u64 = 0
+        while at < size {
+            store_byte(block, at, text.byte_at(at))
+            at += 1
+        }
+        store_byte(block, size, 0)
+        return CString { ptr: block, len: size }
+    }
+
+    // The address of the first byte, as a C string pointer.
+    pub fun as_ptr(self) -> *u8 {
+        return self.ptr
+    }
+
+    // The number of bytes before the terminating zero.
+    pub fun byte_len(self) -> u64 {
+        return self.len
+    }
+}
