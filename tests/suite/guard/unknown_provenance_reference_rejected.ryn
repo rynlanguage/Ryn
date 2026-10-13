@@ -1,5 +1,6 @@
 // test: fail
-// code: R0250
+// code: R0249
+// A view of a named Vec has known provenance; its live element reference blocks resizing.
 fun main() {
     mut v: Vec<i32> = Vec()
     v.push(1)

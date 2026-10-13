@@ -1,0 +1,10 @@
+#[kernel(local = 4)]
+fun ops(a: &[u32], res: &mut [u32]) {
+    i := global_id() as u64
+    x := a[i]
+    res[i] = x % 7 + (x << 3) + (x >> 1)
+}
+
+fun main() {
+    echo "lib"
+}

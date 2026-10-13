@@ -1,0 +1,10 @@
+// test: fail
+// code: R0923
+
+fun plain() {
+    shared tile: [u32; 4]
+}
+
+fun main() {
+    plain()
+}

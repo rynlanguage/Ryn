@@ -49,6 +49,29 @@ and the compiler it makes compiles the full sources.
 
 ## Windows x86-64 target
 
+Programs that do not use `arg_count()` / `arg()` skip command-line parsing and the `shell32` import. Programs using
+arguments keep the Unicode/quoting parser. Startup uses `SetThreadStackGuarantee` for the Windows exception handler,
+without allocating an unused Linux alternate signal stack. Returning from main still runs its destructors before
+the entry point calls `ExitProcess`. Constant echo/template fragments are combined into one write where possible.
+
+The x86-64 backend reduces integer multiplication by constants to immediate `imul`, `lea` for 3/5/9, or shifts and
+add/subtract for `2^k +/- 1`. These preserve integer width, sign, wrapping and operand evaluation; floating-point
+operations are unchanged. `tools/benchmark_process.py` compares two executables in five paired series of 100 launches,
+checks every exit/stdout/stderr and saves all wall-time samples. With `--timed-output`, `benchmarks/startup_arithmetic.ryn`
+also reports the arithmetic loop's internal duration, excluding startup and printing. Results describe the measured
+workload and host, not all Ryn computations.
+
+## References and slices
+
+`&T` / `&mut T` borrow structures with owning fields and custom destructors, as well as scalars. Local loans end after
+their last reachable use; branch joins, loops and `defer` keep all potentially live loans. `&mut [T]` and
+`Vec.as_mut_slice()` / `slice_mut(start, end)` support bounds-checked writes into original storage. Fixed-array views
+are zero-copy, including aggregate elements. Known-source views can be local bindings. Descriptor returns and fields
+still require lifetime annotations. See `examples/borrowing.ryn` and [the memory model](memory-model.md) for syntax,
+ownership rules and the conservative cases of the current Guard analysis.
+
+## Windows runtime details
+
 `rync --target windows` writes a PE32+ console executable (`ryn.exe` and `rync.exe` are built this way), and a `rync`
 that runs on Windows targets Windows by default. The code generator is the same; what changes is how the program
 reaches the system:
@@ -165,3 +188,27 @@ numbers are a record of this run, not a reproducible repository benchmark. They 
 
 The native backend is faster on the map workload and slower on the string workload, and its compile step takes about
 0.8 s against about 0.45 s for the Cranelift path. These numbers are the only benchmark results recorded for 0.1.6.
+
+## GPU kernels (SPIR-V)
+
+A function marked `#[kernel(local = N)]` is a compute kernel with N invocations per workgroup. It is a free `fun` with no
+result and no `extern`, and it is not generic. Its parameters are buffers: `&[T]` (read only) or `&mut [T]`, with T of
+u32, i32, u64, i64, f32 or f64. Buffers are bound to descriptor set 0 in parameter order, and `len()` is the buffer length.
+
+- `global_id()`, `local_id()`, `group_id()`: the x component of the invocation, local and workgroup index, as u32.
+- `barrier()`: a workgroup barrier, which every invocation of the workgroup must reach.
+- `atomic_add(buffer, index, value)`: a u32 atomic add on a buffer or a `shared` array; it returns the previous value.
+- `shared name: [T; N]` at the top of the kernel body: workgroup memory, zeroed by the workgroup before the barrier.
+- Kernels hold bool, u32, i32, u64, i64, f32, f64 locals and fixed arrays of them. They cannot print, call Ryn functions,
+  or be called from Ryn code. Diagnostics: `R0920` attribute, `R0921` signature, `R0922` GPU builtin outside a kernel,
+  `R0923` `shared`, `R0924` type, `R0925` call of a kernel, `R0926` operation a kernel cannot perform.
+
+`rync --target spirv -o kernels.spv program.ryn` writes a SPIR-V 1.3 module with one GLCompute entry point per kernel. A
+program needs no `main` for this target, nor for `rync check`. The module passes `spirv-val`, and the kernels in `tests/gpu`
+run on a Vulkan device with `tools/tests/test_spirv_gpu.py` (it needs `VULKAN_SDK`, and a C compiler for `tools/gpu`).
+
+Behaviour the GPU does not define is made defined: an index outside a buffer or array reads zero and writes nothing;
+integer division or remainder by zero gives zero; the signed quotient of the smallest value by -1 is its negation; a shift
+count is taken modulo the width; integer arithmetic wraps. The signed remainder is computed as `a - b * (a / b)`, which
+keeps the sign of the dividend as the CPU does. The `OpSRem` instruction is not used: one tested driver returns values for
+negative divisors that no remainder definition allows, for `OpSRem` and for the `OpSMod` that `glslc` emits for `%`.

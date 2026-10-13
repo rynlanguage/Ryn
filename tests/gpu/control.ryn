@@ -1,0 +1,32 @@
+#[kernel(local = 64)]
+fun control(data: &[u32], res: &mut [u32], out: &mut [f32]) {
+    i := global_id() as u64
+    mut sum: u32 = 0
+    mut k: u64 = 0
+    while k < data.len() {
+        when k == 2 {
+            k += 1
+            continue
+        }
+        when k > 5 {
+            break
+        }
+        sum = sum + data[k]
+        k += 1
+    }
+    for j in 0..=3 {
+        sum = sum + (j as u32)
+    }
+    flag := sum > 10 && i < 100
+    f: f32 = sum as f32
+    out[i] = f * 0.5 + 1.25
+    when flag {
+        res[i] = sum / (i as u32)
+    } else {
+        res[i] = sum % 7
+    }
+}
+
+fun main() {
+    echo "lib"
+}

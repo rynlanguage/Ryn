@@ -292,9 +292,10 @@ pub struct Gen {
     division_literal: u64,
     // The labels of the runtime routines: writing a buffer, and printing an unsigned, signed or boolean value.
     write_label: u64,
-    // Standard output is buffered (Linux only): 64 KiB, written when it is full, at exit, before an error message, before the
-    // program reads standard input or starts a process, and on `flush`. A terminal, and a program with threads, are not
-    // buffered. `stdout_symbol` holds the mode (0 not known, 1 buffered, 2 direct), the length and the bytes.
+    // Standard output is buffered (Linux and Windows): 64 KiB, written when it is full, at exit, before an error message, before
+    // the program reads standard input or starts a process, and on `flush`. A terminal (`ioctl TCGETS` on Linux, `GetConsoleMode`
+    // on Windows), and a program with threads, are not buffered. `stdout_symbol` holds the mode (0 not known, 1 buffered, 2
+    // direct), the length and the bytes.
     buffered: bool,
     stdout_symbol: u64,
     flush_label: u64,
@@ -361,6 +362,7 @@ pub struct Gen {
     windows: bool,
     win_syscall: u64,
     win_init: u64,
+    win_arguments: bool,
     win_veh: u64,
     win_state: u64,
     win_names: Vec<String>,
@@ -792,6 +794,7 @@ fun build_listing(input: ir::IrProgram, executable: bool, libc: bool, windows: b
         windows: false,
         win_syscall: 0,
         win_init: 0,
+        win_arguments: false,
         win_veh: 0,
         win_state: 0,
         win_names: Vec(),
@@ -995,10 +998,11 @@ fun build_listing(input: ir::IrProgram, executable: bool, libc: bool, windows: b
     }
     when windows {
         gen.windows = true
+        gen.win_arguments = gen.reads_arguments()
         asm.windows = true
         asm.syscall_label = asm.new_label()
         mut symbols: Vec<u64> = Vec()
-        for name in winrt::api_names() {
+        for name in winrt::api_names(gen.win_arguments) {
             symbols.push(gen.foreign_symbol(name))
         }
         state := gen.symbol(String("ryn_win_state"), elf::Where::BSS, 16 + rt::state_size() + 16, 16, false)
@@ -1006,11 +1010,11 @@ fun build_listing(input: ir::IrProgram, executable: bool, libc: bool, windows: b
         gen.win_init = asm.new_label()
         gen.win_veh = asm.new_label()
         gen.win_state = state
-        gen.win_names = winrt::api_names()
+        gen.win_names = winrt::api_names(gen.win_arguments)
         gen.win_symbols = symbols
     }
-    // The buffer of standard output, after the Windows state (there is none for Windows).
-    when !gen.windows && !gen.no_opt {
+    // The buffer of standard output, after the Windows state.
+    when !gen.no_opt {
         gen.buffered = true
         gen.stdout_symbol = gen.symbol(String("ryn_stdout"), elf::Where::BSS, 16 + rt::state_size() + 16 + gen.windows_state_size(), gen.stdout_state_size(), false)
         gen.flush_label = asm.new_label()
@@ -1353,6 +1357,23 @@ extend Gen {
     }
 
     // The entry point: call `main`, then exit with its result (or 0 when it returns nothing).
+    fun reads_arguments(self) -> bool {
+        mut index: u64 = 0
+        while index < self.program.exprs.len() {
+            used := choose self.program.exprs[index] {
+                ir::IrExpr::CallExpr(target, args, ty) => choose target {
+                    ir::CallTarget::ArgCount => true,
+                    ir::CallTarget::Arg => true,
+                    _ => false,
+                },
+                _ => false,
+            }
+            when used { return true }
+            index += 1
+        }
+        return false
+    }
+
     fun entry(mut self, asm: &mut x64::Asm) {
         // A freestanding object starts at `_start`: the stack holds argc, then argv. It sets the C registers and calls the
         // entry below, then exits with its result.
@@ -1380,9 +1401,11 @@ extend Gen {
             asm.call_label(self.win_init)
             asm.alu_ri(4, x64::Reg::RSP, (0 as i64) - 16)
             asm.call_label(entry_body)
-            asm.mov_rr(x64::Reg::RDI, x64::Reg::RAX)
-            asm.mov_ri(x64::Reg::RAX, 231)
-            asm.syscall()
+            // main has already run its destructors. Exit directly using the Windows ABI.
+            asm.mov_rr(x64::Reg::RCX, x64::Reg::RAX)
+            asm.alu_ri(5, x64::Reg::RSP, 32)
+            asm.call_symbol(self.foreign_symbol(String("kernel32!ExitProcess")))
+            asm.trap()
         } else when self.freestanding {
             asm.load(8, false, x64::Reg::RDI, x64::Reg::RSP, 0)
             asm.lea(x64::Reg::RSI, x64::Reg::RSP, 8)
@@ -1394,14 +1417,19 @@ extend Gen {
         }
         asm.bind(entry_body)
         // The C runtime calls main with argc in rdi and argv in rsi; they are kept for `arg_count` and `arg`.
-        asm.lea_symbol(x64::Reg::RAX, self.arguments_symbol)
-        asm.store(8, x64::Reg::RDI, x64::Reg::RAX, 0)
-        asm.store(8, x64::Reg::RSI, x64::Reg::RAX, 8)
+        when !self.windows || self.win_arguments {
+            asm.lea_symbol(x64::Reg::RAX, self.arguments_symbol)
+            asm.store(8, x64::Reg::RDI, x64::Reg::RAX, 0)
+            asm.store(8, x64::Reg::RSI, x64::Reg::RAX, 8)
+        }
         // A stack for the segmentation handler, then the handler for SIGSEGV. The `stack_t` is at the frame's bottom and
         // the `sigaction` (152 bytes, with the handler first and the flags after the 128-byte mask) above it.
         asm.push(x64::Reg::RBP)
         asm.mov_rr(x64::Reg::RBP, x64::Reg::RSP)
         asm.alu_ri(5, x64::Reg::RSP, 192)
+        // Windows has SetThreadStackGuarantee; sigaltstack is not supported by its syscall
+        // adapter. Avoid allocating a Linux alternate stack that Windows would never use.
+        when !self.windows {
         asm.mov_ri(x64::Reg::RDI, 65536)
         when self.freestanding {
             asm.call_label(self.rt.malloc)
@@ -1420,6 +1448,7 @@ extend Gen {
             asm.syscall()
         } else {
             asm.call_symbol(self.foreign_symbol(String("sigaltstack")))
+        }
         }
         asm.mov_ri(x64::Reg::RAX, 0)
         mut zeroed: u64 = 0
@@ -1480,6 +1509,9 @@ extend Gen {
     fun emit_buffered_write(mut self, asm: &mut x64::Asm) {
         known := asm.new_label()
         direct := asm.new_label()
+        long_copy := asm.new_label()
+        four_to_seven := asm.new_label()
+        bytes_loop := asm.new_label()
         make_room := asm.new_label()
         append := asm.new_label()
         done := asm.new_label()
@@ -1523,6 +1555,30 @@ extend Gen {
         asm.lea(x64::Reg::RDI, x64::Reg::R11, 16)
         asm.alu_rr(1, x64::Reg::RDI, x64::Reg::RCX)
         asm.mov_rr(x64::Reg::RCX, x64::Reg::RDX)
+        // Short copies are moved as one byte at a time (1 to 3) or as two overlapping words (4 to 7); `rep movsb` costs
+        // more than they do, and only longer ones use it.
+        asm.alu_ri(7, x64::Reg::RCX, 8)
+        asm.jcc(x64::Cc::ABOVE_EQUAL, long_copy)
+        asm.alu_ri(7, x64::Reg::RCX, 4)
+        asm.jcc(x64::Cc::ABOVE_EQUAL, four_to_seven)
+        asm.bind(bytes_loop)
+        asm.test_rr(x64::Reg::RCX, x64::Reg::RCX)
+        asm.jcc(x64::Cc::EQUAL, done)
+        asm.load(1, false, x64::Reg::RAX, x64::Reg::RSI, 0)
+        asm.store(1, x64::Reg::RAX, x64::Reg::RDI, 0)
+        asm.alu_ri(0, x64::Reg::RSI, 1)
+        asm.alu_ri(0, x64::Reg::RDI, 1)
+        asm.alu_ri(5, x64::Reg::RCX, 1)
+        asm.jmp(bytes_loop)
+        asm.bind(four_to_seven)
+        asm.load(4, false, x64::Reg::RAX, x64::Reg::RSI, 0)
+        asm.lea_scaled(x64::Reg::RDX, x64::Reg::RSI, x64::Reg::RCX, 1, (0 as i64) - 4)
+        asm.load(4, false, x64::Reg::R11, x64::Reg::RDX, 0)
+        asm.store(4, x64::Reg::RAX, x64::Reg::RDI, 0)
+        asm.lea_scaled(x64::Reg::RDX, x64::Reg::RDI, x64::Reg::RCX, 1, (0 as i64) - 4)
+        asm.store(4, x64::Reg::R11, x64::Reg::RDX, 0)
+        asm.jmp(done)
+        asm.bind(long_copy)
         asm.rep_movsb()
         asm.jmp(done)
         asm.bind(make_room)
@@ -1600,14 +1656,19 @@ extend Gen {
             asm.mov_rr(x64::Reg::RBP, x64::Reg::RSP)
             asm.alu_ri(5, x64::Reg::RSP, 32)
             asm.lea(x64::Reg::R8, x64::Reg::RSP, 32)
-            asm.mov_ri(x64::Reg::RCX, 10)
+            asm.mov_ri(x64::Reg::RCX, 14757395258967641293)
             digits := asm.new_label()
             asm.bind(digits)
-            asm.alu_rr(49, x64::Reg::RDX, x64::Reg::RDX)
-            asm.unary(6, x64::Reg::RCX)
-            asm.alu_ri(0, x64::Reg::RDX, 48)
+            // value / 10 without `div`: rdx:rax = value * 0xCCCCCCCCCCCCCCCD, and the quotient is rdx >> 3.
+            asm.mov_rr(x64::Reg::R9, x64::Reg::RAX)
+            asm.unary(4, x64::Reg::RCX)
+            asm.shift_ri(5, x64::Reg::RDX, 3)
+            asm.imul_ri(x64::Reg::RAX, x64::Reg::RDX, 10)
+            asm.alu_rr(41, x64::Reg::R9, x64::Reg::RAX)
+            asm.mov_rr(x64::Reg::RAX, x64::Reg::RDX)
+            asm.alu_ri(0, x64::Reg::R9, 48)
             asm.alu_ri(5, x64::Reg::R8, 1)
-            asm.store(1, x64::Reg::RDX, x64::Reg::R8, 0)
+            asm.store(1, x64::Reg::R9, x64::Reg::R8, 0)
             asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
             asm.jcc(x64::Cc::NOT_EQUAL, digits)
             asm.lea(x64::Reg::RDX, x64::Reg::RSP, 32)
@@ -3097,6 +3158,14 @@ extend Gen {
         }
         // A constant power of two or shift count: one shift of the register.
         known := self.const_value(right)
+        when op == "Mul" && known.is_some() {
+            when self.multiply_constant(asm, target, known.unwrap()) { return Option::Some(true) }
+            bits := known.unwrap() as i64
+            when bits >= (0 as i64) - 2147483648 && bits <= 2147483647 {
+                asm.imul_ri(target, target, bits)
+                return Option::Some(true)
+            }
+        }
         when op == "Div" || op == "ShiftLeft" || op == "ShiftRight" || (op == "Mul" && known.is_some()) {
             when known.is_none() {
                 return Option::None
@@ -3883,6 +3952,7 @@ extend Gen {
         return self.is_string(ty) || choose self.program.types[ty] {
             ir::IrTy::ArrayOf(element, length) => self.is_plain_scalar(element),
             ir::IrTy::SliceOf(element) => true,
+            ir::IrTy::MutSliceOf(element) => true,
             ir::IrTy::VecOf(element) => true,
             ir::IrTy::MapOf(key, value) => true,
             ir::IrTy::SetOf(key, value) => true,
@@ -3940,6 +4010,12 @@ extend Gen {
 
     // `echo value`: the value, then a newline.
     fun echo_statement(mut self, asm: &mut x64::Asm, value: u64, ty: u64) -> bool {
+        text := self.constant_text(value, 0)
+        when text.is_some() {
+            mut line := text.unwrap()
+            line.push('\n')
+            return self.text_part(asm, line)
+        }
         when !self.printed(asm, value, ty) {
             return false
         }
@@ -3948,7 +4024,17 @@ extend Gen {
     }
 
     fun template(mut self, asm: &mut x64::Asm, parts: Vec<u64>) -> bool {
+        mut pending := String()
         for part in parts {
+            constant := choose self.program.parts[part] {
+                ir::PrintPart::TextPart(text) => Option::Some(text),
+                ir::PrintPart::ValuePart(value, ty) => self.constant_text(value, 0),
+            }
+            when constant.is_some() { pending.append(constant.unwrap()) continue }
+            when !pending.is_empty() {
+                self.text_part(asm, pending.clone())
+                pending.clear()
+            }
             done := choose self.program.parts[part] {
                 ir::PrintPart::TextPart(text) => self.text_part(asm, text),
                 ir::PrintPart::ValuePart(value, ty) => self.printed(asm, value, ty),
@@ -3958,8 +4044,8 @@ extend Gen {
             }
         }
         // A template is a line, as `print` writes it.
-        self.write_literal(asm, newline_literal())
-        return true
+        pending.push('\n')
+        return self.text_part(asm, pending)
     }
 
     fun text_part(mut self, asm: &mut x64::Asm, text: String) -> bool {
@@ -4240,7 +4326,7 @@ extend Gen {
     // The zero-filled bytes only a Windows image has: the exception handler's state.
     // The mode, the length and the bytes of the standard output buffer.
     fun stdout_state_size(self) -> u64 {
-        when !self.windows && !self.no_opt {
+        when !self.no_opt {
             return 65552
         }
         return 0
@@ -4275,7 +4361,7 @@ extend Gen {
     fun emit_windows(mut self, asm: &mut x64::Asm) {
         win := winrt::WinRt { syscall_label: self.win_syscall, init_label: self.win_init, veh_label: self.win_veh, state_symbol: self.win_state, api_names: self.win_names.clone(), api_symbols: self.win_symbols.clone() }
         winrt::emit_syscall(asm, &win)
-        winrt::emit_init(asm, &win)
+        winrt::emit_init(asm, &win, self.win_arguments)
         winrt::emit_veh(asm, &win)
     }
 
@@ -4625,6 +4711,23 @@ extend Gen {
             ir::IrExpr::StrLit(text) => Option::Some(text),
             _ => Option::None,
         }
+    }
+
+    fun constant_text(self, index: u64, depth: u64) -> Option<String> {
+        when depth > 64 { return Option::None }
+        literal := self.string_literal(index)
+        when literal.is_some() { return literal }
+        slot := choose self.program.exprs[index] {
+            ir::IrExpr::LocalRef(slot, ty, span) => Option::Some(slot),
+            _ => Option::None,
+        }
+        when slot.is_some() && !self.no_opt && !self.inline_active && slot.unwrap() < self.def_count.len() {
+            local := slot.unwrap()
+            when self.def_count[local] == 1 && !self.def_bad[local] && self.def_init[local] > 0 {
+                return self.constant_text(self.def_init[local] - 1, depth + 1)
+            }
+        }
+        return Option::None
     }
 
     // Whether an owned value of type `ty` is one cell: a String, a vector, a map, a set or an enum, which a temporary can be.
@@ -5542,7 +5645,7 @@ extend Gen {
     }
 
     // Whether the statement is `i = i + c`, `c` a small positive constant.
-    fun bce_is_step(self, statement: u64, idx: u64) -> bool {
+    fun bce_is_step(mut self, statement: u64, idx: u64) -> bool {
         target := choose self.program.stmts[statement] {
             ir::IrStmt::AssignStmt(slot, ty, value, span) => slot,
             _ => 0 - 1,
@@ -5560,7 +5663,7 @@ extend Gen {
         }
     }
 
-    fun step_constant(self, value: u64) -> bool {
+    fun step_constant(mut self, value: u64) -> bool {
         constant := self.const_value(value)
         return constant.is_some() && constant.unwrap() >= 1 && constant.unwrap() <= 4096
     }
@@ -12503,6 +12606,27 @@ extend Gen {
             }
             return true
         }
+        // Whether standard output is a terminal: `ioctl TCGETS` on Linux, `GetConsoleMode` in the Windows emulation. The
+        // answer is the one the buffer decides by, so a program can ask it too.
+        when op == "StdoutIsTerminal" {
+            yes := asm.new_label()
+            over := asm.new_label()
+            asm.alu_ri(5, x64::Reg::RSP, 16)
+            asm.mov_ri(x64::Reg::RDI, 1)
+            asm.mov_ri(x64::Reg::RSI, 21505)
+            asm.mov_rr(x64::Reg::RDX, x64::Reg::RSP)
+            asm.mov_ri(x64::Reg::RAX, 16)
+            asm.syscall()
+            asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
+            asm.jcc(x64::Cc::EQUAL, yes)
+            asm.mov_ri(x64::Reg::RAX, 0)
+            asm.jmp(over)
+            asm.bind(yes)
+            asm.mov_ri(x64::Reg::RAX, 1)
+            asm.bind(over)
+            asm.alu_ri(0, x64::Reg::RSP, 16)
+            return true
+        }
         when op == "Exit" && arguments.len() == 1 {
             // The status is evaluated first, then the owners are dropped, as the runtime's exit does, and the process ends.
             when !self.expr(asm, arguments[0]) {
@@ -13903,6 +14027,7 @@ extend Gen {
             ir::IrTy::StructTy(id) => self.push_structure(asm, value, id),
             ir::IrTy::ArrayOf(element, length) => self.push_array(asm, value, ty),
             ir::IrTy::SliceOf(element) => self.push_slice(asm, value),
+            ir::IrTy::MutSliceOf(element) => self.push_slice(asm, value),
             _ => self.fail("an argument of this type"),
         }
     }
@@ -14106,12 +14231,11 @@ extend Gen {
         return self.is_plain_scalar(element.unwrap())
     }
 
-    // A structure element: any structure without a destructor whose owners a clone can copy (see `owned_cells`).
-    // A structure element of an array: any structure whose owners a clone can copy, destructors included. The array's drops run
-    // the owners in the bootstrap's order (see `phys_slot`).
+    // Array storage includes move-only structures. Reads still require clone support,
+    // while construction, whole-array moves, borrowing and drop need only the cell layout.
     fun is_array_element_structure(self, ty: u64) -> bool {
         return choose self.program.types[ty] {
-            ir::IrTy::StructTy(id) => self.program.structs[id].slot_count > 0 && self.owned_cells(ty).is_some(),
+            ir::IrTy::StructTy(id) => self.program.structs[id].slot_count > 0,
             _ => false,
         }
     }
@@ -14474,6 +14598,7 @@ extend Gen {
     fun slice_element(self, ty: u64) -> Option<u64> {
         return choose self.program.types[ty] {
             ir::IrTy::SliceOf(element) => Option::Some(element),
+            ir::IrTy::MutSliceOf(element) => Option::Some(element),
             _ => Option::None,
         }
     }
@@ -14504,8 +14629,8 @@ extend Gen {
     // `array` viewed as a slice; the IR names the element type.
     fun array_as_slice(mut self, asm: &mut x64::Asm, array: u64, element_ty: u64, length: u64) -> bool {
         element: Option<u64> = Option::Some(element_ty)
-        // An element is one cell: a scalar, or an owner whose slice reads clone it.
-        when !self.is_plain_scalar(element.unwrap()) && !self.is_owner_cell(element.unwrap()) {
+        cells := self.cells_of(element_ty)
+        when cells == 0 {
             return self.fail("a slice of an array of this element type")
         }
         when length == 0 {
@@ -14521,12 +14646,12 @@ extend Gen {
             when !self.is_plain_scalar(element.unwrap()) {
                 return self.fail("a slice of a temporary array of this element type")
             }
-            slot = self.scratch(length)
+            slot = self.scratch(length * cells)
             when !self.store_array_parts(asm, array, slot, element.unwrap(), length) {
                 return false
             }
         }
-        asm.lea(x64::Reg::RAX, x64::Reg::RBP, slot_disp(slot + length - 1))
+        asm.lea(x64::Reg::RAX, x64::Reg::RBP, slot_disp(slot + length * cells - 1))
         asm.mov_ri(x64::Reg::RDX, length)
         return true
     }
@@ -15556,6 +15681,46 @@ extend Gen {
         return Option::Some(true)
     }
 
+    // Multiplication wraps exactly as imul. For 2^k +/- 1 a shift and add/sub
+    // shorten the dependent arithmetic chain; 3, 5 and 9 are a single lea.
+    fun multiply_constant(self, asm: &mut x64::Asm, target: u64, multiplier: u64) -> bool {
+        when self.no_opt { return false }
+        when multiplier == 0 { asm.mov_ri(target, 0) return true }
+        when multiplier == 1 { return true }
+        plus := power_exponent(multiplier - 1)
+        minus := power_exponent(multiplier + 1)
+        when plus > 0 && plus <= 3 {
+            asm.lea_scaled(target, target, target, multiplier - 1, 0)
+            return true
+        }
+        mut exponent := plus
+        mut subtract := false
+        when exponent >= 64 { exponent = minus subtract = true }
+        when exponent == 0 || exponent >= 64 { return false }
+        mut scratch := x64::Reg::RCX
+        when target != x64::Reg::RAX { scratch = x64::Reg::RAX }
+        asm.mov_rr(scratch, target)
+        asm.shift_ri(4, target, exponent)
+        when subtract { asm.alu_rr(41, target, scratch) } else { asm.alu_rr(1, target, scratch) }
+        return true
+    }
+
+    fun constant_multiply(mut self, asm: &mut x64::Asm, op: String, left: u64, right: u64, word: String) -> Option<bool> {
+        when self.no_opt || op != "Mul" || !is_integer_word(word.clone()) { return Option::None }
+        mut value := left
+        mut constant := self.const_value(right)
+        when constant.is_none() { value = right constant = self.const_value(left) }
+        when constant.is_none() { return Option::None }
+        multiplier := constant.unwrap()
+        bits := multiplier as i64
+        supported := multiplier == 0 || multiplier == 1 || power_exponent(multiplier - 1) < 64 || power_exponent(multiplier + 1) < 64 || (bits >= (0 as i64) - 2147483648 && bits <= 2147483647)
+        when !supported { return Option::None }
+        when !self.expr(asm, value) { return Option::Some(false) }
+        when !self.multiply_constant(asm, x64::Reg::RAX, multiplier) { asm.imul_ri(x64::Reg::RAX, x64::Reg::RAX, bits) }
+        self.normalize(asm, word)
+        return Option::Some(true)
+    }
+
     fun expr(mut self, asm: &mut x64::Asm, index: u64) -> bool {
         self.note_expression(index)
         mut at: u64 = 0
@@ -15613,7 +15778,7 @@ extend Gen {
             ir::IrExpr::EnumMatch(value, id, arms, ty) => self.enum_match(asm, value, id, arms, ty),
             ir::IrExpr::Propagate(value, input, output, success_type, failure_type, success_variant, failure_variant, output_failure_variant, deferred) => self.propagate(asm, value, success_type, failure_type, success_variant, output_failure_variant, deferred),
             ir::IrExpr::StringFindOption(value, id) => self.find_option(asm, value, id),
-            ir::IrExpr::SliceElementAddress(slice, index, ty, span) => self.slice_index(asm, slice, index, ty, true),
+            ir::IrExpr::SliceElementAddress(slice, index, ty, span) => self.slice_element_address(asm, slice, index, ty),
             ir::IrExpr::ArrayAsSlice(array, id, length) => self.fail("an array as a slice"),
         }
     }
@@ -16520,6 +16685,7 @@ extend Gen {
         return choose self.program.exprs[index] {
             ir::IrExpr::PlaceAddress(place, ty) => true,
             ir::IrExpr::AddressOf(slot, ty, pointer_type, span) => true,
+            ir::IrExpr::SliceElementAddress(slice, index, ty, span) => true,
             _ => false,
         }
     }
@@ -17022,6 +17188,8 @@ extend Gen {
         when reduced.is_some() {
             return reduced.unwrap()
         }
+        multiplied := self.constant_multiply(asm, op.clone(), left, right, operand.clone())
+        when multiplied.is_some() { return multiplied.unwrap() }
         divided := self.constant_division(asm, op.clone(), left, right, operand.clone())
         when divided.is_some() {
             return divided.unwrap()

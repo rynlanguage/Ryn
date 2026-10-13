@@ -254,6 +254,11 @@ fun derive_outside_struct(start: u64, end: u64) -> lexer::Diag {
     return lexer::diag_help("R0010", String("`#[derive]` applies only to structs"), start, end, String("move the derive attribute onto a `struct`"))
 }
 
+// `#[kernel(local = N)]` is only meaningful on a free function; a kernel runs on the GPU, so it has no `extern` form.
+fun kernel_outside_function(start: u64, end: u64) -> lexer::Diag {
+    return lexer::diag_help("R0920", String("`#[kernel]` applies only to a `fun` declaration"), start, end, String("put the kernel attribute on a free `fun` that is not `extern \"C\"`"))
+}
+
 // Keywords that cannot be used as names or start an expression.
 fun is_reserved_keyword(kind: u32) -> bool {
     when kind == lexer::Tk::FUN || kind == lexer::Tk::MUT || kind == lexer::Tk::WHEN || kind == lexer::Tk::ELSE
@@ -980,6 +985,7 @@ extend Parser {
         }
         when kind == Ty::SLICE {
             mut key := String("&[")
+            when node.flag { key = String("&mut [") }
             key.append(self.type_key(node.first))
             key.push(']')
             return key
@@ -1052,6 +1058,13 @@ extend Parser {
         } else when kind == Ty::SLICE {
             out = word("Slice")
             out.append(self.encode_type(node.first))
+            when node.flag {
+                out.append(enc_span(node.start, node.end))
+                mut wrapped := word("Ref")
+                wrapped.append(out)
+                wrapped.append(enc_bool(true))
+                out = wrapped
+            }
         } else when kind == Ty::RAW {
             out = word("Raw")
             out.append(self.encode_type(node.first))
@@ -1598,12 +1611,12 @@ extend Parser {
         }
         when self.peek_kind() == lexer::Tk::BIT_AND {
             start := self.next().start
+            mutable := self.consume_if(lexer::Tk::MUT)
             when self.consume_if(lexer::Tk::LBRACKET) {
                 element := self.type_name()?
                 closing := self.expect(lexer::Tk::RBRACKET, "expected `]` after slice element type")?
-                return Result::Ok(self.wrapper_type(Ty::SLICE, element, start, closing.end))
+                return Result::Ok(self.new_type(Ty::SLICE, String(), element, 0, 0, mutable, false, Vec<u64>(), start, closing.end))
             }
-            mutable := self.consume_if(lexer::Tk::MUT)
             element := self.type_name()?
             end := self.prev_end()
             return Result::Ok(self.new_type(Ty::REF, String(), element, 0, 0, mutable, false, Vec<u64>(), start, end))
@@ -1900,6 +1913,8 @@ extend Parser {
         mut has_derive := false
         mut derive_start: u64 = 0
         mut derive_end: u64 = 0
+        mut kernel_local: u64 = 0
+        mut kernel_start: u64 = 0
         when self.peek_kind() == lexer::Tk::HASH {
             when self.ident_at(self.at + 2, "drop") {
                 drop_function = self.drop_attribute()?
@@ -1909,6 +1924,9 @@ extend Parser {
                 derives = self.derive_attribute()?
                 derive_end = self.prev_end()
                 has_derive = true
+            } else when self.ident_at(self.at + 2, "kernel") {
+                kernel_start = self.peek().start
+                kernel_local = self.kernel_attribute()?
             } else {
                 layout_entries := self.repr_c_attribute()?
                 repr_c = true
@@ -1926,6 +1944,9 @@ extend Parser {
         }
         when has_derive && kind != lexer::Tk::STRUCT {
             return Result::Err(derive_outside_struct(derive_start, derive_end))
+        }
+        when kernel_local > 0 && kind != lexer::Tk::FUN {
+            return Result::Err(kernel_outside_function(kernel_start, self.prev_end()))
         }
         when kind == lexer::Tk::USE {
             // Imports are visible project-wide, so `pub use` is the same as `use`.
@@ -1973,10 +1994,10 @@ extend Parser {
             when abi.kind != lexer::Tk::STRING || self.texts[abi.text] != "C" {
                 return Result::Err(self.error("expected `\"C\"` after `extern`"))
             }
-            self.declared = self.function(public, true, false, 0, false, String())?
+            self.declared = self.function(public, true, false, 0, false, String(), 0)?
             return Result::Ok(7)
         }
-        self.declared = self.function(public, false, false, 0, false, String())?
+        self.declared = self.function(public, false, false, 0, false, String(), kernel_local)?
         return Result::Ok(7)
     }
     fun namespace_decl(mut self) -> Result<bool, lexer::Diag> {
@@ -2181,7 +2202,7 @@ extend Parser {
         while self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
             member_public := self.consume_if(lexer::Tk::PUB)
             when self.peek_kind() == lexer::Tk::FUN {
-                methods.append(self.function(member_public, false, true, receiver, true, type_name.clone())?)
+                methods.append(self.function(member_public, false, true, receiver, true, type_name.clone(), 0)?)
                 method_count += 1
             } else when self.peek_kind() == lexer::Tk::CONST {
                 constants.append(self.constant_def(member_public, type_name.clone())?)
@@ -2354,7 +2375,7 @@ extend Parser {
         while self.peek_kind() != lexer::Tk::RBRACE && self.peek_kind() != lexer::Tk::EOF {
             member_public := self.consume_if(lexer::Tk::PUB)
             when self.peek_kind() == lexer::Tk::FUN {
-                self.generated_methods.append(self.function(member_public, false, true, receiver, true, internal.clone())?)
+                self.generated_methods.append(self.function(member_public, false, true, receiver, true, internal.clone(), 0)?)
                 self.generated_method_count += 1
             } else when self.peek_kind() == lexer::Tk::CONST {
                 constants.append(self.constant_def(member_public, internal.clone())?)
@@ -2388,6 +2409,7 @@ extend Parser {
         out.append(enc_str(self.qualified_declaration_name(qualified)))
         out.append(enc_bool(false))
         out.append(enc_bool(false))
+        out.append(enc_uint(0))
         out.append(enc_none())
         out.append(enc_uint(0))
         out.append(enc_uint(0))
@@ -2422,6 +2444,7 @@ extend Parser {
         out.append(enc_str(self.qualified_declaration_name(name.text)))
         out.append(enc_bool(false))
         out.append(enc_bool(false))
+        out.append(enc_uint(0))
         out.append(enc_some(enc_str(String("$const"))))
         out.append(enc_uint(0))
         out.append(enc_uint(0))
@@ -2585,6 +2608,30 @@ extend Parser {
         self.expect(lexer::Tk::RPAREN, "expected `)` after the derive list")?
         self.expect(lexer::Tk::RBRACKET, "expected `]` after the attribute")?
         return Result::Ok(derives)
+    }
+
+    // `#[kernel(local = N)]`: the function is a GPU compute kernel whose workgroup has N invocations (1 to 1024).
+    // The result is N.
+    fun kernel_attribute(mut self) -> Result<u64, lexer::Diag> {
+        self.expect(lexer::Tk::HASH, "expected `#`")?
+        self.expect(lexer::Tk::LBRACKET, "expected `[` after `#`")?
+        attribute := self.next()
+        when attribute.kind != lexer::Tk::IDENT || self.texts[attribute.text] != "kernel" {
+            return Result::Err(lexer::diag_help("R0014", String("unsupported attribute"), attribute.start, attribute.end, String("the supported attribute is `#[kernel(local = N)]`")))
+        }
+        self.expect(lexer::Tk::LPAREN, "expected `(` after `kernel`")?
+        key := self.next()
+        when key.kind != lexer::Tk::IDENT || self.texts[key.text] != "local" {
+            return Result::Err(lexer::diag_help("R0920", String("a kernel takes its workgroup size as `local = N`"), key.start, key.end, String("write `#[kernel(local = 64)]`")))
+        }
+        self.expect(lexer::Tk::EQUAL, "expected `=` after `local`")?
+        size := self.next()
+        when size.kind != lexer::Tk::INTEGER || size.value == 0 || size.value > 1024 {
+            return Result::Err(lexer::diag_help("R0920", String("the workgroup size must be an integer from 1 to 1024"), size.start, size.end, String("choose the number of invocations per workgroup, such as `local = 64`")))
+        }
+        self.expect(lexer::Tk::RPAREN, "expected `)` after the workgroup size")?
+        self.expect(lexer::Tk::RBRACKET, "expected `]` after the attribute")?
+        return Result::Ok(size.value)
     }
 
     fun drop_attribute(mut self) -> Result<String, lexer::Diag> {
@@ -2926,11 +2973,15 @@ extend Parser {
 
     // `has_self` marks an `extend` method whose receiver has type `receiver`;
     // `prefix` qualifies its name with the extended type.
-    fun function(mut self, public: bool, extern_c: bool, has_self: bool, receiver: u64, has_prefix: bool, prefix: String) -> Result<String, lexer::Diag> {
+    fun function(mut self, public: bool, extern_c: bool, has_self: bool, receiver: u64, has_prefix: bool, prefix: String, kernel_local: u64) -> Result<String, lexer::Diag> {
         start := (self.expect(lexer::Tk::FUN, "expected `fun`")?).start
         name_token := self.next()
         when name_token.kind != lexer::Tk::IDENT {
             return Result::Err(self.error("expected function name"))
+        }
+        // A kernel is a free, non-generic function: it is compiled for the GPU, and nothing in Ryn calls it.
+        when kernel_local > 0 && (has_self || has_prefix || self.peek_kind() == lexer::Tk::LESS) {
+            return Result::Err(lexer::diag_help("R0920", String("a kernel must be a free function that is not generic"), start, name_token.end, String("move the kernel out of any `extend` block and remove its type parameters")))
         }
         mut name := self.texts[name_token.text]
         when has_prefix {
@@ -3046,6 +3097,7 @@ extend Parser {
         head.append(enc_str(name))
         head.append(enc_bool(extern_c))
         head.append(enc_bool(variadic))
+        head.append(enc_uint(kernel_local))
         when self.peek_kind() == lexer::Tk::FAT_ARROW {
             when extern_c {
                 return Result::Err(self.error("`extern \"C\"` functions cannot have a body"))
@@ -3159,7 +3211,7 @@ extend Parser {
             || kind == lexer::Tk::CONTINUE || kind == lexer::Tk::RETURN || kind == lexer::Tk::STAR {
             return true
         }
-        when self.unsafe_block_start() || self.field_assignment_start() || self.short_declaration_start() || self.index_assignment_start() || self.place_assignment_start() {
+        when self.unsafe_block_start() || self.field_assignment_start() || self.short_declaration_start() || self.shared_declaration_start() || self.index_assignment_start() || self.place_assignment_start() {
             return true
         }
         next := self.kind_at(self.at + 1)
@@ -3491,6 +3543,34 @@ extend Parser {
         return false
     }
 
+    // `shared name: Type` inside a kernel: the name is an identifier followed by `:`, after the word `shared`.
+    fun shared_declaration_start(self) -> bool {
+        return self.peek_is_ident("shared") && self.kind_at(self.at + 1) == lexer::Tk::IDENT && self.kind_at(self.at + 2) == lexer::Tk::COLON
+    }
+
+    // `shared name: [T; N]`: a workgroup array of a kernel. It is encoded as a `let` whose name is `shared name` (a source
+    // identifier has no space, so no program declares it), with no initializer: lowering gives the array its zero value.
+    fun shared_declaration(mut self) -> Result<String, lexer::Diag> {
+        start := self.peek().start
+        self.skip()
+        name := self.ident("expected a name after `shared`")?
+        self.expect(lexer::Tk::COLON, "expected `:` and the array type after the shared name")?
+        annotation := self.encode_type(self.type_name()?)
+        end := self.prev_end()
+        mut marked := String("shared ")
+        marked.append(name.text)
+        mut out := String("\n")
+        out.append(word("Let"))
+        out.append(enc_str(marked))
+        out.append(enc_bool(true))
+        out.append(enc_some(annotation))
+        out.append(word("Int"))
+        out.append(enc_uint(0))
+        out.append(enc_span(start, end))
+        out.append(enc_span(start, end))
+        return Result::Ok(out)
+    }
+
     fun short_declaration_start(self) -> bool {
         when self.peek_kind() != lexer::Tk::IDENT {
             return false
@@ -3689,6 +3769,9 @@ extend Parser {
         }
         when kind == lexer::Tk::IDENT && self.short_declaration_start() {
             return self.declaration_statement()
+        }
+        when kind == lexer::Tk::IDENT && self.shared_declaration_start() {
+            return self.shared_declaration()
         }
         when kind == lexer::Tk::IDENT && self.index_assignment_start() {
             return self.index_assignment()
@@ -4681,6 +4764,7 @@ extend Parser {
             head.append(enc_str(self.qualified_declaration_name(name.clone())))
             head.append(enc_bool(false))
             head.append(enc_bool(false))
+            head.append(enc_uint(0))
             head.append(enc_none())
             head.append(enc_strings(Vec<String>()))
             head.append(enc_list(0, String()))

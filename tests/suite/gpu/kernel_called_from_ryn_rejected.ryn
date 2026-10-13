@@ -1,0 +1,11 @@
+// test: fail
+// code: R0925
+
+#[kernel(local = 4)]
+fun k(data: &mut [u32]) {
+}
+
+fun main() {
+    mut a: [u32; 4] = [0; 4]
+    k(&mut a)
+}

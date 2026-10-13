@@ -18,6 +18,7 @@ pub enum IrTy {
     EnumTy(u64),
     VecOf(u64),
     SliceOf(u64),
+    MutSliceOf(u64),
     ArrayOf(u64, u64),
     MapOf(u64, u64),
     SetOf(u64, u64),
@@ -46,6 +47,8 @@ pub enum CallTarget {
     EnumUnwrapOr(u64, u64),
     EnumUnwrap(u64, u64, bool, u64, String),
     VecGetOption(u64, u64, bool),
+    // A GPU builtin of a kernel (`global_id`, `barrier`, `atomic_add`, ...): the name of its operation.
+    GpuOp(String),
 }
 
 // Expression children are indices into `IrProgram.exprs`; lists of children are `Vec<u64>`.
@@ -151,6 +154,15 @@ pub struct IrEnumDef {
     pub variants: Vec<EnumVariant>,
 }
 
+// A `#[kernel(local = N)]` function: its index in `functions`, its workgroup size, and the first slot of each workgroup
+// array it declares with `shared`. The array's `Let` is a top-level statement of the kernel.
+#[derive(Clone)]
+pub struct IrKernel {
+    pub function: u64,
+    pub local_size: u64,
+    pub shared_slots: Vec<u64>,
+}
+
 // `parameters` is a flat list of (slot, type) pairs. Statement and value lists hold
 // indices into the arenas.
 pub struct IrFunction {
@@ -173,6 +185,8 @@ pub struct IrProgram {
     pub functions: Vec<IrFunction>,
     // The name of each function, in order, when the producer wrote them (a trailing section; empty for programs without it).
     pub names: Vec<String>,
+    // The kernels, in function order. A trailing section after the names, empty for a program without kernels.
+    pub kernels: Vec<IrKernel>,
     pub types: Vec<IrTy>,
     pub exprs: Vec<IrExpr>,
     pub stmts: Vec<IrStmt>,
@@ -424,6 +438,26 @@ extend IrDecoder {
                 name_index += 1
             }
         }
+        // The kernels follow the names, in the same optional section.
+        mut kernels: Vec<IrKernel> = Vec()
+        self.skip_spaces()
+        when self.at != self.text.len() {
+            kernel_count := self.uint()?
+            mut kernel_index: u64 = 0
+            while kernel_index < kernel_count {
+                kernel_function := self.uint()?
+                local_size := self.uint()?
+                shared_count := self.uint()?
+                mut shared_slots: Vec<u64> = Vec()
+                mut shared_index: u64 = 0
+                while shared_index < shared_count {
+                    shared_slots.push(self.uint()?)
+                    shared_index += 1
+                }
+                kernels.push(IrKernel { function: kernel_function, local_size: local_size, shared_slots: shared_slots })
+                kernel_index += 1
+            }
+        }
         return Result::Ok(IrProgram {
             main_index: main_index,
             instant_drop: instant_drop,
@@ -431,6 +465,7 @@ extend IrDecoder {
             enums: enums,
             functions: functions,
             names: names,
+            kernels: kernels,
             types: self.types,
             exprs: self.exprs,
             stmts: self.stmts,
@@ -573,6 +608,10 @@ extend IrDecoder {
         when word == "Slice" {
             element := self.ty()?
             return Result::Ok(self.push_ty(IrTy::SliceOf(element)))
+        }
+        when word == "MutableSlice" {
+            element := self.ty()?
+            return Result::Ok(self.push_ty(IrTy::MutSliceOf(element)))
         }
         when word == "Array" {
             element := self.ty()?
@@ -809,6 +848,9 @@ extend IrDecoder {
         }
         when word == "SliceLen" {
             return Result::Ok(CallTarget::SliceLen)
+        }
+        when word == "Gpu" {
+            return Result::Ok(CallTarget::GpuOp(self.token()?))
         }
         when word == "Map" {
             op := self.token()?
@@ -1101,6 +1143,7 @@ pub fun decode_ir(text: String) -> Result<IrProgram, String> {
 pub fun append_ir(program: IrProgram, text: String) -> Result<IrProgram, String> {
     main_index := program.main_index
     instant_drop := program.instant_drop
+    program_functions := program.functions.len()
     mut decoder := IrDecoder {
         function_base: program.functions.len(), struct_base: program.structs.len(), enum_base: program.enums.len(),
         text: text, at: 0, types: program.types, exprs: program.exprs, stmts: program.stmts, parts: program.parts, arms: program.arms,
@@ -1120,6 +1163,12 @@ pub fun append_ir(program: IrProgram, text: String) -> Result<IrProgram, String>
     added.names = program.names
     added.main_index = main_index
     added.instant_drop = instant_drop
+    // The appended module's kernels follow the program's, with their function indices after the program's functions.
+    mut kernels := program.kernels
+    for kernel in added.kernels {
+        kernels.push(IrKernel { function: kernel.function + program_functions, local_size: kernel.local_size, shared_slots: kernel.shared_slots })
+    }
+    added.kernels = kernels
     return Result::Ok(added)
 }
 
@@ -1232,10 +1281,24 @@ extend IrWriter {
             self.function(function)
             index += 1
         }
-        when !self.program.names.is_empty() {
+        // The optional trailing section: the names (possibly none, when kernels follow), then the kernels.
+        when !self.program.names.is_empty() || !self.program.kernels.is_empty() {
             self.uint(self.program.names.len())
             for name in self.program.names.clone() {
                 self.string(name)
+            }
+            kernel_count := self.program.kernels.len()
+            self.uint(kernel_count)
+            mut kernel_index: u64 = 0
+            while kernel_index < kernel_count {
+                kernel := self.program.kernels[kernel_index]
+                self.uint(kernel.function)
+                self.uint(kernel.local_size)
+                self.uint(kernel.shared_slots.len())
+                for slot in kernel.shared_slots.clone() {
+                    self.uint(slot)
+                }
+                kernel_index += 1
             }
         }
     }
@@ -1309,6 +1372,7 @@ extend IrWriter {
             IrTy::EnumTy(id) => self.emit_ty_enum_ty(id),
             IrTy::VecOf(element) => self.emit_ty_vec_of(element),
             IrTy::SliceOf(element) => self.emit_ty_slice_of(element),
+            IrTy::MutSliceOf(element) => self.emit_ty_mut_slice_of(element),
             IrTy::ArrayOf(element, length) => self.emit_ty_array_of(element, length),
             IrTy::MapOf(key, value) => self.emit_ty_map_of(key, value),
             IrTy::SetOf(key, value) => self.emit_ty_set_of(key, value),
@@ -1360,6 +1424,7 @@ extend IrWriter {
             CallTarget::EnumUnwrapOr(enum_id, value_type) => self.emit_call_target_enum_unwrap_or(enum_id, value_type),
             CallTarget::EnumUnwrap(enum_id, value_type, message, success_tag, failure) => self.emit_call_target_enum_unwrap(enum_id, value_type, message, success_tag, failure),
             CallTarget::VecGetOption(elem_id, option_id, pop) => self.emit_call_target_vec_get_option(elem_id, option_id, pop),
+            CallTarget::GpuOp(op) => self.emit_call_target_gpu_op(op),
         }
     }
 
@@ -1475,6 +1540,11 @@ extend IrWriter {
         self.ty(element)
         return true
     }
+    fun emit_ty_mut_slice_of(mut self, element: u64) -> bool {
+        self.word("MutableSlice")
+        self.ty(element)
+        return true
+    }
 
     fun emit_ty_array_of(mut self, element: u64, length: u64) -> bool {
         self.word("Array")
@@ -1576,6 +1646,12 @@ extend IrWriter {
 
     fun emit_call_target_system_op(mut self, op: String) -> bool {
         self.word("System")
+        self.raw(op)
+        return true
+    }
+
+    fun emit_call_target_gpu_op(mut self, op: String) -> bool {
+        self.word("Gpu")
         self.raw(op)
         return true
     }

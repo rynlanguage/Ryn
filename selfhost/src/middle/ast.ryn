@@ -126,6 +126,8 @@ pub struct Function {
     pub extern_c: bool,
     // `...` after the named parameters of an `extern "C"` function: C's variable arguments.
     pub variadic: bool,
+    // The workgroup size of a `#[kernel(local = N)]` function (1 to 1024); 0 for an ordinary function.
+    pub kernel_local: u64,
     pub external_symbol: Option<String>,
     pub type_parameters: Vec<String>,
     pub type_parameter_bounds: Vec<u64>,
@@ -774,6 +776,7 @@ extend Decoder {
         name := self.string()?
         extern_c := self.boolean()?
         variadic := self.boolean()?
+        kernel_local := self.uint()?
         external_symbol := self.optional_string()?
         type_parameters := self.strings()?
         bounds := self.bound_list()?
@@ -789,6 +792,7 @@ extend Decoder {
             name: name,
             extern_c: extern_c,
             variadic: variadic,
+            kernel_local: kernel_local,
             external_symbol: external_symbol,
             type_parameters: type_parameters,
             type_parameter_bounds: bounds,
@@ -1667,6 +1671,7 @@ extend Writer {
         self.string(definition.name)
         self.boolean(definition.extern_c)
         self.boolean(definition.variadic)
+        self.uint(definition.kernel_local)
         self.optional_string(definition.external_symbol)
         self.strings(definition.type_parameters)
         self.bound_list(definition.type_parameter_bounds)

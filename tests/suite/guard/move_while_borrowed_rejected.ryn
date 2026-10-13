@@ -4,5 +4,6 @@ fun main() {
     mut s := String("a")
     r := &s
     t := s
-    echo 1
+    // The reference must still be live when the owner is moved.
+    echo r.len()
 }

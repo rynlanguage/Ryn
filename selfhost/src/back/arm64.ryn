@@ -420,7 +420,7 @@ extend Gen64 {
     }
 
     // Loads and stores of the frame slot `slot`, through x9.
-    fun load_slot(self, asm: &mut Arm, slot: u64) -> bool {
+    fun load_slot(mut self, asm: &mut Arm, slot: u64) -> bool {
         when slot_address(slot) > 4088 {
             return self.fail(String("a frame with more than 511 slots"))
         }
@@ -429,7 +429,7 @@ extend Gen64 {
         return true
     }
 
-    fun store_slot(self, asm: &mut Arm, slot: u64) -> bool {
+    fun store_slot(mut self, asm: &mut Arm, slot: u64) -> bool {
         when slot_address(slot) > 4088 {
             return self.fail(String("a frame with more than 511 slots"))
         }
@@ -1182,6 +1182,7 @@ pub fun generate_executable_text(text: String) -> Result<Vec<u8>, String> {
 // the data. The entry point is the first instruction, which calls `main`.
 pub fun generate(program: ir::IrProgram) -> Result<Vec<u8>, String> {
     functions := program.functions.len()
+    main := program.main_index
     mut gen := Gen64 { program: program, func_labels: Vec(), current: 0, body: 0, stack_cell: 0, overflow_label: 0, queued: Vec(), pending: Vec(), epilogue: 0, loop_top: 0, loop_end: 0, print_label: 0, division_label: 0, newline_label: 0, true_label: 0, false_label: 0, reason: String() }
     mut asm := new_arm()
     mut position: u64 = 0
@@ -1200,7 +1201,6 @@ pub fun generate(program: ir::IrProgram) -> Result<Vec<u8>, String> {
     division_text := String("Ryn runtime error: integer division or remainder by zero\n")
     division_length := division_text.len()
     division_message := asm.data_label(division_text)
-    main := program.main_index
     when main >= functions {
         return Result::Err(String("a program without main"))
     }

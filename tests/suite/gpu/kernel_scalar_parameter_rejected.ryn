@@ -1,0 +1,10 @@
+// test: fail
+// code: R0921
+
+#[kernel(local = 4)]
+fun bad(n: u32) {
+}
+
+fun main() {
+    echo 1
+}

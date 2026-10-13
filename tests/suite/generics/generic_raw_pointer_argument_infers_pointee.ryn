@@ -1,0 +1,17 @@
+// test: run
+// out: 9
+// out: 4
+// exit: 0
+
+fun pick<T>(p: *T, q: *T) -> T {
+    return *q
+}
+fun load<T>(p: *T) -> T {
+    return *p
+}
+fun main() {
+    mut a: u32 = 4
+    mut b: u32 = 9
+    echo pick(&raw mut a, &raw mut b)
+    echo load(&raw mut a)
+}

@@ -1,0 +1,13 @@
+#[kernel(local = 8)]
+fun arrays(data: &mut [i32]) {
+    mut local: [i32; 4] = [1, 2, 3, 4]
+    mut zeros: [f32; 3] = [0.0; 3]
+    lane := local_id() as u64
+    local[lane % 4] = data[lane]
+    zeros[0] = 2.5
+    data[lane] = local[0] - local[3] + (0 - 7) / (data[lane] - data[lane])
+}
+
+fun main() {
+    echo "lib"
+}

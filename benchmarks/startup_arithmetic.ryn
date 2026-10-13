@@ -1,0 +1,15 @@
+// A dependent integer workload; the timer excludes process startup and printing.
+use std::time
+
+fun main() {
+    started := time::monotonic()
+    mut value: u64 = 1
+    mut index: u64 = 0
+    while index < 5000000 {
+        value = (value * 33 + 17) ^ ((value >> 7) + index)
+        index += 1
+    }
+    elapsed := time::monotonic() - started
+    echo value
+    echo elapsed
+}

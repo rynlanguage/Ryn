@@ -1,0 +1,11 @@
+// test: fail
+// code: R0924
+
+#[kernel(local = 4)]
+fun k(data: &mut [u32]) {
+    s := String("x")
+}
+
+fun main() {
+    echo 1
+}

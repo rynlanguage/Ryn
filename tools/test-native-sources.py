@@ -15,7 +15,10 @@ No Rust frontend, IR dump, system linker or C library is used to compile; progra
 linked against the system's shared C library at run time. Every process runs under a 1 GiB address-space limit.
 """
 from pathlib import Path
-import resource
+try:
+    import resource
+except ImportError:
+    resource = None  # Native Windows has no POSIX resource limits or preexec_fn.
 import subprocess
 import sys
 import tempfile
@@ -25,22 +28,24 @@ import os
 ROOT = Path(__file__).resolve().parents[1]
 # RYN_TEST_TARGET=windows compiles every program for Windows and runs it under Wine in the container `ryn-wine`
 # (`podman run`), so the result is the behaviour under Wine, not on Windows itself.
-WINDOWS = os.environ.get("RYN_TEST_TARGET") == "windows"
+NATIVE_WINDOWS = os.name == "nt"
+WINDOWS = NATIVE_WINDOWS or os.environ.get("RYN_TEST_TARGET") == "windows"
 # RYN_TEST_WINE_COMPILER=/path/to/rync.exe runs that Windows compiler under Wine too (it compiles inside the container).
 WINE_COMPILER = os.environ.get("RYN_TEST_WINE_COMPILER")
 if WINE_COMPILER:
     WINDOWS = True
 COMPILER = str(Path(sys.argv[1]).resolve())
-STDLIB = str(ROOT / "stdlib/std/src")
+STDLIB = (ROOT / "stdlib/std/src").as_posix()
 
 
 def limit():
-    resource.setrlimit(resource.RLIMIT_AS, (1073741824, 1073741824))
+    if resource is not None:
+        resource.setrlimit(resource.RLIMIT_AS, (1073741824, 1073741824))
 
 
 def header(source):
     case = {"target": None, "kind": None, "out": [], "err": [], "exit": 0, "code": None, "msg": []}
-    for line in source.read_text().splitlines():
+    for line in source.read_text(encoding="utf-8").splitlines():
         if not line.startswith("//"):
             break
         rest = line[2:].removeprefix(" ")
@@ -78,13 +83,13 @@ def run(path):
         return "skip", path, "no `// test:` header"
     with tempfile.TemporaryDirectory(prefix="ryn-native-source-") as directory:
         executable = Path(directory) / ("program.exe" if WINDOWS else "program")
-        build_command = [COMPILER, "build"] + (["--target", "windows"] if WINDOWS else []) + ["--stdlib", STDLIB, "-o", str(executable), str(target)]
+        build_command = [COMPILER, "build"] + (["--target", "windows"] if WINDOWS else []) + ["--stdlib", STDLIB, "-o", executable.as_posix(), target.as_posix()]
         if WINE_COMPILER:
             exe = Path(WINE_COMPILER).resolve()
             relative = os.path.relpath(target, ROOT)
             build_command = ["podman", "run", "--rm", "--network=none", "-v", f"{exe.parent}:/k:ro,Z", "-v", f"{ROOT}:/repo:ro,Z", "-v", f"{directory}:/w:Z", "-w", "/repo", "ryn-wine", "wine", f"/k/{exe.name}", "build", "--stdlib", "/repo/stdlib/std/src", "-o", "/w/program.exe", relative]
         build = subprocess.run(build_command,
-                               cwd=ROOT, capture_output=True, preexec_fn=None if WINE_COMPILER else limit, timeout=600)
+                               cwd=ROOT, capture_output=True, preexec_fn=None if NATIVE_WINDOWS or WINE_COMPILER else limit, timeout=600)
         stderr = build.stderr.decode(errors="replace")
         if case["kind"] == "fail":
             if build.returncode == 0:
@@ -101,7 +106,9 @@ def run(path):
             return "declined", path, stderr.strip().splitlines()[0][:200] if stderr.strip() else "needs the C library"
         if build.returncode:
             return "compilefail", path, stderr.strip()[:600]
-        if WINDOWS:
+        if NATIVE_WINDOWS:
+            result = subprocess.run([str(executable)], cwd=ROOT, capture_output=True, timeout=120)
+        elif WINDOWS:
             run_command = ["wine", str(executable)] if os.environ.get("RYN_TEST_WINE") == "local" else ["podman", "run", "--rm", "--network=none", "-v", f"{directory}:/w:Z", "-v", f"{ROOT}:/repo:ro,Z", "-w", "/repo", "ryn-wine", "wine", "/w/program.exe"]
             result = subprocess.run(run_command, cwd=ROOT, capture_output=True, timeout=120)
             if not result.stdout and result.returncode == 0 and case["out"]:
