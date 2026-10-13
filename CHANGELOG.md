@@ -18,8 +18,9 @@ sequence: minor releases may change language details while the compiler is pre-1
   `repr_c_struct_reference_and_out_pointer`, `vulkan_loader_through_a_function_pointer`.
 
 - Windows keyboard hotfix (2026-10-13): `std::keyboard` uses `GetAsyncKeyState` from `user32.dll` for continuous
-  key state, pressed/released edges and blocking `read_key`, without Linux `opendir` calls (R0905). Four Windows
-  regression tests cover CLI check/build/run, imports, polling, virtual-key mappings and deterministic transitions.
+  key state, pressed/released edges and blocking `read_key`, without Linux `opendir` calls (R0905). Five Windows
+  regression tests cover CLI check/build/run, imports, polling, virtual-key mappings, deterministic transitions and
+  building and running the release archive on Windows. Release packaging normalizes compiler paths to forward slashes.
 - `extern "C" fun printf(format: *u8, ...) -> i32;`: `...` after the named parameters of an `extern "C"` function. Call
   it with any number of variable arguments: integers of any width, `f64` and raw pointers are passed as they are; an
   `f32` (`R0270`, write `as f64`), a string or a structure is rejected. The native backend sets `al` to the number of

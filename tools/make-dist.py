@@ -33,7 +33,7 @@ def run(command):
 
 
 def compile_program(rync, source, output, windows):
-    command = [rync, "build", "--stdlib", str(ROOT / "stdlib/std/src"), "-o", str(output), str(ROOT / source)]
+    command = [rync, "build", "--stdlib", (ROOT / "stdlib/std/src").as_posix(), "-o", Path(output).as_posix(), (ROOT / source).as_posix()]
     if windows:
         command[2:2] = ["--target", "windows"]
     run(command)

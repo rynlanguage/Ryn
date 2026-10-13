@@ -4,10 +4,13 @@ The transition test substitutes only GetAsyncKeyState in a temporary stdlib. No 
 keypresses are injected into the user's desktop. RYN_TEST_RYNC can select a rebuilt compiler.
 """
 import os
+import hashlib
 import shutil
 import subprocess
 import tempfile
 import unittest
+import sys
+import zipfile
 from pathlib import Path
 
 from ryn_harness import IS_WINDOWS, REPO_ROOT, ryn_binary
@@ -51,6 +54,30 @@ class WindowsKeyboardTests(unittest.TestCase):
         self.assertIn(b"GetAsyncKeyState\0", image)
         for function in (b"opendir\0", b"readdir\0", b"closedir\0"):
             self.assertNotIn(function, image)
+
+    @unittest.skipUnless(IS_WINDOWS, "executes a Windows program")
+    def test_windows_release_package_builds_and_runs_with_its_bundled_stdlib(self):
+        dist = self.directory / "dist"
+        result = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "tools/make-dist.py"), str(self.compiler),
+             "0.1.13", str(dist), "--windows"], capture_output=True, timeout=180,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        archive = dist / "ryn-0.1.13-windows-x86_64.zip"
+        checksum = Path(str(archive) + ".sha256").read_text().split()[0]
+        self.assertEqual(checksum, hashlib.sha256(archive.read_bytes()).hexdigest())
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(self.directory / "unpacked")
+        package = self.directory / "unpacked/ryn-0.1.13-windows-x86_64"
+        program = package / "smoke.ryn"
+        program.write_text('use std::keyboard\nfun main() { _ := keyboard::key_down(Key::W) echo "package ready" }\n')
+        environment = os.environ.copy()
+        environment.pop("RYN_STDLIB", None)
+        run = subprocess.run([str(package / "ryn.exe"), "run", "smoke.ryn"],
+                             cwd=package, env=environment, capture_output=True, timeout=120)
+        self.assertEqual(run.returncode, 0, run.stderr.decode())
+        self.assertEqual(run.stderr, b"")
+        self.assertEqual(run.stdout, b"package ready\n")
 
     @unittest.skipUnless(IS_WINDOWS, "executes a Windows program")
     def test_cli_check_build_and_run_with_windows_keyboard(self):
