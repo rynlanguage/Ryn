@@ -1,0 +1,2016 @@
+// The SPIR-V backend of `rync --target spirv`. It takes the IR text that the other backends take and writes a SPIR-V 1.3
+// module with one GLCompute entry point per `#[kernel(local = N)]` function.
+//
+// A kernel's buffer parameters `&[T]` and `&mut [T]` are storage buffers, bound to descriptor set 0 in parameter order
+// (`&[T]` is read only). `len()` is the runtime array length. A `shared` array is a Workgroup variable; it starts as zeros,
+// which the kernel stores before the barrier at its declaration. `global_id()`, `local_id()` and `group_id()` are the
+// x components of the GlobalInvocationId, LocalInvocationId and WorkgroupId builtins. `barrier()` is a workgroup barrier,
+// and `atomic_add` is an atomic add on a buffer or a shared array that returns the value before the add.
+//
+// Scalar locals are Function variables, and control flow is structured: `if`, `while`, `for` and `break`/`continue` map to
+// selection and loop constructs with their merge blocks. Expressions have no side effects of their own, except the calls
+// above and the element accesses below.
+//
+// Behaviour the GPU does not give for free, made defined:
+//   - an index outside a buffer or array is not read (the read gives zero) and not written;
+//   - integer division or remainder by zero gives zero, and the signed quotient of the smallest value by -1 is its negation;
+//   - a shift count is taken modulo the width of the shifted type;
+//   - integer arithmetic wraps, as it does in SPIR-V.
+// Everything else the backend does not handle is refused with a message that names it, and the program is not written.
+//
+// The opcodes and enumerants are the values of the SPIR-V 1.0 grammar (spirv.core.grammar.json in the Vulkan SDK).
+
+use middle::ir
+
+const OP_CAPABILITY: u64 = 17
+const OP_MEMORY_MODEL: u64 = 14
+const OP_ENTRY_POINT: u64 = 15
+const OP_EXECUTION_MODE: u64 = 16
+const OP_DECORATE: u64 = 71
+const OP_MEMBER_DECORATE: u64 = 72
+const OP_TYPE_VOID: u64 = 19
+const OP_TYPE_BOOL: u64 = 20
+const OP_TYPE_INT: u64 = 21
+const OP_TYPE_FLOAT: u64 = 22
+const OP_TYPE_VECTOR: u64 = 23
+const OP_TYPE_ARRAY: u64 = 28
+const OP_TYPE_RUNTIME_ARRAY: u64 = 29
+const OP_TYPE_STRUCT: u64 = 30
+const OP_TYPE_POINTER: u64 = 32
+const OP_TYPE_FUNCTION: u64 = 33
+const OP_CONSTANT_TRUE: u64 = 41
+const OP_CONSTANT_FALSE: u64 = 42
+const OP_CONSTANT: u64 = 43
+const OP_FUNCTION: u64 = 54
+const OP_FUNCTION_END: u64 = 56
+const OP_VARIABLE: u64 = 59
+const OP_LOAD: u64 = 61
+const OP_STORE: u64 = 62
+const OP_ACCESS_CHAIN: u64 = 65
+const OP_ARRAY_LENGTH: u64 = 68
+const OP_COMPOSITE_EXTRACT: u64 = 81
+const OP_CONVERT_F_TO_U: u64 = 109
+const OP_CONVERT_F_TO_S: u64 = 110
+const OP_CONVERT_S_TO_F: u64 = 111
+const OP_CONVERT_U_TO_F: u64 = 112
+const OP_U_CONVERT: u64 = 113
+const OP_S_CONVERT: u64 = 114
+const OP_F_CONVERT: u64 = 115
+const OP_BITCAST: u64 = 124
+const OP_S_NEGATE: u64 = 126
+const OP_F_NEGATE: u64 = 127
+const OP_I_ADD: u64 = 128
+const OP_F_ADD: u64 = 129
+const OP_I_SUB: u64 = 130
+const OP_F_SUB: u64 = 131
+const OP_I_MUL: u64 = 132
+const OP_F_MUL: u64 = 133
+const OP_U_DIV: u64 = 134
+const OP_S_DIV: u64 = 135
+const OP_F_DIV: u64 = 136
+const OP_U_MOD: u64 = 137
+const OP_F_REM: u64 = 140
+const OP_LOGICAL_EQUAL: u64 = 164
+const OP_LOGICAL_NOT_EQUAL: u64 = 165
+const OP_LOGICAL_OR: u64 = 166
+const OP_LOGICAL_AND: u64 = 167
+const OP_LOGICAL_NOT: u64 = 168
+const OP_SELECT: u64 = 169
+const OP_I_EQUAL: u64 = 170
+const OP_I_NOT_EQUAL: u64 = 171
+const OP_U_GREATER_THAN: u64 = 172
+const OP_S_GREATER_THAN: u64 = 173
+const OP_U_GREATER_THAN_EQUAL: u64 = 174
+const OP_S_GREATER_THAN_EQUAL: u64 = 175
+const OP_U_LESS_THAN: u64 = 176
+const OP_S_LESS_THAN: u64 = 177
+const OP_U_LESS_THAN_EQUAL: u64 = 178
+const OP_S_LESS_THAN_EQUAL: u64 = 179
+const OP_F_ORD_EQUAL: u64 = 180
+const OP_F_UNORD_NOT_EQUAL: u64 = 183
+const OP_F_ORD_LESS_THAN: u64 = 184
+const OP_F_ORD_GREATER_THAN: u64 = 186
+const OP_F_ORD_LESS_THAN_EQUAL: u64 = 188
+const OP_F_ORD_GREATER_THAN_EQUAL: u64 = 190
+const OP_SHIFT_RIGHT_LOGICAL: u64 = 194
+const OP_SHIFT_RIGHT_ARITHMETIC: u64 = 195
+const OP_SHIFT_LEFT_LOGICAL: u64 = 196
+const OP_BITWISE_OR: u64 = 197
+const OP_BITWISE_XOR: u64 = 198
+const OP_BITWISE_AND: u64 = 199
+const OP_NOT: u64 = 200
+const OP_ATOMIC_I_ADD: u64 = 234
+const OP_CONTROL_BARRIER: u64 = 224
+const OP_PHI: u64 = 245
+const OP_LOOP_MERGE: u64 = 246
+const OP_SELECTION_MERGE: u64 = 247
+const OP_LABEL: u64 = 248
+const OP_BRANCH: u64 = 249
+const OP_BRANCH_CONDITIONAL: u64 = 250
+const OP_RETURN: u64 = 253
+
+const CAPABILITY_SHADER: u64 = 1
+const CAPABILITY_FLOAT64: u64 = 10
+const CAPABILITY_INT64: u64 = 11
+const ADDRESSING_LOGICAL: u64 = 0
+const MEMORY_GLSL450: u64 = 1
+const EXECUTION_GLCOMPUTE: u64 = 5
+const EXECUTION_MODE_LOCAL_SIZE: u64 = 17
+const DECORATION_BLOCK: u64 = 2
+const DECORATION_ARRAY_STRIDE: u64 = 6
+const DECORATION_BUILTIN: u64 = 11
+const DECORATION_NON_WRITABLE: u64 = 24
+const DECORATION_BINDING: u64 = 33
+const DECORATION_DESCRIPTOR_SET: u64 = 34
+const DECORATION_OFFSET: u64 = 35
+const BUILTIN_WORKGROUP_ID: u64 = 26
+const BUILTIN_LOCAL_INVOCATION_ID: u64 = 27
+const BUILTIN_GLOBAL_INVOCATION_ID: u64 = 28
+const STORAGE_WORKGROUP: u64 = 4
+const STORAGE_FUNCTION: u64 = 7
+const STORAGE_INPUT: u64 = 1
+const STORAGE_STORAGE_BUFFER: u64 = 12
+const SCOPE_DEVICE: u64 = 1
+const SCOPE_WORKGROUP: u64 = 2
+// Acquire-release on workgroup and uniform memory: the barrier orders the shared and the buffer accesses before it.
+const SEMANTICS_BARRIER: u64 = 328
+// Relaxed: an atomic add needs no ordering of other accesses.
+const SEMANTICS_RELAXED: u64 = 0
+
+// The sections of the module, in the order they are written.
+const SECTION_CAPABILITIES: u64 = 0
+const SECTION_ENTRIES: u64 = 1
+const SECTION_ANNOTATIONS: u64 = 2
+const SECTION_TYPES: u64 = 3
+const SECTION_BODY: u64 = 4
+
+// The text the driver reports for a construct this backend does not handle.
+fun refused(what: str) -> String {
+    mut text := String("the SPIR-V backend does not handle ")
+    text.append(what)
+    text.append(" yet")
+    return text
+}
+
+// As `refused`, for a description that is built at run time.
+fun refused_text(what: String) -> String {
+    mut text := String("the SPIR-V backend does not handle ")
+    text.append(what)
+    text.append(" yet")
+    return text
+}
+
+fun v1(a: u64) -> Vec<u64> {
+    mut items: Vec<u64> = Vec()
+    items.push(a)
+    return items
+}
+
+fun v2(a: u64, b: u64) -> Vec<u64> {
+    mut items: Vec<u64> = Vec()
+    items.push(a)
+    items.push(b)
+    return items
+}
+
+fun v3(a: u64, b: u64, c: u64) -> Vec<u64> {
+    mut items: Vec<u64> = Vec()
+    items.push(a)
+    items.push(b)
+    items.push(c)
+    return items
+}
+
+fun v4(a: u64, b: u64, c: u64, d: u64) -> Vec<u64> {
+    mut items: Vec<u64> = Vec()
+    items.push(a)
+    items.push(b)
+    items.push(c)
+    items.push(d)
+    return items
+}
+
+fun v5(a: u64, b: u64, c: u64, d: u64, e: u64) -> Vec<u64> {
+    mut items: Vec<u64> = Vec()
+    items.push(a)
+    items.push(b)
+    items.push(c)
+    items.push(d)
+    items.push(e)
+    return items
+}
+
+fun v6(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64) -> Vec<u64> {
+    mut items: Vec<u64> = Vec()
+    items.push(a)
+    items.push(b)
+    items.push(c)
+    items.push(d)
+    items.push(e)
+    items.push(f)
+    return items
+}
+
+// The words of a literal string: its bytes, a zero byte, and padding to a whole word.
+fun string_words(text: String) -> Vec<u64> {
+    mut words: Vec<u64> = Vec()
+    mut word: u64 = 0
+    mut shift: u32 = 0
+    mut at: u64 = 0
+    while at < text.len() {
+        word = word | ((text.byte_at(at) as u64) << shift)
+        shift += 8
+        when shift == 32 {
+            words.push(word)
+            word = 0
+            shift = 0
+        }
+        at += 1
+    }
+    words.push(word)
+    return words
+}
+
+// The value of an integer literal as the IR writes it: an optional minus sign and decimal digits, as two's complement.
+fun literal_bits(text: String) -> u64 {
+    mut negative := false
+    mut at: u64 = 0
+    when text.len() > 0 && text.byte_at(0) == 45 {
+        negative = true
+        at = 1
+    }
+    mut value: u64 = 0
+    while at < text.len() {
+        value = value * 10 + ((text.byte_at(at) - 48) as u64)
+        at += 1
+    }
+    when negative {
+        return 0 - value
+    }
+    return value
+}
+
+// The binary32 bits of a value held as binary64 bits, rounded to nearest with ties to even. The IR keeps every float literal
+// as binary64 (`floatlib::parse_f64`), as the x86-64 backend does before it narrows a binary32 literal.
+fun f32_bits_of(bits: u64) -> u64 {
+    sign := (bits >> 63) << 31
+    exponent := (bits >> 52) & 2047
+    fraction := bits & 4503599627370495
+    when exponent == 2047 {
+        when fraction != 0 {
+            return sign | 2143289344
+        }
+        return sign | 2139095040
+    }
+    // A binary64 zero or subnormal is below the smallest binary32 subnormal, so it rounds to a signed zero.
+    when exponent == 0 {
+        return sign
+    }
+    e: i64 = (exponent as i64) - 1023
+    one: u64 = 1
+    significand: u64 = fraction | (one << 52)
+    when e > 127 {
+        return sign | 2139095040
+    }
+    mut shift: u32 = 29
+    when e < -126 {
+        shift = shift + ((0 - (e + 126)) as u32)
+        when shift > 54 {
+            return sign
+        }
+    }
+    mut kept: u64 = significand >> shift
+    dropped: u64 = significand & ((one << shift) - 1)
+    half: u64 = one << (shift - 1)
+    when dropped > half || (dropped == half && (kept & 1) == 1) {
+        kept += 1
+    }
+    when e < -126 {
+        return sign | kept
+    }
+    mut exponent_field: u64 = ((e + 127) as u64)
+    when kept == (one << 24) {
+        kept = kept >> 1
+        exponent_field += 1
+    }
+    when exponent_field >= 255 {
+        return sign | 2139095040
+    }
+    return sign | (exponent_field << 23) | (kept & 8388607)
+}
+
+fun is_float_word(word: String) -> bool {
+    return word == "F32" || word == "F64"
+}
+
+fun is_signed_word(word: String) -> bool {
+    return word == "I32" || word == "I64"
+}
+
+fun is_wide_word(word: String) -> bool {
+    return word == "U64" || word == "I64" || word == "F64"
+}
+
+fun is_integer_word(word: String) -> bool {
+    return word == "U32" || word == "I32" || word == "U64" || word == "I64"
+}
+
+// The width in bits of a scalar word.
+fun width_of(word: String) -> u64 {
+    when is_wide_word(word.clone()) {
+        return 64
+    }
+    return 32
+}
+
+// A value of the program: its id in the module, and its scalar word.
+#[derive(Clone)]
+pub struct Value {
+    id: u64,
+    word: String,
+}
+
+// A storage the element accesses of a kernel go to: a buffer's storage block, or a workgroup or function array.
+#[derive(Clone)]
+pub struct Buffer {
+    var: u64,
+    element: String,
+    storage: u64,
+    runtime: bool,
+    length: u64,
+}
+
+pub struct SpirvGen {
+    program: ir::IrProgram,
+    next: u64,
+    int64: bool,
+    float64: bool,
+    // The words of each section, written in the order of `SECTION_*`.
+    capabilities: Vec<u64>,
+    entries: Vec<u64>,
+    annotations: Vec<u64>,
+    types: Vec<u64>,
+    functions: Vec<u64>,
+    // The module-level ids of the types and constants already declared, by their key.
+    declared: Map<String, u64>,
+    // The state of the kernel being written.
+    body: Vec<u64>,
+    block: u64,
+    open: bool,
+    interface: Vec<u64>,
+    builtins: Map<String, u64>,
+    buffers: Map<u64, u64>,
+    buffer_words: Map<u64, String>,
+    buffer_storage: Map<u64, u64>,
+    locals: Map<u64, u64>,
+    local_words: Map<u64, String>,
+    array_words: Map<u64, String>,
+    array_lengths: Map<u64, u64>,
+    counters: Map<u64, u64>,
+    shared: Vec<u64>,
+    loops: Vec<u64>,
+    local_size: u64,
+}
+
+fun new_gen(program: ir::IrProgram) -> SpirvGen {
+    return SpirvGen {
+        program: program,
+        next: 1,
+        int64: false,
+        float64: false,
+        capabilities: Vec(),
+        entries: Vec(),
+        annotations: Vec(),
+        types: Vec(),
+        functions: Vec(),
+        declared: Map<String, u64>(),
+        body: Vec(),
+        block: 0,
+        open: false,
+        interface: Vec(),
+        builtins: Map<String, u64>(),
+        buffers: Map<u64, u64>(),
+        buffer_words: Map<u64, String>(),
+        buffer_storage: Map<u64, u64>(),
+        locals: Map<u64, u64>(),
+        local_words: Map<u64, String>(),
+        array_words: Map<u64, String>(),
+        array_lengths: Map<u64, u64>(),
+        counters: Map<u64, u64>(),
+        shared: Vec(),
+        loops: Vec(),
+        local_size: 0,
+    }
+}
+
+// The SPIR-V module of the program's kernels, as bytes (little-endian words).
+pub fun generate_text(text: String) -> Result<Vec<u8>, String> {
+    decoded := ir::decode_ir(text)
+    when decoded.is_err() {
+        return Result::Err(String("the IR text cannot be read"))
+    }
+    program := decoded.unwrap()
+    when program.kernels.len() == 0 {
+        return Result::Err(String("the program has no `#[kernel]` function to compile for the SPIR-V target"))
+    }
+    mut gen := new_gen(program)
+    gen.put(SECTION_CAPABILITIES, OP_CAPABILITY, v1(CAPABILITY_SHADER))
+    kernels := gen.program.kernels.len()
+    mut at: u64 = 0
+    while at < kernels {
+        kernel := gen.program.kernels[at]
+        gen.kernel(kernel.function, kernel.local_size, kernel.shared_slots.clone())?
+        at += 1
+    }
+    // The memory model follows the capabilities, which the kernels have added to as they used them.
+    gen.put(SECTION_CAPABILITIES, OP_MEMORY_MODEL, v2(ADDRESSING_LOGICAL, MEMORY_GLSL450))
+    return Result::Ok(gen.bytes())
+}
+
+extend SpirvGen {
+    // A new id.
+    fun fresh(mut self) -> u64 {
+        id := self.next
+        self.next += 1
+        return id
+    }
+
+    // Appends an instruction to a section: the word count and opcode, then the operands.
+    fun put(mut self, section: u64, opcode: u64, operands: Vec<u64>) {
+        mut words: Vec<u64> = Vec()
+        words.push(((operands.len() + 1) << 16) | opcode)
+        for operand in operands {
+            words.push(operand)
+        }
+        when section == SECTION_CAPABILITIES {
+            for word in words {
+                self.capabilities.push(word)
+            }
+        } else when section == SECTION_ENTRIES {
+            for word in words {
+                self.entries.push(word)
+            }
+        } else when section == SECTION_ANNOTATIONS {
+            for word in words {
+                self.annotations.push(word)
+            }
+        } else when section == SECTION_TYPES {
+            for word in words {
+                self.types.push(word)
+            }
+        } else {
+            for word in words {
+                self.body.push(word)
+            }
+        }
+    }
+
+    fun need_int64(mut self) {
+        when !self.int64 {
+            self.int64 = true
+            self.put(SECTION_CAPABILITIES, OP_CAPABILITY, v1(CAPABILITY_INT64))
+        }
+    }
+
+    fun need_float64(mut self) {
+        when !self.float64 {
+            self.float64 = true
+            self.put(SECTION_CAPABILITIES, OP_CAPABILITY, v1(CAPABILITY_FLOAT64))
+        }
+    }
+
+    // The id of a scalar type, declared on first use.
+    fun scalar_type(mut self, word: String) -> Result<u64, String> {
+        key := word.clone()
+        found := self.declared.get(key.clone())
+        when found.is_some() {
+            return Result::Ok(found.unwrap())
+        }
+        id := self.fresh()
+        when word == "Bool" {
+            self.put(SECTION_TYPES, OP_TYPE_BOOL, v1(id))
+        } else when word == "U32" {
+            self.put(SECTION_TYPES, OP_TYPE_INT, v3(id, 32, 0))
+        } else when word == "I32" {
+            self.put(SECTION_TYPES, OP_TYPE_INT, v3(id, 32, 1))
+        } else when word == "U64" {
+            self.need_int64()
+            self.put(SECTION_TYPES, OP_TYPE_INT, v3(id, 64, 0))
+        } else when word == "I64" {
+            self.need_int64()
+            self.put(SECTION_TYPES, OP_TYPE_INT, v3(id, 64, 1))
+        } else when word == "F32" {
+            self.put(SECTION_TYPES, OP_TYPE_FLOAT, v2(id, 32))
+        } else when word == "F64" {
+            self.need_float64()
+            self.put(SECTION_TYPES, OP_TYPE_FLOAT, v2(id, 64))
+        } else {
+            mut what := String("a value of the type `")
+            what.append(word)
+            what.push('`')
+            return Result::Err(refused_text(what))
+        }
+        self.declared.insert(key, id)
+        return Result::Ok(id)
+    }
+
+    fun pointer_type(mut self, storage: u64, pointee: u64) -> u64 {
+        mut key := String("pointer ")
+        key.append(String(storage))
+        key.append(" ")
+        key.append(String(pointee))
+        found := self.declared.get(key.clone())
+        when found.is_some() {
+            return found.unwrap()
+        }
+        id := self.fresh()
+        self.put(SECTION_TYPES, OP_TYPE_POINTER, v3(id, storage, pointee))
+        self.declared.insert(key, id)
+        return id
+    }
+
+    // A constant of an integer type with the given bits (two words for a 64-bit type).
+    fun constant(mut self, ty: u64, word: String, bits: u64) -> u64 {
+        mut key := String("constant ")
+        key.append(String(ty))
+        key.append(" ")
+        key.append(String(bits))
+        found := self.declared.get(key.clone())
+        when found.is_some() {
+            return found.unwrap()
+        }
+        id := self.fresh()
+        when width_of(word.clone()) == 64 {
+            self.put(SECTION_TYPES, OP_CONSTANT, v4(ty, id, bits & 4294967295, bits >> 32))
+        } else {
+            self.put(SECTION_TYPES, OP_CONSTANT, v3(ty, id, bits & 4294967295))
+        }
+        self.declared.insert(key, id)
+        return id
+    }
+
+    // The constant zero, one or true/false of a scalar word.
+    fun zero(mut self, word: String) -> Result<u64, String> {
+        ty := self.scalar_type(word.clone())?
+        when word == "Bool" {
+            return Result::Ok(self.boolean_constant(false))
+        }
+        when is_float_word(word.clone()) {
+            return Result::Ok(self.float_constant(ty, word, 0))
+        }
+        return Result::Ok(self.constant(ty, word, 0))
+    }
+
+    fun boolean_constant(mut self, value: bool) -> u64 {
+        mut key := String("boolean ")
+        when value {
+            key.append("true")
+        } else {
+            key.append("false")
+        }
+        found := self.declared.get(key.clone())
+        when found.is_some() {
+            return found.unwrap()
+        }
+        ty := self.scalar_type(String("Bool")).unwrap()
+        id := self.fresh()
+        when value {
+            self.put(SECTION_TYPES, OP_CONSTANT_TRUE, v2(ty, id))
+        } else {
+            self.put(SECTION_TYPES, OP_CONSTANT_FALSE, v2(ty, id))
+        }
+        self.declared.insert(key, id)
+        return id
+    }
+
+    // A float constant with the bits of its width (binary64 bits are narrowed for a binary32 type by the caller).
+    fun float_constant(mut self, ty: u64, word: String, bits: u64) -> u64 {
+        mut key := String("float ")
+        key.append(String(ty))
+        key.append(" ")
+        key.append(String(bits))
+        found := self.declared.get(key.clone())
+        when found.is_some() {
+            return found.unwrap()
+        }
+        id := self.fresh()
+        when width_of(word) == 64 {
+            self.put(SECTION_TYPES, OP_CONSTANT, v4(ty, id, bits & 4294967295, bits >> 32))
+        } else {
+            self.put(SECTION_TYPES, OP_CONSTANT, v3(ty, id, bits & 4294967295))
+        }
+        self.declared.insert(key, id)
+        return id
+    }
+
+    // The id of an integer constant of a scalar word, for array lengths and scopes.
+    fun u32_constant(mut self, value: u64) -> u64 {
+        ty := self.scalar_type(String("U32")).unwrap()
+        return self.constant(ty, String("U32"), value)
+    }
+
+    // An array type, with its element stride declared when it is in a buffer or workgroup (`stride` is the element size).
+    fun array_type(mut self, element: u64, length: u64, stride: u64) -> u64 {
+        mut key := String("array ")
+        key.append(String(element))
+        key.append(" ")
+        key.append(String(length))
+        key.append(" ")
+        key.append(String(stride))
+        found := self.declared.get(key.clone())
+        when found.is_some() {
+            return found.unwrap()
+        }
+        count := self.u32_constant(length)
+        id := self.fresh()
+        self.put(SECTION_TYPES, OP_TYPE_ARRAY, v3(id, element, count))
+        when stride > 0 {
+            self.put(SECTION_ANNOTATIONS, OP_DECORATE, v3(id, DECORATION_ARRAY_STRIDE, stride))
+        }
+        self.declared.insert(key, id)
+        return id
+    }
+
+    // The storage block of a buffer of elements: a struct holding a runtime array, bound as a storage buffer.
+    fun buffer_block(mut self, element: u64, stride: u64) -> u64 {
+        mut key := String("block ")
+        key.append(String(element))
+        found := self.declared.get(key.clone())
+        when found.is_some() {
+            return found.unwrap()
+        }
+        array := self.fresh()
+        self.put(SECTION_TYPES, OP_TYPE_RUNTIME_ARRAY, v2(array, element))
+        self.put(SECTION_ANNOTATIONS, OP_DECORATE, v3(array, DECORATION_ARRAY_STRIDE, stride))
+        block := self.fresh()
+        self.put(SECTION_TYPES, OP_TYPE_STRUCT, v2(block, array))
+        self.put(SECTION_ANNOTATIONS, OP_DECORATE, v2(block, DECORATION_BLOCK))
+        self.put(SECTION_ANNOTATIONS, OP_MEMBER_DECORATE, v4(block, 0, DECORATION_OFFSET, 0))
+        self.declared.insert(key, block)
+        return block
+    }
+
+    // The type of a three-component vector of u32 (the type of the builtin invocation and workgroup indices).
+    fun vector3_type(mut self) -> Result<u64, String> {
+        uint := self.scalar_type(String("U32"))?
+        mut key := String("vector3 ")
+        key.append(String(uint))
+        found := self.declared.get(key.clone())
+        when found.is_some() {
+            return Result::Ok(found.unwrap())
+        }
+        id := self.fresh()
+        self.put(SECTION_TYPES, OP_TYPE_VECTOR, v3(id, uint, 3))
+        self.declared.insert(key, id)
+        return Result::Ok(id)
+    }
+
+    // The Input variable of a builtin index vector (`GlobalInvocationId`, ...), declared on first use. The variable is an
+    // interface of every entry point that reads it.
+    fun builtin_variable(mut self, name: String, builtin: u64) -> Result<u64, String> {
+        found := self.builtins.get(name.clone())
+        when found.is_some() {
+            return Result::Ok(found.unwrap())
+        }
+        vector := self.vector3_type()?
+        pointer := self.pointer_type(STORAGE_INPUT, vector)
+        id := self.fresh()
+        self.put(SECTION_TYPES, OP_VARIABLE, v3(pointer, id, STORAGE_INPUT))
+        self.put(SECTION_ANNOTATIONS, OP_DECORATE, v3(id, DECORATION_BUILTIN, builtin))
+        self.builtins.insert(name, id)
+        self.interface.push(id)
+        return Result::Ok(id)
+    }
+
+    fun void_type(mut self) -> u64 {
+        found := self.declared.get(String("void"))
+        when found.is_some() {
+            return found.unwrap()
+        }
+        id := self.fresh()
+        self.put(SECTION_TYPES, OP_TYPE_VOID, v1(id))
+        self.declared.insert(String("void"), id)
+        return id
+    }
+
+    // The type of a function without parameters and results: the entry points.
+    fun function_type(mut self) -> u64 {
+        found := self.declared.get(String("function void"))
+        when found.is_some() {
+            return found.unwrap()
+        }
+        void := self.void_type()
+        id := self.fresh()
+        self.put(SECTION_TYPES, OP_TYPE_FUNCTION, v2(id, void))
+        self.declared.insert(String("function void"), id)
+        return id
+    }
+
+    // Begins a block: its label, after which instructions go into it.
+    fun start_block(mut self, label: u64) {
+        self.put(SECTION_BODY, OP_LABEL, v1(label))
+        self.block = label
+        self.open = true
+    }
+
+    // Ends the current block with a branch to `target`, unless it has already ended.
+    fun branch(mut self, target: u64) {
+        when self.open {
+            self.put(SECTION_BODY, OP_BRANCH, v1(target))
+            self.open = false
+        }
+    }
+
+    fun load(mut self, pointer: u64, word: String) -> Result<u64, String> {
+        ty := self.scalar_type(word)?
+        id := self.fresh()
+        self.put(SECTION_BODY, OP_LOAD, v3(ty, id, pointer))
+        return Result::Ok(id)
+    }
+
+    fun store(mut self, pointer: u64, value: u64) {
+        self.put(SECTION_BODY, OP_STORE, v2(pointer, value))
+    }
+
+    fun is_shared(self, slot: u64) -> bool {
+        mut at: u64 = 0
+        while at < self.shared.len() {
+            when self.shared[at] == slot {
+                return true
+            }
+            at += 1
+        }
+        return false
+    }
+
+    // The scalar word of an IR type, which must be one.
+    fun scalar_word(self, ty: u64) -> Result<String, String> {
+        return choose self.program.types[ty] {
+            ir::IrTy::Scalar(word) => Result::Ok(word),
+            _ => Result::Err(refused("a value of a type that is not a scalar")),
+        }
+    }
+
+    // One kernel: its buffers, its declarations, its body, and its entry point. Its functions are appended to the module.
+    fun kernel(mut self, function: u64, local_size: u64, shared: Vec<u64>) -> Result<bool, String> {
+        self.body = Vec()
+        self.interface = Vec()
+        self.builtins = Map<String, u64>()
+        self.buffers = Map<u64, u64>()
+        self.buffer_words = Map<u64, String>()
+        self.buffer_storage = Map<u64, u64>()
+        self.locals = Map<u64, u64>()
+        self.local_words = Map<u64, String>()
+        self.array_words = Map<u64, String>()
+        self.array_lengths = Map<u64, u64>()
+        self.counters = Map<u64, u64>()
+        self.loops = Vec()
+        self.shared = shared
+        self.local_size = local_size
+        self.open = false
+        definition := self.program.functions[function]
+        // The buffer parameters: each is a storage block, bound in parameter order.
+        mut binding: u64 = 0
+        mut position: u64 = 0
+        while position + 1 < definition.parameters.len() {
+            self.buffer_parameter(definition.parameters[position], definition.parameters[position + 1], binding)?
+            binding += 1
+            position += 2
+        }
+        entry := self.fresh()
+        label := self.fresh()
+        self.start_block(label)
+        for statement in definition.statements.clone() {
+            self.declare_statement(statement)?
+        }
+        for statement in definition.statements.clone() {
+            self.statement(statement)?
+        }
+        when self.open {
+            self.put(SECTION_BODY, OP_RETURN, Vec())
+            self.open = false
+        }
+        // The entry point: its name, its interface (the builtin indices it reads), and its workgroup size.
+        mut name := String("kernel")
+        when function < self.program.names.len() {
+            name = self.program.names[function].clone()
+        }
+        mut operands: Vec<u64> = Vec()
+        operands.push(EXECUTION_GLCOMPUTE)
+        operands.push(entry)
+        for word in string_words(name) {
+            operands.push(word)
+        }
+        for id in self.interface.clone() {
+            operands.push(id)
+        }
+        self.put(SECTION_ENTRIES, OP_ENTRY_POINT, operands)
+        self.put(SECTION_ENTRIES, OP_EXECUTION_MODE, v5(entry, EXECUTION_MODE_LOCAL_SIZE, self.local_size, 1, 1))
+        // The function: its header, its body, and its end.
+        fn_type := self.function_type()
+        void := self.void_type()
+        self.functions.push((5 << 16) | OP_FUNCTION)
+        self.functions.push(void)
+        self.functions.push(entry)
+        self.functions.push(0)
+        self.functions.push(fn_type)
+        for word in self.body.clone() {
+            self.functions.push(word)
+        }
+        self.functions.push((1 << 16) | OP_FUNCTION_END)
+        return Result::Ok(true)
+    }
+
+    // The element word of a buffer parameter type.
+    fun buffer_element_word(self, ty: u64) -> Result<String, String> {
+        return choose self.program.types[ty] {
+            ir::IrTy::SliceOf(element) => self.scalar_word(element),
+            ir::IrTy::MutSliceOf(element) => self.scalar_word(element),
+            _ => Result::Err(refused("a kernel parameter that is not a buffer")),
+        }
+    }
+
+    // Whether a buffer parameter type is read only (`&[T]`).
+    fun is_read_only(self, ty: u64) -> bool {
+        return choose self.program.types[ty] {
+            ir::IrTy::SliceOf(element) => true,
+            _ => false,
+        }
+    }
+
+    // A buffer parameter `&[T]` (read only) or `&mut [T]`: a storage block, bound at `binding` in descriptor set 0.
+    fun buffer_parameter(mut self, slot: u64, ty: u64, binding: u64) -> Result<bool, String> {
+        element_word := self.buffer_element_word(ty)?
+        readonly := self.is_read_only(ty)
+        element := self.scalar_type(element_word.clone())?
+        block := self.buffer_block(element, width_of(element_word.clone()) / 8)
+        pointer := self.pointer_type(STORAGE_STORAGE_BUFFER, block)
+        var := self.fresh()
+        self.put(SECTION_TYPES, OP_VARIABLE, v3(pointer, var, STORAGE_STORAGE_BUFFER))
+        self.put(SECTION_ANNOTATIONS, OP_DECORATE, v3(var, DECORATION_DESCRIPTOR_SET, 0))
+        self.put(SECTION_ANNOTATIONS, OP_DECORATE, v3(var, DECORATION_BINDING, binding))
+        when readonly {
+            self.put(SECTION_ANNOTATIONS, OP_DECORATE, v2(var, DECORATION_NON_WRITABLE))
+        }
+        self.buffers.insert(slot, var)
+        self.buffer_words.insert(slot, element_word)
+        self.buffer_storage.insert(slot, STORAGE_STORAGE_BUFFER)
+        return Result::Ok(true)
+    }
+
+    // The variables of the function, declared before its first instruction: every local that a `let` or a loop binds.
+    fun declare_statement(mut self, index: u64) -> Result<bool, String> {
+        return choose self.program.stmts[index] {
+            ir::IrStmt::BlockStmt(body) => self.declare_all(body),
+            ir::IrStmt::LetStmt(slot, ty, value, span) => self.declare_let(slot, ty),
+            ir::IrStmt::IfStmt(condition, then_body, else_body) => self.declare_both(then_body, else_body),
+            ir::IrStmt::WhileStmt(setup, condition, body) => self.declare_both(setup, body),
+            ir::IrStmt::ForStmt(slot, end_slot, ty, start, end, inclusive, body) => self.declare_for(slot, end_slot, ty, body),
+            _ => Result::Ok(true),
+        }
+    }
+
+    fun declare_all(mut self, body: Vec<u64>) -> Result<bool, String> {
+        for statement in body {
+            self.declare_statement(statement)?
+        }
+        return Result::Ok(true)
+    }
+
+    fun declare_both(mut self, first: Vec<u64>, second: Vec<u64>) -> Result<bool, String> {
+        self.declare_all(first)?
+        return self.declare_all(second)
+    }
+
+    fun declare_let(mut self, slot: u64, ty: u64) -> Result<bool, String> {
+        when self.is_shared(slot) {
+            return self.declare_shared(slot, ty)
+        }
+        return choose self.program.types[ty] {
+            ir::IrTy::ArrayOf(element, length) => self.declare_array(slot, element, length, STORAGE_FUNCTION),
+            _ => self.declare_scalar(slot, ty, STORAGE_FUNCTION),
+        }
+    }
+
+    fun declare_for(mut self, slot: u64, end_slot: u64, ty: u64, body: Vec<u64>) -> Result<bool, String> {
+        self.declare_scalar(slot, ty, STORAGE_FUNCTION)?
+        self.declare_scalar(end_slot, ty, STORAGE_FUNCTION)?
+        return self.declare_all(body)
+    }
+
+    // A scalar local: a Function variable of its type.
+    fun declare_scalar(mut self, slot: u64, ty: u64, storage: u64) -> Result<bool, String> {
+        word := self.scalar_word(ty)?
+        ty_id := self.scalar_type(word.clone())?
+        pointer := self.pointer_type(storage, ty_id)
+        var := self.fresh()
+        self.put(SECTION_BODY, OP_VARIABLE, v3(pointer, var, storage))
+        self.locals.insert(slot, var)
+        self.local_words.insert(slot, word)
+        return Result::Ok(true)
+    }
+
+    // A fixed array local: a Function variable of the array type, whose elements are its own slots.
+    fun declare_array(mut self, slot: u64, element: u64, length: u64, storage: u64) -> Result<bool, String> {
+        word := self.scalar_word(element)?
+        element_id := self.scalar_type(word.clone())?
+        array := self.array_type(element_id, length, 0)
+        pointer := self.pointer_type(storage, array)
+        var := self.fresh()
+        self.put(SECTION_BODY, OP_VARIABLE, v3(pointer, var, storage))
+        self.locals.insert(slot, var)
+        self.array_words.insert(slot, word)
+        self.array_lengths.insert(slot, length)
+        return Result::Ok(true)
+    }
+
+    // A `shared` array: a Workgroup variable, shared by the invocations of the workgroup. Its loop counter is a local.
+    fun declare_shared(mut self, slot: u64, ty: u64) -> Result<bool, String> {
+        return choose self.program.types[ty] {
+            ir::IrTy::ArrayOf(element, length) => self.declare_workgroup(slot, element, length),
+            _ => Result::Err(refused("a `shared` value that is not an array")),
+        }
+    }
+
+    fun declare_workgroup(mut self, slot: u64, element: u64, length: u64) -> Result<bool, String> {
+        word := self.scalar_word(element)?
+        element_id := self.scalar_type(word.clone())?
+        array := self.array_type(element_id, length, width_of(word.clone()) / 8)
+        pointer := self.pointer_type(STORAGE_WORKGROUP, array)
+        var := self.fresh()
+        self.put(SECTION_TYPES, OP_VARIABLE, v3(pointer, var, STORAGE_WORKGROUP))
+        self.locals.insert(slot, var)
+        self.array_words.insert(slot, word)
+        self.array_lengths.insert(slot, length)
+        uint := self.scalar_type(String("U32"))?
+        counter_pointer := self.pointer_type(STORAGE_FUNCTION, uint)
+        counter := self.fresh()
+        self.put(SECTION_BODY, OP_VARIABLE, v3(counter_pointer, counter, STORAGE_FUNCTION))
+        self.counters.insert(slot, counter)
+        return Result::Ok(true)
+    }
+
+    // The instructions of a statement list.
+    fun statements(mut self, body: Vec<u64>) -> Result<bool, String> {
+        for statement in body {
+            self.statement(statement)?
+        }
+        return Result::Ok(true)
+    }
+
+    fun statement(mut self, index: u64) -> Result<bool, String> {
+        // A statement after a branch or return is unreachable; it goes into a block of its own, which has no predecessor.
+        when !self.open {
+            label := self.fresh()
+            self.start_block(label)
+        }
+        return choose self.program.stmts[index] {
+            ir::IrStmt::BlockStmt(body) => self.statements(body),
+            ir::IrStmt::DropStmt(slots, types) => Result::Ok(true),
+            ir::IrStmt::LetStmt(slot, ty, value, span) => self.let_statement(slot, ty, value),
+            ir::IrStmt::AssignStmt(slot, ty, value, span) => self.scalar_assign(slot, value),
+            ir::IrStmt::ArrayAssignStmt(slot, element, length, index, value, span) => self.array_assign(slot, length, index, value),
+            ir::IrStmt::DereferenceAssignStmt(pointer, ty, value) => self.dereference_assign(pointer, value),
+            ir::IrStmt::CallStmt(target, arguments) => self.call_statement(target, arguments),
+            ir::IrStmt::IfStmt(condition, then_body, else_body) => self.if_statement(condition, then_body, else_body),
+            ir::IrStmt::WhileStmt(setup, condition, body) => self.while_statement(setup, condition, body),
+            ir::IrStmt::ForStmt(slot, end_slot, ty, start, end, inclusive, body) => self.for_statement(slot, end_slot, ty, start, end, inclusive, body),
+            ir::IrStmt::BreakStmt => self.jump(true),
+            ir::IrStmt::ContinueStmt => self.jump(false),
+            ir::IrStmt::ReturnStmt(value) => self.return_statement(value),
+            _ => Result::Err(refused("this statement in a kernel")),
+        }
+    }
+
+    // `let`: a scalar is stored into its variable; a fixed array is filled from its repeat or its items; a `shared` array
+    // is zeroed by the invocations of the workgroup, then the workgroup waits for them.
+    fun let_statement(mut self, slot: u64, ty: u64, value: u64) -> Result<bool, String> {
+        when self.is_shared(slot) {
+            return self.zero_shared(slot)
+        }
+        return choose self.program.types[ty] {
+            ir::IrTy::ArrayOf(element, length) => self.array_value(slot, length, value),
+            _ => self.scalar_assign(slot, value),
+        }
+    }
+
+    fun scalar_assign(mut self, slot: u64, value: u64) -> Result<bool, String> {
+        v := self.value(value)?
+        var := self.local_variable(slot)?
+        self.store(var, v.id)
+        return Result::Ok(true)
+    }
+
+    fun local_variable(self, slot: u64) -> Result<u64, String> {
+        found := self.locals.get(slot)
+        when found.is_none() {
+            return Result::Err(refused("a local that is not a variable of its own"))
+        }
+        return Result::Ok(found.unwrap())
+    }
+
+    // A fixed array's elements, from `[item; n]` or `[a, b, ...]`.
+    fun array_value(mut self, slot: u64, length: u64, value: u64) -> Result<bool, String> {
+        var := self.local_variable(slot)?
+        word := self.array_words.get(slot).unwrap()
+        return choose self.program.exprs[value] {
+            ir::IrExpr::ArrayRepeat(item, count) => self.fill_array(var, word, count, item),
+            ir::IrExpr::ArrayValue(items) => self.store_items(var, word, items),
+            _ => Result::Err(refused("an array value that is not a repeat or a list of items")),
+        }
+    }
+
+    fun fill_array(mut self, var: u64, word: String, count: u64, item: u64) -> Result<bool, String> {
+        when count > 256 {
+            return Result::Err(refused("an array of more than 256 elements in a kernel"))
+        }
+        v := self.value(item)?
+        mut at: u64 = 0
+        while at < count {
+            index := self.u32_constant(at)
+            elem := self.element_of_local(var, word.clone(), index)?
+            self.store(elem, v.id)
+            at += 1
+        }
+        return Result::Ok(true)
+    }
+
+    fun store_items(mut self, var: u64, word: String, items: Vec<u64>) -> Result<bool, String> {
+        when items.len() > 256 {
+            return Result::Err(refused("an array of more than 256 elements in a kernel"))
+        }
+        mut at: u64 = 0
+        for item in items {
+            v := self.value(item)?
+            index := self.u32_constant(at)
+            elem := self.element_of_local(var, word.clone(), index)?
+            self.store(elem, v.id)
+            at += 1
+        }
+        return Result::Ok(true)
+    }
+
+    // The pointer to an element of a local array (Function storage) at a constant index.
+    fun element_of_local(mut self, var: u64, word: String, index: u64) -> Result<u64, String> {
+        elem := self.scalar_type(word)?
+        pointer := self.pointer_type(STORAGE_FUNCTION, elem)
+        id := self.fresh()
+        self.put(SECTION_BODY, OP_ACCESS_CHAIN, v4(pointer, id, var, index))
+        return Result::Ok(id)
+    }
+
+    // The invocations of the workgroup zero a `shared` array, each starting at its local index and stepping by the workgroup
+    // size, and then the workgroup waits for all of them. The zeros are stored before the first read.
+    fun zero_shared(mut self, slot: u64) -> Result<bool, String> {
+        var := self.local_variable(slot)?
+        counter := self.counters.get(slot).unwrap()
+        word := self.array_words.get(slot).unwrap()
+        length := self.array_lengths.get(slot).unwrap()
+        local := self.builtin_index(String("LocalInvocationId"), BUILTIN_LOCAL_INVOCATION_ID)?
+        self.store(counter, local.id)
+        header := self.fresh()
+        body_label := self.fresh()
+        cont := self.fresh()
+        merge := self.fresh()
+        self.branch(header)
+        self.start_block(header)
+        i := self.load(counter, String("U32"))?
+        bound := self.u32_constant(length)
+        boolean := self.scalar_type(String("Bool"))?
+        inside := self.fresh()
+        self.put(SECTION_BODY, OP_U_LESS_THAN, v4(boolean, inside, i, bound))
+        self.put(SECTION_BODY, OP_LOOP_MERGE, v3(merge, cont, 0))
+        self.put(SECTION_BODY, OP_BRANCH_CONDITIONAL, v3(inside, body_label, merge))
+        self.open = false
+        self.start_block(body_label)
+        at := self.load(counter, String("U32"))?
+        elem_type := self.scalar_type(word.clone())?
+        pointer := self.pointer_type(STORAGE_WORKGROUP, elem_type)
+        elem := self.fresh()
+        self.put(SECTION_BODY, OP_ACCESS_CHAIN, v4(pointer, elem, var, at))
+        zero := self.zero(word)?
+        self.store(elem, zero)
+        self.branch(cont)
+        self.start_block(cont)
+        step := self.load(counter, String("U32"))?
+        size := self.local_size
+        stride := self.u32_constant(size)
+        next := self.fresh()
+        uint := self.scalar_type(String("U32"))?
+        self.put(SECTION_BODY, OP_I_ADD, v4(uint, next, step, stride))
+        self.store(counter, next)
+        self.branch(header)
+        self.start_block(merge)
+        self.barrier()
+        return Result::Ok(true)
+    }
+
+    // A workgroup barrier: every invocation of the workgroup reaches it before any continues, and the workgroup's memory
+    // accesses before it are visible after it.
+    fun barrier(mut self) {
+        workgroup := self.u32_constant(SCOPE_WORKGROUP)
+        semantics := self.u32_constant(SEMANTICS_BARRIER)
+        self.put(SECTION_BODY, OP_CONTROL_BARRIER, v3(workgroup, workgroup, semantics))
+    }
+
+    fun array_assign(mut self, slot: u64, length: u64, index: u64, value: u64) -> Result<bool, String> {
+        buffer := self.array_buffer(slot)?
+        idx := self.value(index)?
+        v := self.value(value)?
+        when self.literal_below(index, length) {
+            pointer := self.element_pointer(buffer, idx.id)?
+            self.store(pointer, v.id)
+            return Result::Ok(true)
+        }
+        width := self.index_word(idx.word.clone())
+        bound := self.int_value(length, width)?
+        inside := self.below(idx.clone(), bound)?
+        store_label := self.fresh()
+        skip := self.fresh()
+        merge := self.fresh()
+        self.put(SECTION_BODY, OP_SELECTION_MERGE, v2(merge, 0))
+        self.put(SECTION_BODY, OP_BRANCH_CONDITIONAL, v3(inside, store_label, skip))
+        self.open = false
+        self.start_block(store_label)
+        pointer := self.element_pointer(buffer, idx.id)?
+        self.store(pointer, v.id)
+        self.branch(merge)
+        self.start_block(skip)
+        self.branch(merge)
+        self.start_block(merge)
+        return Result::Ok(true)
+    }
+
+    // `buffer[index] = value` through a pointer to an element: the store happens only for an index inside the buffer.
+    fun dereference_assign(mut self, pointer: u64, value: u64) -> Result<bool, String> {
+        return choose self.program.exprs[pointer] {
+            ir::IrExpr::SliceElementAddress(slice, index, ty, span) => self.element_store(slice, index, value),
+            _ => Result::Err(refused("a store through a pointer other than an element of a buffer")),
+        }
+    }
+
+    fun element_store(mut self, slice: u64, index: u64, value: u64) -> Result<bool, String> {
+        buffer := self.buffer_of(slice)?
+        idx := self.value(index)?
+        v := self.value(value)?
+        length := self.length_value(buffer.clone())?
+        inside := self.below(idx.clone(), length)?
+        store_label := self.fresh()
+        skip := self.fresh()
+        merge := self.fresh()
+        self.put(SECTION_BODY, OP_SELECTION_MERGE, v2(merge, 0))
+        self.put(SECTION_BODY, OP_BRANCH_CONDITIONAL, v3(inside, store_label, skip))
+        self.open = false
+        self.start_block(store_label)
+        pointer := self.element_pointer(buffer, idx.id)?
+        self.store(pointer, v.id)
+        self.branch(merge)
+        self.start_block(skip)
+        self.branch(merge)
+        self.start_block(merge)
+        return Result::Ok(true)
+    }
+
+    fun call_statement(mut self, target: ir::CallTarget, arguments: Vec<u64>) -> Result<bool, String> {
+        return choose target {
+            ir::CallTarget::GpuOp(name) => self.gpu_statement(name, arguments),
+            _ => Result::Err(refused("a call of a Ryn function from a kernel")),
+        }
+    }
+
+    fun gpu_statement(mut self, name: String, arguments: Vec<u64>) -> Result<bool, String> {
+        when name == "Barrier" {
+            self.barrier()
+            return Result::Ok(true)
+        }
+        when name == "AtomicAdd" {
+            self.atomic_add(arguments)?
+            return Result::Ok(true)
+        }
+        return Result::Err(refused("this GPU builtin as a statement"))
+    }
+
+    fun if_statement(mut self, condition: u64, then_body: Vec<u64>, else_body: Vec<u64>) -> Result<bool, String> {
+        c := self.value(condition)?
+        then_label := self.fresh()
+        else_label := self.fresh()
+        merge := self.fresh()
+        self.put(SECTION_BODY, OP_SELECTION_MERGE, v2(merge, 0))
+        self.put(SECTION_BODY, OP_BRANCH_CONDITIONAL, v3(c.id, then_label, else_label))
+        self.open = false
+        self.start_block(then_label)
+        self.statements(then_body)?
+        self.branch(merge)
+        self.start_block(else_label)
+        self.statements(else_body)?
+        self.branch(merge)
+        self.start_block(merge)
+        return Result::Ok(true)
+    }
+
+    // `while`: the header merges with the loop's exit and continues to the condition, which runs the setup statements first.
+    fun while_statement(mut self, setup: Vec<u64>, condition: u64, body: Vec<u64>) -> Result<bool, String> {
+        header := self.fresh()
+        cond_label := self.fresh()
+        body_label := self.fresh()
+        cont := self.fresh()
+        merge := self.fresh()
+        self.branch(header)
+        self.start_block(header)
+        self.put(SECTION_BODY, OP_LOOP_MERGE, v3(merge, cont, 0))
+        self.put(SECTION_BODY, OP_BRANCH, v1(cond_label))
+        self.open = false
+        self.start_block(cond_label)
+        self.statements(setup)?
+        c := self.value(condition)?
+        self.put(SECTION_BODY, OP_BRANCH_CONDITIONAL, v3(c.id, body_label, merge))
+        self.open = false
+        self.loops.push(merge)
+        self.loops.push(cont)
+        self.start_block(body_label)
+        self.statements(body)?
+        self.branch(cont)
+        self.loops.pop()
+        self.loops.pop()
+        self.start_block(cont)
+        self.branch(header)
+        self.start_block(merge)
+        return Result::Ok(true)
+    }
+
+    // `for slot in start..end` (or `..=`): the end is evaluated once, and the variable steps from start while it is below.
+    fun for_statement(mut self, slot: u64, end_slot: u64, ty: u64, start: u64, end: u64, inclusive: bool, body: Vec<u64>) -> Result<bool, String> {
+        word := self.scalar_word(ty)?
+        when is_float_word(word.clone()) {
+            return Result::Err(refused("a range over floats"))
+        }
+        s := self.value(start)?
+        e := self.value(end)?
+        var := self.local_variable(slot)?
+        end_var := self.local_variable(end_slot)?
+        self.store(var, s.id)
+        self.store(end_var, e.id)
+        header := self.fresh()
+        body_label := self.fresh()
+        cont := self.fresh()
+        merge := self.fresh()
+        self.branch(header)
+        self.start_block(header)
+        k := self.load(var, word.clone())?
+        bound := self.load(end_var, word.clone())?
+        boolean := self.scalar_type(String("Bool"))?
+        signed := is_signed_word(word.clone())
+        inside := self.fresh()
+        mut opcode := OP_U_LESS_THAN
+        when signed && inclusive {
+            opcode = OP_S_LESS_THAN_EQUAL
+        } else when signed {
+            opcode = OP_S_LESS_THAN
+        } else when inclusive {
+            opcode = OP_U_LESS_THAN_EQUAL
+        }
+        self.put(SECTION_BODY, opcode, v4(boolean, inside, k, bound))
+        self.put(SECTION_BODY, OP_LOOP_MERGE, v3(merge, cont, 0))
+        self.put(SECTION_BODY, OP_BRANCH_CONDITIONAL, v3(inside, body_label, merge))
+        self.open = false
+        self.loops.push(merge)
+        self.loops.push(cont)
+        self.start_block(body_label)
+        self.statements(body)?
+        self.branch(cont)
+        self.loops.pop()
+        self.loops.pop()
+        self.start_block(cont)
+        current := self.load(var, word.clone())?
+        one := self.constant_of(word.clone(), 1)?
+        ty_id := self.scalar_type(word)?
+        next := self.fresh()
+        self.put(SECTION_BODY, OP_I_ADD, v4(ty_id, next, current, one))
+        self.store(var, next)
+        self.branch(header)
+        self.start_block(merge)
+        return Result::Ok(true)
+    }
+
+    // `break` and `continue` leave the innermost loop: its merge or its continue block.
+    fun jump(mut self, is_break: bool) -> Result<bool, String> {
+        count := self.loops.len()
+        when count == 0 {
+            return Result::Err(refused("`break` or `continue` outside a loop of a kernel"))
+        }
+        mut target := self.loops[count - 1]
+        when is_break {
+            target = self.loops[count - 2]
+        }
+        self.branch(target)
+        return Result::Ok(true)
+    }
+
+    fun return_statement(mut self, value: Option<u64>) -> Result<bool, String> {
+        when value.is_some() {
+            return Result::Err(refused("a return value in a kernel"))
+        }
+        when self.open {
+            self.put(SECTION_BODY, OP_RETURN, Vec())
+            self.open = false
+        }
+        return Result::Ok(true)
+    }
+
+    // ---- Values ----
+
+    // The width at which an index is compared: 64 bits for a 64-bit index, 32 bits otherwise.
+    fun index_word(self, word: String) -> String {
+        when word == "U64" || word == "I64" {
+            return String("U64")
+        }
+        return String("U32")
+    }
+
+    // An integer constant of a scalar word, as a value.
+    fun int_value(mut self, bits: u64, word: String) -> Result<Value, String> {
+        ty := self.scalar_type(word.clone())?
+        id := self.constant(ty, word.clone(), bits)
+        return Result::Ok(Value { id: id, word: word })
+    }
+
+    fun constant_of(mut self, word: String, bits: u64) -> Result<u64, String> {
+        ty := self.scalar_type(word.clone())?
+        return Result::Ok(self.constant(ty, word, bits))
+    }
+
+    // Whether the index expression is an integer literal below `length`, so that its element access needs no check.
+    fun literal_below(self, index: u64, length: u64) -> bool {
+        return choose self.program.exprs[index] {
+            ir::IrExpr::IntegerLit(text, ty) => literal_bits(text) < length,
+            _ => false,
+        }
+    }
+
+    // An instruction with one result, of the type `ty`, from two or one operands.
+    fun binop(mut self, opcode: u64, ty: u64, a: u64, b: u64) -> u64 {
+        id := self.fresh()
+        self.put(SECTION_BODY, opcode, v4(ty, id, a, b))
+        return id
+    }
+
+    fun unop(mut self, opcode: u64, ty: u64, a: u64) -> u64 {
+        id := self.fresh()
+        self.put(SECTION_BODY, opcode, v3(ty, id, a))
+        return id
+    }
+
+    fun select(mut self, ty: u64, condition: u64, when_true: u64, when_false: u64) -> u64 {
+        id := self.fresh()
+        self.put(SECTION_BODY, OP_SELECT, v5(ty, id, condition, when_true, when_false))
+        return id
+    }
+
+    fun integer_literal(mut self, text: String, ty: u64) -> Result<Value, String> {
+        word := self.scalar_word(ty)?
+        ty_id := self.scalar_type(word.clone())?
+        id := self.constant(ty_id, word.clone(), literal_bits(text))
+        return Result::Ok(Value { id: id, word: word })
+    }
+
+    fun float_literal(mut self, bits: u64, ty: u64) -> Result<Value, String> {
+        word := self.scalar_word(ty)?
+        ty_id := self.scalar_type(word.clone())?
+        mut narrowed := bits
+        when word == "F32" {
+            narrowed = f32_bits_of(bits)
+        }
+        id := self.float_constant(ty_id, word.clone(), narrowed)
+        return Result::Ok(Value { id: id, word: word })
+    }
+
+    fun local_value(mut self, slot: u64) -> Result<Value, String> {
+        found := self.local_words.get(slot)
+        when found.is_none() {
+            return Result::Err(refused("an array or a buffer used as a value"))
+        }
+        word := found.unwrap()
+        var := self.local_variable(slot)?
+        id := self.load(var, word.clone())?
+        return Result::Ok(Value { id: id, word: word })
+    }
+
+    // The value of an expression, which is computed into the current block.
+    fun value(mut self, index: u64) -> Result<Value, String> {
+        return choose self.program.exprs[index] {
+            ir::IrExpr::IntegerLit(text, ty) => self.integer_literal(text, ty),
+            ir::IrExpr::FloatLit(bits, ty) => self.float_literal(bits, ty),
+            ir::IrExpr::BoolLit(flag) => self.bool_value(flag),
+            ir::IrExpr::LocalRef(slot, ty, span) => self.local_value(slot),
+            ir::IrExpr::Binary(op, left, right, ty) => self.binary(op, left, right),
+            ir::IrExpr::Negate(operand, ty) => self.negate(operand, ty),
+            ir::IrExpr::Not(operand) => self.not(operand),
+            ir::IrExpr::BitNot(operand, ty) => self.bit_not(operand, ty),
+            ir::IrExpr::CastExpr(operand, source, target) => self.cast(operand, target),
+            ir::IrExpr::CallExpr(target, arguments, ty) => self.call_value(target, arguments),
+            ir::IrExpr::SliceIndex(slice, index, ty) => self.slice_read(slice, index),
+            ir::IrExpr::ArrayIndex(array, index, ty, length) => self.array_read(array, index, length),
+            ir::IrExpr::IfExpr(condition, then_value, else_value, ty) => self.if_value(condition, then_value, else_value),
+            _ => Result::Err(refused("this expression in a kernel")),
+        }
+    }
+
+    fun bool_value(mut self, flag: bool) -> Result<Value, String> {
+        id := self.boolean_constant(flag)
+        return Result::Ok(Value { id: id, word: String("Bool") })
+    }
+
+    // `a op b` for the operators of the IR. Comparisons give a `bool`; the others have the operands' type.
+    fun binary(mut self, op: String, left: u64, right: u64) -> Result<Value, String> {
+        when op == "And" || op == "Or" {
+            return self.logical(op, left, right)
+        }
+        a := self.value(left)?
+        b := self.value(right)?
+        when is_comparison(op.clone()) {
+            return self.compare(op, a, b)
+        }
+        when a.word == "Bool" {
+            return self.boolean_binary(op, a, b)
+        }
+        when op == "Div" || op == "Rem" {
+            return self.divide(op, a, b)
+        }
+        when op == "ShiftLeft" || op == "ShiftRight" {
+            return self.shift(op, a, b)
+        }
+        opcode := arithmetic_opcode(op, is_float_word(a.word.clone()))?
+        ty := self.scalar_type(a.word.clone())?
+        id := self.binop(opcode, ty, a.id, b.id)
+        return Result::Ok(Value { id: id, word: a.word })
+    }
+
+    // `&&` and `||`: the right operand runs only when the left one does not decide the result, as in Ryn.
+    fun logical(mut self, op: String, left: u64, right: u64) -> Result<Value, String> {
+        a := self.value(left)?
+        right_label := self.fresh()
+        short := self.fresh()
+        merge := self.fresh()
+        mut when_true := right_label
+        mut when_false := short
+        mut decided := false
+        when op == "Or" {
+            when_true = short
+            when_false = right_label
+            decided = true
+        }
+        self.put(SECTION_BODY, OP_SELECTION_MERGE, v2(merge, 0))
+        self.put(SECTION_BODY, OP_BRANCH_CONDITIONAL, v3(a.id, when_true, when_false))
+        self.open = false
+        self.start_block(right_label)
+        b := self.value(right)?
+        right_end := self.block
+        self.branch(merge)
+        self.start_block(short)
+        known := self.boolean_constant(decided)
+        self.branch(merge)
+        self.start_block(merge)
+        boolean := self.scalar_type(String("Bool"))?
+        result := self.fresh()
+        self.put(SECTION_BODY, OP_PHI, v6(boolean, result, b.id, right_end, known, short))
+        return Result::Ok(Value { id: result, word: String("Bool") })
+    }
+
+    fun compare(mut self, op: String, a: Value, b: Value) -> Result<Value, String> {
+        opcode := compare_opcode(op, a.word.clone())?
+        boolean := self.scalar_type(String("Bool"))?
+        id := self.binop(opcode, boolean, a.id, b.id)
+        return Result::Ok(Value { id: id, word: String("Bool") })
+    }
+
+    fun boolean_binary(mut self, op: String, a: Value, b: Value) -> Result<Value, String> {
+        mut opcode: u64 = OP_LOGICAL_NOT_EQUAL
+        when op == "BitAnd" {
+            opcode = OP_LOGICAL_AND
+        } else when op == "BitOr" {
+            opcode = OP_LOGICAL_OR
+        } else when op == "Eq" {
+            opcode = OP_LOGICAL_EQUAL
+        } else when op == "BitXor" || op == "Ne" {
+            opcode = OP_LOGICAL_NOT_EQUAL
+        } else {
+            return Result::Err(refused("this operator on `bool` values"))
+        }
+        boolean := self.scalar_type(String("Bool"))?
+        id := self.binop(opcode, boolean, a.id, b.id)
+        return Result::Ok(Value { id: id, word: String("Bool") })
+    }
+
+    // Integer division and remainder that do not trap: a zero divisor gives zero, and for a signed type the quotient of the
+    // smallest value by -1 is its negation (the remainder is zero).
+    fun divide(mut self, op: String, a: Value, b: Value) -> Result<Value, String> {
+        word := a.word.clone()
+        when is_float_word(word.clone()) {
+            opcode := arithmetic_opcode(op, true)?
+            ty := self.scalar_type(word.clone())?
+            id := self.binop(opcode, ty, a.id, b.id)
+            return Result::Ok(Value { id: id, word: word })
+        }
+        ty := self.scalar_type(word.clone())?
+        boolean := self.scalar_type(String("Bool"))?
+        zero := self.constant_of(word.clone(), 0)?
+        one := self.constant_of(word.clone(), 1)?
+        is_zero := self.binop(OP_I_EQUAL, boolean, b.id, zero)
+        mut quotient: u64 = 0
+        when is_signed_word(word.clone()) {
+            ones := self.constant_of(word.clone(), all_ones(width_of(word.clone())))?
+            is_minus := self.binop(OP_I_EQUAL, boolean, b.id, ones)
+            bad := self.binop(OP_LOGICAL_OR, boolean, is_zero, is_minus)
+            divisor := self.select(ty, bad, one, b.id)
+            truncated := self.binop(OP_S_DIV, ty, a.id, divisor)
+            when op == "Div" {
+                negated := self.binop(OP_I_SUB, ty, zero, a.id)
+                quotient = self.select(ty, is_minus, negated, truncated)
+            } else {
+                // The remainder is a - divisor * quotient, from the truncated quotient, so its sign follows the dividend as
+                // it does on the CPU. OpSRem is not used: some drivers compute it with the sign of the divisor.
+                product := self.binop(OP_I_MUL, ty, divisor, truncated)
+                quotient = self.binop(OP_I_SUB, ty, a.id, product)
+            }
+        } else {
+            divisor := self.select(ty, is_zero, one, b.id)
+            quotient = self.binop(unsigned_division_opcode(op.clone()), ty, a.id, divisor)
+        }
+        result := self.select(ty, is_zero, zero, quotient)
+        return Result::Ok(Value { id: result, word: word })
+    }
+
+    // A shift by the count taken modulo the width of the shifted value.
+    fun shift(mut self, op: String, a: Value, b: Value) -> Result<Value, String> {
+        word := a.word.clone()
+        count := self.convert(b, word.clone())?
+        ty := self.scalar_type(word.clone())?
+        mask := self.constant_of(word.clone(), width_of(word.clone()) - 1)?
+        masked := self.binop(OP_BITWISE_AND, ty, count.id, mask)
+        mut opcode: u64 = OP_SHIFT_LEFT_LOGICAL
+        when op == "ShiftRight" {
+            opcode = OP_SHIFT_RIGHT_LOGICAL
+            when is_signed_word(word.clone()) {
+                opcode = OP_SHIFT_RIGHT_ARITHMETIC
+            }
+        }
+        id := self.binop(opcode, ty, a.id, masked)
+        return Result::Ok(Value { id: id, word: word })
+    }
+
+    fun negate(mut self, operand: u64, ty: u64) -> Result<Value, String> {
+        v := self.value(operand)?
+        ty_id := self.scalar_type(v.word.clone())?
+        mut id: u64 = 0
+        when is_float_word(v.word.clone()) {
+            id = self.unop(OP_F_NEGATE, ty_id, v.id)
+        } else {
+            zero := self.constant_of(v.word.clone(), 0)?
+            id = self.binop(OP_I_SUB, ty_id, zero, v.id)
+        }
+        return Result::Ok(Value { id: id, word: v.word })
+    }
+
+    fun not(mut self, operand: u64) -> Result<Value, String> {
+        v := self.value(operand)?
+        boolean := self.scalar_type(String("Bool"))?
+        id := self.unop(OP_LOGICAL_NOT, boolean, v.id)
+        return Result::Ok(Value { id: id, word: String("Bool") })
+    }
+
+    fun bit_not(mut self, operand: u64, ty: u64) -> Result<Value, String> {
+        v := self.value(operand)?
+        ty_id := self.scalar_type(v.word.clone())?
+        id := self.unop(OP_NOT, ty_id, v.id)
+        return Result::Ok(Value { id: id, word: v.word })
+    }
+
+    fun cast(mut self, operand: u64, target: u64) -> Result<Value, String> {
+        v := self.value(operand)?
+        word := self.scalar_word(target)?
+        return self.convert(v, word)
+    }
+
+    // A conversion between the integer and float words, as `as` gives it.
+    fun convert(mut self, v: Value, target: String) -> Result<Value, String> {
+        when v.word == target {
+            return Result::Ok(v)
+        }
+        when v.word == "Bool" || target == "Bool" {
+            return Result::Err(refused("a conversion of a `bool`"))
+        }
+        ty := self.scalar_type(target.clone())?
+        source_float := is_float_word(v.word.clone())
+        target_float := is_float_word(target.clone())
+        mut opcode: u64 = OP_F_CONVERT
+        when !source_float && !target_float {
+            opcode = OP_U_CONVERT
+            when width_of(v.word.clone()) == width_of(target.clone()) {
+                opcode = OP_BITCAST
+            } else when width_of(target.clone()) > width_of(v.word.clone()) && is_signed_word(v.word.clone()) {
+                opcode = OP_S_CONVERT
+            }
+        } else when !source_float {
+            opcode = OP_CONVERT_U_TO_F
+            when is_signed_word(v.word.clone()) {
+                opcode = OP_CONVERT_S_TO_F
+            }
+        } else when !target_float {
+            opcode = OP_CONVERT_F_TO_U
+            when is_signed_word(target.clone()) {
+                opcode = OP_CONVERT_F_TO_S
+            }
+        }
+        id := self.unop(opcode, ty, v.id)
+        return Result::Ok(Value { id: id, word: target })
+    }
+
+    fun call_value(mut self, target: ir::CallTarget, arguments: Vec<u64>) -> Result<Value, String> {
+        return choose target {
+            ir::CallTarget::GpuOp(name) => self.gpu_value(name, arguments),
+            ir::CallTarget::SliceLen => self.slice_length(arguments),
+            _ => Result::Err(refused("a call of a Ryn function from a kernel")),
+        }
+    }
+
+    fun gpu_value(mut self, name: String, arguments: Vec<u64>) -> Result<Value, String> {
+        when name == "GlobalId" {
+            return self.builtin_index(String("GlobalInvocationId"), BUILTIN_GLOBAL_INVOCATION_ID)
+        }
+        when name == "LocalId" {
+            return self.builtin_index(String("LocalInvocationId"), BUILTIN_LOCAL_INVOCATION_ID)
+        }
+        when name == "GroupId" {
+            return self.builtin_index(String("WorkgroupId"), BUILTIN_WORKGROUP_ID)
+        }
+        when name == "AtomicAdd" {
+            return self.atomic_add(arguments)
+        }
+        return Result::Err(refused("this GPU builtin"))
+    }
+
+    // The x component of a builtin index vector.
+    fun builtin_index(mut self, name: String, builtin: u64) -> Result<Value, String> {
+        variable := self.builtin_variable(name, builtin)?
+        vector := self.vector3_type()?
+        uint := self.scalar_type(String("U32"))?
+        loaded := self.fresh()
+        self.put(SECTION_BODY, OP_LOAD, v3(vector, loaded, variable))
+        id := self.fresh()
+        self.put(SECTION_BODY, OP_COMPOSITE_EXTRACT, v4(uint, id, loaded, 0))
+        return Result::Ok(Value { id: id, word: String("U32") })
+    }
+
+    // The length of a buffer, as a `u64` as `len()` gives it.
+    fun slice_length(mut self, arguments: Vec<u64>) -> Result<Value, String> {
+        buffer := self.buffer_of(arguments[0])?
+        length := self.length_value(buffer)?
+        return self.convert(length, String("U64"))
+    }
+
+    fun length_value(mut self, buffer: Buffer) -> Result<Value, String> {
+        when buffer.runtime {
+            uint := self.scalar_type(String("U32"))?
+            id := self.fresh()
+            self.put(SECTION_BODY, OP_ARRAY_LENGTH, v4(uint, id, buffer.var, 0))
+            return Result::Ok(Value { id: id, word: String("U32") })
+        }
+        return self.int_value(buffer.length, String("U32"))
+    }
+
+    // Whether `index` is below `bound`, compared at the width of the index.
+    fun below(mut self, index: Value, bound: Value) -> Result<u64, String> {
+        width := self.index_word(index.word.clone())
+        a := self.convert(index, width.clone())?
+        b := self.convert(bound, width)?
+        boolean := self.scalar_type(String("Bool"))?
+        return Result::Ok(self.binop(OP_U_LESS_THAN, boolean, a.id, b.id))
+    }
+
+    // ---- Buffers and arrays ----
+
+    // The buffer parameter or the array that a slice expression names.
+    fun buffer_of(mut self, slice: u64) -> Result<Buffer, String> {
+        return choose self.program.exprs[slice] {
+            ir::IrExpr::LocalRef(slot, ty, span) => self.buffer_parameter_of(slot),
+            ir::IrExpr::ArrayAsSlice(array, slice_id, length) => self.array_slice_buffer(array),
+            _ => Result::Err(refused("a slice that is not a buffer parameter or an array")),
+        }
+    }
+
+    fun buffer_parameter_of(self, slot: u64) -> Result<Buffer, String> {
+        found := self.buffers.get(slot)
+        when found.is_none() {
+            return Result::Err(refused("a slice local that is not a buffer parameter"))
+        }
+        return Result::Ok(Buffer { var: found.unwrap(), element: self.buffer_words.get(slot).unwrap(), storage: STORAGE_STORAGE_BUFFER, runtime: true, length: 0 })
+    }
+
+    fun array_slice_buffer(mut self, array: u64) -> Result<Buffer, String> {
+        slot := self.array_slot(array)?
+        return self.array_buffer(slot)
+    }
+
+    fun array_slot(self, array: u64) -> Result<u64, String> {
+        return choose self.program.exprs[array] {
+            ir::IrExpr::LocalRef(slot, ty, span) => Result::Ok(slot),
+            _ => Result::Err(refused("an array that is not a local")),
+        }
+    }
+
+    // A fixed array local, as an element storage of its own.
+    fun array_buffer(self, slot: u64) -> Result<Buffer, String> {
+        var := self.local_variable(slot)?
+        found := self.array_words.get(slot)
+        when found.is_none() {
+            return Result::Err(refused("an access to a value that is not an array"))
+        }
+        mut storage := STORAGE_FUNCTION
+        when self.is_shared(slot) {
+            storage = STORAGE_WORKGROUP
+        }
+        return Result::Ok(Buffer { var: var, element: found.unwrap(), storage: storage, runtime: false, length: self.array_lengths.get(slot).unwrap() })
+    }
+
+    // The pointer to element `index` of a buffer or an array.
+    fun element_pointer(mut self, buffer: Buffer, index: u64) -> Result<u64, String> {
+        elem := self.scalar_type(buffer.element.clone())?
+        id := self.fresh()
+        when buffer.runtime {
+            zero := self.u32_constant(0)
+            pointer := self.pointer_type(STORAGE_STORAGE_BUFFER, elem)
+            self.put(SECTION_BODY, OP_ACCESS_CHAIN, v5(pointer, id, buffer.var, zero, index))
+        } else {
+            pointer := self.pointer_type(buffer.storage, elem)
+            self.put(SECTION_BODY, OP_ACCESS_CHAIN, v4(pointer, id, buffer.var, index))
+        }
+        return Result::Ok(id)
+    }
+
+    // `slice[index]` and `array[index]` read the element when the index is inside, and zero otherwise. The branches merge
+    // with a phi of the two values.
+    fun slice_read(mut self, slice: u64, index: u64) -> Result<Value, String> {
+        buffer := self.buffer_of(slice)?
+        idx := self.value(index)?
+        length := self.length_value(buffer.clone())?
+        inside := self.below(idx.clone(), length)?
+        return self.guarded_read(buffer, idx, inside)
+    }
+
+    fun array_read(mut self, array: u64, index: u64, length: u64) -> Result<Value, String> {
+        slot := self.array_slot(array)?
+        buffer := self.array_buffer(slot)?
+        idx := self.value(index)?
+        when self.literal_below(index, length) {
+            pointer := self.element_pointer(buffer.clone(), idx.id)?
+            loaded := self.load(pointer, buffer.element.clone())?
+            return Result::Ok(Value { id: loaded, word: buffer.element })
+        }
+        bound := self.int_value(length, self.index_word(idx.word.clone()))?
+        inside := self.below(idx.clone(), bound)?
+        return self.guarded_read(buffer, idx, inside)
+    }
+
+    fun guarded_read(mut self, buffer: Buffer, index: Value, inside: u64) -> Result<Value, String> {
+        word := buffer.element.clone()
+        elem := self.scalar_type(word.clone())?
+        read_label := self.fresh()
+        skip := self.fresh()
+        merge := self.fresh()
+        self.put(SECTION_BODY, OP_SELECTION_MERGE, v2(merge, 0))
+        self.put(SECTION_BODY, OP_BRANCH_CONDITIONAL, v3(inside, read_label, skip))
+        self.open = false
+        self.start_block(read_label)
+        pointer := self.element_pointer(buffer, index.id)?
+        loaded := self.load(pointer, word.clone())?
+        read_end := self.block
+        self.branch(merge)
+        self.start_block(skip)
+        zero := self.zero(word.clone())?
+        skip_end := self.block
+        self.branch(merge)
+        self.start_block(merge)
+        result := self.fresh()
+        self.put(SECTION_BODY, OP_PHI, v6(elem, result, loaded, read_end, zero, skip_end))
+        return Result::Ok(Value { id: result, word: word })
+    }
+
+    // `if c { a } else { b }` as a value: the branches merge with a phi.
+    fun if_value(mut self, condition: u64, then_value: u64, else_value: u64) -> Result<Value, String> {
+        c := self.value(condition)?
+        then_label := self.fresh()
+        else_label := self.fresh()
+        merge := self.fresh()
+        self.put(SECTION_BODY, OP_SELECTION_MERGE, v2(merge, 0))
+        self.put(SECTION_BODY, OP_BRANCH_CONDITIONAL, v3(c.id, then_label, else_label))
+        self.open = false
+        self.start_block(then_label)
+        tv := self.value(then_value)?
+        then_end := self.block
+        self.branch(merge)
+        self.start_block(else_label)
+        ev := self.value(else_value)?
+        else_end := self.block
+        self.branch(merge)
+        self.start_block(merge)
+        ty := self.scalar_type(tv.word.clone())?
+        result := self.fresh()
+        self.put(SECTION_BODY, OP_PHI, v6(ty, result, tv.id, then_end, ev.id, else_end))
+        return Result::Ok(Value { id: result, word: tv.word })
+    }
+
+    // `atomic_add(buffer, index, value)`: adds `value` to the element and returns the element before the add. An index
+    // outside the buffer adds nothing and returns zero.
+    fun atomic_add(mut self, arguments: Vec<u64>) -> Result<Value, String> {
+        when arguments.len() != 3 {
+            return Result::Err(refused("an atomic add with other than three arguments"))
+        }
+        buffer := self.buffer_of(arguments[0])?
+        when buffer.element != "U32" {
+            return Result::Err(refused("an atomic add on a buffer that is not of u32"))
+        }
+        idx := self.value(arguments[1])?
+        v := self.value(arguments[2])?
+        length := self.length_value(buffer.clone())?
+        inside := self.below(idx.clone(), length)?
+        add_label := self.fresh()
+        skip := self.fresh()
+        merge := self.fresh()
+        self.put(SECTION_BODY, OP_SELECTION_MERGE, v2(merge, 0))
+        self.put(SECTION_BODY, OP_BRANCH_CONDITIONAL, v3(inside, add_label, skip))
+        self.open = false
+        self.start_block(add_label)
+        pointer := self.element_pointer(buffer.clone(), idx.id)?
+        mut scope := SCOPE_WORKGROUP
+        when buffer.runtime {
+            scope = SCOPE_DEVICE
+        }
+        scope_id := self.u32_constant(scope)
+        semantics := self.u32_constant(SEMANTICS_RELAXED)
+        uint := self.scalar_type(String("U32"))?
+        old := self.fresh()
+        self.put(SECTION_BODY, OP_ATOMIC_I_ADD, v6(uint, old, pointer, scope_id, semantics, v.id))
+        add_end := self.block
+        self.branch(merge)
+        self.start_block(skip)
+        zero := self.constant_of(String("U32"), 0)?
+        skip_end := self.block
+        self.branch(merge)
+        self.start_block(merge)
+        result := self.fresh()
+        self.put(SECTION_BODY, OP_PHI, v6(uint, result, old, add_end, zero, skip_end))
+        return Result::Ok(Value { id: result, word: String("U32") })
+    }
+
+    // ---- The module ----
+
+    // The bytes of the module: the header, then the sections in the order SPIR-V requires.
+    fun bytes(self) -> Vec<u8> {
+        mut words: Vec<u64> = Vec()
+        words.push(119734787)
+        // SPIR-V 1.3, the first version with the StorageBuffer storage class in core (Vulkan 1.1).
+        words.push(66304)
+        words.push(0)
+        words.push(self.next)
+        words.push(0)
+        for word in self.capabilities.clone() {
+            words.push(word)
+        }
+        for word in self.entries.clone() {
+            words.push(word)
+        }
+        for word in self.annotations.clone() {
+            words.push(word)
+        }
+        for word in self.types.clone() {
+            words.push(word)
+        }
+        for word in self.functions.clone() {
+            words.push(word)
+        }
+        mut out: Vec<u8> = Vec()
+        for word in words {
+            out.push((word & 255) as u8)
+            out.push(((word >> 8) & 255) as u8)
+            out.push(((word >> 16) & 255) as u8)
+            out.push(((word >> 24) & 255) as u8)
+        }
+        return out
+    }
+}
+
+fun is_comparison(op: String) -> bool {
+    return op == "Eq" || op == "Ne" || op == "Lt" || op == "Le" || op == "Gt" || op == "Ge"
+}
+
+// The arithmetic instruction of an operator: the float or the integer form, which is the same for add, subtract and multiply.
+fun arithmetic_opcode(op: String, float: bool) -> Result<u64, String> {
+    when op == "Add" {
+        when float {
+            return Result::Ok(OP_F_ADD)
+        }
+        return Result::Ok(OP_I_ADD)
+    }
+    when op == "Sub" {
+        when float {
+            return Result::Ok(OP_F_SUB)
+        }
+        return Result::Ok(OP_I_SUB)
+    }
+    when op == "Mul" {
+        when float {
+            return Result::Ok(OP_F_MUL)
+        }
+        return Result::Ok(OP_I_MUL)
+    }
+    when op == "Div" {
+        return Result::Ok(OP_F_DIV)
+    }
+    when op == "Rem" {
+        return Result::Ok(OP_F_REM)
+    }
+    when op == "BitAnd" {
+        return Result::Ok(OP_BITWISE_AND)
+    }
+    when op == "BitOr" {
+        return Result::Ok(OP_BITWISE_OR)
+    }
+    when op == "BitXor" {
+        return Result::Ok(OP_BITWISE_XOR)
+    }
+    mut what := String("the operator `")
+    what.append(op)
+    what.push('`')
+    return Result::Err(refused_text(what))
+}
+
+fun compare_opcode(op: String, word: String) -> Result<u64, String> {
+    when is_float_word(word.clone()) {
+        when op == "Eq" {
+            return Result::Ok(OP_F_ORD_EQUAL)
+        }
+        when op == "Ne" {
+            return Result::Ok(OP_F_UNORD_NOT_EQUAL)
+        }
+        when op == "Lt" {
+            return Result::Ok(OP_F_ORD_LESS_THAN)
+        }
+        when op == "Le" {
+            return Result::Ok(OP_F_ORD_LESS_THAN_EQUAL)
+        }
+        when op == "Gt" {
+            return Result::Ok(OP_F_ORD_GREATER_THAN)
+        }
+        return Result::Ok(OP_F_ORD_GREATER_THAN_EQUAL)
+    }
+    when word == "Bool" {
+        when op == "Eq" {
+            return Result::Ok(OP_LOGICAL_EQUAL)
+        }
+        return Result::Ok(OP_LOGICAL_NOT_EQUAL)
+    }
+    when op == "Eq" {
+        return Result::Ok(OP_I_EQUAL)
+    }
+    when op == "Ne" {
+        return Result::Ok(OP_I_NOT_EQUAL)
+    }
+    signed := is_signed_word(word)
+    when op == "Lt" {
+        when signed {
+            return Result::Ok(OP_S_LESS_THAN)
+        }
+        return Result::Ok(OP_U_LESS_THAN)
+    }
+    when op == "Le" {
+        when signed {
+            return Result::Ok(OP_S_LESS_THAN_EQUAL)
+        }
+        return Result::Ok(OP_U_LESS_THAN_EQUAL)
+    }
+    when op == "Gt" {
+        when signed {
+            return Result::Ok(OP_S_GREATER_THAN)
+        }
+        return Result::Ok(OP_U_GREATER_THAN)
+    }
+    when signed {
+        return Result::Ok(OP_S_GREATER_THAN_EQUAL)
+    }
+    return Result::Ok(OP_U_GREATER_THAN_EQUAL)
+}
+
+fun unsigned_division_opcode(op: String) -> u64 {
+    when op == "Div" {
+        return OP_U_DIV
+    }
+    return OP_U_MOD
+}
+
+// The all-ones pattern of a width, the value -1 of a signed type.
+fun all_ones(width: u64) -> u64 {
+    when width == 64 {
+        return 18446744073709551615
+    }
+    return 4294967295
+}

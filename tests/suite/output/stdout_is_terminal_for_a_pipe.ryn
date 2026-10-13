@@ -1,0 +1,7 @@
+// test: run
+// out: false
+
+// Standard output of a test run is a pipe, not a terminal: the answer is the one the buffer decides by.
+fun main() {
+    echo stdout_is_terminal()
+}

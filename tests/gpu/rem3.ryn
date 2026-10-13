@@ -1,0 +1,9 @@
+#[kernel(local = 8)]
+fun rem3(a: &[i32], b: &[i32], r: &mut [i32]) {
+    i := global_id() as u64
+    r[i] = a[i] % b[i]
+}
+
+fun main() {
+    echo "lib"
+}

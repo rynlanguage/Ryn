@@ -1,0 +1,12 @@
+#[kernel(local = 4)]
+fun reduce(data: &[u32], total: &mut [u32]) {
+    shared tile: [u32; 4]
+    lane := local_id()
+    tile[lane as u64] = data[lane as u64]
+    barrier()
+    atomic_add(total, 0, tile[0])
+}
+
+fun main() {
+    echo "lib"
+}

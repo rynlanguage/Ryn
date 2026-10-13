@@ -4,6 +4,40 @@ All notable changes to Ryn are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses a `0.x` version
 sequence: minor releases may change language details while the compiler is pre-1.0.
 
+## Unreleased — borrowing and native execution
+
+- GPU kernels and the SPIR-V target. `#[kernel(local = N)]` (1 to 1024) marks a free function without a result whose
+  parameters are buffers, `&[T]` (read only) or `&mut [T]`, of u32, i32, u64, i64, f32 or f64. `global_id()`, `local_id()`
+  and `group_id()` are u32 builtins; `barrier()` is a workgroup barrier; `atomic_add(buffer, index, value)` returns the
+  value before the add; `shared name: [T; N]` declares a workgroup array, zeroed by the workgroup before the barrier.
+  `rync --target spirv` and `rync check` need no `main`: the kernels are written as a SPIR-V 1.3 module with one
+  GLCompute entry point per kernel. Kernels cannot print, call Ryn functions, or be called from Ryn code (`R0920` to
+  `R0926`). `tests/gpu` runs the kernels on a Vulkan device with `tools/tests/test_spirv_gpu.py`.
+- `&raw mut value` passed to a generic `*T` parameter infers `T` from the value (it was `R0263`).
+- A field of a structure that was moved as a whole, or whose field was moved out, is `R0240` when read; before, the read
+  compiled and failed at run time with a segmentation fault.
+
+- `io::stdout_is_terminal()` answers whether standard output is a terminal (`ioctl TCGETS` on Linux, `GetConsoleMode` on
+  Windows), the question the output buffer decides by; `tests/suite/output/stdout_is_terminal_for_a_pipe.ryn` runs it on a pipe.
+- Standard output is buffered on Windows too, with the Linux rules (64 KiB, flushed at exit, before an error message,
+  before reading standard input or starting a process, and by `io::stdout_flush()`). A console is still written at once:
+  the syscall emulation answers `ioctl TCGETS` with `GetConsoleMode`. Integers are printed without `div`, and short
+  writes skip `rep movsb`: 1 000 000 `echo` lines to a file on Windows take 4.96 s before and 0.038 s now (process
+  wrapper left out). `tests/suite/output/print_u64_and_short_writes.ryn` checks the digit limits and every copy length.
+- Borrow scalar, aggregate and custom-destructor structures with `&T` / `&mut T`; moving an owner out of a
+  reference remains rejected. Guard releases local loans after their last reachable use, retains loans across
+  loop backedges and `defer`, tracks reborrows and reference reassignment, and reports both conflict and loan origin.
+- Mutable slices `&mut [T]`, `Vec.as_mut_slice()` and `Vec.slice_mut(start, end)`, with checked indexing and in-place
+  replacement/drop. Fixed-array slices use the original stack storage, including aggregate elements. Known-source
+  slice views can be bound locally; descriptor returns and structure fields still require unsupported lifetimes.
+- Windows startup parses arguments and imports `shell32` only for programs using argument builtins. It uses the
+  Windows stack guarantee without allocating an unused Linux signal stack, retains the exception handler, and
+  exits directly through `ExitProcess` after main's cleanup. Constant echo/template fragments share one write.
+- x86-64 integer multiplication by constants uses immediate `imul`, single `lea` for 3/5/9 and shift plus add/subtract
+  for `2^k +/- 1`, preserving sign, width, wrapping and operand evaluation. Benchmark sources and a paired
+  five-series / 100-launch runner record checked outputs and all process/computation samples.
+- The native source-suite runner also runs directly on Windows, without Wine or POSIX `resource`.
+
 ## [0.1.13] — 2026-10-12 — Registers, AArch64, variadic C calls, sugar and gamedev
 
 - Native language fixes (2026-10-13): move custom-destructor values into enum payloads from locals and calls,

@@ -1,0 +1,10 @@
+// test: fail
+// code: R0922
+
+fun plain() -> u32 {
+    return global_id()
+}
+
+fun main() {
+    echo plain()
+}

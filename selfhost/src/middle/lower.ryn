@@ -58,6 +58,9 @@ pub struct ActiveBorrow {
     slot: u64,
     holder: u64,
     mutable: bool,
+    start: u64,
+    end: u64,
+    parent: u64,
 }
 
 // An owned local that a move has left, with the span of the move. The guard reports a later use of it.
@@ -67,6 +70,8 @@ pub struct MovedValue {
     slot: u64,
     start: u64,
     end: u64,
+    // Whether a field was moved out (its slot is the field's), rather than the whole value (its slot is the local's).
+    part: bool,
 }
 
 pub struct Signature {
@@ -162,6 +167,11 @@ pub struct Lowering {
     continue_moves: Vec<MovedValue>,
     // The references in scope that borrow a local.
     borrows: Vec<ActiveBorrow>,
+    argument_loans: Vec<ExplicitBorrow>,
+    // Statements still reachable after the current statement, including loop backedges.
+    live_tail: Vec<u64>,
+    live_result: u64,
+    has_live_result: bool,
     // Which local each reference or raw pointer local points at.
     origins: Vec<LocalOrigin>,
     param_slots: Vec<u64>,
@@ -191,6 +201,13 @@ pub struct Lowering {
     abandoned: bool,
     // Whether every function of the native runtime module is lowered; otherwise only those a program reaches are.
     lower_all: bool,
+    // A library (`rync check`, and the SPIR-V target) need not have `main`; an executable does.
+    library: bool,
+    // The workgroup size of the kernel being lowered (0 outside a kernel), and the index of the function being lowered.
+    kernel_size: u64,
+    current_id: u64,
+    // The workgroup arrays of the kernels: a function index and the first slot of each array, as flat pairs.
+    shared_pairs: Vec<u64>,
 }
 
 // The IEEE bit pattern of a float literal's text, as the IR writes it.
@@ -1720,7 +1737,7 @@ fun type_end(tokens: Vec<String>, at: u64) -> u64 {
     when word == "Struct" || word == "Enum" {
         return at + 2
     }
-    when word == "Vec" || word == "Slice" || word == "RawPointer" {
+    when word == "Vec" || word == "Slice" || word == "MutableSlice" || word == "RawPointer" {
         return type_end(tokens.clone(), at + 1)
     }
     when word == "Reference" || word == "Array" {
@@ -1833,6 +1850,19 @@ fun reference_inner(ty: String) -> Option<String> {
 
 fun reference_is_mutable(ty: String) -> bool {
     return ty.ends_with(" 1")
+}
+
+fun is_slice_word(ty: String) -> bool {
+    return ty.starts_with("Slice ") || ty.starts_with("MutableSlice ")
+}
+fun slice_inner(ty: String) -> String {
+    when ty.starts_with("MutableSlice ") { return ty.slice(13, ty.len()) }
+    return ty.slice(6, ty.len())
+}
+fun one_u64(value: u64) -> Vec<u64> {
+    mut values: Vec<u64> = Vec()
+    values.push(value)
+    return values
 }
 
 // The element type of a `Vec <element>` word.
@@ -2189,7 +2219,7 @@ extend Lowering {
             self.next_slot += 1
             return Result::Ok(slot)
         }
-        when ty.starts_with("Slice ") {
+        when is_slice_word(ty.clone()) {
             self.local_types.push(String("Ptr"))
             self.owners.push(String(""))
             self.local_types.push(String("I64"))
@@ -2260,7 +2290,7 @@ extend Lowering {
 
     // The slots a value of `ty` occupies: two for `str`, one for a scalar, and the sum for a structure.
     fun slot_count(self, ty: String) -> u64 {
-        when ty == "Str" || ty.starts_with("Slice ") {
+        when ty == "Str" || is_slice_word(ty.clone()) {
             return 2
         }
         when array_parts(ty.clone()).is_some() {
@@ -2570,11 +2600,20 @@ extend Lowering {
             ast::ExprTree::NameRef(name, span) => self.moved_name(index, name, expected),
             ast::ExprTree::FieldE(value, name, name_span, span) => self.moved_field_checked(value, name, name_span, span, expected),
             ast::ExprTree::DerefE(pointer, span) => self.moved_dereference(pointer, span),
+            ast::ExprTree::IndexE(base, at, span) => self.moved_index(base, at, expected, span),
             _ => self.expression(index, expected),
         }
     }
 
     // A value read through a reference is copied, never moved out of it: an owned pointee is `R0240`, at the pointer.
+    fun moved_index(mut self, base: u64, at: u64, expected: String, span: ast::Span) -> Result<Lowered, String> {
+        value := self.index_expression(base, at, expected, span)?
+        when self.move_only_value(value.ty.clone(), 0) {
+            return Result::Err(moved_out_of_reference_error(span.start, span.end))
+        }
+        return Result::Ok(value)
+    }
+
     fun moved_dereference(mut self, pointer: u64, span: ast::Span) -> Result<Lowered, String> {
         lowered := self.dereference(pointer, span)?
         when self.owns(lowered.ty.clone()) {
@@ -2893,7 +2932,7 @@ extend Lowering {
         holder := self.local_holding_slot(place.slot)
         when holder.is_some() {
             part := self.expr_span_of(value)
-            self.pending_moves.push(MovedValue { name: self.locals[holder.unwrap()].name.clone(), slot: place.slot, start: part.start, end: part.end })
+            self.pending_moves.push(MovedValue { name: self.locals[holder.unwrap()].name.clone(), slot: place.slot, start: part.start, end: part.end, part: true })
         }
         return Result::Ok(Lowered { text: join(words3(String("Move"), num(place.slot), place.ty.clone())), ty: place.ty })
     }
@@ -2901,7 +2940,7 @@ extend Lowering {
     fun moved_name(mut self, expression: u64, name: String, expected: String) -> Result<Lowered, String> {
         when self.borrowed_name(name.clone(), true) {
             use_span := self.expr_span_of(expression)
-            return Result::Err(borrowed_use_error(use_span.start, use_span.end))
+            return Result::Err(self.borrow_error(name.clone(), use_span.start, use_span.end, String("cannot use a value while a mutable reference to it is active")))
         }
         when self.is_moved(name.clone()) {
             span := self.expr_span_of(expression)
@@ -2932,12 +2971,12 @@ extend Lowering {
         }
         when self.borrowed_name(name.clone(), false) {
             move_span := self.expr_span_of(expression)
-            return Result::Err(borrowed_move_error(move_span.start, move_span.end))
+            return Result::Err(self.borrow_error(name.clone(), move_span.start, move_span.end, String("cannot move a value while it is borrowed")))
         }
         slot := self.locals[index].slot
         // A move holds from the end of its statement on (see `commit_moves`).
         moved := self.expr_span_of(expression)
-        self.pending_moves.push(MovedValue { name: name, slot: slot, start: moved.start, end: moved.end })
+        self.pending_moves.push(MovedValue { name: name, slot: slot, start: moved.start, end: moved.end, part: false })
         return Result::Ok(Lowered { text: join(words3(String("Move"), num(slot), ty.clone())), ty: ty })
     }
 
@@ -3002,6 +3041,24 @@ extend Lowering {
         return false
     }
 
+    // Whether a field of the local at `holder` (its slots from `field_slot` on) can no longer be read: the whole local was
+    // moved, or this field was. The other fields of a partly moved local stay readable.
+    fun field_moved(self, holder: u64, field_slot: u64, field_count: u64) -> bool {
+        name := self.locals[holder].name.clone()
+        whole := self.locals[holder].slot
+        for item in self.moved_names.clone() {
+            when item.name == name && ((!item.part && item.slot == whole) || (item.part && item.slot >= field_slot && item.slot < field_slot + field_count)) {
+                return true
+            }
+        }
+        for item in self.pending_moves.clone() {
+            when item.name == name && ((!item.part && item.slot == whole) || (item.part && item.slot >= field_slot && item.slot < field_slot + field_count)) {
+                return true
+            }
+        }
+        return false
+    }
+
     // Whether the local at `index` has been moved, matched by its name and slot.
     fun is_moved_local(self, index: u64) -> bool {
         name := self.locals[index].name.clone()
@@ -3046,11 +3103,15 @@ extend Lowering {
 
     // Whether the local that `name` now refers to is borrowed by a reference in scope (a mutable one, if asked).
     fun borrowed_name(self, name: String, mutable_only: bool) -> bool {
+        when self.borrows.is_empty() && self.argument_loans.is_empty() { return false }
         found := self.find(name)
         when found.is_err() {
             return false
         }
         slot := self.locals[found.unwrap()].slot
+        for item in self.argument_loans.clone() {
+            when self.locals[item.local].slot == slot && (!mutable_only || item.mutable) { return true }
+        }
         mut position: u64 = 0
         while position < self.borrows.len() {
             when self.borrows[position].slot == slot && (!mutable_only || self.borrows[position].mutable) {
@@ -3059,6 +3120,232 @@ extend Lowering {
             position += 1
         }
         return false
+    }
+
+    fun loan_parent(self, value: u64) -> Option<u64> {
+        choose self.program.exprs[value] {
+            ast::ExprTree::NameRef(n, s) => self.reference_local(n),
+            ast::ExprTree::AddressOfE(m, r, v, s) => self.loan_parent(v),
+            ast::ExprTree::IndexE(v, i, s) => self.loan_parent(v),
+            ast::ExprTree::FieldE(v, n, ns, s) => self.loan_parent(v),
+            ast::ExprTree::MethodCallE(r, n, t, a, s) => self.loan_parent(r),
+            _ => Option::None,
+        }
+    }
+    fun reference_local(self, name: String) -> Option<u64> {
+        found := self.local_index(name)
+        when found.is_some() {
+            ty := self.locals[found.unwrap()].ty.clone()
+            when ty.starts_with("Reference ") || is_slice_word(ty) { return found }
+        }
+        return Option::None
+    }
+    fun loan_descends(self, holder: u64, ancestor: u64) -> bool {
+        mut current := holder
+        mut depth: u64 = 0
+        while depth < self.locals.len() {
+            mut next: u64 = 18446744073709551615
+            for item in self.borrows.clone() { when item.holder == current { next = item.parent } }
+            when next == ancestor { return true }
+            when next >= self.locals.len() { return false }
+            current = next
+            depth += 1
+        }
+        return false
+    }
+    fun loan_access(self, name: String, write: bool, span: ast::Span) -> Result<bool, String> {
+        when self.borrows.is_empty() && self.argument_loans.is_empty() { return Result::Ok(true) }
+        holder := self.reference_local(name.clone())
+        when holder.is_none() { return Result::Ok(true) }
+        source := self.origin_of_name(name.clone())
+        mut roots: Vec<u64> = Vec()
+        when holder.is_some() {
+            for item in self.borrows.clone() { when item.holder == holder.unwrap() { roots.push(item.slot) } }
+        }
+        when roots.is_empty() && source.is_some() { roots.push(self.locals[source.unwrap()].slot) }
+        when holder.is_some() {
+          for root in roots {
+            for item in self.argument_loans.clone() {
+                when self.locals[item.local].slot == root && (write || item.mutable) {
+                    return Result::Err(conflicting_argument_error(span.start, span.end))
+                }
+            }
+            for item in self.borrows.clone() {
+                when item.slot == root && item.holder != holder.unwrap() && !self.loan_descends(holder.unwrap(), item.holder) && (write || item.mutable) {
+                    return Result::Err(diagnostic("R0249", span.start, span.end, String("cannot use a reference while an overlapping reborrow is active"), String("finish using the reborrow before using its parent reference")))
+                }
+            }
+          }
+        }
+        return Result::Ok(true)
+    }
+    fun track_loan(mut self, holder: u64, value: u64, ty: String, span: ast::Span) {
+        source := self.loan_source(value)
+        parent := self.loan_parent(value).unwrap_or(18446744073709551615)
+        self.track_known_loan(holder, source, parent, ty, span)
+    }
+    fun track_known_loan(mut self, holder: u64, source: Option<u64>, parent: u64, ty: String, span: ast::Span) {
+        mut kept: Vec<ActiveBorrow> = Vec()
+        for item in self.borrows.clone() { when item.holder != holder { kept.push(item) } }
+        when source.is_some() {
+            kept.push(ActiveBorrow { slot: self.locals[source.unwrap()].slot, holder: holder, mutable: reference_is_mutable(ty.clone()) || ty.starts_with("MutableSlice "), start: span.start, end: span.end, parent: parent })
+            self.replace_origins(holder, one_u64(source.unwrap()))
+        }
+        self.borrows = kept
+    }
+
+    fun join_borrows(self, first: Vec<ActiveBorrow>, first_falls: bool, second: Vec<ActiveBorrow>, second_falls: bool) -> Vec<ActiveBorrow> {
+        when !first_falls { return second }
+        when !second_falls { return first }
+        mut result := first
+        for item in second {
+            mut found := false
+            for other in result.clone() {
+                when other.holder == item.holder && other.slot == item.slot && other.mutable == item.mutable { found = true }
+            }
+            when !found { result.push(item) }
+        }
+        return result
+    }
+
+    fun borrow_error(self, name: String, start: u64, end: u64, operation: String) -> String {
+        mut help := String("finish using the reference before this operation")
+        mut note_start: u64 = 0
+        mut note_end: u64 = 0
+        found := self.find(name)
+        when found.is_ok() {
+            for item in self.borrows.clone() {
+                when item.slot == self.locals[found.unwrap()].slot {
+                    help = String("borrow held by `")
+                    help.append(self.locals[item.holder].name.clone())
+                    help.append("` begins at bytes ")
+                    help.append(String(item.start))
+                    help.append("..")
+                    help.append(String(item.end))
+                    help.append("; its last use must precede this operation")
+                    note_start = item.start
+                    note_end = item.end
+                    break
+                }
+            }
+            for item in self.argument_loans.clone() {
+                when item.local == found.unwrap() && note_end == 0 {
+                    note_start = item.start note_end = item.end
+                    help = String("this earlier argument borrows the value until the call completes")
+                }
+            }
+        }
+        when note_end > note_start {
+            mut marked := String("@borrow ")
+            marked.append(String(note_start)) marked.append(" ") marked.append(String(note_end)) marked.append("\n") marked.append(help)
+            help = marked
+        }
+        return diagnostic("R0249", start, end, operation, help)
+    }
+
+    // Liveness is conservative across branches, loop backedges and deferred bodies. Shadowed
+    // names may keep a loan longer, but can never release a live loan early.
+    fun uses_expr(self, index: u64, name: String) -> bool {
+        return choose self.program.exprs[index] {
+            ast::ExprTree::NameRef(n, s) => n == name,
+            ast::ExprTree::CallE(n, t, a, s) => n == name || self.uses_exprs(a, name),
+            ast::ExprTree::MethodCallE(r, n, t, a, s) => self.uses_expr(r, name.clone()) || self.uses_exprs(a, name),
+            ast::ExprTree::StructLit(n, fields, s) => self.uses_inits(fields, name),
+            ast::ExprTree::FieldE(v, n, ns, s) => self.uses_expr(v, name),
+            ast::ExprTree::OptionalFieldE(v, n, ns, s) => self.uses_expr(v, name),
+            ast::ExprTree::RangeE(a, b, flag, s) => self.uses_expr(a, name.clone()) || self.uses_expr(b, name),
+            ast::ExprTree::IfE(c, a, b, s) => self.uses_expr(c, name.clone()) || self.uses_expr(a, name.clone()) || self.uses_expr(b, name),
+            ast::ExprTree::BinaryE(op, a, b, s) => self.uses_expr(a, name.clone()) || self.uses_expr(b, name),
+            ast::ExprTree::IndexE(a, b, s) => self.uses_expr(a, name.clone()) || self.uses_expr(b, name),
+            ast::ExprTree::PipeE(a, b, s) => self.uses_expr(a, name.clone()) || self.uses_expr(b, name),
+            ast::ExprTree::CoalesceE(a, b, s) => self.uses_expr(a, name.clone()) || self.uses_expr(b, name),
+            ast::ExprTree::NegateE(v, s) => self.uses_expr(v, name),
+            ast::ExprTree::NotE(v, s) => self.uses_expr(v, name),
+            ast::ExprTree::BitNotE(v, s) => self.uses_expr(v, name),
+            ast::ExprTree::AddressOfE(m, r, v, s) => self.uses_expr(v, name),
+            ast::ExprTree::DerefE(v, s) => self.uses_expr(v, name),
+            ast::ExprTree::CastE(v, t, s) => self.uses_expr(v, name),
+            ast::ExprTree::PropagateE(v, s) => self.uses_expr(v, name),
+            ast::ExprTree::TupleE(v, s) => self.uses_exprs(v, name),
+            ast::ExprTree::ArrayE(v, s) => self.uses_exprs(v, name),
+            ast::ExprTree::RepeatE(v, count, s) => self.uses_expr(v, name),
+            ast::ExprTree::EnumE(n, tag, v, s) => self.uses_exprs(v, name),
+            ast::ExprTree::ChooseE(v, arms, s) => self.uses_expr(v, name.clone()) || self.uses_arms(arms, name),
+            _ => false,
+        }
+    }
+
+    fun uses_exprs(self, values: Vec<u64>, name: String) -> bool {
+        for value in values { when self.uses_expr(value, name.clone()) { return true } }
+        return false
+    }
+    fun uses_inits(self, fields: Vec<u64>, name: String) -> bool {
+        for field in fields { when self.uses_expr(self.program.inits[field].value, name.clone()) { return true } }
+        return false
+    }
+    fun uses_arms(self, arms: Vec<u64>, name: String) -> bool {
+        for arm in arms { when self.uses_expr(self.program.arms[arm].body, name.clone()) { return true } }
+        return false
+    }
+    fun uses_parts(self, parts: Vec<u64>, name: String) -> bool {
+        for part in parts {
+            value := choose self.program.parts[part] {
+                ast::TemplatePart::ValuePart(v) => Option::Some(v),
+                _ => Option::None,
+            }
+            when value.is_some() && self.uses_expr(value.unwrap(), name.clone()) { return true }
+        }
+        return false
+    }
+    fun uses_body(self, body: Vec<u64>, name: String) -> bool {
+        for statement in body { when self.uses_statement(statement, name.clone()) { return true } }
+        return false
+    }
+    fun uses_statement(self, index: u64, name: String) -> bool {
+        return choose self.program.stmts[index] {
+            ast::Stmt::LetS(n, m, t, v, s) => self.uses_expr(v, name),
+            ast::Stmt::AssignS(n, v, s) => n == name || self.uses_expr(v, name),
+            ast::Stmt::CompoundS(n, op, v, s) => n == name || self.uses_expr(v, name),
+            ast::Stmt::IndexAssignS(n, i, v, s) => n.split(".")[0] == name || self.uses_expr(i, name.clone()) || self.uses_expr(v, name),
+            ast::Stmt::DerefAssignS(p, v, s) => self.uses_expr(p, name.clone()) || self.uses_expr(v, name),
+            ast::Stmt::FieldAssignS(n, fields, spans, op, v, s) => n == name || self.uses_expr(v, name),
+            ast::Stmt::PrintS(v, s) => self.uses_expr(v, name),
+            ast::Stmt::TemplateS(parts, s) => self.uses_parts(parts, name),
+            ast::Stmt::CallS(n, t, a, s) => n == name || self.uses_exprs(a, name),
+            ast::Stmt::MethodCallS(r, n, a, s) => self.uses_expr(r, name.clone()) || self.uses_exprs(a, name),
+            ast::Stmt::IfS(c, a, b, s) => self.uses_expr(c, name.clone()) || self.uses_body(a, name.clone()) || self.uses_body(b, name),
+            ast::Stmt::WhileS(c, b, s) => self.uses_expr(c, name.clone()) || self.uses_body(b, name),
+            ast::Stmt::DeferS(b, s) => self.uses_body(b, name),
+            ast::Stmt::ForS(n, ns, a, b, flag, body, s) => self.uses_expr(a, name.clone()) || self.uses_expr(b, name.clone()) || self.uses_body(body, name),
+            ast::Stmt::ForEachS(n, ns, v, b, s) => self.uses_expr(v, name.clone()) || self.uses_body(b, name),
+            ast::Stmt::ReturnS(v, s) => self.uses_optional(v, name),
+            _ => false,
+        }
+    }
+    fun uses_optional(self, value: Option<u64>, name: String) -> bool {
+        when value.is_some() { return self.uses_expr(value.unwrap(), name) }
+        return false
+    }
+    fun tail_of(self, body: Vec<u64>, position: u64, outer: Vec<u64>) -> Vec<u64> {
+        mut tail := outer
+        mut at := position + 1
+        while at < body.len() { tail.push(body[at]) at += 1 }
+        return tail
+    }
+    fun expire_borrows(mut self, current: u64) {
+        when self.borrows.is_empty() { return }
+        mut kept: Vec<ActiveBorrow> = Vec()
+        for item in self.borrows.clone() {
+            name := self.locals[item.holder].name.clone()
+            mut live := self.uses_statement(current, name.clone()) || self.uses_body(self.live_tail.clone(), name.clone()) || (self.has_live_result && self.uses_expr(self.live_result, name.clone()))
+            mut at: u64 = 0
+            while at < self.defer_count && !live {
+                live = self.uses_body(self.defers[at].body.clone(), name.clone())
+                at += 1
+            }
+            when live { kept.push(item) }
+        }
+        self.borrows = kept
     }
 
     // The references that are declared at `start` or later go out of scope with their block.
@@ -3076,11 +3363,37 @@ extend Lowering {
     // `&name`, `&mut name`, `&raw mut name`, or a reference local whose origin is known.
     fun pointed_local(self, value: u64) -> Option<u64> {
         choose self.program.exprs[value] {
-            ast::ExprTree::AddressOfE(mutable, raw, inner, span) => self.local_named(inner),
+            ast::ExprTree::AddressOfE(mutable, raw, inner, span) => self.loan_source(inner),
             ast::ExprTree::NameRef(name, span) => self.origin_of_name(name),
             ast::ExprTree::CallE(name, type_arguments, arguments, span) => self.call_origin(name, arguments),
+            ast::ExprTree::MethodCallE(r, n, t, a, s) => self.slice_source(r, n),
             _ => Option::None,
         }
+    }
+
+    fun slice_source(self, receiver: u64, name: String) -> Option<u64> {
+        when name == "as_slice" || name == "slice" || name == "as_mut_slice" || name == "slice_mut" {
+            return self.loan_source(receiver)
+        }
+        return Option::None
+    }
+    fun loan_source(self, value: u64) -> Option<u64> {
+        choose self.program.exprs[value] {
+            ast::ExprTree::NameRef(n, s) => self.named_loan_source(n),
+            ast::ExprTree::IndexE(v, i, s) => self.loan_source(v),
+            ast::ExprTree::FieldE(v, n, ns, s) => self.loan_source(v),
+            ast::ExprTree::AddressOfE(m, r, v, s) => self.loan_source(v),
+            ast::ExprTree::MethodCallE(r, n, t, a, s) => self.slice_source(r, n),
+            ast::ExprTree::CallE(n, t, a, s) => self.call_origin(n, a),
+            _ => Option::None,
+        }
+    }
+    fun named_loan_source(self, name: String) -> Option<u64> {
+        origin := self.origin_of_name(name.clone())
+        when origin.is_some() { return origin }
+        local := self.reference_local(name.clone())
+        when local.is_some() && !slot_listed(self.param_slots.clone(), self.locals[local.unwrap()].slot) { return Option::None }
+        return self.local_index(name)
     }
 
     // The local that a call's reference result points at: the argument for the parameter that the callee returns.
@@ -3097,7 +3410,7 @@ extend Lowering {
         when position >= arguments.len() {
             return Option::None
         }
-        return self.pointed_local(arguments[position])
+        return self.loan_source(arguments[position])
     }
 
     // The parameter that a function returns, when it returns a reference and every `return` names that parameter.
@@ -3108,7 +3421,7 @@ extend Lowering {
         mut returned: Vec<String> = Vec()
         returned = self.returned_names(body, returned)
         when return_value.is_some() {
-            returned.push(self.name_of_value(return_value.unwrap()))
+            returned.push(self.reference_value_name(return_value.unwrap()))
         }
         when returned.is_empty() {
             return Option::None
@@ -3154,11 +3467,25 @@ extend Lowering {
     fun returned_value_name(self, value: Option<u64>, names: Vec<String>) -> Vec<String> {
         mut found := names
         when value.is_some() {
-            found.push(self.name_of_value(value.unwrap()))
+            found.push(self.reference_value_name(value.unwrap()))
         } else {
             found.push(String(""))
         }
         return found
+    }
+    fun reference_value_name(self, value: u64) -> String {
+        choose self.program.exprs[value] {
+            ast::ExprTree::NameRef(n, s) => n,
+            ast::ExprTree::AddressOfE(m, raw, inner, s) => self.reference_element_name(inner, raw),
+            _ => String(""),
+        }
+    }
+    fun reference_element_name(self, value: u64, raw: bool) -> String {
+        when raw { return String("") }
+        choose self.program.exprs[value] {
+            ast::ExprTree::IndexE(v, i, s) => self.name_of_value(v),
+            _ => String(""),
+        }
     }
 
     // The name of a value that is a plain name, and "" for any other value.
@@ -3534,7 +3861,7 @@ extend Lowering {
         mut kept: Vec<MovedValue> = Vec()
         mut index: u64 = 0
         while index < length && index < self.pending_moves.len() {
-            kept.push(MovedValue { name: self.pending_moves[index].name.clone(), slot: self.pending_moves[index].slot, start: self.pending_moves[index].start, end: self.pending_moves[index].end })
+            kept.push(MovedValue { name: self.pending_moves[index].name.clone(), slot: self.pending_moves[index].slot, start: self.pending_moves[index].start, end: self.pending_moves[index].end, part: self.pending_moves[index].part })
             index += 1
         }
         self.pending_moves = kept
@@ -4173,6 +4500,11 @@ extend Lowering {
         when !expected.is_empty() && expected != place.ty {
             return Result::Err(unsupported("field type where another type is expected"))
         }
+        // `R0240`: the field's structure was moved as a whole, or this field was moved out, before this read.
+        holder := self.local_holding_slot(place.slot)
+        when holder.is_some() && self.field_moved(holder.unwrap(), place.slot, self.slot_count(place.ty.clone())) {
+            return Result::Err(moved_value_error(span.start, span.end))
+        }
         text := join(words5(String("Local"), num(place.slot), place.ty.clone(), num(span.start), num(span.end)))
         return Result::Ok(Lowered { text: text, ty: place.ty })
     }
@@ -4491,6 +4823,10 @@ extend Lowering {
 
     // `place.field = value`, or `place.field op= value` with the target's span.
     fun field_assign(mut self, object: String, names: Vec<String>, spans: Vec<u64>, op: Option<String>, value: u64, span: ast::Span) -> Result<bool, String> {
+        _ := self.loan_access(object.clone(), true, span)?
+        when self.borrowed_name(object.clone(), false) {
+            return Result::Err(self.borrow_error(object.clone(), span.start, span.end, String("cannot write a field while its structure is borrowed")))
+        }
         mut place := self.name_place(object.clone())?
         when reference_inner(place.ty.clone()).is_some() || place.ty.starts_with("RawPointer ") {
             return self.reference_field_assign(object, names, spans, op, value, span)
@@ -4722,6 +5058,9 @@ extend Lowering {
     }
 
     fun expression(mut self, index: u64, expected: String) -> Result<Lowered, String> {
+        when is_slice_word(expected.clone()) && self.borrow_target(index).is_some() {
+            return self.array_slice_address(index, expected)
+        }
         choose self.program.exprs[index] {
             ast::ExprTree::IntLit(value, span) => self.integer(value, expected, span),
             ast::ExprTree::FloatLit(bits, span) => self.float_literal(bits, expected),
@@ -4985,8 +5324,9 @@ extend Lowering {
 
     // A name is a local, or a function where a function pointer is expected.
     fun name_with(self, name: String, span: ast::Span, expected: String) -> Result<Lowered, String> {
+        _ := self.loan_access(name.clone(), false, span)?
         when self.borrowed_name(name.clone(), true) {
-            return Result::Err(borrowed_use_error(span.start, span.end))
+            return Result::Err(self.borrow_error(name.clone(), span.start, span.end, String("cannot use a value while a mutable reference to it is active")))
         }
         when self.is_moved(name.clone()) || self.has_moved_part_named(name.clone()) {
             return Result::Err(moved_value_error(span.start, span.end))
@@ -5833,6 +6173,12 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
     }
 
     fun arguments(mut self, id: u64, name: String, arguments: Vec<u64>) -> Result<Vec<String>, String> {
+        outer := self.argument_loans.clone()
+        result := self.arguments_inner(id, name, arguments)
+        self.argument_loans = outer
+        return result
+    }
+    fun arguments_inner(mut self, id: u64, name: String, arguments: Vec<u64>) -> Result<Vec<String>, String> {
         params := self.signatures[id].params.clone()
         variadic := self.signatures[id].variadic
         when arguments.len() != params.len() && !(variadic && arguments.len() > params.len()) {
@@ -5842,6 +6188,20 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         mut explicit: Vec<ExplicitBorrow> = Vec()
         mut position: u64 = 0
         while position < arguments.len() {
+            when position < params.len() && (params[position].starts_with("Reference ") || is_slice_word(params[position].clone())) && self.is_name(arguments[position]) && self.reference_local(self.name_of_value(arguments[position])).is_some() && self.loan_source(arguments[position]).is_none() {
+                span := self.expr_span_of(arguments[position])
+                return Result::Err(unknown_provenance_error(span.start, span.end))
+            }
+            when position > 0 && position - 1 < params.len() {
+                previous := position - 1
+                when params[previous].starts_with("Reference ") || is_slice_word(params[previous].clone()) {
+                    source := self.loan_source(arguments[previous])
+                    when source.is_some() {
+                        span := self.expr_span_of(arguments[previous])
+                        self.argument_loans.push(ExplicitBorrow { local: source.unwrap(), mutable: reference_is_mutable(params[previous].clone()) || params[previous].starts_with("MutableSlice "), start: span.start, end: span.end })
+                    }
+                }
+            }
             // An argument after the named parameters of a variadic C function (see `variadic_argument`).
             when position >= params.len() {
                 lowered.push(self.variadic_argument(name.clone(), arguments[position])?)
@@ -5880,7 +6240,7 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
                 position += 1
                 continue
             }
-            when params[position].starts_with("Slice ") {
+            when is_slice_word(params[position].clone()) {
                 coerced := self.slice_argument(arguments[position], params[position].clone())?
                 lowered.push(coerced)
                 position += 1
@@ -6216,6 +6576,13 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
     }
 
     fun call_statement_at(mut self, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: ast::Span) -> Result<bool, String> {
+        when self.kernel_call(name.clone()) {
+            return Result::Err(kernel_call_error(name, span.start, span.end))
+        }
+        gpu_failure := self.gpu_call_error(name.clone(), span)
+        when gpu_failure.is_some() {
+            return Result::Err(gpu_failure.unwrap())
+        }
         // The built-in output calls are checked first; a user function of the same name takes their place.
         when (name == "print" || name == "eprint" || name == "write") && self.signature_index(name.clone()).is_err() {
             return self.output_call(name, arguments, span)
@@ -6459,6 +6826,13 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         when !type_arguments.is_empty() {
             return Result::Err(unsupported("generic call"))
         }
+        when self.kernel_call(name.clone()) {
+            return Result::Err(kernel_call_error(name, span.start, span.end))
+        }
+        gpu_failure := self.gpu_call_error(name.clone(), span)
+        when gpu_failure.is_some() {
+            return Result::Err(gpu_failure.unwrap())
+        }
         when self.signature_index(name.clone()).is_err() {
             // `Enum::Variant(args)` is a call by name, and constructs the variant.
             cut := last_index_of(name.clone(), String("::"))
@@ -6532,6 +6906,7 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
     // A block whose scope starts with a loop item: `prelude` is the statement that binds it.
     fun block_with(mut self, prelude: String, item_name: String, item_slot: u64, item_ty: String, body: Vec<u64>) -> Result<Block, String> {
         locals_before := self.visible
+        outer_tail := self.live_tail.clone()
         start := self.statements.len()
         self.scope_floors.push(locals_before)
         self.open_frame()
@@ -6542,11 +6917,13 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         mut falls := true
         mut position: u64 = 0
         while position < body.len() && falls && !self.abandoned {
+            self.live_tail = self.tail_of(body.clone(), position, outer_tail.clone())
             falls = !self.statement(body[position])?
             self.commit_moves()
             position += 1
         }
         self.abandoned = false
+        self.live_tail = outer_tail
         deferred := self.close_frame()?
         // A body that does not fall through leaves the deferred bodies unreachable, and the
         // guard drops statements after such a point.
@@ -6599,12 +6976,16 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         self.commit_moves()
         before := self.moved_names.clone()
         before_origins := self.origins.clone()
+        before_borrows := self.borrows.clone()
         then_block := self.block(then_body)?
         after_then := self.moved_names.clone()
         then_origins := self.origins.clone()
+        then_borrows := self.borrows.clone()
         self.moved_names = before.clone()
         self.origins = before_origins
+        self.borrows = before_borrows
         else_block := self.block(else_body)?
+        self.borrows = self.join_borrows(then_borrows, then_block.falls, self.borrows.clone(), else_block.falls)
         self.moved_names = merge_branch_moves(before, after_then, then_block.falls, self.moved_names.clone(), else_block.falls)
         self.origins = self.join_branch_origins(then_origins, then_block.falls, self.origins.clone(), else_block.falls)
         mut tokens: Vec<String> = Vec()
@@ -6870,11 +7251,15 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         // The moves of the loop header (a condition or a collection) happen before the first iteration.
         self.commit_moves()
         loop_before := self.moved_names.clone()
+        loop_borrows := self.borrows.clone()
+        loop_origins := self.origins.clone()
         outer_breaks := self.break_moves.clone()
         outer_continues := self.continue_moves.clone()
         self.break_moves = Vec()
         self.continue_moves = Vec()
         body_block := self.block(body)?
+        self.borrows = self.join_borrows(loop_borrows, true, self.borrows.clone(), true)
+        self.origins = self.join_branch_origins(loop_origins, true, self.origins.clone(), true)
         loop_error := self.loop_move_error(loop_before.clone(), body_block.falls, self.continue_moves.clone())
         when loop_error.is_some() {
             return Result::Err(loop_error.unwrap())
@@ -6940,11 +7325,15 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         // The moves of the loop header (a condition or a collection) happen before the first iteration.
         self.commit_moves()
         loop_before := self.moved_names.clone()
+        loop_borrows := self.borrows.clone()
+        loop_origins := self.origins.clone()
         outer_breaks := self.break_moves.clone()
         outer_continues := self.continue_moves.clone()
         self.break_moves = Vec()
         self.continue_moves = Vec()
         body_block := self.block(body)?
+        self.borrows = self.join_borrows(loop_borrows, true, self.borrows.clone(), true)
+        self.origins = self.join_branch_origins(loop_origins, true, self.origins.clone(), true)
         loop_error := self.loop_move_error(loop_before.clone(), body_block.falls, self.continue_moves.clone())
         when loop_error.is_some() {
             return Result::Err(loop_error.unwrap())
@@ -7052,13 +7441,23 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
     // names the function and source offset of the innermost statement it came from. A
     // diagnostic already carries its own span, so it is passed on unchanged.
     fun statement(mut self, index: u64) -> Result<bool, String> {
+        self.expire_borrows(index)
         // The setup of an enclosing statement waits until this one is lowered, and this statement's own setup is its alone.
         outer := self.setup.clone()
         self.setup = Vec()
         start := self.statements.len()
         visible_before := self.visible
         saved := self.checkpoint()
+        saved_tail := self.live_tail.clone()
+        backedge := choose self.program.stmts[index] {
+            ast::Stmt::WhileS(c, b, s) => true,
+            ast::Stmt::ForS(n, ns, a, b, flag, body, s) => true,
+            ast::Stmt::ForEachS(n, ns, v, b, s) => true,
+            _ => false,
+        }
+        when backedge { self.live_tail.push(index) }
         lowered := self.statement_inner(index)
+        self.live_tail = saved_tail
         when lowered.is_err() {
             self.setup = outer
             message := lowered.unwrap_err()
@@ -7146,6 +7545,10 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
     }
 
     fun let_statement(mut self, name: String, mutable: bool, annotation: Option<u64>, value: u64, span: ast::Span) -> Result<bool, String> {
+        // `shared name: [T; N]` is a workgroup array, which the parser marks by the name (see `shared_declaration`).
+        when name.starts_with("shared ") {
+            return self.shared_statement(name, annotation, span)
+        }
         // The bootstrap reports a redeclared name before it looks at the initializer.
         when name != "_" && self.declared(name.clone()) {
             return Result::Err(redeclared_let(name, span.start, span.end))
@@ -7174,10 +7577,9 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         when ty.is_empty() {
             ty = lowered.ty.clone()
         }
-        // `R0240`: a borrowed slice is used where it is made, so it cannot be bound to a name.
-        when ty.starts_with("Slice ") {
+        when is_slice_word(ty.clone()) && self.loan_source(value).is_none() {
             value_span := self.expr_span_of(value)
-            return Result::Err(slice_binding_error(value_span.start, value_span.end))
+            return Result::Err(unknown_provenance_error(value_span.start, value_span.end))
         }
         when ty != lowered.ty {
             when !declared.is_empty() {
@@ -7188,8 +7590,11 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
             }
             return Result::Err(unsupported("annotation does not match the value"))
         }
+        when self.kernel_size > 0 && !gpu_local_word(ty.clone()) {
+            return Result::Err(gpu_type_error(ty.clone(), span.start, span.end))
+        }
         // `R0250`: a reference to an element of a slice that is not named, so its source is not a known local.
-        when ty.starts_with("Reference ") && self.unknown_element_source(value) {
+        when ty.starts_with("Reference ") && self.loan_source(value).is_none() {
             return Result::Err(unknown_provenance_error(span.start, span.end))
         }
         // `_ := value` keeps a value without a name that could be used or clash.
@@ -7197,7 +7602,13 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         when name == "_" {
             bound = String(" discard")
         }
-        slot := self.allocate(ty.clone())?
+        mut slot: u64 = 0
+        when array_parts(ty.clone()).is_some() && self.slot_count(ty.clone()) == 0 {
+            // A named empty array has a unique stack place for Guard provenance.
+            slot = self.allocate(String("U64"))?
+        } else { slot = self.allocate(ty.clone())? }
+        loan_source_before := self.loan_source(value)
+        loan_parent_before := self.loan_parent(value).unwrap_or(18446744073709551615)
         self.forget_moved(bound.clone())
         self.declare(Local { name: bound.clone(), slot: slot, ty: ty.clone(), mutable: mutable })
         when name != "_" && self.pointed_local(value).is_some() {
@@ -7212,12 +7623,9 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
                 self.origins.push(LocalOrigin { holder: holder, source: source })
             }
         }
-        when name != "_" && self.borrow_target(value).is_some() {
-            source := self.borrow_target(value).unwrap()
-            source_index := self.find(source)?
+        when name != "_" && (ty.starts_with("Reference ") || is_slice_word(ty.clone())) && loan_source_before.is_some() {
             holder_index := self.find(bound.clone())?
-            borrow_mutable := self.address_is_mutable(value)
-            self.borrows.push(ActiveBorrow { slot: self.locals[source_index].slot, holder: holder_index, mutable: borrow_mutable })
+            self.track_known_loan(holder_index, loan_source_before, loan_parent_before, ty.clone(), span)
         }
         self.statements.push(join(words6(String("Let"), num(slot), ty, lowered.text, num(span.start), num(span.end))))
         return Result::Ok(false)
@@ -7230,7 +7638,7 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         }
         // `R0251`/`R0252`: a reference or raw pointer may not come to point at a local of a deeper block.
         target_ty := self.locals[index].ty.clone()
-        when (target_ty.starts_with("Reference ") || target_ty.starts_with("RawPointer ")) && self.outlives_block(index, value) {
+        when (target_ty.starts_with("Reference ") || is_slice_word(target_ty.clone()) || target_ty.starts_with("RawPointer ")) && self.outlives_block(index, value) {
             when target_ty.starts_with("RawPointer ") {
                 // The address of the local written directly is `R0248`; a pointer copied through a local is `R0252`.
                 when self.direct_raw_address(value) {
@@ -7253,9 +7661,10 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
         ty := self.locals[index].ty.clone()
         lowered := self.moved_expression(value, ty.clone())?
         when self.borrowed_name(name.clone(), false) && !ty.starts_with("Reference ") {
-            return Result::Err(borrowed_assign_error(span.start, span.end))
+            return Result::Err(self.borrow_error(name.clone(), span.start, span.end, String("cannot assign to a value while it is borrowed")))
         }
         self.set_origin(index, value)
+        when ty.starts_with("Reference ") || is_slice_word(ty.clone()) { self.track_loan(index, value, ty.clone(), span) }
         when struct_id_of(ty.clone()).is_some() {
             self.replace_origins(index, sources)
         }
@@ -7277,6 +7686,9 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
     }
 
     fun compound_statement(mut self, name: String, op: String, value: u64, span: ast::Span) -> Result<bool, String> {
+        when self.borrowed_name(name.clone(), false) {
+            return Result::Err(self.borrow_error(name.clone(), span.start, span.end, String("cannot assign to a value while it is borrowed")))
+        }
         index := self.assigned_local(name.clone(), span)?
         when !self.locals[index].mutable {
             end := span.start + name.len()
@@ -7312,6 +7724,9 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
     }
 
     fun print_statement(mut self, value: u64, start: u64, end: u64) -> Result<bool, String> {
+        when self.kernel_size > 0 {
+            return Result::Err(kernel_builtin_error(String("echo"), start, end))
+        }
         lowered := self.printed_lowered(value, String("echo"), start, end)?
         self.statements.push(join(words3(String("Print"), lowered.text, lowered.ty)))
         return Result::Ok(false)
@@ -7329,6 +7744,9 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
     }
 
     fun return_statement(mut self, value: Option<u64>, span: ast::Span) -> Result<bool, String> {
+        when is_slice_word(self.return_ty.clone()) {
+            return Result::Err(local_reference_error(span.start, span.end))
+        }
         when self.defer_depth > 0 {
             return Result::Err(diagnostic("R0267", span.start, span.end, String("`return` cannot leave a `defer` block"), String("return from the enclosing function after the `defer` block")))
         }
@@ -7541,6 +7959,11 @@ extend Lowering {
 
     fun reference(self, target: u64, mutable: bool) -> Result<String, String> {
         inner := self.resolve(target)?
+        when mutable && inner.starts_with("Slice ") {
+            mut slice := String("MutableSlice ")
+            slice.append(slice_inner(inner))
+            return Result::Ok(slice)
+        }
         mut word := String("Reference ")
         word.append(inner)
         word.append(" ")
@@ -7662,6 +8085,10 @@ fun new_lowering(program: ast::Program, recovering: bool) -> Lowering {
         break_moves: Vec(),
         continue_moves: Vec(),
         borrows: Vec(),
+        argument_loans: Vec(),
+        live_tail: Vec(),
+        live_result: 0,
+        has_live_result: false,
         origins: Vec(),
         param_slots: Vec(),
         structs: Vec(),
@@ -7685,6 +8112,10 @@ fun new_lowering(program: ast::Program, recovering: bool) -> Lowering {
         recovered: Vec(),
         abandoned: false,
         lower_all: false,
+        library: false,
+        kernel_size: 0,
+        current_id: 0,
+        shared_pairs: Vec(),
     }
 }
 
@@ -7696,14 +8127,15 @@ pub fun lower_program(program: ast::Program) -> Result<String, String> {
 // Lowers the program and reports every error that does not depend on another one: one `diagnostic` line each, in
 // source order. A construct the analysis does not handle declines the whole program, as `lower_program` does.
 pub fun lower_recovering(program: ast::Program) -> Result<String, String> {
-    return lower_recovering_with(program, false)
+    return lower_recovering_with(program, false, false)
 }
 
 // As `lower_recovering`; with `lower_all` every function of the native runtime module is lowered, not only the ones the
-// program reaches (to check the module itself).
-pub fun lower_recovering_with(program: ast::Program, lower_all: bool) -> Result<String, String> {
+// program reaches (to check the module itself). With `library` the program need not have a `main` function.
+pub fun lower_recovering_with(program: ast::Program, lower_all: bool, library: bool) -> Result<String, String> {
     mut lowering := new_lowering(program, true)
     lowering.lower_all = lower_all
+    lowering.library = library
     outcome := lowering.lower()
     when outcome.is_ok() && lowering.recovered.len() == 0 {
         return outcome
@@ -7864,6 +8296,9 @@ extend Lowering {
                     continue
                 }
                 resolved := resolved_type.unwrap()
+                when is_slice_word(resolved.clone()) {
+                    self.report(diagnostic("R0250", field.span.start, field.span.end, String("a borrowed slice cannot be stored in a structure field without lifetime annotations"), String("store an owning collection and borrow a slice when calling a function")))?
+                }
                 when struct_id_of(resolved.clone()).is_some() {
                     edge_targets.push(struct_id_of(resolved.clone()).unwrap())
                     edge_starts.push(field.span.start)
@@ -7974,6 +8409,9 @@ extend Lowering {
             when definition.return_type.is_some() {
                 ret = self.resolve(definition.return_type.unwrap())?
             }
+            when is_slice_word(ret.clone()) {
+                return Result::Err(diagnostic("R0248", definition.span.start, definition.span.end, String("returning a slice descriptor requires lifetime annotations, which are not implemented yet"), String("pass the slice to a function or return an owning collection")))
+            }
             // `R0247`: an `extern "C"` signature with a value the C ABI does not pass, and an `extern "C"` `main`.
             when definition.extern_c {
                 for word in params.clone() {
@@ -7999,7 +8437,7 @@ extend Lowering {
             signatures.push(Signature { name: key, params: params, ret: ret, public: definition.public, variadic: definition.variadic, external: definition.extern_c, module: definition.module_path.clone(), return_param: returned })
             position += 1
         }
-        when main_index == count {
+        when main_index == count && !self.library {
             return Result::Err(unsupported("no main function"))
         }
         self.scope_path = String("")
@@ -8140,7 +8578,7 @@ extend Lowering {
             clone_name.append("::clone")
             function_names.push(clone_name)
         }
-        return Result::Ok(assemble(main_index, self.struct_records()?, functions, self.user_enum_records(), function_names))
+        return Result::Ok(assemble(main_index, self.struct_records()?, functions, self.user_enum_records(), function_names, self.kernel_records(count)))
     }
 }
 
@@ -8311,7 +8749,7 @@ extend Lowering {
         when method.default_body.is_some() {
             body = method.default_body.unwrap()
         }
-        self.program.function_defs.push(ast::Function { name: key, extern_c: false, variadic: false, external_symbol: Option::None, type_parameters: Vec(), type_parameter_bounds: Vec(), public: true, module_path: module, parameters: parameters, return_type: method.return_type, body: body, return_value: method.default_value, span: method.span })
+        self.program.function_defs.push(ast::Function { name: key, extern_c: false, variadic: false, kernel_local: 0, external_symbol: Option::None, type_parameters: Vec(), type_parameter_bounds: Vec(), public: true, module_path: module, parameters: parameters, return_type: method.return_type, body: body, return_value: method.default_value, span: method.span })
         self.program.functions.push(self.program.function_defs.len() - 1)
     }
 
@@ -8400,6 +8838,10 @@ extend Lowering {
         self.break_moves = Vec()
         self.continue_moves = Vec()
         self.borrows = Vec()
+        self.argument_loans = Vec()
+        self.live_tail = Vec()
+        self.live_result = 0
+        self.has_live_result = false
         self.origins = Vec()
         self.defers = Vec()
         self.defer_depth = 0
@@ -8408,12 +8850,19 @@ extend Lowering {
         self.abandoned = false
         self.open_frame()
         definition := self.program.function_defs[self.program.functions[id]]
+        when definition.return_value.is_some() { self.live_result = definition.return_value.unwrap() self.has_live_result = true }
         self.scope_path = declaration_namespace(definition.name.clone(), definition.module_path.clone())
         self.call_scope = prefix_of(definition.name.clone())
         self.module = definition.module_path.clone()
         self.current_function = definition.name.clone()
+        self.kernel_size = definition.kernel_local
+        self.current_id = id
         when definition.extern_c {
             return Result::Ok(self.extern_function_text(id, definition.external_symbol))
+        }
+        kernel_failure := self.kernel_signature_error(id)
+        when kernel_failure.is_some() {
+            return Result::Err(kernel_failure.unwrap())
         }
         mut parameters: Vec<String> = Vec()
         mut parameter_index: u64 = 0
@@ -8446,6 +8895,7 @@ extend Lowering {
         mut falls_through := true
         mut position: u64 = 0
         while position < definition.body.len() && falls_through && !self.abandoned {
+            self.live_tail = self.tail_of(definition.body.clone(), position, Vec())
             falls_through = !self.statement(definition.body[position])?
             self.commit_moves()
             position += 1
@@ -8465,6 +8915,9 @@ extend Lowering {
                 return Result::Err(result_without_type_error(definition.name.clone(), definition.span.start, definition.span.end))
             }
             lowered := self.moved_expression(definition.return_value.unwrap(), self.return_ty.clone())?
+            when self.return_ty.starts_with("Reference ") && !self.reference_from_parameter(lowered.text.clone(), lowered.ty.clone()) {
+                return Result::Err(local_reference_error(definition.span.start, definition.span.end))
+            }
             when deferred.is_empty() {
                 self.note_return(lowered.text.clone(), lowered.ty.clone())
                 self.statements.push(join(words3(String("Return"), String("+"), lowered.text)))
@@ -8494,6 +8947,193 @@ extend Lowering {
             self.statements.push(self.owned_drop(drop_floor))
         }
         return Result::Ok(self.function_text(id, parameters))
+    }
+}
+
+// The element types a kernel stores in its buffers, workgroup arrays and locals: the 32- and 64-bit integers and floats.
+fun gpu_element_word(word: String) -> bool {
+    return word == "U32" || word == "I32" || word == "U64" || word == "I64" || word == "F32" || word == "F64"
+}
+
+// A kernel parameter: a buffer, `&[T]` or `&mut [T]` of a GPU element type.
+fun gpu_buffer_word(ty: String) -> bool {
+    when ty.starts_with("MutableSlice ") {
+        return gpu_element_word(ty.slice(13, ty.len()))
+    }
+    when ty.starts_with("Slice ") {
+        return gpu_element_word(ty.slice(6, ty.len()))
+    }
+    return false
+}
+
+// A type a kernel may hold in a local: a `bool`, a GPU scalar, or a fixed array of one of them.
+fun gpu_local_word(ty: String) -> bool {
+    when ty == "Bool" || gpu_element_word(ty.clone()) {
+        return true
+    }
+    parts := array_parts(ty)
+    when parts.is_none() {
+        return false
+    }
+    items := parts.unwrap()
+    return items[0] == "Bool" || gpu_element_word(items[0].clone())
+}
+
+fun gpu_type_error(ty: String, start: u64, end: u64) -> String {
+    mut message := String("the type `")
+    message.append(ty)
+    message.append("` is not available in a kernel")
+    return diagnostic("R0924", start, end, message, String("a kernel holds bool, u32, i32, u64, i64, f32 and f64 values, and fixed arrays of them"))
+}
+
+fun gpu_outside_kernel_error(name: String, start: u64, end: u64) -> String {
+    mut message := String("`")
+    message.append(name)
+    message.append("` is a GPU builtin: it is only available in a `#[kernel]` function")
+    return diagnostic("R0922", start, end, message, String("move the call into a kernel, or compute the value on the CPU"))
+}
+
+fun kernel_builtin_error(name: String, start: u64, end: u64) -> String {
+    mut message := String("`")
+    message.append(name)
+    message.append("` cannot run in a kernel: a kernel runs on the GPU and uses only GPU builtins and arithmetic")
+    return diagnostic("R0926", start, end, message, String("compute it on the CPU and pass the result to the kernel through a buffer"))
+}
+
+fun kernel_call_error(name: String, start: u64, end: u64) -> String {
+    mut message := String("the kernel `")
+    message.append(name)
+    message.append("` runs on the GPU and cannot be called from Ryn code")
+    return diagnostic("R0925", start, end, message, String("start it from the GPU host, or call a plain `fun` from the program"))
+}
+
+extend Lowering {
+    // `R0921`: a kernel returns nothing, and every parameter is a buffer of a GPU element type.
+    fun kernel_signature_error(self, id: u64) -> Option<String> {
+        definition := self.program.function_defs[self.program.functions[id]]
+        when definition.kernel_local == 0 {
+            return Option::None
+        }
+        when definition.return_type.is_some() {
+            return Option::Some(diagnostic("R0921", definition.span.start, definition.span.end, String("a kernel returns nothing"), String("write the results into a buffer parameter: `data: &mut [u32]`")))
+        }
+        mut position: u64 = 0
+        while position < definition.parameters.len() {
+            parameter := self.program.parameters[definition.parameters[position]]
+            when !gpu_buffer_word(self.signatures[id].params[position].clone()) {
+                return Option::Some(diagnostic("R0921", parameter.span.start, parameter.span.end, String("a kernel parameter is a buffer of a GPU element type"), String("write the parameter as `&[T]` (read only) or `&mut [T]`, with T of u32, i32, u64, i64, f32 or f64")))
+            }
+            position += 1
+        }
+        return Option::None
+    }
+
+    // Whether `name` is a kernel: a kernel runs on the GPU, so no Ryn code calls it.
+    fun kernel_call(self, name: String) -> bool {
+        found := self.signature_index(name)
+        when found.is_err() {
+            return false
+        }
+        return self.program.function_defs[self.program.functions[found.unwrap()]].kernel_local > 0
+    }
+
+    // The GPU builtins (`global_id`, `barrier`, `atomic_add`, ...) run only in a kernel, and a kernel calls no other builtin.
+    // A program function of the same name takes the place of a builtin, as elsewhere.
+    fun gpu_call_error(self, name: String, span: ast::Span) -> Option<String> {
+        when self.signature_index(name.clone()).is_ok() {
+            return Option::None
+        }
+        when self.kernel_size > 0 && (name == "print" || name == "eprint" || name == "write") {
+            return Option::Some(kernel_builtin_error(name, span.start, span.end))
+        }
+        entry := builtins::builtin_named(name.clone())
+        when entry.is_none() {
+            return Option::None
+        }
+        gpu := entry.unwrap().target.starts_with("Gpu ")
+        when gpu && self.kernel_size == 0 {
+            return Option::Some(gpu_outside_kernel_error(name, span.start, span.end))
+        }
+        when !gpu && self.kernel_size > 0 {
+            return Option::Some(kernel_builtin_error(name, span.start, span.end))
+        }
+        return Option::None
+    }
+
+    // `shared name: [T; N]` in a kernel: a workgroup array that the invocations of one workgroup share. It starts as zeros
+    // (the SPIR-V target stores them before the first barrier), and it is declared at the top of the kernel body, where every
+    // invocation reaches it.
+    fun shared_statement(mut self, marked: String, annotation: Option<u64>, span: ast::Span) -> Result<bool, String> {
+        name := marked.slice(7, marked.len())
+        when self.kernel_size == 0 {
+            return Result::Err(diagnostic("R0923", span.start, span.end, String("`shared` declares workgroup memory, which only a `#[kernel]` function has"), String("move the declaration into a kernel, or use an ordinary `mut` array")))
+        }
+        when self.scope_floors.len() > 0 {
+            return Result::Err(diagnostic("R0923", span.start, span.end, String("`shared` must be declared at the top of the kernel body, not inside a block"), String("move the declaration to the start of the kernel, where every invocation reaches it")))
+        }
+        when self.declared(name.clone()) {
+            return Result::Err(redeclared_let(name, span.start, span.end))
+        }
+        ty := self.annotation(annotation.unwrap())?
+        parts := array_parts(ty.clone())
+        when parts.is_none() {
+            return Result::Err(diagnostic("R0923", span.start, span.end, String("`shared` needs an array type, such as `[f32; 64]`"), String("write the element type and the number of elements in the annotation")))
+        }
+        items := parts.unwrap()
+        element := items[0].clone()
+        when !gpu_element_word(element.clone()) {
+            return Result::Err(gpu_type_error(element, span.start, span.end))
+        }
+        length := array_length_of(items)
+        when length == 0 || length > 65536 {
+            return Result::Err(diagnostic("R0923", span.start, span.end, String("a shared array has from 1 to 65536 elements"), String("choose a smaller array; workgroup memory is limited")))
+        }
+        slot := self.allocate(ty.clone())?
+        self.declare(Local { name: name.clone(), slot: slot, ty: ty.clone(), mutable: true })
+        mut kind := String("Integer")
+        when element.starts_with("F") {
+            kind = String("Float")
+        }
+        zero := join(words3(kind, String("0"), element))
+        self.statements.push(join(words6(String("Let"), num(slot), ty, join(words3(String("ArrayRepeat"), zero, num(length))), num(span.start), num(span.end))))
+        self.shared_pairs.push(self.current_id)
+        self.shared_pairs.push(slot)
+        return Result::Ok(false)
+    }
+
+    // The kernels of the program as IR tokens: their number, then for each its function index, workgroup size and the first
+    // slot of each of its workgroup arrays. `count` is the number of the program's own functions.
+    fun kernel_records(self, count: u64) -> Vec<String> {
+        mut records: Vec<String> = Vec()
+        mut found: u64 = 0
+        mut id: u64 = 0
+        while id < count {
+            definition := self.program.function_defs[self.program.functions[id]]
+            when definition.kernel_local > 0 {
+                mut slots: Vec<u64> = Vec()
+                mut pair: u64 = 0
+                while pair < self.shared_pairs.len() {
+                    when self.shared_pairs[pair] == id {
+                        slots.push(self.shared_pairs[pair + 1])
+                    }
+                    pair += 2
+                }
+                records.push(num(id))
+                records.push(num(definition.kernel_local))
+                records.push(num(slots.len()))
+                for slot in slots {
+                    records.push(num(slot))
+                }
+                found += 1
+            }
+            id += 1
+        }
+        mut kernels: Vec<String> = Vec()
+        kernels.push(num(found))
+        for record in records {
+            kernels.push(record)
+        }
+        return kernels
     }
 }
 
@@ -8598,7 +9238,7 @@ extend Lowering {
 }
 
 // The whole IR text: header, builtin enums, and the functions in source order.
-fun assemble(main_index: u64, structs: Vec<String>, functions: Vec<String>, enums: Vec<String>, names: Vec<String>) -> String {
+fun assemble(main_index: u64, structs: Vec<String>, functions: Vec<String>, enums: Vec<String>, names: Vec<String>, kernels: Vec<String>) -> String {
     mut tokens: Vec<String> = Vec()
     tokens.push(String("Ir"))
     tokens.push(num(main_index))
@@ -8616,11 +9256,14 @@ fun assemble(main_index: u64, structs: Vec<String>, functions: Vec<String>, enum
     for function in functions {
         tokens.push(function)
     }
-    // The function names, as an optional trailing section.
+    // The function names, as an optional trailing section, followed by the kernels (see `kernel_records`).
     when names.len() == function_count {
         tokens.push(num(names.len()))
         for name in names {
             tokens.push(length_prefixed(name))
+        }
+        for kernel in kernels {
+            tokens.push(kernel)
         }
     }
     // The bootstrap encoder writes a space before every word, including the first.
@@ -8862,6 +9505,7 @@ extend Lowering {
 
     // A local used as a method receiver. A moved local is `R0240` at the receiver's name, as the guard reports it.
     fun receiver_name(mut self, name: String, span: ast::Span) -> Result<Lowered, String> {
+        _ := self.loan_access(name.clone(), false, span)?
         when self.is_moved(name.clone()) {
             return Result::Err(moved_value_error(span.start, span.end))
         }
@@ -8991,6 +9635,22 @@ extend Lowering {
     // A method call on a local: an argument that moves that same local is `R0242`, since the receiver is borrowed for the whole
     // call.
     fun method_target(mut self, receiver: u64, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: ast::Span) -> Result<Lowered, String> {
+        root := self.field_place_base(receiver)
+        when root.is_some() {
+            root_name := root.unwrap()
+            mutable_method := name == "push" || name == "append" || name == "set" || name == "take" || name == "pop" || name == "clear" || name == "insert" || name == "remove" || name == "reserve" || name == "as_mut_slice" || name == "slice_mut"
+            _ := self.loan_access(root_name.clone(), mutable_method, span)?
+            root_ty := self.locals[self.find(root_name.clone())?].ty.clone()
+            when mutable_method && root_ty.starts_with("Reference ") && !reference_is_mutable(root_ty) {
+                when reference_inner(self.locals[self.find(root_name.clone())?].ty.clone()).unwrap() == "OwnedString" {
+                    return Result::Err(mutable_string_error(name.clone(), span.start, span.end))
+                }
+                return Result::Err(shared_assign_error(span.start, span.end))
+            }
+            when self.borrowed_name(root_name.clone(), !mutable_method) {
+                return Result::Err(self.borrow_error(root_name, span.start, span.end, String("cannot call this method while the receiver is borrowed")))
+            }
+        }
         before := self.pending_moves.len()
         extracting := name == "unwrap" || name == "expect" || name == "unwrap_err"
         lowered := self.method_target_unchecked(receiver, name, type_arguments, arguments, span)?
@@ -9020,6 +9680,9 @@ extend Lowering {
     fun method_target_unchecked(mut self, receiver: u64, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: ast::Span) -> Result<Lowered, String> {
         mut recv := self.receiver(receiver)?
         ty := recv.ty.clone()
+        when (name == "as_mut_slice" || name == "slice_mut") && self.immutable_local_receiver(receiver) {
+            return Result::Err(mutable_receiver_error(name.clone(), span.start, span.end))
+        }
         // A `String` field of a temporary (`make().label.len()`) is moved into a hidden local, which ends the statement's
         // borrow and drops the string with the enclosing block; reading its bytes in place would use freed memory.
         when ty == "OwnedString" && self.is_field_of_temporary(receiver) {
@@ -9067,8 +9730,13 @@ extend Lowering {
         when ty.starts_with("Array ") && name == "len" && arguments.is_empty() {
             return Result::Ok(Lowered { text: join(words3(String("Integer"), num(array_length_of(array_parts(ty.clone()).unwrap())), String("U64"))), ty: String("U64") })
         }
-        when ty.starts_with("Slice ") && name == "len" && arguments.is_empty() {
+        when is_slice_word(ty.clone()) && name == "len" && arguments.is_empty() {
             return Result::Ok(Lowered { text: join(words3(String("SliceLen"), String("1"), recv.text)), ty: String("U64") })
+        }
+        when is_slice_word(ty.clone()) && name == "as_slice" && arguments.is_empty() {
+            mut shared := String("Slice ")
+            shared.append(slice_inner(ty))
+            return Result::Ok(Lowered { text: recv.text, ty: shared })
         }
         element := vec_element_of(ty.clone())
         when element.is_some() {
@@ -9123,10 +9791,10 @@ extend Lowering {
             option_id := self.option_index(element.clone())?
             return Result::Ok(Lowered { text: join(words6(String("VecGetOption"), element, num(option_id), String("1"), String("1"), recv.text)), ty: join(words2(String("Enum"), num(option_id))) })
         }
-        when name == "as_slice" || name == "slice" {
+        when name == "as_slice" || name == "slice" || name == "as_mut_slice" || name == "slice_mut" {
             mut start := String("Integer 0 U64")
             mut end := join(words6(String("Call"), String("Vec"), String("Len"), element.clone(), String("1"), join(words2(recv.text.clone(), String("U64")))))
-            when name == "slice" {
+            when name == "slice" || name == "slice_mut" {
                 when arguments.len() != 2 {
                     return Result::Err(unsupported("slice arguments"))
                 }
@@ -9139,6 +9807,7 @@ extend Lowering {
                 end = last.text
             }
             mut slice_ty := String("Slice ")
+            when name == "as_mut_slice" || name == "slice_mut" { slice_ty = String("MutableSlice ") }
             slice_ty.append(element.clone())
             return Result::Ok(Lowered { text: join(words6(String("VecSlice"), element, String("3"), recv.text, start, end)), ty: slice_ty })
         }
@@ -9322,6 +9991,7 @@ extend Lowering {
         when lowered.text.starts_with("Integer ") {
             return Result::Ok(lowered)
         }
+        when name == "as_slice" && is_slice_word(lowered.ty.clone()) && !lowered.text.starts_with("VecSlice ") { return Result::Ok(lowered) }
         // `find` yields an `Option<u64>` made from the signed position the runtime returns.
         when lowered.text.starts_with("String FindStr") || lowered.text.starts_with("String FindString") {
             option_id := self.option_index(String("U64"))?
@@ -9351,7 +10021,10 @@ extend Lowering {
             items.push(join(words2(String("CallStatement"), lowered.text)))
         }
         last := self.method_target(root, name, Vec(), arguments, span)?
-        items.push(join(words2(String("CallStatement"), last.text)))
+        when is_slice_word(last.ty.clone()) && !last.text.starts_with("VecSlice ") {
+            slot := self.allocate(last.ty.clone())?
+            items.push(join(words6(String("Let"), num(slot), last.ty, last.text, num(span.start), num(span.end))))
+        } else { items.push(join(words2(String("CallStatement"), last.text))) }
         when items.len() == 1 {
             self.statements.push(items[0].clone())
         } else {
@@ -9434,6 +10107,15 @@ extend Lowering {
         }
         borrowed := reference_inner(recv.ty.clone())
         mut lent := recv.text.clone()
+        when reference_is_mutable(params[0].clone()) {
+            when borrowed.is_some() && !reference_is_mutable(recv.ty.clone()) { return Result::Err(shared_assign_error(span.start, span.end)) }
+            receiver_root := self.field_place_base(receiver)
+            when receiver_root.is_some() {
+                root_name := receiver_root.unwrap()
+                _ := self.loan_access(root_name.clone(), true, span)?
+                when self.borrowed_name(root_name.clone(), false) { return Result::Err(self.borrow_error(root_name, span.start, span.end, String("cannot mutate a borrowed receiver"))) }
+            }
+        }
         when borrowed.is_none() && reference_is_mutable(params[0].clone()) && self.immutable_local_receiver(receiver) {
             return Result::Err(mutable_receiver_error(name.clone(), span.start, span.end))
         }
@@ -9549,6 +10231,8 @@ extend Lowering {
         return choose self.program.exprs[index] {
             ast::ExprTree::NameRef(name, span) => Option::Some(name),
             ast::ExprTree::FieldE(value, name, name_span, span) => self.field_place_base(value),
+            ast::ExprTree::DerefE(value, span) => self.field_place_base(value),
+            ast::ExprTree::IndexE(value, at, span) => self.field_place_base(value),
             _ => Option::None,
         }
     }
@@ -9564,7 +10248,7 @@ extend Lowering {
     // Whether a value of a type may be stored in a temporary and borrowed (the bootstrap's `receiver_is_copyable`): strings,
     // collections, enums, slices, references and function pointers are not, and a structure is unless it owns data.
     fun receiver_copyable(self, ty: String) -> bool {
-        when ty == "OwnedString" || ty == "Str" || ty.starts_with("Vec ") || ty.starts_with("Map ") || ty.starts_with("Set ") || ty.starts_with("Enum ") || ty.starts_with("Slice ") || ty.starts_with("Reference ") || ty.starts_with("FunctionPointer ") {
+        when ty == "OwnedString" || ty == "Str" || ty.starts_with("Vec ") || ty.starts_with("Map ") || ty.starts_with("Set ") || ty.starts_with("Enum ") || is_slice_word(ty.clone()) || ty.starts_with("Reference ") || ty.starts_with("FunctionPointer ") {
             return false
         }
         when struct_id_of(ty.clone()).is_some() {
@@ -9615,7 +10299,7 @@ extend Lowering {
 
     // An argument for a slice parameter. An array, or an array literal, is lent as a slice.
     fun slice_argument(mut self, argument: u64, expected: String) -> Result<String, String> {
-        element := expected.slice(6, expected.len())
+        element := slice_inner(expected.clone())
         mut context := self.value_hint(argument)
         when !context.starts_with("Array ") {
             context = String("")
@@ -9626,6 +10310,7 @@ extend Lowering {
         }
         when context.is_empty() {
             value := self.moved_expression(argument, expected.clone())?
+            when expected.starts_with("Slice ") && value.ty.starts_with("MutableSlice ") && slice_inner(expected.clone()) == slice_inner(value.ty.clone()) { return Result::Ok(value.text) }
             when value.ty != expected {
                 return Result::Err(unsupported("argument type"))
             }
@@ -9634,6 +10319,10 @@ extend Lowering {
         value := self.expression(argument, context)?
         parts := array_parts(value.ty.clone())
         when parts.is_some() && parts.unwrap()[0] == element {
+            when expected.starts_with("MutableSlice ") {
+                span := self.expr_span_of(argument)
+                return Result::Err(diagnostic("R0206", span.start, span.end, String("a mutable array slice requires an explicit mutable borrow"), String("pass `&mut array`")))
+            }
             length := array_length_of(array_parts(value.ty.clone()).unwrap())
             return Result::Ok(join(words4(String("ArrayAsSlice"), value.text, element, num(length))))
         }
@@ -9641,6 +10330,21 @@ extend Lowering {
             return Result::Err(unsupported("argument type"))
         }
         return Result::Ok(value.text)
+    }
+
+    fun array_slice_address(mut self, argument: u64, expected: String) -> Result<Lowered, String> {
+        name := self.borrow_target(argument).unwrap()
+        mutable := self.address_is_mutable(argument)
+        span := self.expr_span_of(argument)
+        when expected.starts_with("MutableSlice ") && !mutable { return Result::Err(shared_assign_error(span.start, span.end)) }
+        local := self.locals[self.find(name.clone())?]
+        parts := array_parts(local.ty.clone())
+        when parts.is_none() || parts.unwrap()[0] != slice_inner(expected.clone()) {
+            return Result::Err(unsupported("array slice element type"))
+        }
+        _ := self.address_of_local(name.clone(), mutable, false, span, span)?
+        value := self.name(name, span)?
+        return Result::Ok(Lowered { text: join(words4(String("ArrayAsSlice"), value.text, parts.unwrap()[0].clone(), num(array_length_of(parts.unwrap())))), ty: expected })
     }
 
     fun literal_array_context(self, argument: u64, element: String) -> String {
@@ -9825,12 +10529,12 @@ extend Lowering {
             }
             return Result::Ok(Lowered { text: join(words3(String("Call"), lowered.text, lowered.ty.clone())), ty: lowered.ty })
         }
-        when base.ty.starts_with("Slice ") {
+        when is_slice_word(base.ty.clone()) {
             at := self.expression(index, String(""))?
             when !is_integer_word(at.ty.clone()) {
                 return Result::Err(unsupported("index type"))
             }
-            slice_element := base.ty.slice(6, base.ty.len())
+            slice_element := slice_inner(base.ty.clone())
             return Result::Ok(Lowered { text: join(words4(String("SliceIndex"), base.text, at.text, slice_element.clone())), ty: slice_element })
         }
         parts := array_parts(base.ty.clone())
@@ -10023,7 +10727,7 @@ extend Lowering {
             result.push(4)
             return result
         }
-        when ty == "Str" || ty.starts_with("Slice ") {
+        when ty == "Str" || is_slice_word(ty.clone()) {
             result.push(16)
             result.push(8)
             return result
@@ -10082,7 +10786,7 @@ extend Lowering {
     fun address_of(mut self, mutable: bool, raw: bool, value: u64, span: ast::Span) -> Result<Lowered, String> {
         choose self.program.exprs[value] {
             ast::ExprTree::NameRef(name, name_span) => self.address_of_local(name, mutable, raw, span, name_span),
-            ast::ExprTree::IndexE(slice, position, index_span) => self.slice_element_address(slice, position, span),
+            ast::ExprTree::IndexE(slice, position, index_span) => self.slice_element_address(slice, position, mutable, span),
             _ => Result::Err(address_operand_error(span.start, span.end)),
         }
     }
@@ -10090,6 +10794,9 @@ extend Lowering {
     fun address_of_local(mut self, name: String, mutable: bool, raw: bool, span: ast::Span, name_span: ast::Span) -> Result<Lowered, String> {
         found := self.find(name.clone())?
         local := self.locals[found]
+        when !raw && self.borrowed_name(name.clone(), !mutable) {
+            return Result::Err(self.borrow_error(name.clone(), span.start, span.end, String("cannot create a conflicting reference to a borrowed value")))
+        }
         when self.is_c_record(local.ty.clone()) {
             when slot_listed(self.c_loop_written.clone(), local.slot) {
                 return Result::Err(unsupported("a repr(C) local written in a loop before its address is taken"))
@@ -10122,22 +10829,24 @@ extend Lowering {
     }
 
     // `&slice[index]`: the address of an element of a borrowed slice.
-    fun slice_element_address(mut self, slice: u64, position: u64, span: ast::Span) -> Result<Lowered, String> {
+    fun slice_element_address(mut self, slice: u64, position: u64, mutable: bool, span: ast::Span) -> Result<Lowered, String> {
         base := self.expression(slice, String(""))?
         when base.ty.starts_with("Array ") {
             return Result::Err(diagnostic("R0271", span.start, span.end, String("a pointer into a local array is only passed to an extern \"C\" function"), String("pass `&array[index]` directly as an argument of an extern \"C\" function, or copy the element into a variable")))
         }
-        when !base.ty.starts_with("Slice ") {
+        when !is_slice_word(base.ty.clone()) {
             return Result::Err(unsupported("address of an element of this type"))
         }
+        when mutable && !base.ty.starts_with("MutableSlice ") { return Result::Err(shared_assign_error(span.start, span.end)) }
+        when self.is_name(slice) { _ := self.loan_access(self.name_of_value(slice), mutable, span)? }
         at := self.expression(position, String(""))?
         when !is_integer_word(at.ty.clone()) {
             return Result::Err(unsupported("index type"))
         }
-        element := base.ty.slice(6, base.ty.len())
+        element := slice_inner(base.ty.clone())
         mut pointer := String("Reference ")
         pointer.append(element.clone())
-        pointer.append(" 0")
+        when mutable { pointer.append(" 1") } else { pointer.append(" 0") }
         return Result::Ok(Lowered { text: join(words6(String("SliceElementAddress"), base.text, at.text, element, num(span.start), num(span.end))), ty: pointer })
     }
 
@@ -10204,10 +10913,7 @@ extend Lowering {
     fun dereference(mut self, pointer: u64, span: ast::Span) -> Result<Lowered, String> {
         value := self.field_tree(pointer)?
         pointee := self.pointee_of(value.ty.clone())?
-        // `R0206`: a structure that cannot be copied (it has a destructor, or a field that owns memory) is not read through a reference.
-        when struct_id_of(pointee.clone()).is_some() && !self.record_is_copy(pointee.clone()) {
-            return Result::Err(diagnostic("R0206", span.start, span.end, String("dereferencing `structure` is not supported yet"), String("")))
-        }
+        // A dereference identifies a borrowed place; moved_dereference rejects ownership transfer.
         return Result::Ok(Lowered { text: join(words3(String("Dereference"), value.text, pointee.clone())), ty: pointee })
     }
 
@@ -10229,20 +10935,21 @@ extend Lowering {
         when array_parts(ty.clone()).is_some() {
             return self.record_is_copy(array_parts(ty).unwrap()[0].clone())
         }
-        when ty == "OwnedString" || ty == "Str" || ty.starts_with("Vec ") || ty.starts_with("Map ") || ty.starts_with("Set ") || ty.starts_with("Enum ") || ty.starts_with("Slice ") || ty.starts_with("Reference ") {
+        when ty == "OwnedString" || ty == "Str" || ty.starts_with("Vec ") || ty.starts_with("Map ") || ty.starts_with("Set ") || ty.starts_with("Enum ") || is_slice_word(ty.clone()) || ty.starts_with("Reference ") {
             return false
         }
         return true
     }
 
     fun dereference_assign(mut self, pointer: u64, value: u64, span: ast::Span) -> Result<bool, String> {
+        when self.is_name(pointer) { _ := self.loan_access(self.name_of_value(pointer), true, span)? }
         target := self.expression(pointer, String(""))?
         // `R0206`: a shared reference is not assigned through.
         when target.ty.starts_with("Reference ") && !reference_is_mutable(target.ty.clone()) {
             return Result::Err(shared_assign_error(span.start, span.end))
         }
         pointee := self.pointee_of(target.ty.clone())?
-        stored := self.expression(value, pointee.clone())?
+        stored := self.moved_expression(value, pointee.clone())?
         when stored.ty != pointee {
             return Result::Err(unsupported("assignment through a pointer type"))
         }
@@ -10426,8 +11133,24 @@ extend Lowering {
     fun index_assign(mut self, name: String, index: u64, value: u64, span: ast::Span) -> Result<bool, String> {
         path := name.split(".")
         root := path[0].clone()
+        _ := self.loan_access(root.clone(), true, span)?
         found := self.find(root.clone())?
         local := self.locals[found]
+        when self.borrowed_name(root.clone(), false) {
+            return Result::Err(self.borrow_error(root.clone(), span.start, span.end, String("cannot write an element while its collection is borrowed")))
+        }
+        when is_slice_word(local.ty.clone()) {
+            when !local.ty.starts_with("MutableSlice ") { return Result::Err(shared_assign_error(span.start, span.end)) }
+            view := self.name(root, span)?
+            position := self.expression(index, String(""))?
+            when !is_integer_word(position.ty.clone()) { return Result::Err(unsupported("index type")) }
+            element := slice_inner(local.ty.clone())
+            stored := self.moved_expression(value, element.clone())?
+            when stored.ty != element { return Result::Err(unsupported("slice element assignment type")) }
+            address := join(words6(String("SliceElementAddress"), view.text, position.text, element.clone(), num(span.start), num(span.end)))
+            self.statements.push(join(words4(String("DereferenceAssign"), address, element, stored.text)))
+            return Result::Ok(false)
+        }
         mut through := local.ty.clone()
         when reference_inner(local.ty.clone()).is_some() {
             when !reference_is_mutable(local.ty.clone()) {
@@ -10593,8 +11316,8 @@ extend Lowering {
             item_ty = String("Char")
         } else when is_range {
             item_ty = self.structs[range_id.unwrap()].field_types[0].clone()
-        } else when lowered.ty.starts_with("Slice ") {
-            item_ty = lowered.ty.slice(6, lowered.ty.len())
+        } else when is_slice_word(lowered.ty.clone()) {
+            item_ty = slice_inner(lowered.ty.clone())
         } else when lowered.ty.starts_with("Array ") {
             item_ty = array_parts(lowered.ty.clone()).unwrap()[0].clone()
         } else {
@@ -10619,7 +11342,7 @@ extend Lowering {
         } else when lowered.ty == "Str" {
             length = join(words5(String("Call"), String("String"), String("StrCharCount"), String("1"), join(words2(view.clone(), String("U64")))))
             take = join(words6(String("Call"), String("String"), String("StrCharAt"), String("2"), view.clone(), join(words2(counter, String("Char")))))
-        } else when lowered.ty.starts_with("Slice ") {
+        } else when is_slice_word(lowered.ty.clone()) {
             length = join(words5(String("Call"), String("SliceLen"), String("1"), view.clone(), String("U64")))
             take = join(words4(String("SliceIndex"), view.clone(), counter.clone(), item_ty.clone()))
         } else when lowered.ty.starts_with("Array ") {
@@ -10639,11 +11362,15 @@ extend Lowering {
         // The moves of the loop header (a condition or a collection) happen before the first iteration.
         self.commit_moves()
         loop_before := self.moved_names.clone()
+        loop_borrows := self.borrows.clone()
+        loop_origins := self.origins.clone()
         outer_breaks := self.break_moves.clone()
         outer_continues := self.continue_moves.clone()
         self.break_moves = Vec()
         self.continue_moves = Vec()
         body_block := self.block_with(item_let, name, item_slot, item_ty.clone(), body)?
+        self.borrows = self.join_borrows(loop_borrows, true, self.borrows.clone(), true)
+        self.origins = self.join_branch_origins(loop_origins, true, self.origins.clone(), true)
         loop_error := self.loop_move_error(loop_before.clone(), body_block.falls, self.continue_moves.clone())
         when loop_error.is_some() {
             return Result::Err(loop_error.unwrap())
@@ -10835,7 +11562,7 @@ extend Lowering {
                     when self.borrowed_name(local_name.clone(), false) { return Result::Err(borrowed_move_error(self.expr_span_of(receiver).start, self.expr_span_of(receiver).end)) }
                     slot := self.locals[self.find(local_name.clone())?].slot
                     source_span := self.expr_span_of(receiver)
-                    self.pending_moves.push(MovedValue { name: local_name, slot: slot, start: source_span.start, end: source_span.end })
+                    self.pending_moves.push(MovedValue { name: local_name, slot: slot, start: source_span.start, end: source_span.end, part: false })
                 }
             }
             mut tokens: Vec<String> = Vec()
@@ -11205,7 +11932,7 @@ extend Lowering {
                 has_main = true
             }
         }
-        when !has_main {
+        when !has_main && !self.library {
             return Option::Some(unsupported("program without main"))
         }
         for index in self.program.extends.clone() {

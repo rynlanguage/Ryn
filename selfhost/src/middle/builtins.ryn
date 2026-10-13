@@ -56,6 +56,7 @@ fun builtin_rows() -> Vec<String> {
     rows.push(String("ask;System Ask;Str;OwnedString"))
     rows.push(String("stdout_write;System WriteStdout;Str;"))
     rows.push(String("stdout_flush;System FlushStdout;;"))
+    rows.push(String("stdout_is_terminal;System StdoutIsTerminal;;Bool"))
     rows.push(String("stderr_write;System WriteStderr;Str;"))
     rows.push(String("stderr_flush;System FlushStderr;;"))
     rows.push(String("__io_read_line;System ReadStdinLine;;OwnedString"))
@@ -65,6 +66,7 @@ fun builtin_rows() -> Vec<String> {
     rows.push(String("__io_stderr_write;System WriteStderr;Str;"))
     rows.push(String("__io_stdout_flush;System FlushStdout;;"))
     rows.push(String("__io_stdout_direct;System StdoutDirect;;"))
+    rows.push(String("__io_stdout_is_terminal;System StdoutIsTerminal;;Bool"))
     rows.push(String("__io_stderr_flush;System FlushStderr;;"))
     rows.push(String("__input_key_down;System KeyDown;U32;Bool"))
     rows.push(String("__input_key_pressed;System KeyPressed;U32;Bool"))
@@ -201,6 +203,13 @@ fun builtin_rows() -> Vec<String> {
     rows.push(String("unload_library;System UnloadLibrary;RawPointer U8;Bool"))
     rows.push(String("pointer_is_null;System PointerIsNull;RawPointer U8;Bool"))
     rows.push(String("call_c_i32_1;System CallCI32One;RawPointer U8,I32;I32"))
+    // The GPU builtins: available in a `#[kernel]` function only (`lower::gpu_call_error`). The identifiers are the
+    // invocation and workgroup indices of the SPIR-V compute model, and `atomic_add` returns the value before the add.
+    rows.push(String("global_id;Gpu GlobalId;;U32"))
+    rows.push(String("local_id;Gpu LocalId;;U32"))
+    rows.push(String("group_id;Gpu GroupId;;U32"))
+    rows.push(String("barrier;Gpu Barrier;;"))
+    rows.push(String("atomic_add;Gpu AtomicAdd;MutableSlice U32,U64,U32;U32"))
     return rows
 }
 

@@ -199,6 +199,8 @@ struct FunctionNode {
     name: String,
     extern_c: bool,
     variadic: bool,
+    // The workgroup size of a `#[kernel(local = N)]` function, 0 for an ordinary function.
+    kernel_local: u64,
     has_symbol: bool,
     symbol: String,
     type_params: Vec<String>,
@@ -875,6 +877,7 @@ extend Tree {
             name: self.string(),
             extern_c: false,
             variadic: false,
+            kernel_local: 0,
             has_symbol: false,
             symbol: String(),
             type_params: Vec<String>(),
@@ -896,6 +899,7 @@ extend Tree {
         }
         function.extern_c = self.boolean()
         function.variadic = self.boolean()
+        function.kernel_local = self.uint()
         when self.present() {
             function.has_symbol = true
             function.symbol = self.string()
@@ -1641,6 +1645,7 @@ extend Tree {
         out.append(enc_str(function.name.clone()))
         out.append(enc_bool(function.extern_c))
         out.append(enc_bool(function.variadic))
+        out.append(enc_uint(function.kernel_local))
         when function.has_symbol {
             out.append(word("+"))
             out.append(enc_str(function.symbol.clone()))
@@ -1902,7 +1907,10 @@ extend Tree {
             when node.flag {
                 key.append("mut ")
             }
-            key.append(self.type_key(node.first))
+            inner := self.types[node.first]
+            when inner.kind == TypeKind::SLICE {
+                key.push('[') key.append(self.type_key(inner.first)) key.push(']')
+            } else { key.append(self.type_key(node.first)) }
             return key
         }
         when kind == TypeKind::RAW {
@@ -2320,7 +2328,10 @@ extend Tree {
             when node.flag {
                 key.append("mut ")
             }
-            key.append(self.display_key(node.first))
+            inner := self.types[node.first]
+            when inner.kind == TypeKind::SLICE {
+                key.push('[') key.append(self.display_key(inner.first)) key.push(']')
+            } else { key.append(self.display_key(node.first)) }
             return key
         }
         when kind == TypeKind::RAW {
@@ -2423,6 +2434,16 @@ extend Tree {
                 result.insert(left.name, actual)
             }
             return Result::Ok(result)
+        }
+        when left.kind == TypeKind::REF && right.kind == TypeKind::REF && left.flag == right.flag {
+            return self.unify(left.first, right.first, result, start, end)
+        }
+        when left.kind == TypeKind::RAW && right.kind == TypeKind::RAW {
+            return self.unify(left.first, right.first, result, start, end)
+        }
+        // An argument `&raw mut value` has the type of a reference to the value; a `*T` parameter takes its target type.
+        when left.kind == TypeKind::RAW && right.kind == TypeKind::REF {
+            return self.unify(left.first, right.first, result, start, end)
         }
         when (left.kind == TypeKind::VEC && right.kind == TypeKind::VEC) || (left.kind == TypeKind::SLICE && right.kind == TypeKind::SLICE)
             || (left.kind == TypeKind::SLICE && right.kind == TypeKind::ARRAY)
@@ -2947,6 +2968,13 @@ extend Tree {
             method := node.text
             when receiver.kind == TypeKind::VEC && (method == "as_slice" || method == "slice") {
                 return self.wrapped(TypeKind::SLICE, receiver.first, receiver.start, receiver.end)
+            }
+            when receiver.kind == TypeKind::VEC && (method == "as_mut_slice" || method == "slice_mut") {
+                slice := self.wrapped(TypeKind::SLICE, receiver.first, receiver.start, receiver.end)
+                mut reference := blank_type(TypeKind::REF)
+                reference.first = slice reference.flag = true
+                reference.start = receiver.start reference.end = receiver.end
+                return self.new_type(reference)
             }
             when receiver.kind == TypeKind::VEC && (method == "len" || method == "capacity") {
                 return TypeKind::U64 as u64

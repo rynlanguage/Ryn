@@ -1,0 +1,67 @@
+// test: run
+// out: 0
+// out: 9
+// out: 10
+// out: 99
+// out: 100
+// out: 999
+// out: 1000
+// out: 4294967295
+// out: 4294967296
+// out: 9999999999
+// out: 10000000000
+// out: 18446744073709551615
+// out: -9223372036854775808
+// out: -1
+// out: 
+// out: a
+// out: ab
+// out: abc
+// out: abcd
+// out: abcde
+// out: abcdef
+// out: abcdefg
+// out: abcdefgh
+// out: abcdefghi
+// out: abcdefghijklmno
+// out: abcdefghijklmnop
+// out: abcdefghijklmnopq
+// out: xy123456
+
+fun main() {
+    echo 0
+    echo 9
+    echo 10
+    echo 99
+    echo 100
+    echo 999
+    echo 1000
+    a: u64 = 4294967295
+    b: u64 = 4294967296
+    c: u64 = 9999999999
+    d: u64 = 10000000000
+    e: u64 = 18446744073709551615
+    echo a
+    echo b
+    echo c
+    echo d
+    echo e
+    f: i64 = -9223372036854775807 - 1
+    echo f
+    echo -1
+    echo ""
+    echo "a"
+    echo "ab"
+    echo "abc"
+    echo "abcd"
+    echo "abcde"
+    echo "abcdef"
+    echo "abcdefg"
+    echo "abcdefgh"
+    echo "abcdefghi"
+    echo "abcdefghijklmno"
+    echo "abcdefghijklmnop"
+    echo "abcdefghijklmnopq"
+    write("xy")
+    echo 123456
+}

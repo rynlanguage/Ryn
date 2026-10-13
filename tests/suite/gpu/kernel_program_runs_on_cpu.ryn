@@ -1,0 +1,15 @@
+// test: run
+// out: lib
+// out: 3
+// exit: 0
+
+#[kernel(local = 64)]
+fun double(data: &mut [u32]) {
+    i := global_id() as u64
+    data[i] = data[i] * 2
+}
+
+fun main() {
+    echo "lib"
+    echo 3
+}

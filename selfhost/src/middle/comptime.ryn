@@ -3467,6 +3467,7 @@ extend Comptime {
                         name: name,
                         extern_c: false,
                         variadic: false,
+                        kernel_local: 0,
                         external_symbol: Option::None,
                         type_parameters: Vec(),
                         type_parameter_bounds: Vec(),

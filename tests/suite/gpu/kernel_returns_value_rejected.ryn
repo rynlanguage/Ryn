@@ -1,0 +1,11 @@
+// test: fail
+// code: R0921
+
+#[kernel(local = 4)]
+fun bad(data: &mut [u32]) -> u32 {
+    return 1
+}
+
+fun main() {
+    echo 1
+}

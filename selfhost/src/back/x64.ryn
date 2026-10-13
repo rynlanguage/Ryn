@@ -698,6 +698,17 @@ extend Asm {
         self.rr(dst, src)
     }
 
+    // `imul dst, src, sign-extended imm32`.
+    pub fun imul_ri(mut self, dst: u64, src: u64, immediate: i64) {
+        when self.listing {
+            self.note(inst3(String("imul"), reg_name(dst), reg_name(src), String(immediate)))
+        }
+        self.rex(1, dst, src, false)
+        self.b(105)
+        self.rr(dst, src)
+        self.s32(immediate)
+    }
+
     // F7 group at 64 bits: not (2), neg (3), mul (4), imul (5), div (6), idiv (7).
     pub fun unary(mut self, extension: u64, reg: u64) {
         when self.listing {

@@ -1,0 +1,14 @@
+// test: fail
+// code: R0240
+
+struct Holder {
+    name: String,
+}
+fun consume(h: Holder) -> u64 {
+    return 1
+}
+fun main() {
+    h := Holder { name: String("hi") }
+    n := consume(h)
+    echo h.name
+}

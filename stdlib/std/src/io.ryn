@@ -44,6 +44,10 @@ pub fun stdout_flush() {
     __io_stdout_flush()
 }
 
+pub fun stdout_is_terminal() -> bool {
+    return __io_stdout_is_terminal()
+}
+
 pub fun stderr_flush() {
     __io_stderr_flush()
 }

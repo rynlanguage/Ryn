@@ -31,6 +31,7 @@ use middle::comptime
 use middle::desugar
 use back::gen
 use back::arm64
+use back::spirv
 use driver::report
 use driver::manifest
 use std::fs
@@ -395,6 +396,24 @@ extend Loader {
 extend Compilation {
     // The unit and the span in it of a span of the joined text; `diagnostic` keeps its message.
     fun render(self, diagnostic: report::Diagnostic) -> String {
+        // Secondary loan spans remain inside the existing help string wire format, so
+        // bootstrap readers stay compatible. Map both spans through the joined modules.
+        when diagnostic.code == "R0249" && diagnostic.help.starts_with("@borrow ") {
+            first := diagnostic.help.split("\n")[0].clone()
+            fields := first.split(" ")
+            when fields.len() == 3 && first.len() < diagnostic.help.len() {
+                start := fields[1].try_parse::<u64>()
+                end := fields[2].try_parse::<u64>()
+                when start.is_some() && end.is_some() {
+                    primary := report::Diagnostic { code: diagnostic.code.clone(), message: diagnostic.message.clone(), start: diagnostic.start, end: diagnostic.end, has_help: true, help: diagnostic.help.slice(first.len() + 1, diagnostic.help.len()) }
+                    note := report::Diagnostic { code: String("R0249"), message: String("borrow starts here"), start: start.unwrap(), end: end.unwrap(), has_help: false, help: String("") }
+                    mut out := self.render(primary)
+                    out.append("\n")
+                    out.append(self.render(note).replace("error[R0249]:", "note:"))
+                    return out
+                }
+            }
+        }
         when self.single {
             unit := self.units[0]
             return report::render(diagnostic, unit.path.clone(), unit.text.clone())
@@ -1154,7 +1173,8 @@ fun rync_expand_bitflags(text: String) -> String {
 }
 
 // The program from its entry file through the typed IR. `recovering` reports every syntax error of a file without modules.
-fun rync_frontend(units: Vec<Unit>, recovering: bool) -> Result<Compiled, Failure> {
+// `library`: the program need not have `main` (`check`, and the SPIR-V target, which compiles kernels only).
+fun rync_frontend(units: Vec<Unit>, recovering: bool, library: bool) -> Result<Compiled, Failure> {
     mut clock := time::monotonic()
     single := units.len() == 1 && units[0].import_paths.is_empty()
     mut compilation := Compilation { units: units.clone(), segments: Vec(), single: true, joined: String("") }
@@ -1206,7 +1226,7 @@ fun rync_frontend(units: Vec<Unit>, recovering: bool) -> Result<Compiled, Failur
     when desugared.is_err() {
         return Result::Err(compilation.stage_failure(desugared.unwrap_err()))
     }
-    lowered := lower::lower_recovering_with(desugared.unwrap(), !env::get("RYN_LOWER_ALL").is_empty())
+    lowered := lower::lower_recovering_with(desugared.unwrap(), !env::get("RYN_LOWER_ALL").is_empty(), library)
     clock = rync_tick("lower", clock)
     when lowered.is_err() {
         return Result::Err(compilation.stage_failure(lowered.unwrap_err()))
@@ -1308,7 +1328,7 @@ fun rync_fail(message: String, code: i32) -> i32 {
 }
 
 fun rync_usage() -> String {
-    return String("usage: rync [build|check] [-o <path>] [--profile-generate <file>] [--profile-use <file>] [--target <linux|windows>] [--stdlib <directory>] [--package <name>=<directory>] <entry.ryn|project-dir>\n       rync asm [--function <name>] [--summary] [--arch x86-64] [--target <linux|windows>] [--stdlib <directory>] <entry.ryn|project-dir>\n       rync --version")
+    return String("usage: rync [build|check] [-o <path>] [--profile-generate <file>] [--profile-use <file>] [--target <linux|windows|aarch64-linux|spirv>] [--stdlib <directory>] [--package <name>=<directory>] <entry.ryn|project-dir>\n       rync asm [--function <name>] [--summary] [--arch x86-64] [--target <linux|windows>] [--stdlib <directory>] <entry.ryn|project-dir>\n       rync --version")
 }
 
 fun main() -> i32 {
@@ -1332,6 +1352,8 @@ fun main() -> i32 {
     mut windows := system::os() == "windows"
     // `--target aarch64-linux` selects the AArch64 backend, which makes a Linux executable for ARM64.
     mut arm64 := false
+    // `--target spirv` writes the `#[kernel]` functions as a SPIR-V module (`back/spirv`), with no `main`.
+    mut spirv_target := false
     while position < arg_count() {
         word := String(arg(position))
         when word == "--version" || word == "-V" {
@@ -1370,12 +1392,19 @@ fun main() -> i32 {
             when target == "windows" || target == "x86_64-windows" {
                 windows = true
                 arm64 = false
+                spirv_target = false
             } else when target == "linux" || target == "x86_64-linux" {
                 windows = false
                 arm64 = false
+                spirv_target = false
             } else when target == "aarch64-linux" || target == "aarch64" {
                 windows = false
                 arm64 = true
+                spirv_target = false
+            } else when target == "spirv" {
+                windows = false
+                arm64 = false
+                spirv_target = true
             } else {
                 return rync_fail(rync_usage(), 2)
             }
@@ -1492,13 +1521,15 @@ fun main() -> i32 {
     }
     loaded_files := loader.found_files.clone()
     mut analyzed: Result<Compiled, Failure> = Result::Err(Failure { text: String(""), status: 1 })
-    when !checking && !windows && env::get("RYN_NO_PRUNE").is_empty() && rync_prune_worthwhile(loader.units.clone()) {
-        analyzed = rync_frontend(rync_pruned_units(loader.units.clone()), false)
+    // A library (`check`, and the SPIR-V target) keeps every function: pruning keeps only what `main` reaches.
+    library := checking || spirv_target
+    when !library && !windows && env::get("RYN_NO_PRUNE").is_empty() && rync_prune_worthwhile(loader.units.clone()) {
+        analyzed = rync_frontend(rync_pruned_units(loader.units.clone()), false, false)
         when analyzed.is_err() {
-            analyzed = rync_frontend(loader.units.clone(), false)
+            analyzed = rync_frontend(loader.units.clone(), false, false)
         }
     } else {
-        analyzed = rync_frontend(loader.units.clone(), checking)
+        analyzed = rync_frontend(loader.units.clone(), checking, library)
     }
     when analyzed.is_err() {
         failure := analyzed.unwrap_err()
@@ -1555,10 +1586,15 @@ fun main() -> i32 {
         rync_write_file(dump_path, dump)
     }
     mut linked: Result<Vec<u8>, String> = Result::Err(String(""))
+    when spirv_target && (!profile_out.is_empty() || !profile_text.is_empty()) {
+        return rync_fail(String("error[R0910]: profiling is not available for the SPIR-V target"), 2)
+    }
     when arm64 && (!profile_out.is_empty() || !profile_text.is_empty()) {
         return rync_fail(String("error[R0910]: profiling is not available for the AArch64 target"), 2)
     }
-    when arm64 {
+    when spirv_target {
+        linked = spirv::generate_text(compiled.ir_text.clone())
+    } else when arm64 {
         linked = arm64::generate_executable_text(compiled.ir_text.clone())
     } else when !profile_out.is_empty() || !profile_text.is_empty() {
         linked = gen::generate_profiled(compiled.ir_text.clone(), windows, profile_out.clone(), profile_text)

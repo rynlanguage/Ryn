@@ -1,0 +1,10 @@
+// test: fail
+// code: R0920
+
+#[kernel(local = 0)]
+fun k(data: &mut [u32]) {
+}
+
+fun main() {
+    echo 1
+}

@@ -1,5 +1,6 @@
 // test: fail
-// code: R0240
+// code: R0249
+// Local slice bindings are supported; resizing their source before the last use is unsafe.
 fun main() {
     mut v: Vec<i32> = Vec()
     v.push(1)

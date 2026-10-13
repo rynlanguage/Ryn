@@ -10,7 +10,7 @@
 use back::x64
 
 // The functions of the system libraries that these routines call, each as `library!name`.
-pub fun api_names() -> Vec<String> {
+pub fun api_names(arguments: bool) -> Vec<String> {
     mut names: Vec<String> = Vec()
     names.push(String("kernel32!ExitProcess"))
     names.push(String("kernel32!GetStdHandle"))
@@ -24,7 +24,7 @@ pub fun api_names() -> Vec<String> {
     names.push(String("kernel32!GetFileAttributesW"))
     names.push(String("kernel32!MultiByteToWideChar"))
     names.push(String("kernel32!WideCharToMultiByte"))
-    names.push(String("kernel32!GetCommandLineW"))
+    when arguments { names.push(String("kernel32!GetCommandLineW")) }
     names.push(String("kernel32!AddVectoredExceptionHandler"))
     names.push(String("kernel32!SetConsoleOutputCP"))
     names.push(String("kernel32!SetThreadStackGuarantee"))
@@ -37,7 +37,8 @@ pub fun api_names() -> Vec<String> {
     names.push(String("kernel32!DeleteFileW"))
     names.push(String("kernel32!RemoveDirectoryW"))
     names.push(String("kernel32!CreateDirectoryW"))
-    names.push(String("shell32!CommandLineToArgvW"))
+    names.push(String("kernel32!GetConsoleMode"))
+    when arguments { names.push(String("shell32!CommandLineToArgvW")) }
     return names
 }
 
@@ -180,9 +181,12 @@ pub fun emit_syscall(asm: &mut x64::Asm, rt: &WinRt) {
     getcwd_case := asm.new_label()
     stat_case := asm.new_label()
     getpid_case := asm.new_label()
+    ioctl_case := asm.new_label()
 
     asm.alu_ri(7, x64::Reg::RBX, 1)
     asm.jcc(x64::Cc::EQUAL, write_case)
+    asm.alu_ri(7, x64::Reg::RBX, 16)
+    asm.jcc(x64::Cc::EQUAL, ioctl_case)
     asm.alu_ri(7, x64::Reg::RBX, 231)
     asm.jcc(x64::Cc::EQUAL, exit_case)
     asm.alu_ri(7, x64::Reg::RBX, 9)
@@ -244,6 +248,24 @@ pub fun emit_syscall(asm: &mut x64::Asm, rt: &WinRt) {
     asm.jmp(done)
     asm.bind(write_failed)
     asm.mov_ri(x64::Reg::RAX, negative(5))
+    asm.jmp(done)
+
+    // ioctl(descriptor, TCGETS, termios): 0 for a console, the terminal test of standard output; ENOTTY otherwise.
+    asm.bind(ioctl_case)
+    not_console := asm.new_label()
+    asm.mov_ri(x64::Reg::RAX, 21505)
+    asm.alu_rr(57, reg_r13(), x64::Reg::RAX)
+    asm.jcc(x64::Cc::NOT_EQUAL, not_console)
+    emit_handle(asm, rt)
+    asm.lea(x64::Reg::RDX, x64::Reg::RSP, 96)
+    call_api(asm, rt, String("kernel32!GetConsoleMode"))
+    asm.zext_rr(x64::Reg::RAX, x64::Reg::RAX, 4)
+    asm.test_rr(x64::Reg::RAX, x64::Reg::RAX)
+    asm.jcc(x64::Cc::EQUAL, not_console)
+    asm.mov_ri(x64::Reg::RAX, 0)
+    asm.jmp(done)
+    asm.bind(not_console)
+    asm.mov_ri(x64::Reg::RAX, negative(25))
     asm.jmp(done)
 
     // exit_group(status)
@@ -660,7 +682,7 @@ pub fun emit_syscall(asm: &mut x64::Asm, rt: &WinRt) {
 
 // Start-up: the console writes UTF-8, the thread keeps 64 KiB of stack for the exception handler, and the command line is
 // split into arguments in UTF-8. Returns argc in rdi and the argument vector (a zero ends it) in rsi.
-pub fun emit_init(asm: &mut x64::Asm, rt: &WinRt) {
+pub fun emit_init(asm: &mut x64::Asm, rt: &WinRt, arguments: bool) {
     asm.bind(rt.init_label)
     asm.push(x64::Reg::RBP)
     asm.mov_rr(x64::Reg::RBP, x64::Reg::RSP)
@@ -676,6 +698,12 @@ pub fun emit_init(asm: &mut x64::Asm, rt: &WinRt) {
     asm.store(4, x64::Reg::RAX, x64::Reg::RSP, 64)
     asm.lea(x64::Reg::RCX, x64::Reg::RSP, 64)
     call_api(asm, rt, String("kernel32!SetThreadStackGuarantee"))
+    when !arguments {
+        asm.lea(x64::Reg::RSP, x64::Reg::RBP, (0 as i64) - 32)
+        asm.pop(reg_r14()) asm.pop(reg_r13()) asm.pop(reg_r12()) asm.pop(x64::Reg::RBX) asm.pop(x64::Reg::RBP)
+        asm.ret()
+        return
+    }
     call_api(asm, rt, String("kernel32!GetCommandLineW"))
     asm.mov_rr(x64::Reg::RCX, x64::Reg::RAX)
     asm.lea(x64::Reg::RDX, x64::Reg::RSP, 72)
