@@ -1280,7 +1280,7 @@ fun vec_of_set_error(name: String, start: u64, end: u64) -> String {
 
 // The built-in calls that `call` lowers by name: a name that is none of these and is no function of the program is unknown.
 fun is_builtin_call_name(name: String) -> bool {
-    when name == "String" || name == "arg" || name == "arg_count" || name == "try_read_file" || name == "read_file_result" {
+    when name == "String" || name == "Map" || name == "HashMap" || name == "arg" || name == "arg_count" || name == "try_read_file" || name == "read_file_result" {
         return true
     }
     return builtins::builtin_named(name).is_some()
@@ -4352,6 +4352,28 @@ extend Lowering {
         return !self.structs[id.unwrap()].drop_name.is_empty()
     }
 
+    fun move_only_value(self, ty: String, depth: u64) -> bool {
+        when depth > 64 { return true }
+        when self.has_destructor(ty.clone()) { return true }
+        id := struct_id_of(ty.clone())
+        when id.is_some() {
+            for field in self.structs[id.unwrap()].field_types.clone() {
+                when self.move_only_value(field, depth + 1) { return true }
+            }
+        }
+        when ty.starts_with("Enum ") {
+            enum_id := ty.slice(5, ty.len()).to_u64()
+            for field in self.enums[enum_id].field_types.clone() {
+                when self.move_only_value(field, depth + 1) { return true }
+            }
+        }
+        when ty.starts_with("Vec ") { return self.move_only_value(ty.slice(4, ty.len()), depth + 1) }
+        when ty.starts_with("Array ") { return self.move_only_value(array_element_word(ty), depth + 1) }
+        parts := map_parts(ty)
+        when parts.is_some() { return self.move_only_value(parts.unwrap()[1], depth + 1) }
+        return false
+    }
+
     // `reference.field = value` (or `op=`): a store through the pointer held in the local.
     fun reference_field_assign(mut self, object: String, names: Vec<String>, spans: Vec<u64>, op: Option<String>, value: u64, span: ast::Span) -> Result<bool, String> {
         index := self.find(object.clone())?
@@ -5005,6 +5027,18 @@ extend Lowering {
                 return Result::Ok(Lowered { text: join(words4(String("Cast"), operand.text, operand.ty.clone(), target.clone())), ty: target })
             }
             return Result::Err(unsupported("raw pointer cast source"))
+        }
+        when target == "Char" {
+            operand := self.expression(value, String(""))?
+            when operand.ty == "Char" { return Result::Ok(operand) }
+            when !is_integer_word(operand.ty.clone()) { return Result::Err(unsupported("cast to char from a non-integer")) }
+            when !expected.is_empty() && expected != "Char" { return Result::Err(unsupported("cast where another type is expected")) }
+            mut parameters: Vec<String> = Vec()
+            parameters.push(String("U64"))
+            runtime := self.runtime_function(String("String CharFromU64"), parameters, String("Char"))
+            when runtime.is_none() { return Result::Err(unsupported("integer-to-char runtime is missing")) }
+            converted := join(words4(String("Cast"), operand.text, operand.ty, String("U64")))
+            return Result::Ok(Lowered { text: join(words5(String("Call"), join(words2(String("Function"), num(runtime.unwrap()))), String("1"), converted, String("Char"))), ty: String("Char") })
         }
         when !is_numeric_word(target.clone()) {
             return Result::Err(unsupported("cast to this type"))
@@ -6413,6 +6447,14 @@ fun redeclared_let(name: String, start: u64, end: u64) -> String {
                 return Result::Err(unsupported("Vec without an element type"))
             }
             return Result::Ok(Lowered { text: join(words5(String("Call"), String("Vec"), String("New"), element.unwrap(), join(words2(String("0"), expected.clone())))), ty: expected })
+        }
+        when (name == "Map" || name == "HashMap") && arguments.is_empty() && type_arguments.is_empty() && self.signature_index(name.clone()).is_err() {
+            parts := map_parts(expected.clone())
+            when parts.is_none() {
+                return Result::Err(diagnostic("R0262", span.start, span.end, String("cannot infer Map key and value types"), String("provide a Map<K, V> annotation or use Map<K, V>()")))
+            }
+            types := parts.unwrap()
+            return self.map_new_words(types[0].clone(), types[1].clone(), span)
         }
         when !type_arguments.is_empty() {
             return Result::Err(unsupported("generic call"))
@@ -8118,6 +8160,7 @@ extend Lowering {
             mut position: u64 = 0
             for struct_index in self.program.structs.clone() {
                 definition := self.program.struct_defs[struct_index]
+                when definition.public && definition.name == module_path { self.register_type(alias.clone(), struct_word(position)) }
                 when definition.public && definition.module_path == module_path {
                     mut alias_name := alias.clone()
                     alias_name.append("::")
@@ -8129,6 +8172,7 @@ extend Lowering {
             mut enum_position: u64 = 0
             for enum_index in self.program.enums.clone() {
                 definition := self.program.enum_defs[enum_index]
+                when definition.public && definition.name == module_path { self.register_type(alias.clone(), join(words2(String("Enum"), num(enum_position)))) }
                 when definition.public && definition.module_path == module_path {
                     mut alias_name := alias.clone()
                     alias_name.append("::")
@@ -8157,6 +8201,11 @@ extend Lowering {
             mut function_id: u64 = 0
             for function_index in self.program.functions.clone() {
                 definition := self.program.function_defs[function_index]
+                when definition.public && definition.name == module_path && function_id < self.signatures.len() && self.signature_exact(alias.clone()).is_err() {
+                    when !self.alias_index.contains_key(alias.clone()) { self.alias_index.insert(alias.clone(), self.alias_names.len()) }
+                    self.alias_names.push(alias.clone())
+                    self.alias_targets.push(function_id)
+                }
                 when !definition.public && definition.module_path == module_path && definition.name.starts_with(prefix.clone()) {
                     mut private_name := alias.clone()
                     private_name.append("::")
@@ -8164,7 +8213,7 @@ extend Lowering {
                     self.private_alias_names.push(private_name)
                     self.private_alias_targets.push(definition.name.clone())
                 }
-                when definition.public && definition.module_path == module_path && definition.name.starts_with(prefix.clone()) && function_id < self.signatures.len() {
+                when definition.public && (definition.module_path == module_path || self.type_index.contains_key(alias.clone())) && definition.name.starts_with(prefix.clone()) && function_id < self.signatures.len() {
                     suffix := definition.name.slice(prefix.len(), definition.name.len())
                     mut alias_name := alias.clone()
                     alias_name.append("::")
@@ -8943,6 +8992,7 @@ extend Lowering {
     // call.
     fun method_target(mut self, receiver: u64, name: String, type_arguments: Vec<u64>, arguments: Vec<u64>, span: ast::Span) -> Result<Lowered, String> {
         before := self.pending_moves.len()
+        extracting := name == "unwrap" || name == "expect" || name == "unwrap_err"
         lowered := self.method_target_unchecked(receiver, name, type_arguments, arguments, span)?
         receiver_name := self.receiver_local_name(receiver)
         when receiver_name.is_some() {
@@ -8951,7 +9001,7 @@ extend Lowering {
             wanted := receiver_name.unwrap()
             while position < all.len() {
                 moved := all[position]
-                when moved.name == wanted {
+                when moved.name == wanted && !(extracting && lowered.text.starts_with("EnumUnwrap ")) {
                     return Result::Err(diagnostic("R0242", moved.start, moved.end, String("cannot move a value while an earlier operand borrows it"), String("complete the borrowing operation first, or pass an explicit `.clone()`")))
                 }
                 position += 1
@@ -9029,7 +9079,7 @@ extend Lowering {
         }
         enum_id := enum_id_of(ty.clone())
         when enum_id.is_some() {
-            return self.enum_method(recv, enum_id.unwrap(), name, arguments)
+            return self.enum_method(receiver, recv, enum_id.unwrap(), name, arguments)
         }
         when map_parts(ty.clone()).is_some() {
             return self.map_method_call(recv, name, arguments)
@@ -9670,6 +9720,10 @@ extend Lowering {
     fun map_new(self, key: u64, value: u64, span: ast::Span) -> Result<Lowered, String> {
         key_ty := self.annotation(key)?
         value_ty := self.annotation(value)?
+        return self.map_new_words(key_ty, value_ty, span)
+    }
+
+    fun map_new_words(self, key_ty: String, value_ty: String, span: ast::Span) -> Result<Lowered, String> {
         // `R0244`: a key hashes and compares as its words, so it is a String, an integer, a bool, a char, or a structure that
         // derives `Hash` with only such fields (and nested structures of the same kind).
         when !self.map_key_hashable(key_ty.clone()) {
@@ -10716,7 +10770,7 @@ extend Lowering {
     }
 
     // `is_some`, `unwrap`, `unwrap_or`, and the like, on an `Option` or `Result` receiver.
-    fun enum_method(mut self, recv: Lowered, id: u64, name: String, arguments: Vec<u64>) -> Result<Lowered, String> {
+    fun enum_method(mut self, receiver: u64, recv: Lowered, id: u64, name: String, arguments: Vec<u64>) -> Result<Lowered, String> {
         is_option := self.has_variant(id, String("Some")) && self.has_variant(id, String("None"))
         is_result := self.has_variant(id, String("Ok")) && self.has_variant(id, String("Err"))
         mut predicate := String("")
@@ -10774,6 +10828,16 @@ extend Lowering {
             }
             success_tag := self.variant_index(id, success_name.clone())?
             value_type := self.variant_payload(id, success_name)?
+            when self.move_only_value(value_type.clone(), 0) {
+                named := self.receiver_local_name(receiver)
+                when named.is_some() {
+                    local_name := named.unwrap()
+                    when self.borrowed_name(local_name.clone(), false) { return Result::Err(borrowed_move_error(self.expr_span_of(receiver).start, self.expr_span_of(receiver).end)) }
+                    slot := self.locals[self.find(local_name.clone())?].slot
+                    source_span := self.expr_span_of(receiver)
+                    self.pending_moves.push(MovedValue { name: local_name, slot: slot, start: source_span.start, end: source_span.end })
+                }
+            }
             mut tokens: Vec<String> = Vec()
             tokens.push(String("EnumUnwrap"))
             tokens.push(num(id))

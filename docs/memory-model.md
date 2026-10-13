@@ -91,6 +91,12 @@ Out-of-bounds indexing and slicing at a non-UTF-8 boundary produce a runtime dia
 
 ## Enums and pattern matching
 
+Custom-destructor resources can be moved into enum payloads, including `Option<Resource>` and `Result<Resource, E>`.
+Construction accepts literals, moved locals and function results. `choose` and `?` transfer the resource, and
+`unwrap`, `expect` and `unwrap_err` move a move-only payload out rather than cloning its handle. Its source enum
+binding becomes unavailable after extraction. Payload cleanup runs the destructor once; copying an enum containing
+a move-only resource is rejected.
+
 Enums use tagged, heap-backed values. A declaration can contain unit variants and tuple-style payloads:
 
 ```ryn

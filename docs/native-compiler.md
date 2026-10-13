@@ -92,6 +92,19 @@ failure, guard cleanup and four workers incrementing a plain counter under one m
 
 ## Float text and runtime ownership
 
+Contextual `Map()`/`HashMap()` constructors infer their key and value types from an annotation, function result,
+argument or structure field, like `Vec()`. A constructor with no type context reports R0262.
+`use std::arena::Arena` imports a public type directly; selected public functions and type aliases can also be imported,
+including with `as`. Missing or private items are rejected at the import.
+
+Both project arguments and source-file arguments discover path dependencies from the enclosing `ryn.yaml`; `path:`
+is relative to that manifest. This applies consistently to `ryn check`, `ryn build`, `ryn run` and direct `rync` calls,
+including when invoked from outside the project. Windows path separators are normalized at the CLI boundary.
+
+Integer `as char` conversions validate the complete integer value as a Unicode scalar (0 to 0x10FFFF, excluding
+surrogates). Negative and oversized values fail rather than truncating to a valid character. Constant evaluation
+performs the same validation. Casting individual bytes is useful for ASCII; UTF-8 byte sequences require decoding.
+
 The native backend embeds typed IR generated from the same Ryn big-integer
 algorithms the frontend uses for decimal literals. Both binary32 and binary64
 have shortest, round-tripping formatting, with Rust-style fixed decimal output,

@@ -57,6 +57,7 @@ struct Unit {
     alias_names: Vec<String>,
     alias_parameters: Vec<String>,
     alias_types: Vec<String>,
+    public_items: Vec<String>,
     // The modules it imports (`a::b`) and the names they are known by.
     import_paths: Vec<String>,
     import_locals: Vec<String>,
@@ -184,7 +185,7 @@ extend Loader {
         file.append(".ryn")
         mut found: Vec<String> = Vec()
         found.push(root)
-        when components[0] == "std" {
+        when components[0] == "std" && file_exists(file.clone()) {
             found.push(file)
             return Result::Ok(found)
         }
@@ -197,6 +198,16 @@ extend Loader {
         when file_exists(directory_file.clone()) {
             found.push(directory_file)
             return Result::Ok(found)
+        }
+        when components.len() > first + 1 {
+            mut parent := components.clone()
+            parent.pop()
+            resolved := self.resolve(parent.clone(), found[0].clone())
+            when resolved.is_ok() {
+                mut place := resolved.unwrap()
+                place.push(rync_join_components(parent, "::"))
+                return Result::Ok(place)
+            }
         }
         mut message := String("error[R0420]: module `")
         message.append(joined)
@@ -222,7 +233,7 @@ extend Loader {
         }
         self.found_files.push(file.clone())
         self.found_modules.push(module_path.clone())
-        self.units.push(Unit { path: file, module_path: module_path, text: text, alias_names: Vec(), alias_parameters: Vec(), alias_types: Vec(), import_paths: Vec(), import_locals: Vec() })
+        self.units.push(Unit { path: file, module_path: module_path, text: text, alias_names: Vec(), alias_parameters: Vec(), alias_types: Vec(), public_items: Vec(), import_paths: Vec(), import_locals: Vec() })
         return true
     }
 
@@ -306,10 +317,23 @@ extend Loader {
             return false
         }
         program := decoded.unwrap()
-        mut unit := Unit { path: file.clone(), module_path: module_path.clone(), text: text.clone(), alias_names: Vec(), alias_parameters: Vec(), alias_types: Vec(), import_paths: Vec(), import_locals: Vec() }
+        mut unit := Unit { path: file.clone(), module_path: module_path.clone(), text: text.clone(), alias_names: Vec(), alias_parameters: Vec(), alias_types: Vec(), public_items: Vec(), import_paths: Vec(), import_locals: Vec() }
+        for index in program.structs.clone() {
+            definition := program.struct_defs[index]
+            when definition.public { unit.public_items.push(definition.name.clone()) }
+        }
+        for index in program.enums.clone() {
+            definition := program.enum_defs[index]
+            when definition.public { unit.public_items.push(definition.name.clone()) }
+        }
+        for index in program.functions.clone() {
+            definition := program.function_defs[index]
+            when definition.public { unit.public_items.push(definition.name.clone()) }
+        }
         for alias_index in program.type_aliases.clone() {
             alias := program.alias_defs[alias_index]
             when alias.public && alias.span.end <= text.len() {
+                unit.public_items.push(alias.name.clone())
                 declared := text.slice(alias.span.start, alias.span.end)
                 equals := declared.find("=")
                 when equals.is_some() {
@@ -340,8 +364,25 @@ extend Loader {
                 return false
             }
             place := resolved.unwrap()
-            when !self.load(place[1].clone(), imported, place[0].clone()) {
+            mut loaded_module := imported.clone()
+            when place.len() > 2 { loaded_module = place[2].clone() }
+            when !self.load(place[1].clone(), loaded_module.clone(), place[0].clone()) {
                 return false
+            }
+            when place.len() > 2 {
+                item := imported.slice(loaded_module.len() + 2, imported.len())
+                mut visible := false
+                for provider in self.units.clone() {
+                    when provider.module_path == loaded_module {
+                        for name in provider.public_items.clone() { when name == item { visible = true } }
+                    }
+                }
+                when !visible {
+                    self.error = String("error[R0425]: unknown or private imported item `")
+                    self.error.append(imported)
+                    self.error.append("`")
+                    return false
+                }
             }
             use_at += 1
         }
@@ -466,6 +507,25 @@ fun rync_join(units: Vec<Unit>) -> Compilation {
             imported := unit.import_paths[import_at].clone()
             local := unit.import_locals[import_at].clone()
             for provider in units.clone() {
+                mut item_prefix := provider.module_path.clone()
+                item_prefix.append("::")
+                when imported.starts_with(item_prefix.clone()) {
+                    item := imported.slice(item_prefix.len(), imported.len())
+                    mut selected: u64 = 0
+                    while selected < provider.alias_names.len() {
+                        when provider.alias_names[selected] == item && local != item {
+                            text.append("type ")
+                            text.append(local.clone())
+                            parameters := provider.alias_parameters[selected].clone()
+                            when !parameters.is_empty() { text.append("<") text.append(parameters.clone()) text.append(">") }
+                            text.append(" = ")
+                            text.append(item.clone())
+                            when !parameters.is_empty() { text.append("<") text.append(parameters) text.append(">") }
+                            text.push('\n')
+                        }
+                        selected += 1
+                    }
+                }
                 when provider.module_path == imported {
                     mut alias_at: u64 = 0
                     while alias_at < provider.alias_names.len() {
@@ -1360,9 +1420,19 @@ fun main() -> i32 {
     mut entry_file := entry.clone()
     mut manifest_file := entry.clone()
     manifest_file.append("/ryn.yaml")
+    mut package_directory := entry.clone()
+    when !file_exists(manifest_file.clone()) && entry.ends_with(".ryn") {
+        enclosing := manifest::project_for_source(entry.clone())
+        when enclosing.is_some() {
+            package_directory = enclosing.unwrap()
+            manifest_file = manifest::join_path(package_directory.clone(), String("ryn.yaml"))
+        }
+    }
     when file_exists(manifest_file.clone()) {
-        source_root = manifest::join_path(entry.clone(), String("src"))
-        entry_file = manifest::join_path(source_root.clone(), String("main.ryn"))
+        source_root = manifest::join_path(package_directory.clone(), String("src"))
+        when package_directory == entry {
+            entry_file = manifest::join_path(source_root.clone(), String("main.ryn"))
+        }
         when !file_exists(entry_file.clone()) {
             mut message := String("error[R0001]: project entry point not found: ")
             message.append(entry_file)
@@ -1375,7 +1445,7 @@ fun main() -> i32 {
             message.append("\nmissing field `name`")
             return rync_fail(message, 1)
         }
-        added := rync_path_dependencies(entry.clone(), package_names.clone())
+        added := rync_path_dependencies(package_directory, package_names.clone())
         when added.is_err() {
             return rync_fail(added.unwrap_err(), 1)
         }

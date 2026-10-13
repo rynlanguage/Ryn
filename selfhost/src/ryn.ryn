@@ -185,11 +185,14 @@ fun ryn_default_output(input: String, project: bool, release: bool) -> String {
 // project with registry dependencies writes the lock file.
 fun ryn_dependencies(project: String) -> Vec<String> {
     mut none: Vec<String> = Vec()
-    when !fs::is_file(manifest::join_path(project.clone(), String("ryn.yaml"))) {
-        return none
+    mut directory := project
+    when !fs::is_file(manifest::join_path(directory.clone(), String("ryn.yaml"))) {
+        found := manifest::project_for_source(directory.clone())
+        when found.is_none() { return none }
+        directory = found.unwrap()
     }
-    when pkg::uses_registry(project.clone()) && !fs::is_file(manifest::join_path(project.clone(), String("ryn.lock"))) {
-        written := pkg::write_lock(project.clone())
+    when pkg::uses_registry(directory.clone()) && !fs::is_file(manifest::join_path(directory.clone(), String("ryn.lock"))) {
+        written := pkg::write_lock(directory.clone())
         when written.is_err() {
             eprint("{}", written.unwrap_err())
             return none
@@ -197,7 +200,7 @@ fun ryn_dependencies(project: String) -> Vec<String> {
         path := written.unwrap()
         eprint("note: created {}\n", path)
     }
-    resolved := pkg::dependency_directories(project)
+    resolved := pkg::dependency_directories(directory)
     when resolved.is_err() {
         eprint("{}\n", resolved.unwrap_err())
         none.push(String("!"))
@@ -522,6 +525,7 @@ fun ryn_bench() -> i32 {
     }
     // The programs to time: every file in the `benches` directory of a project, or the given file or project itself.
     mut targets: Vec<String> = Vec()
+    input = manifest::normalize(input)
     project := fs::is_dir(input.clone())
     mut packages := ryn_dependencies(input.clone())
     when packages.len() == 1 {
@@ -842,6 +846,7 @@ fun main() -> i32 {
     when input.is_empty() {
         return ryn_fail(ryn_usage())
     }
+    input = manifest::normalize(input)
     project := fs::is_dir(input.clone())
     when command == "check" {
         packages := ryn_dependencies(input.clone())

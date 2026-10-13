@@ -6,6 +6,12 @@ sequence: minor releases may change language details while the compiler is pre-1
 
 ## [0.1.13] — 2026-10-12 — Registers, AArch64, variadic C calls, sugar and gamedev
 
+- Native language fixes (2026-10-13): move custom-destructor values into enum payloads from locals and calls,
+  propagate them with `?`, and extract them with `unwrap`/`expect`/`unwrap_err` without copying the handle or double
+  dropping. Integer `as char` validates Unicode scalars without truncation. `Map()` infers types from its context,
+  including structure fields. `use module::PublicItem` supports public types, functions and type aliases. Source-file
+  check/build/run discovers the enclosing manifest and resolves path dependencies relative to it; Windows CLI paths
+  are normalized. Regression programs verify execution, drop counts, diagnostics, imports and CLI consistency.
 - Windows threads and mutexes (2026-10-13): `std::thread::Thread` supports spawn/id/join/drop through Windows APIs,
   with an independent worker startup context and synchronized allocator state. `std::sync::Mutex`, `MutexGuard`
   and `lock_raw` use non-recursive exclusive SRW locks on Windows and pthread mutexes on Linux through a common

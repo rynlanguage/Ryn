@@ -7226,6 +7226,7 @@ extend Gen {
     // code (1 for a String, 2 for a vector) and the type (the String, or the element type of the vector). None when the value
     // owns something a clone does not copy: a map or a set, an enum whose payloads own memory, or a vector of such.
     fun owned_cells(self, ty: u64) -> Option<Vec<u64>> {
+        when self.has_destructor(ty) { return Option::None }
         mut cells: Vec<u64> = Vec()
         when self.is_string(ty) {
             cells.push(0)
@@ -13455,9 +13456,7 @@ extend Gen {
         when !self.is_cell(ty) && self.aggregate_cells(ty) == 0 {
             return self.fail("an unwrap of a payload of this type")
         }
-        when self.has_destructor(ty) {
-            return self.fail("an unwrap of a payload with a destructor")
-        }
+        moving := self.owned_cells(ty).is_none()
         mut text := String("")
         when failure == "OptionUnwrapFailed" {
             text = String("Ryn runtime error: called Option.unwrap() on None\n")
@@ -13489,7 +13488,12 @@ extend Gen {
         asm.alu_ri(7, x64::Reg::RCX, tag as i64)
         asm.jcc(x64::Cc::NOT_EQUAL, failed)
         when self.is_cell(ty) {
+            asm.mov_rr(x64::Reg::RDX, x64::Reg::RAX)
             asm.load(8, false, x64::Reg::RAX, x64::Reg::RAX, 8)
+            when moving {
+                asm.mov_ri(x64::Reg::RCX, 0)
+                asm.store(8, x64::Reg::RCX, x64::Reg::RDX, 8)
+            }
             // The payload is a copy of what the box owns, as the runtime's unwrap copies it; the box keeps its own.
             owned := self.owned_cells(ty)
             when owned.is_some() && owned.unwrap().len() == 3 {
@@ -13505,6 +13509,14 @@ extend Gen {
                 asm.load(8, false, x64::Reg::RCX, x64::Reg::RAX, (8 * (1 + cell)) as i64)
                 asm.push(x64::Reg::RCX)
                 cell += 1
+            }
+            when moving {
+                asm.mov_ri(x64::Reg::RDX, 0)
+                cell = 0
+                while cell < count {
+                    asm.store(8, x64::Reg::RDX, x64::Reg::RAX, (8 * (1 + cell)) as i64)
+                    cell += 1
+                }
             }
             // The payload's owners are copies too: each is replaced on the stack by its copy.
             copies := self.owned_cells(ty)
@@ -15629,7 +15641,7 @@ extend Gen {
     // The part of `value?` up to the success: rax is then the box of the success, whose payload is the cell after the tag.
     // A failure returns from the function, after the `defer` bodies of the scopes it leaves have run.
     fun propagate_box(mut self, asm: &mut x64::Asm, value: u64, failure_type: Option<u64>, success_variant: u64, output_failure_variant: u64, deferred: Vec<u64>) -> bool {
-        when failure_type.is_some() && (self.cells_of(failure_type.unwrap()) == 0 || self.has_destructor(failure_type.unwrap())) {
+        when failure_type.is_some() && self.cells_of(failure_type.unwrap()) == 0 {
             return self.fail("a propagated error of this type")
         }
         mut errors: u64 = 0
@@ -15678,9 +15690,6 @@ extend Gen {
 
     // `value?` of a structure, pushed as its cells, as a call returns it.
     fun push_propagated(mut self, asm: &mut x64::Asm, value: u64, id: u64, failure_type: Option<u64>, success_variant: u64, output_failure_variant: u64, deferred: Vec<u64>) -> bool {
-        when self.struct_destructor_cells(id).len() > 0 {
-            return self.fail("a propagated structure with a destructor")
-        }
         when !self.propagate_box(asm, value, failure_type, success_variant, output_failure_variant, deferred) {
             return false
         }
@@ -15700,9 +15709,6 @@ extend Gen {
 
     // `value?` of a structure: its cells are copied from the success box into the frame from `base` on.
     fun propagate_struct(mut self, asm: &mut x64::Asm, value: u64, id: u64, failure_type: Option<u64>, success_variant: u64, output_failure_variant: u64, deferred: Vec<u64>, base: u64) -> bool {
-        when self.struct_destructor_cells(id).len() > 0 {
-            return self.fail("a propagated structure with a destructor")
-        }
         when !self.propagate_box(asm, value, failure_type, success_variant, output_failure_variant, deferred) {
             return false
         }
@@ -16343,9 +16349,6 @@ extend Gen {
 
     // A structure local moved into the box at the payload `offset`.
     fun store_moved_to_box(mut self, asm: &mut x64::Asm, slot: u64, offset: u64, id: u64) -> bool {
-        when self.struct_destructor_cells(id).len() > 0 {
-            return self.fail("a structure with a destructor in a box")
-        }
         when !self.copy_local_to_box(asm, slot, offset, self.program.structs[id].slot_count) {
             return false
         }
@@ -16355,9 +16358,6 @@ extend Gen {
 
     // A structure that a call returns, stored into the box at the payload `offset`: its cells are on the stack above the box.
     fun call_into_box(mut self, asm: &mut x64::Asm, target: ir::CallTarget, arguments: Vec<u64>, offset: u64, id: u64) -> bool {
-        when self.struct_destructor_cells(id).len() > 0 {
-            return self.fail("a structure with a destructor in a box")
-        }
         count := self.program.structs[id].slot_count
         when !self.call_expression(asm, target, arguments) {
             return false

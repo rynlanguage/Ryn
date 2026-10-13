@@ -13,6 +13,7 @@ pub struct Builtin {
 fun builtin_rows() -> Vec<String> {
     mut rows: Vec<String> = Vec()
     rows.push(String("char_from_u32;String CharFromU32;U32;Char"))
+    rows.push(String("__char_from_u64;String CharFromU64;U64;Char"))
     // Only the native runtime module uses this one; the bootstrap compiler does not know it.
     rows.push(String("__native_string_from_raw;String FromRaw;RawPointer U8,U64;OwnedString"))
     rows.push(String("read_file,__fs_read_file;Filesystem ReadFile;Str;OwnedString"))

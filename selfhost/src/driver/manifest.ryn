@@ -205,17 +205,33 @@ pub fun read_manifest(text: String) -> Manifest {
 
 // The directory part of a path, without the final slash ("" when there is none).
 pub fun directory_of(path: String) -> String {
-    mut at: u64 = path.len()
+    mut normalized := path
+    when __os() == "windows" { normalized = normalized.replace("\\", "/") }
+    mut at: u64 = normalized.len()
     while at > 0 {
         at -= 1
-        when (path.byte_at(at) as u64) == 47 {
+        when (normalized.byte_at(at) as u64) == 47 {
             when at == 0 {
                 return String("/")
             }
-            return path.slice(0, at)
+            return normalized.slice(0, at)
         }
     }
     return String("")
+}
+
+// A source checked by filename still belongs to its nearest enclosing project.
+pub fun project_for_source(source: String) -> Option<String> {
+    mut directory := directory_of(source)
+    when directory.is_empty() { directory = String(".") }
+    while true {
+        when file_exists(join_path(directory.clone(), String("ryn.yaml"))) { return Option::Some(directory) }
+        parent := directory_of(directory.clone())
+        when parent == directory || directory == "." { return Option::None }
+        directory = parent
+        when directory.is_empty() { directory = String(".") }
+    }
+    return Option::None
 }
 
 // Whether a path starts at a root: `/`, or a drive letter and a colon (`C:/`).
@@ -244,9 +260,11 @@ pub fun join_path(base: String, relative: String) -> String {
 }
 
 pub fun normalize(path: String) -> String {
-    absolute := path.starts_with("/")
+    mut normalized := path
+    when __os() == "windows" { normalized = normalized.replace("\\", "/") }
+    absolute := normalized.starts_with("/")
     mut parts: Vec<String> = Vec()
-    for part in mf_split(path, 47) {
+    for part in mf_split(normalized, 47) {
         when part.is_empty() || part == "." {
             continue
         }

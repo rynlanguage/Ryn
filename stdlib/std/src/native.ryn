@@ -1827,6 +1827,13 @@ extern "C" fun pthread_mutex_lock(mutex: *u8) -> i32;
 extern "C" fun pthread_mutex_trylock(mutex: *u8) -> i32;
 extern "C" fun pthread_mutex_unlock(mutex: *u8) -> i32;
 
+pub fun __rt_string_char_from_u64(value: u64) -> char {
+    when value > 1114111 || (value >= 55296 && value <= 57343) {
+        runtime_failure(String("invalid Unicode scalar value"))
+    }
+    return char_from_u32(value as u32)
+}
+
 pub fun __rt_system_mutex_new() -> *u8 {
     lock := malloc(64)
     when lock == null { return null }
